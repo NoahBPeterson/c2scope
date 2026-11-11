@@ -1,0 +1,107 @@
+"""Shared access to an original binary in Bin/ and its PDB index (work/index/<file name>.csv).
+
+Image(name)       name is the file stem, e.g. "cl", "c2", "c1xx", "link"
+  .read(va, n)    bytes at a VA
+  .func(key)      index row for a VA (int) or an exact mangled symbol (str); None if absent
+  .relocs         set of VAs covered by base relocations (DLLs have them; the exes don't)
+  .reloc_mask(va, n)  offsets in [0, n) whose bytes a base relocation (or, without .reloc, an image-address
+                  displacement/immediate operand) covers: the bytes an object file leaves as relocations
+"""
+import bisect, csv, glob, os, struct
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def find_binary(name):
+    """Bin/ file by full name (c2.dll) or by stem (c2) when the stem is unique (vcbuild needs .exe or .dll)."""
+    files = [p for p in glob.glob(os.path.join(ROOT, "Bin", "*")) if os.path.isfile(p)]
+    hit = [p for p in files if os.path.basename(p).lower() == name.lower()]
+    hit = hit or [p for p in files if os.path.basename(p).lower().rsplit(".", 1)[0] == name.lower()
+                  and p.lower().endswith((".exe", ".dll"))]
+    if len(hit) != 1:
+        raise SystemExit("Bin/%s: %s" % (name, "ambiguous, give the extension" if hit else "not found"))
+    return hit[0]
+
+
+class Image:
+    def __init__(self, name):
+        import pefile
+        self.path = find_binary(name)
+        self.name = os.path.basename(self.path).lower()
+        self.pe = pefile.PE(self.path, fast_load=True)
+        self.base = self.pe.OPTIONAL_HEADER.ImageBase
+        self.size = self.pe.OPTIONAL_HEADER.SizeOfImage
+        self.data = self.pe.get_memory_mapped_image()
+        self.rows, self.by_va, self.by_sym = [], {}, {}
+        idx = os.path.join(ROOT, "work", "index", self.name + ".csv")
+        if os.path.exists(idx):
+            for r in csv.DictReader(open(idx)):
+                r["va"] = int(r["va"], 16)
+                r["size"] = int(r["size"])
+                self.rows.append(r)
+                self.by_va.setdefault(r["va"], r)
+                self.by_sym.setdefault(r["symbol"], r)
+        self.starts = sorted(self.by_va)
+        self.relocs = self._relocs()
+        self.imports = {}
+        try:
+            self.pe.parse_data_directories(directories=[1])
+            for e in getattr(self.pe, "DIRECTORY_ENTRY_IMPORT", []):
+                for i in e.imports:
+                    self.imports[i.address] = "%s!%s" % (e.dll.decode().lower().rsplit(".", 1)[0],
+                                                         i.name.decode() if i.name else "ord%d" % i.ordinal)
+        except Exception:
+            pass
+
+    def name_at(self, va):
+        """Symbol or import name at a VA, else None."""
+        r = self.by_va.get(va)
+        return r["symbol"] if r else self.imports.get(va)
+
+    def _relocs(self):
+        d = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
+        out = set()
+        if not d.Size:
+            return out
+        raw = self.data[d.VirtualAddress:d.VirtualAddress + d.Size]
+        o = 0
+        while o + 8 <= len(raw):
+            page, size = struct.unpack_from("<II", raw, o)
+            if size < 8:
+                break
+            for e in struct.unpack_from("<%dH" % ((size - 8) // 2), raw, o + 8):
+                if e >> 12 == 3:
+                    out.add(self.base + page + (e & 0xFFF))
+            o += size
+        return out
+
+    def read(self, va, n):
+        o = va - self.base
+        return bytes(self.data[o:o + n])
+
+    def func(self, key):
+        if isinstance(key, int):
+            return self.by_va.get(key)
+        return self.by_sym.get(key)
+
+    def in_image(self, v):
+        return self.base <= v < self.base + self.size
+
+    def reloc_mask(self, va, n):
+        m = set()
+        if self.relocs:
+            for k in range(-3, n):
+                if va + k in self.relocs:
+                    m.update(x for x in range(k, k + 4) if 0 <= x < n)
+            return m
+        import capstone
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+        code = self.read(va, n)
+        for i in md.disasm(code, 0):
+            for at, size in ((i.disp_offset, i.disp_size), (i.imm_offset, i.imm_size)):
+                if at and size == 4:
+                    v = int.from_bytes(code[i.address + at:i.address + at + 4], "little")
+                    if self.in_image(v):
+                        m.update(range(i.address + at, i.address + at + 4))
+        return m

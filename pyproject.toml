@@ -1,0 +1,10 @@
+[project]
+name = "c2-glassbox"
+version = "0.1.0"
+description = "Tracer, register-allocation model and search tools for VS2005 SP1 c2.dll"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "capstone==5.0.7",
+    "pefile==2024.8.26",
+]

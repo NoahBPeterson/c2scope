@@ -1,0 +1,7 @@
+work/
+Bin/
+__pycache__/
+.venv/
+*.obj
+*.asm
+tools/rasim/target/
