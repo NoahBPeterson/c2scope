@@ -24,7 +24,7 @@
 //! register (`var:` only raises P); preferences created by the edit (give `pref:` / `copy:` as well).
 
 use super::*;
-use choose::{rname, rnum, Change, Item, Model, Mods, Outcome, ORDER};
+use choose::{rname, rnum, Change, DiffOut, Inf, Item, Model, Mods, Outcome, PopOut, ORDER};
 
 /// A source edit resolved to a globreg of the first int pass (index into Uni::base.vars).
 #[derive(Clone, Debug)]
@@ -58,6 +58,28 @@ pub struct Uni {
     elig: Vec<usize>,                          // the vars `steps` can pop, ascending
     elig_at: Vec<usize>,                       // per var: its index in elig (usize::MAX: none)
     bcoef: BTreeMap<u32, Vec<(usize, i64)>>,   // per block b: (index in elig, d prio / d P_b) of the first-pass vars
+    // for `Uni::quick`:
+    ord0: Vec<usize>,      // elig indices in colouring order (unedited priorities)
+    rank: Vec<u32>,        // per elig index: its place in ord0
+    tiek: Vec<Option<(std::cmp::Reverse<u32>, std::cmp::Reverse<u32>, i64)>>, // per elig index: sort_order's tie key
+    kall: Vec<u32>,        // per block: `kills_fast` for a var that does not span it
+    pw: Vec<i64>,          // pw[k]: sum of P_b * w_b over the first-pass blocks b < k
+    p1vars: Vec<usize>,    // the first-pass vars, ascending
+    rnew: Vec<Vec<usize>>, // per round: the vars that `steps_ord` can pop from it on (empty: rounds not ascending)
+    pres_of: Vec<(u32, u32, bool, u32, u32)>, // per var: (first, last present block, present in all between, ...)
+    pbl: Vec<u32>,         // per var u: its present blocks pbl[pres_of[u].3..], then the blocks k with k and k + 1
+                           // present, up to pres_of[u].4
+}
+
+/// A source edit as `Uni::quick` gives it: the order is unchanged, or the colouring order it gives.
+enum Quick {
+    Same,
+    Order(Vec<usize>),
+}
+
+thread_local! {
+    static MARK: std::cell::RefCell<Vec<(u32, i64)>> = std::cell::RefCell::new(vec![]); // per elig index: (stamp, new prio)
+    static MARK_G: std::cell::Cell<u32> = std::cell::Cell::new(0);
 }
 
 fn range(v: &Var) -> Option<(u32, u32)> {
@@ -146,6 +168,15 @@ impl Uni {
             elig: vec![],
             elig_at: vec![],
             bcoef: BTreeMap::new(),
+            ord0: vec![],
+            rank: vec![],
+            tiek: vec![],
+            kall: vec![],
+            pw: vec![],
+            p1vars: vec![],
+            rnew: vec![],
+            pres_of: vec![],
+            pbl: vec![],
         };
         let mut pending: Vec<usize> = vec![];
         let mut pre: Vec<usize> = vec![];
@@ -275,6 +306,263 @@ impl Uni {
                 u.bcoef.entry(b).or_default().push((i, c * t.get(&b).map_or(1, |y| y.0)));
             }
         }
+        u.prepare_quick();
+    }
+
+    /// The rest of `prepare`: the unedited colouring order of the eligible vars, kill estimates and penalty sums.
+    fn prepare_quick(&mut self) {
+        let u = self;
+        let tie = |v: &Var| {
+            v.num.map(|n| {
+                if v.pass <= 1 {
+                    (std::cmp::Reverse(v.pass), std::cmp::Reverse(n & 0x3ff), n as i64)
+                } else {
+                    (std::cmp::Reverse(v.pass), std::cmp::Reverse(0), -(n as i64))
+                }
+            })
+        };
+        u.tiek = u.elig.iter().map(|&v| tie(&u.base.vars[v])).collect();
+        let mut o: Vec<(usize, i64)> = u.elig.iter().map(|&v| (v, u.prio0[v])).collect();
+        u.base.sort_order(&mut o);
+        u.ord0 = o.iter().map(|x| u.elig_at[x.0]).collect();
+        u.rank = vec![0; u.elig.len()];
+        for (r, &i) in u.ord0.iter().enumerate() {
+            u.rank[i] = r as u32;
+        }
+        let tbl = u.base.vars.iter().find(|v| v.pass == u.p1).and_then(|v| v.own.clone()).unwrap_or_default();
+        let maxb = tbl.keys().copied().max().unwrap_or(0) as usize + 2;
+        u.pw = vec![0; maxb + 1];
+        for k in 0..maxb {
+            let (w, p) = tbl.get(&(k as u32)).copied().unwrap_or((1, 0));
+            u.pw[k + 1] = u.pw[k] + p * w;
+        }
+        u.kall = (0..maxb as u32).map(|k| u.kills_fast(usize::MAX, k)).collect();
+        // the rounds in which steps_ord may pop each var: an interval, the passes ascending
+        if u.rounds.windows(2).all(|p| p[0] < p[1]) {
+            let nv = u.base.vars.len().min(u.ev_of.len());
+            let mut rnew = vec![vec![]; u.rounds.len()];
+            for v in 0..nv {
+                if !(u.ev_of[v].is_some() || u.synth[v]) {
+                    continue;
+                }
+                let ok: Vec<bool> = u.rounds.iter().map(|&k| u.base.vars[v].pass <= k && u.alive(v, k)).collect();
+                let Some(lo) = ok.iter().position(|&b| b) else { continue };
+                let hi = ok.iter().rposition(|&b| b).unwrap();
+                if ok[lo..=hi].iter().any(|&b| !b) {
+                    rnew.clear();
+                    break;
+                }
+                rnew[lo].push(v);
+            }
+            u.rnew = rnew;
+        }
+        u.pres_of = vec![(0, 0, false, 0, 0); u.base.vars.len()];
+        for (i, x) in u.base.vars.iter().enumerate() {
+            if x.pass != u.p1 {
+                continue;
+            }
+            let mut bl: Vec<u32> = x.cost.keys().chain(x.live.iter()).copied().collect();
+            bl.sort_unstable();
+            bl.dedup();
+            if bl.is_empty() {
+                continue;
+            }
+            u.p1vars.push(i);
+            let (lo, hi) = (bl[0], *bl.last().unwrap());
+            let all = (hi - lo + 1) as usize == bl.len();
+            let s = u.pbl.len() as u32;
+            let pairs: Vec<u32> = bl.windows(2).filter(|p| p[1] == p[0] + 1).map(|p| p[0]).collect();
+            u.pbl.extend(&bl);
+            let m = u.pbl.len() as u32;
+            u.pbl.extend(pairs);
+            u.pres_of[i] = (lo, hi, all, s, m);
+        }
+    }
+
+    /// Var u is present in a block of k0..k1, or in two neighbouring blocks of c0..=c1.
+    fn meets(&self, u: usize, k0: u32, k1: u32, c0: u32, c1: u32) -> bool {
+        let (lo, hi, all, s, m) = self.pres_of[u];
+        if all {
+            return (k0 < k1 && lo < k1 && hi >= k0) || lo.max(c0) < hi.min(c1);
+        }
+        let bl = &self.pbl[s as usize..m as usize];
+        let i = bl.partition_point(|&b| b < k0);
+        if i < bl.len() && bl[i] < k1 {
+            return true;
+        }
+        let pe = self.pair_end(u);
+        let pr = &self.pbl[m as usize..pe];
+        let j = pr.partition_point(|&b| b < c0);
+        j < pr.len() && pr[j] < c1
+    }
+
+    fn pair_end(&self, u: usize) -> usize {
+        // the next first-pass var's lists start where u's pairs end
+        match self.p1vars.binary_search(&u) {
+            Ok(k) if k + 1 < self.p1vars.len() => self.pres_of[self.p1vars[k + 1]].3 as usize,
+            _ => self.pbl.len(),
+        }
+    }
+
+    /// sort_order's rule: elig index i (priority pi) is coloured before j (priority pj).
+    fn first(&self, i: usize, pi: i64, j: usize, pj: i64) -> bool {
+        let (a, b) = (&self.base.vars[self.elig[i]], &self.base.vars[self.elig[j]]);
+        (pj, b.def_ord, &self.tiek[i], i) < (pi, a.def_ord, &self.tiek[j], j)
+    }
+
+    /// One `ref:`, `unref:` or `extend:` edit for the fast path of `Ctx::eval`: what `apply` adds to the mods
+    /// (without the description), and the colouring order from the changed priorities (computed from the few vars
+    /// whose priority changes). None: an edit this does not handle.
+    fn quick(&self, m: &Model, e: &Src, md: &mut Mods) -> Option<Result<Quick, String>> {
+        let v = match e {
+            Src::Ref(v, ..) | Src::Unref(v, ..) | Src::Extend(v, ..) => *v,
+            _ => return None,
+        };
+        let x = &self.base.vars[v];
+        if x.pass != self.p1 {
+            return None;
+        }
+        let name = || self.vlabel(v);
+        let web = self.web_of[v];
+        let tb = |b: u32| x.own.as_ref().and_then(|t| t.get(&b)).copied().unwrap_or((1, 0));
+        let lv = |b: &u32| x.live.contains(b) as i64;
+        // (the edited var's new priority, the block whose P changes and by how much)
+        let (pv, bump): (i64, Option<(u32, i64)>) = match e {
+            Src::Ref(_, b, c) => {
+                if !present(x, *b) {
+                    return Some(Err(format!("{} is not live in block {}; use extend:{}:{}", name(), b, name(), b)));
+                }
+                let had = x.cost.contains_key(b);
+                let c0 = x.cost.get(b).copied().unwrap_or(0);
+                let (w, p) = tb(*b);
+                let old = c0 * p * w - lv(b) * p * w;
+                let new = (c0 + c) * (p + !had as i64) * w;
+                if let Some(wv) = web {
+                    md.ben.push((wv, c * w));
+                }
+                (self.prio0[v] - old + new, (!had).then_some((*b, 1)))
+            }
+            Src::Unref(_, b) => {
+                let Some(&c0) = x.cost.get(b) else {
+                    return Some(Err(format!("{} has no reference in block {}", name(), b)));
+                };
+                let (w, p) = tb(*b);
+                let old = c0 * p * w - lv(b) * p * w;
+                let new = -(p - 1) * w;
+                if let Some(wv) = web {
+                    md.ben.push((wv, -c0 * w));
+                }
+                (self.prio0[v] - old + new, Some((*b, -1)))
+            }
+            Src::Extend(_, b) => {
+                let Some((lo, hi)) = range(x) else { return Some(Err(format!("{} has no blocks", name()))) };
+                if (lo..=hi).contains(b) {
+                    return Some(Err(format!("{} already reaches block {} (range {}..{}); use ref:", name(), b, lo, hi)));
+                }
+                let Some(wv) = web else { return Some(Err(format!("{} has no avail set in the trace", name()))) };
+                if !x.own.as_ref().map_or(false, |t| t.contains_key(b)) {
+                    return Some(Err(format!("no block {} in Spillcosts pass {}", b, self.p1)));
+                }
+                let (k0, k1) = if *b < lo { (*b + 1, lo) } else { (hi + 1, *b) }; // the blocks in between
+                let (c0, c1) = if *b < lo { (*b, lo) } else { (hi, *b) }; // the chain of blocks it now spans
+                if (k1 as usize) >= self.pw.len() {
+                    return None;
+                }
+                // the first-pass vars present in a block in between, or in two neighbouring blocks of the chain
+                let meet: Vec<usize> = self.p1vars.iter().copied().filter(|&u| self.meets(u, k0, k1, c0, c1)).collect();
+                let mut over: Vec<usize> =
+                    meet.iter().filter(|&&u| u != v).filter_map(|&u| self.web_of[u]).filter(|&wu| m.init_seen[wu]).collect();
+                let mut ws = over.clone();
+                ws.sort_unstable();
+                if ws.windows(2).any(|p| p[0] == p[1]) {
+                    let mut seen = BTreeSet::new();
+                    over.retain(|&w| seen.insert(w));
+                }
+                let mut kills = 0u32;
+                for k in k0..k1 {
+                    kills |= self.kall[k as usize];
+                }
+                kills &= self.init_av[wv].unwrap_or(0);
+                let (w, p) = tb(*b);
+                md.ben.push((wv, 2 * w));
+                for &y in &over {
+                    md.add_e.push((wv, y));
+                }
+                if kills != 0 {
+                    md.kills.push((wv, kills));
+                }
+                md.ext.push((wv, over));
+                let pen = self.pw[k1 as usize] - self.pw[k0 as usize];
+                (self.prio0[v] - pen + 2 * (p + 1) * w, Some((*b, 1)))
+            }
+            _ => unreachable!(),
+        };
+        // the eligible vars whose priority changes, with the new one
+        let mut chg: Vec<(usize, i64)> = vec![];
+        if let Some((b, dp)) = bump {
+            for &(i, c) in self.bcoef.get(&b).map_or(&[][..], |l| &l[..]) {
+                chg.push((i, self.prio0[self.elig[i]] + c * dp));
+            }
+        }
+        let ve = self.elig_at[v];
+        if ve != usize::MAX {
+            match chg.iter_mut().find(|x| x.0 == ve) {
+                Some(x) => x.1 = pv,
+                None => chg.push((ve, pv)),
+            }
+        }
+        chg.retain(|&(i, p)| p != self.prio0[self.elig[i]]);
+        let n = self.ord0.len();
+        MARK.with(|mk| {
+            let mut mk = mk.borrow_mut();
+            if mk.len() < n {
+                mk.resize(n, (0, 0));
+            }
+            let g = MARK_G.with(|c| {
+                let g = c.get().wrapping_add(1).max(1);
+                c.set(g);
+                g
+            });
+            if g == 1 {
+                mk.iter_mut().for_each(|x| x.0 = 0);
+            }
+            for &(i, p) in &chg {
+                mk[i] = (g, p);
+            }
+            let prio = |i: usize| if mk[i].0 == g { mk[i].1 } else { self.prio0[self.elig[i]] };
+            let sorted = chg.iter().all(|&(i, p)| {
+                let r = self.rank[i] as usize;
+                (r == 0 || self.first(self.ord0[r - 1], prio(self.ord0[r - 1]), i, p))
+                    && (r + 1 >= n || self.first(i, p, self.ord0[r + 1], prio(self.ord0[r + 1])))
+            });
+            if sorted {
+                return Some(Ok(Quick::Same));
+            }
+            // the unchanged ones keep their order; the changed ones are sorted and merged in
+            let mut moved: Vec<(usize, i64)> = chg.clone();
+            moved.sort_by(|a, b| {
+                if self.first(a.0, a.1, b.0, b.1) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+            let mut ord: Vec<usize> = Vec::with_capacity(n);
+            let mut k = 0;
+            for &i in &self.ord0 {
+                if mk[i].0 == g {
+                    continue;
+                }
+                let p = self.prio0[self.elig[i]];
+                while k < moved.len() && self.first(moved[k].0, moved[k].1, i, p) {
+                    ord.push(self.elig[moved[k].0]);
+                    k += 1;
+                }
+                ord.push(self.elig[i]);
+            }
+            ord.extend(moved[k..].iter().map(|x| self.elig[x.0]));
+            Some(Ok(Quick::Order(ord)))
+        })
     }
 
     fn alive(&self, v: usize, k: u32) -> bool {
@@ -293,6 +581,18 @@ impl Uni {
         let st = &self.base; // pass and count only: an edit changes neither
         let nv = st.vars.len().min(self.ev_of.len());
         let mut popped = vec![false; st.vars.len()];
+        // A var can be popped in an interval of rounds (Uni::rlo). A new round's scan would start over at ord[0]; it
+        // finds the same var when started at the old position or at the first var that has just become poppable.
+        let fresh = !self.rnew.is_empty();
+        let mut pos: Vec<u32> = vec![];
+        if fresh {
+            pos = vec![u32::MAX; st.vars.len()];
+            for (i, &v) in ord.iter().enumerate() {
+                if v < pos.len() {
+                    pos[v] = i as u32;
+                }
+            }
+        }
         // ord[..cur] holds nothing round r can pop: popped, or not in the list in this round
         let (mut cur, mut cur_r) = (0usize, usize::MAX);
         let nr = self.rounds.len();
@@ -303,7 +603,18 @@ impl Uni {
         loop {
             let k = self.rounds[r];
             if cur_r != r {
-                (cur, cur_r) = (0, r);
+                if !fresh || cur_r == usize::MAX {
+                    cur = 0;
+                } else {
+                    for rr in cur_r + 1..=r {
+                        for &v in &self.rnew[rr] {
+                            if !popped[v] {
+                                cur = cur.min(pos[v] as usize);
+                            }
+                        }
+                    }
+                }
+                cur_r = r;
             }
             while cur < ord.len() {
                 let v = ord[cur];
@@ -843,10 +1154,68 @@ pub struct Ctx<'a> {
     fast: bool,
     tr_nat: Option<choose::Trace>,   // the unedited run in the traced order (abstract changes only)
     tr_steps: Option<choose::Trace>, // the unedited run in the order `Uni::steps` computes (with source edits)
+    alias: bool,                     // the two unedited runs colour alike, in the same colourings
+    collide: bool,                   // two webs have the same label (inferred lines are then compared as text)
 }
 
-pub struct Eval {
-    pub out: Outcome,
+/// A run's outcome: in full (the reference path), or as differences from an unedited run (`Model::run_diff`).
+pub enum Run<'t> {
+    Full(Outcome),
+    Diff(DiffOut<'t>),
+}
+
+impl<'t> Run<'t> {
+    pub fn colour(&self, w: usize) -> Option<u32> {
+        match self {
+            Run::Full(o) => o.colour[w],
+            Run::Diff(d) => d.colour(w),
+        }
+    }
+
+    pub fn colours(&self, n: usize) -> Vec<Option<u32>> {
+        (0..n).map(|w| self.colour(w)).collect()
+    }
+
+    pub fn first_pop(&self, w: usize) -> Option<&PopOut> {
+        match self {
+            Run::Full(o) => o.pops.iter().find(|p| p.web == w),
+            Run::Diff(d) => d.first_pop(w),
+        }
+    }
+
+    pub fn pops(&self) -> Vec<&PopOut> {
+        match self {
+            Run::Full(o) => o.pops.iter().collect(),
+            Run::Diff(d) => d.pops().collect(),
+        }
+    }
+
+    pub fn infs(&self) -> Vec<&Inf> {
+        match self {
+            Run::Full(o) => o.inferred.iter().collect(),
+            Run::Diff(d) => d.infs().collect(),
+        }
+    }
+
+    pub fn outcome(&self, n: usize) -> Outcome {
+        Outcome {
+            colour: self.colours(n),
+            pops: self.pops().into_iter().cloned().collect(),
+            inferred: self.infs().into_iter().cloned().collect(),
+        }
+    }
+}
+
+/// A candidate ready to run (`Ctx::prep`).
+struct Prep {
+    md: Mods,
+    same: bool,                // the step order is the unedited one
+    ord: Option<Vec<usize>>,   // the colouring order (its step order is computed when run)
+    desc: Vec<String>,
+}
+
+pub struct Eval<'t> {
+    pub out: Run<'t>,
     pub desc: Vec<String>,
 }
 
@@ -856,7 +1225,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// `fast`: the fast path of `eval` (an overlay of the priority state, precomputed tables, and the unedited runs
-    /// kept for `Model::run_fast`); worth its setup only when many candidates are evaluated. RASIM_REF=1 turns it off.
+    /// kept for `Model::run_diff`); worth its setup only when many candidates are evaluated. RASIM_REF=1 turns it off.
     pub fn with(s: &'a Snap, traces: bool) -> Ctx<'a> {
         let m = Model::build(s).unwrap_or_else(|e| die(&e));
         let mut uni = Uni::build(s, &m);
@@ -870,7 +1239,14 @@ impl<'a> Ctx<'a> {
         } else {
             (None, None)
         };
-        Ctx { s, m, uni, fast, tr_nat, tr_steps }
+        let alias = match (&tr_nat, &tr_steps) {
+            (Some(a), Some(b)) => a.outcome().pops == b.outcome().pops && a.outcome().colour == b.outcome().colour,
+            _ => false,
+        };
+        let mut labs: Vec<String> = (0..m.webs.len()).map(|w| m.label(w)).collect();
+        labs.sort_unstable();
+        let collide = labs.windows(2).any(|p| p[0] == p[1]);
+        Ctx { s, m, uni, fast, tr_nat, tr_steps, alias, collide }
     }
 
     pub fn label(&self, c: &Cand) -> String {
@@ -890,35 +1266,53 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    pub fn eval(&self, cs: &[&Cand]) -> Result<Eval, String> {
+    pub fn eval(&self, cs: &[&Cand]) -> Result<Eval<'_>, String> {
+        self.eval_d(cs, true)
+    }
+
+    /// `want_desc` false: the edits' descriptions may be left out (Eval.desc empty).
+    pub fn eval_d(&self, cs: &[&Cand], want_desc: bool) -> Result<Eval<'_>, String> {
+        let p = self.prep(cs, want_desc)?;
+        let out = self.exec(&p)?;
+        Ok(Eval { out, desc: p.desc })
+    }
+
+    /// Everything but the register model's run: the changes resolved, the edits applied, the step order.
+    fn prep(&self, cs: &[&Cand], want_desc: bool) -> Result<Prep, String> {
         let abs: Vec<Change> = cs.iter().filter_map(|c| if let Cand::Abs(c) = c { Some(c.clone()) } else { None }).collect();
         let mut md = self.m.resolve(&abs)?;
         let mut desc = vec![];
         let srcs: Vec<&Src> = cs.iter().filter_map(|c| if let Cand::Src(e) = c { Some(e) } else { None }).collect();
+        let (mut same, mut ord) = (false, None);
         if !srcs.is_empty() {
             self.uni.exact.clone()?;
-            if self.fast {
-                let u = &self.uni;
-                let mut ov = Ov { base: &u.base, prio0: &u.prio0, ed: vec![], bumps: vec![] };
-                for e in srcs {
-                    u.apply(&self.m, e, &mut ov, &mut md, &mut desc, true)?;
+            let q = match (&self.tr_steps, self.fast && !want_desc && srcs.len() == 1) {
+                (Some(_), true) => self.uni.quick(&self.m, srcs[0], &mut md),
+                _ => None,
+            };
+            if let Some(q) = q {
+                let q = q?;
+                if std::env::var_os("RASIM_QCHECK").is_some() {
+                    // the overlay path must give the same mods and order
+                    let mut m2 = self.m.resolve(&abs)?;
+                    let o2 = self.ov_order(&srcs, &mut m2, &mut vec![])?;
+                    let o1 = match &q {
+                        Quick::Same => self.tr_steps.as_ref().unwrap().order().to_vec(),
+                        Quick::Order(o) => self.uni.steps_ord(&self.m, o),
+                    };
+                    let key = |m: &Mods| format!("{:?} {:?} {:?} {:?} {:?} {:?}", m.ben, m.kills, m.gives, m.add_e, m.del_e, m.ext);
+                    assert!(o1 == o2 && key(&md) == key(&m2), "quick differs for {}", self.uni.label(srcs[0]));
                 }
-                // the priorities Ov::prio_of gives, from the per-block coefficients
-                let mut o: Vec<(usize, i64)> = u.elig.iter().map(|&v| (v, u.prio0[v])).collect();
-                for &(p1, b, dp) in &ov.bumps {
-                    debug_assert_eq!(p1, u.p1);
-                    for &(i, c) in u.bcoef.get(&b).map_or(&[][..], |l| &l[..]) {
-                        o[i].1 += c * dp;
-                    }
+                match q {
+                    Quick::Same => same = true,
+                    Quick::Order(o) => ord = Some(o),
                 }
-                for (v, x) in &ov.ed {
-                    if u.elig_at[*v] != usize::MAX {
-                        o[u.elig_at[*v]].1 = u.base.prio(x);
-                    }
+                if same && !md.moves.is_empty() {
+                    md.order = Some(self.tr_steps.as_ref().unwrap().order().to_vec());
+                    same = false;
                 }
-                u.base.sort_order(&mut o);
-                let ord: Vec<usize> = o.into_iter().map(|x| x.0).collect();
-                md.order = Some(u.steps_ord(&self.m, &ord));
+            } else if self.fast {
+                md.order = Some(self.ov_order(&srcs, &mut md, &mut desc)?);
             } else {
                 let mut st = self.uni.base.clone();
                 for e in srcs {
@@ -927,12 +1321,104 @@ impl<'a> Ctx<'a> {
                 md.order = Some(self.uni.steps(&self.m, &st));
             }
         }
-        let tr = if md.order.is_some() { self.tr_steps.as_ref() } else { self.tr_nat.as_ref() };
-        let out = match tr {
-            Some(t) => self.m.run_fast(&md, t)?,
-            None => self.m.run(&md)?,
+        Ok(Prep { md, same, ord, desc })
+    }
+
+    /// The register model's run for a `prep`.
+    fn exec(&self, p: &Prep) -> Result<Run<'_>, String> {
+        let steps;
+        let md = match &p.ord {
+            Some(o) => {
+                let mut m = p.md.clone();
+                steps = self.uni.steps_ord(&self.m, o);
+                m.order = Some(steps);
+                std::borrow::Cow::Owned(m)
+            }
+            None => std::borrow::Cow::Borrowed(&p.md),
         };
-        Ok(Eval { out, desc })
+        let tr = if md.order.is_some() || p.same { self.tr_steps.as_ref() } else { self.tr_nat.as_ref() };
+        Ok(match tr {
+            Some(t) => Run::Diff(self.m.run_diff(&md, t, p.same)?),
+            None => Run::Full(self.m.run(&md)?),
+        })
+    }
+
+    /// The edits applied to an overlay of the priority state; the step order from the changed priorities.
+    fn ov_order(&self, srcs: &[&Src], md: &mut Mods, desc: &mut Vec<String>) -> Result<Vec<usize>, String> {
+        let u = &self.uni;
+        let mut ov = Ov { base: &u.base, prio0: &u.prio0, ed: vec![], bumps: vec![] };
+        for e in srcs {
+            u.apply(&self.m, e, &mut ov, md, desc, true)?;
+        }
+        // the priorities Ov::prio_of gives, from the per-block coefficients
+        let mut o: Vec<(usize, i64)> = u.elig.iter().map(|&v| (v, u.prio0[v])).collect();
+        for &(p1, b, dp) in &ov.bumps {
+            debug_assert_eq!(p1, u.p1);
+            for &(i, c) in u.bcoef.get(&b).map_or(&[][..], |l| &l[..]) {
+                o[i].1 += c * dp;
+            }
+        }
+        for (v, x) in &ov.ed {
+            if u.elig_at[*v] != usize::MAX {
+                o[u.elig_at[*v]].1 = u.base.prio(x);
+            }
+        }
+        u.base.sort_order(&mut o);
+        let ord: Vec<usize> = o.into_iter().map(|x| x.0).collect();
+        Ok(u.steps_ord(&self.m, &ord))
+    }
+
+    /// The webs whose colour differs between two outcomes, ascending.
+    fn colour_diff(&self, a: &Run, b: &Run) -> Vec<usize> {
+        let n = self.m.webs.len();
+        if let (Run::Diff(x), Run::Diff(y)) = (a, b) {
+            if self.alias || std::ptr::eq(x.tr, y.tr) {
+                let mut v: Vec<usize> = x.cdiff.iter().chain(&y.cdiff).map(|e| e.0).collect();
+                v.sort_unstable();
+                v.dedup();
+                v.retain(|&w| a.colour(w) != b.colour(w));
+                return v;
+            }
+        }
+        (0..n).filter(|&w| a.colour(w) != b.colour(w)).collect()
+    }
+
+    /// Some colouring at the same index differs in web, candidates or weights (over the shorter list).
+    fn pops_differ(&self, a: &Run, b: &Run) -> bool {
+        if let (Run::Diff(x), Run::Diff(y)) = (a, b) {
+            return DiffOut::pops_differ(x, y, self.alias);
+        }
+        a.pops().iter().zip(b.pops().iter()).any(|(p, q)| p.web != q.web || p.avail != q.avail || p.w != q.w)
+    }
+
+    /// The number of distinct inferred lines, and those of them `need` prints under an answer.
+    fn inf_summary(&self, o: &Run) -> (usize, Vec<String>) {
+        let all = o.infs();
+        if all.is_empty() {
+            return (0, vec![]);
+        }
+        if self.collide {
+            let txt: Vec<String> = all.iter().map(|l| self.m.inf_text(l)).collect();
+            let u = uniq(&txt);
+            let notes = u
+                .iter()
+                .filter(|l| l.contains("runs out of registers") || l.contains("is coloured here") || l.contains("no register left"))
+                .cloned()
+                .collect();
+            return (u.len(), notes);
+        }
+        let mut seen: std::collections::HashSet<&Inf> = std::collections::HashSet::new();
+        let mut n = 0;
+        let mut notes = vec![];
+        for l in all {
+            if seen.insert(l) {
+                n += 1;
+                if l.is_note() {
+                    notes.push(self.m.inf_text(l));
+                }
+            }
+        }
+        (n, notes)
     }
 
     fn side(&self, base: &Outcome, o: &Outcome, tg: &[(usize, u32)]) -> Vec<String> {
@@ -954,24 +1440,27 @@ fn uniq(v: &[String]) -> Vec<String> {
 /// `rasim regs SNAP [CHANGE|EDIT...]`: the model's register for every colouring, after the changes.
 pub fn cmd_regs(s: &Snap, args: &[String]) {
     let cx = Ctx::new(s);
+    let n = cx.m.webs.len();
     let given: Vec<Cand> = args.iter().map(|a| cx.parse(a).unwrap_or_else(|e| die(&e))).collect();
-    let base = cx.eval(&[]).unwrap_or_else(|e| die(&e));
+    let base = cx.eval(&[]).unwrap_or_else(|e| die(&e)).out.outcome(n);
     let refs: Vec<&Cand> = given.iter().collect();
     match cx.eval(&refs) {
         Ok(ev) => {
             for d in &ev.desc {
                 println!("edit: {}", d);
             }
-            choose::show(&cx.m, &ev.out, if given.is_empty() { None } else { Some(&base.out) });
-            for l in uniq(&ev.out.inferred) {
+            let out = ev.out.outcome(n);
+            choose::show(&cx.m, &out, if given.is_empty() { None } else { Some(&base) });
+            let txt: Vec<String> = out.inferred.iter().map(|l| cx.m.inf_text(l)).collect();
+            for l in uniq(&txt) {
                 println!("  [I] {}", l);
             }
             if !given.is_empty() {
-                let side = cx.side(&base.out, &ev.out, &[]);
+                let side = cx.side(&base, &out, &[]);
                 println!(
                     "{} of {} registers change{}{}",
                     side.len(),
-                    base.out.pops.len(),
+                    base.pops.len(),
                     if side.is_empty() { "" } else { ": " },
                     side.join(", ")
                 );
@@ -984,15 +1473,21 @@ pub fn cmd_regs(s: &Snap, args: &[String]) {
 struct Res {
     kind: u8,
     cost: i64,
-    label: String,
+    ids: [u32; 3], // the candidates combined (indices into the single changes), ids[..nid]
+    nid: u8,
     unmet: usize,
     pen: i64,
     changed: bool,
-    side: Vec<String>,
+    side: Vec<(usize, Option<u32>, Option<u32>)>, // other registers that move: (web, from, to)
     ninf: usize,
-    desc: Vec<String>,
     notes: Vec<String>,
-    miss: Vec<String>, // targets still unmet
+    miss: Vec<(usize, Option<u32>, u32)>, // targets still unmet: (web, now, wanted)
+}
+
+impl Res {
+    fn ids(&self) -> &[u32] {
+        &self.ids[..self.nid as usize]
+    }
 }
 
 const KINDS: [&str; 6] = [
@@ -1026,11 +1521,11 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
         println!("  edit: {}", d);
     }
     let base = base.out;
-    let unmet = |o: &Outcome| tg.iter().filter(|&&(w, r)| o.colour[w] != Some(r)).count();
+    let unmet = |o: &Run| tg.iter().filter(|&&(w, r)| o.colour(w) != Some(r)).count();
     // how far a miss is: the wanted register is not available (2), or available but outweighed / later in order (1)
-    let pen = |o: &Outcome| -> i64 {
+    let pen = |o: &Run| -> i64 {
         tg.iter()
-            .map(|&(w, r)| match (o.colour[w] == Some(r), o.pops.iter().find(|p| p.web == w)) {
+            .map(|&(w, r)| match (o.colour(w) == Some(r), o.first_pop(w)) {
                 (true, _) => 0,
                 (false, Some(p)) if p.avail >> r & 1 == 1 => 1,
                 _ => 2,
@@ -1039,8 +1534,8 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
     };
     let shown = tg.len() <= 12;
     for &(w, r) in tg {
-        let p = base.pops.iter().find(|p| p.web == w);
-        let holds = base.colour[w] == Some(r);
+        let p = base.first_pop(w);
+        let holds = base.colour(w) == Some(r);
         if !shown && holds {
             continue;
         }
@@ -1049,7 +1544,7 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
             m.label(w),
             m.webs[w].pop.unwrap_or(0),
             m.webs[w].prio,
-            base.colour[w].map_or("-", rname),
+            base.colour(w).map_or("-", rname),
             rname(r),
             p.map_or("?".into(), |p| ORDER
                 .iter()
@@ -1068,7 +1563,7 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
         println!("every target holds");
         return;
     }
-    let col: Vec<usize> = base.pops.iter().map(|p| p.web).collect(); // coloured webs, in colouring order
+    let col: Vec<usize> = base.pops().iter().map(|p| p.web).collect(); // coloured webs, in colouring order
     let mut cands: Vec<(u8, i64, Cand)> = vec![];
     for (i, &a) in col.iter().enumerate() {
         for (j, &b) in col.iter().enumerate().skip(i + 1) {
@@ -1144,30 +1639,45 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
     let mut why: [Option<String>; 6] = [None, None, None, None, None, None];
     let mut tried = [0usize; 6];
     let mut res: Vec<(usize, Res)> = vec![];
-    let judge = |kind: u8, cost: i64, label: String, ev: &Eval| -> Res {
+    let ids_of = |v: &[usize]| -> ([u32; 3], u8) {
+        let mut a = [0u32; 3];
+        for (i, &x) in v.iter().enumerate() {
+            a[i] = x as u32;
+        }
+        (a, v.len() as u8)
+    };
+    let judge = |kind: u8, cost: i64, ids: &[usize], ev: &Eval| -> Res {
         let o = &ev.out;
-        let inf = uniq(&o.inferred);
+        let (ninf, notes) = cx.inf_summary(o);
+        let diffw = cx.colour_diff(&base, o);
+        let changed = !diffw.is_empty() || cx.pops_differ(o, &base);
+        let (ids, nid) = ids_of(ids);
         Res {
             kind,
             cost,
-            label,
+            ids,
+            nid,
             unmet: unmet(o),
             pen: pen(o),
-            changed: (0..m.webs.len()).any(|w| o.colour[w] != base.colour[w])
-                || o.pops.iter().zip(&base.pops).any(|(a, b)| a.web != b.web || a.avail != b.avail || a.w != b.w),
-            side: cx.side(&base, o, tg),
-            ninf: inf.len(),
-            desc: ev.desc.clone(),
-            notes: inf
-                .into_iter()
-                .filter(|l| l.contains("runs out of registers") || l.contains("is coloured here") || l.contains("no register left"))
-                .collect(),
-            miss: tg
-                .iter()
-                .filter(|&&(w, r)| o.colour[w] != Some(r))
-                .map(|&(w, r)| format!("{} {} (wanted {})", m.label(w), o.colour[w].map_or("-", rname), rname(r)))
-                .collect(),
+            changed,
+            side: diffw.iter().filter(|w| !tg.iter().any(|t| t.0 == **w)).map(|&w| (w, base.colour(w), o.colour(w))).collect(),
+            ninf,
+            notes,
+            miss: tg.iter().filter(|&&(w, r)| o.colour(w) != Some(r)).map(|&(w, r)| (w, o.colour(w), r)).collect(),
         }
+    };
+    // labels, descriptions and side effects are made only for what is printed
+    let lab = |x: &Res| -> String { x.ids().iter().map(|&i| cx.label(&cands[i as usize].2)).collect::<Vec<_>>().join("  +  ") };
+    let side_txt = |x: &Res| -> Vec<String> {
+        x.side.iter().map(|&(w, a, b)| format!("{} {}->{}", m.label(w), a.map_or("-", rname), b.map_or("-", rname))).collect()
+    };
+    let miss_txt = |x: &Res| -> Vec<String> {
+        x.miss.iter().map(|&(w, c, r)| format!("{} {} (wanted {})", m.label(w), c.map_or("-", rname), rname(r))).collect()
+    };
+    let desc_of = |x: &Res| -> Vec<String> {
+        let mut all = g.clone();
+        all.extend(x.ids().iter().map(|&i| &cands[i as usize].2));
+        cx.eval(&all).map_or(vec![], |e| e.desc)
     };
     // Every candidate is an independent run of the model: evaluated on all cores (par_map keeps the order, so the
     // report is the same as from a serial loop).
@@ -1191,29 +1701,31 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
             _ => false,
         }
     };
-    let singles: Vec<Result<Res, String>> = par_map(&cands, |(kind, cost, c)| {
+    let pen0 = pen(&base);
+    let miss0: Vec<(usize, Option<u32>, u32)> =
+        tg.iter().filter(|&&(w, r)| base.colour(w) != Some(r)).map(|&(w, r)| (w, base.colour(w), r)).collect();
+    let idx: Vec<usize> = (0..cands.len()).collect();
+    let singles: Vec<Result<Res, String>> = par_map(&idx, |&k| {
+        let (kind, cost, c) = &cands[k];
         if beyond(c) {
+            let (ids, nid) = ids_of(&[k]);
             return Ok(Res {
                 kind: *kind,
                 cost: *cost,
-                label: cx.label(c),
+                ids,
+                nid,
                 unmet: u0,
-                pen: pen(&base),
+                pen: pen0,
                 changed: false,
                 side: vec![],
                 ninf: 0,
-                desc: vec![],
                 notes: vec![],
-                miss: tg
-                    .iter()
-                    .filter(|&&(w, r)| base.colour[w] != Some(r))
-                    .map(|&(w, r)| format!("{} {} (wanted {})", m.label(w), base.colour[w].map_or("-", rname), rname(r)))
-                    .collect(),
+                miss: miss0.clone(),
             });
         }
         let mut all = g.clone();
         all.push(c);
-        cx.eval(&all).map(|ev| judge(*kind, *cost, cx.label(c), &ev))
+        cx.eval_d(&all, false).map(|ev| judge(*kind, *cost, &[k], &ev))
     });
     for (k, ((kind, _, c), r)) in cands.iter().zip(singles).enumerate() {
         tried[*kind as usize] += 1;
@@ -1225,17 +1737,18 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
             Ok(x) => res.push((k, x)),
         }
     }
-    let line = |x: &Res| -> String {
+    let line = |x: &Res, label: &str| -> String {
+        let side = side_txt(x);
         format!(
             "  {:<34}{}{}{}",
-            x.label,
+            label,
             if x.kind == 0 { format!(" gap {:<4}", x.cost) } else { String::new() },
-            if x.side.is_empty() { "  no other register changes".to_string() } else { format!("  also moves: {}", x.side.join(", ")) },
+            if side.is_empty() { "  no other register changes".to_string() } else { format!("  also moves: {}", side.join(", ")) },
             if x.ninf > 0 { format!("  [I: {} inferred relations]", x.ninf) } else { String::new() }
         )
     };
     let detail = |x: &Res| {
-        for d in x.desc.iter().chain(x.notes.iter()) {
+        for d in desc_of(x).iter().chain(x.notes.iter()) {
             println!("      {}", d);
         }
     };
@@ -1245,28 +1758,29 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
         if tried[k as usize] == 0 {
             continue;
         }
-        let mut mine: Vec<&Res> = res.iter().map(|x| &x.1).filter(|x| x.kind == k && x.unmet == 0).collect();
+        let mut mine: Vec<(&Res, String)> = res.iter().map(|x| &x.1).filter(|x| x.kind == k && x.unmet == 0).map(|x| (x, lab(x))).collect();
         // two more references where one more already does it: not listed
-        let labels: BTreeSet<String> = mine.iter().map(|x| x.label.clone()).collect();
-        mine.retain(|x| !(x.label.starts_with("ref:") && x.label.ends_with(":4") && labels.contains(&x.label[..x.label.len() - 2])));
-        mine.sort_by(|a, b| (a.side.len(), a.cost, &a.label).cmp(&(b.side.len(), b.cost, &b.label)));
+        let labels: BTreeSet<String> = mine.iter().map(|x| x.1.clone()).collect();
+        mine.retain(|x| !(x.1.starts_with("ref:") && x.1.ends_with(":4") && labels.contains(&x.1[..x.1.len() - 2])));
+        mine.sort_by(|a, b| (a.0.side.len(), a.0.cost, &a.1).cmp(&(b.0.side.len(), b.0.cost, &b.1)));
         nsol += mine.len();
         if k == 4 {
             nsrc = mine.len();
         }
         println!("{}: {} single changes tried, {} give every target its register", KINDS[k as usize], tried[k as usize], mine.len());
         // answers that extend the same value the same way (same side effects) are one line; the nearest block first
-        let gkey = |x: &Res| -> (String, Vec<String>) {
-            match (x.label.starts_with("extend:"), x.label.rfind(':')) {
-                (true, Some(i)) => (x.label[..i].to_string(), x.side.clone()),
-                _ => (x.label.clone(), vec![]),
+        let gkey = |x: &(&Res, String)| -> (String, Vec<String>) {
+            match (x.1.starts_with("extend:"), x.1.rfind(':')) {
+                (true, Some(i)) => (x.1[..i].to_string(), side_txt(x.0)),
+                _ => (x.1.clone(), vec![]),
             }
         };
+        let keys: Vec<(String, Vec<String>)> = mine.iter().map(gkey).collect();
         let mut seen: Vec<(String, Vec<String>)> = vec![];
         let mut shown_n = 0;
-        for x in mine.iter() {
-            let key = gkey(x);
-            if seen.contains(&key) {
+        for (xi, x) in mine.iter().enumerate() {
+            let key = &keys[xi];
+            if seen.contains(key) {
                 continue;
             }
             if shown_n == opts.top {
@@ -1274,19 +1788,20 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
                 break;
             }
             shown_n += 1;
-            println!("{}", line(x));
+            println!("{}", line(x.0, &x.1));
             if k == 4 {
-                detail(x);
+                detail(x.0);
                 let same: Vec<&str> = mine
                     .iter()
-                    .filter(|y| gkey(y) == key && y.label != x.label)
-                    .filter_map(|y| y.label.rsplit(':').next())
+                    .enumerate()
+                    .filter(|(yi, y)| keys[*yi] == *key && y.1 != x.1)
+                    .filter_map(|(_, y)| y.1.rsplit(':').next())
                     .collect();
                 if !same.is_empty() {
                     println!("      the same result when the range reaches block {} instead", same.join(", "));
                 }
             }
-            seen.push(key);
+            seen.push(key.clone());
         }
         if undecided[k as usize] > 0 {
             println!("  not decidable: {} changes (e.g. {})", undecided[k as usize], why[k as usize].clone().unwrap_or_default());
@@ -1308,19 +1823,20 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
             }
         }
         let ntried = todo.len();
-        let mut pairs: Vec<(Res, Vec<usize>)> = par_map(&todo, |(a, b)| {
+        let mut pairs: Vec<(Res, String)> = par_map(&todo, |(a, b)| {
             let mut all = g.clone();
             all.push(&cands[a.0].2);
             all.push(&cands[b.0].2);
-            cx.eval(&all).ok().map(|ev| {
-                let lab = format!("{}  +  {}", a.1.label, b.1.label);
-                (judge(a.1.kind.min(b.1.kind), a.1.cost + b.1.cost, lab, &ev), vec![a.0, b.0])
-            })
+            cx.eval_d(&all, false).ok().map(|ev| judge(a.1.kind.min(b.1.kind), a.1.cost + b.1.cost, &[a.0, b.0], &ev))
         })
         .into_iter()
         .flatten()
+        .map(|r| {
+            let l = lab(&r);
+            (r, l)
+        })
         .collect();
-        pairs.sort_by(|a, b| (a.0.unmet, a.0.side.len(), a.0.cost, &a.0.label).cmp(&(b.0.unmet, b.0.side.len(), b.0.cost, &b.0.label)));
+        pairs.sort_by(|a, b| (a.0.unmet, a.0.side.len(), a.0.cost, &a.1).cmp(&(b.0.unmet, b.0.side.len(), b.0.cost, &b.1)));
         let n2 = pairs.iter().filter(|p| p.0.unmet == 0).count();
         nsol += n2;
         println!(
@@ -1332,11 +1848,12 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
             ntried,
             n2
         );
-        for (x, _) in pairs.iter().filter(|p| p.0.unmet == 0).take(opts.top) {
+        for (x, l) in pairs.iter().filter(|p| p.0.unmet == 0).take(opts.top) {
+            let side = side_txt(x);
             println!(
                 "  {}{}{}",
-                x.label,
-                if x.side.is_empty() { "  no other register changes".to_string() } else { format!("  also moves: {}", x.side.join(", ")) },
+                l,
+                if side.is_empty() { "  no other register changes".to_string() } else { format!("  also moves: {}", side.join(", ")) },
                 if x.ninf > 0 { format!("  [I: {} inferred relations]", x.ninf) } else { String::new() }
             );
             detail(x);
@@ -1346,11 +1863,12 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
         }
         if n2 == 0 && opts.depth >= 3 && !src_only {
             // triples: the best pairs, each with one more change from the head of the pool
-            let heads: Vec<&(Res, Vec<usize>)> = pairs.iter().take(40).collect();
-            let mut triples: Vec<Res> = vec![];
+            let heads: Vec<&(Res, String)> = pairs.iter().take(40).collect();
+            let mut triples: Vec<(Res, String)> = vec![];
             let mut nt = 0;
-            for (pr, ids) in heads {
+            for (pr, _) in heads {
                 for c in pool.iter().take(60) {
+                    let ids: Vec<usize> = pr.ids().iter().map(|&i| i as usize).collect();
                     if ids.contains(&c.0) {
                         continue;
                     }
@@ -1358,23 +1876,24 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
                     all.extend(ids.iter().map(|&i| &cands[i].2));
                     all.push(&cands[c.0].2);
                     nt += 1;
-                    if let Ok(ev) = cx.eval(&all) {
-                        let lab = format!("{}  +  {}", pr.label, c.1.label);
-                        let r = judge(4, pr.cost + c.1.cost, lab, &ev);
+                    if let Ok(ev) = cx.eval_d(&all, false) {
+                        let r = judge(4, pr.cost + c.1.cost, &[ids[0], ids[1], c.0], &ev);
                         if r.unmet == 0 {
-                            triples.push(r);
+                            let l = lab(&r);
+                            triples.push((r, l));
                         }
                     }
                 }
             }
-            triples.sort_by(|a, b| (a.side.len(), a.cost, &a.label).cmp(&(b.side.len(), b.cost, &b.label)));
+            triples.sort_by(|a, b| (a.0.side.len(), a.0.cost, &a.1).cmp(&(b.0.side.len(), b.0.cost, &b.1)));
             nsol += triples.len();
             println!("no pair works. Triples (the 40 best pairs, each with one of the 60 best singles): {} tried, {} work", nt, triples.len());
-            for x in triples.iter().take(opts.top) {
+            for (x, l) in triples.iter().take(opts.top) {
+                let side = side_txt(x);
                 println!(
                     "  {}{}",
-                    x.label,
-                    if x.side.is_empty() { "  no other register changes".to_string() } else { format!("  also moves: {}", x.side.join(", ")) }
+                    l,
+                    if side.is_empty() { "  no other register changes".to_string() } else { format!("  also moves: {}", side.join(", ")) }
                 );
                 detail(x);
             }
@@ -1384,7 +1903,7 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
             let mut best: Vec<&Res> = pairs.iter().map(|p| &p.0).chain(res.iter().map(|x| &x.1)).filter(|x| !src_only || x.kind == 4).collect();
             best.sort_by_key(|x| (x.unmet, x.pen, x.side.len(), x.cost));
             for x in best.iter().take(3) {
-                println!("  {}  leaves {} of {} unmet: {}", x.label, x.unmet, tg.len(), x.miss.join(", "));
+                println!("  {}  leaves {} of {} unmet: {}", lab(x), x.unmet, tg.len(), miss_txt(x).join(", "));
             }
         }
     } else if nsol == 0 {
@@ -1468,7 +1987,7 @@ pub fn cmd_want(s: &Snap, path: &str, given: &[String], opts: &Opts) {
     let m = &cx.m;
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{}: {}", path, e)));
     let now: Vec<Option<u32>> = match cx.eval(&[]) {
-        Ok(e) => e.out.colour,
+        Ok(e) => e.out.colours(m.webs.len()),
         Err(e) => die(&e),
     };
     let coloured = |name: &str| -> Vec<usize> { (0..m.webs.len()).filter(|&i| m.webs[i].pop.is_some() && m.webs[i].name == name).collect() };

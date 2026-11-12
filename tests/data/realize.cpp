@@ -44,3 +44,38 @@ extern int cal__decl(const int* q);
 __declspec(noinline) int cal__body(const int* q) { return *q + gi; }
 int ext__base(S* p, int n) { int x = p->a; int s = cal__decl(&x); for (int i = 0; i < n; i++) s += g(i); return s + x; }
 int ext__body(S* p, int n) { int x = p->a; int s = cal__body(&x); for (int i = 0; i < n; i++) s += g(i); return s + x; }
+// Equal arms on a condition of a never-modified value (`this`): three blocks at Color, merged away after it. this
+// gets one more reference in the split block (the test) and S's references move into the arms; no code.
+struct RzL : S { int eqt__base(int n); int eqt__eq(int n); };
+int RzL::eqt__base(int n)
+{
+    int s = 0;
+    int k = g(n);
+    S* q = next;
+    while (q)
+    {
+        s += g(q->a);
+        q = q->next;
+    }
+    s ^= k;
+    return g(s) + b;
+}
+int RzL::eqt__eq(int n)
+{
+    int s = 0;
+    int k = g(n);
+    S* q = next;
+    while (q)
+    {
+        s += g(q->a);
+        q = q->next;
+    }
+    if ((int)this & 1) s ^= k; else s ^= k;
+    return g(s) + b;
+}
+// A statement after an if/else written at the end of both arms: tail-merged after Color, the references count in the arms.
+int tdup__base(S* p, int n) { int s = g(n); if (n > 3) s += g(1); else s -= g2(n, 2); s += p->a; return g(s) + p->b; }
+int tdup__dup(S* p, int n) { int s = g(n); if (n > 3) { s += g(1); s += p->a; } else { s -= g2(n, 2); s += p->a; } return g(s) + p->b; }
+// Two independent statements exchanged: no reference changes, a defOrd tie flips (and here an interference goes).
+int swp__base(S* p, S* q, int n) { int s = g(n); int t = n * 3; s += p->a; t ^= q->b; return g2(s, t) + p->c + q->c; }
+int swp__swap(S* p, S* q, int n) { int s = g(n); int t = n * 3; t ^= q->b; s += p->a; return g2(s, t) + p->c + q->c; }

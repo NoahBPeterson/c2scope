@@ -221,10 +221,23 @@ whose end forced the split and its source line:
       not colourable: coloured web b ends at src +2 while c is on the x87 stack above it (InsertColoredLifetimeEndSplit: split there)
 ```
 
-The events come from 17 hooks of the build table's `hooks.regs_fp` (after `regs_dec`; `FPEVN` in c2regs.py):
+The events come from 19 hooks of the build table's `hooks.regs_fp` (after `regs_dec`; `FPEVN` in c2regs.py):
 FPSpillcosts' block start, edge pop, use, enterload and def sites, FPAddToPriorityList's insert, FPRemoveSplitGlobregs
-(entry and each member), FPSpillWorthless' initial-set exception, and the entries / exits of FPSpillcosts,
-FPCheckColorability and its sub-tests, FPUpdateRegisterPressure and FPInitialRegPressure. `--export` adds the
+(entry and each member), FPSpillWorthless' initial-set exception, the entries / exits of FPSpillcosts,
+FPCheckColorability and its sub-tests, FPUpdateRegisterPressure and FPInitialRegPressure, and ColMakeSplitPoint /
+FPMakeSplitPoint (every split point made inside FPColor: events `csp` / `fsp`).
+
+**The x87 view.** FPCheckColorability's and FPInitialRegPressure's entry hooks also dump the function as FPColor
+sees it, with the `&` spec (c2trace.dll `dumpfp`; the format is in the DLL source's comment): "T X B" a block
+(BB, flags, first / end tuple, live-in / live-out / referenced sets as `base:bits` chunks, the 8-entry stack image
+BB+0x60, predecessor and successor BBs), "T X I" an instruction (opcode, kind, type, depth +0x16, temporaries +0x17,
+line offset, destination and source leaves: `rf` x87-typed register leaf, `x` dies, the globreg with `c` when
+coloured, `s1` a register SYM, `.R` +0x18 a register, `k<kind>` any other leaf, `k4n` a call target that leaves the
+x87 stack alone), "T X L" / "T X N" labels and other tuples, and one "T X W" line per x87 globreg (number, colour,
+first / last block, def and end lists). `--export` keeps the dumps in `fp.ils` (indices into `fp.ilpool`, every
+distinct line once; a check event's `il`, `fp.il0` for FPInitialRegPressure's). A compile server whose c2trace.dll
+predates the dump (no `# fpdump 1` in the log) is detected and the compile is redone here; redeploy the trace
+directory's DLL there. `--export` adds the
 snapshot key `fp` (`passes` with each web's terms, `events` in order, `pops`); `rasim check` and `rasim need` use it.
 `--export 'DIR/%s.json'` writes one snapshot per traced function (`%s` = its decorated name, made file-safe).
 
@@ -399,8 +412,8 @@ I c89b7c call 1 0 | pas5:6000 esp:1004 regset:0 cc:8000 <- ?m@A@@QAEXH@Z:1004 ec
 
 The same dump feeds `regs --blocks`, `scratch` and `c2sched`, so their call lines change the same way. The
 DLL writes `# fename 1` into the log when it knows the directive; a compile server whose traced compiler is an
-older copy (M&B's laptop: docs/remote_worker.md there) lacks it, and c2trace.py then says so on stderr: copy
-`work/toolchain/c2-13.10.*-trace/VC/Bin` there again, or set `C2TRACE_REMOTE=0`.
+older copy lacks it, and c2trace.py then says so on stderr: copy
+`work/toolchain/<build>-trace/VC/Bin` there again, or set `C2TRACE_REMOTE=0`.
 
 ## `merges`: every tail and head merge, and why a pair stopped
 
@@ -630,7 +643,12 @@ bytes. The names available are listed in the script's docstring:
 - `regdiff`: an **aligned** difference against a `VA mnemonic operands` disassembly of the original: instructions
   (mnemonic plus registers) left unmatched by a sequence alignment, both sides counted, our trailing EH funclets
   ignored. `posdiff` is the old positional count. Use `regdiff`: one inserted instruction shifts every later line
-  in a positional count (0x008e7d40's best variant: posdiff 238, regdiff 5);
+  in a positional count (0x008e7d40's best variant: posdiff 238, regdiff 5). Printing differences between the
+  listing and the disassembler are not counted (since 2026-11-12, so older numbers can be higher): register
+  names inside symbols (`??_C@_01..@?$CL?$AA@` is not `cl`), capstone's `imul r, r, imm` for the listing's
+  `imul r, imm`, and alignment padding (the listing's `npad n` against `lea r, [r]`, `nop`, `mov edi, edi` or a
+  `jmp` over the pad; a run of pad instructions counts as one). Mount & Blade `CharSheet::init_screen`: 102 before
+  for the draft, 5 after, all of it the one real difference;
 - `hinge(x, t)`.
 
 Traces are cached (tools/ccache.py, below), so re-scoring a finished sweep with a different metric takes seconds
@@ -666,9 +684,22 @@ exception; pieces of a split costed and inserted into the remaining list (x87.md
 'A>B'` with x87 webs (both names x87 webs and not int globregs) answers from FPColor's list: the gap at the first
 pop that decides between them, and the single edits that close it (or, when it holds, the ones that would break
 it): `ref:VAR:B:COST` (1 = a use of a double, 2 / 4 = a def of a float / double), `unref:VAR:B`, `w:B:N`. An x87
-web's priority does not depend on any other web, so each edit moves exactly one. FPCheckColorability (whether the
-web then stays on the stack) is not modelled: it depends on the x87 stack shape at each instruction, which the
-snapshot does not carry.
+web's priority does not depend on any other web, so each edit moves exactly one. With the x87 view in the snapshot,
+`check` also prints `FPCheckColorability predicted from the x87 view: N of N answers, sub-test calls N of N, split
+points N of N` (the model of x87.md section 11.1 run on the view at each check; a miss is listed with both call
+sequences), the sub-tests that returned 1 in the trace, the copy sinkings / enterload moves the model made, and
+`split sets predicted: FPInitialRegPressure ..., FPUpdateRegisterPressure ...`. `rasim need SNAP stack:V` answers
+what keeps V on the stack: V's fate (dropped as worthless, split before its pop, kept, split), at its check the
+blockers (the rule, the coloured web, the source line) and, per coloured blocker, whether V would stay had it popped
+first and the priority it needs for that (`need 'V>C'` lists the edits):
+
+```
+$ rasim need tf.json stack:c
+c (web 4, prio 5, def 10): not colourable: split (trace; model: split)
+  blocker: b (web 3) ends at src +2 while c is on the stack above it (InsertColoredLifetimeEndSplit)
+    popped before b (b prio 6, def 13): c would be colourable; it needs +2 priority (rasim need SNAP 'c>b' lists the edits)
+  split points: src +2, src +2
+```
 
 The snapshot holds every Spillcosts pass: its class, each block's w and true P, and each uncoloured globreg's
 per-block terms, plus the actual pops. rasim applies the Spillcosts formula and the tie-break (regalloc.md §3.2,
@@ -810,51 +841,66 @@ Known limits:
   both models (next section). Which register each value *should* have comes from `regmap` (below).
 
 **Speed of `need reg:` and `want`.** Every candidate change is one run of the register model; a function with n
-coloured values has about 2·n² of them (415 globregs: about 230,000 runs). They are evaluated on all cores
-(`par_map` in combo.rs; `RASIM_THREADS=N` to limit, 1 = serial; the report is in the same order), and a change
-between two values that are both coloured after the last target is not run at all (it cannot reach a target; it is
-counted as tried with nothing moved, and is run if picked for a pair; an undecidable one among them is not counted
-in the "not decidable" lines). What makes one run cheap (code: `Model::trace`, `Model::run_fast`, `RunSt::same` in
-choose.rs; `Ov`, `Uni::prepare` in combo.rs):
-- **Restart from a saved state.** The unedited run is simulated once per step order (the traced order, and the
-  order `Uni::steps` computes, which edits use), with its state saved every k steps (k = max(8, steps/256)). A
-  candidate starts at the last saved state before the first step its change can affect: the first position where
-  its step order differs, or the first step that reads or writes what it changes. `Model::touches` says how each
-  step touches a web: queued (Init), benefit (Ben), coloured or restricted, a Spillcosts preference for it, the
-  source of one, a neighbour or partner of the web being coloured (read only while live). A changed PREF count,
-  benefit or killed/given register set is patched into the restored state when the web's Init came before.
-- **Stop when converged.** At each saved state after the last step that reads the change itself, where the rest of
-  the order is the unedited one, the state is compared with the unedited one, but only what a later step reads
-  (`Trace::look`): a web that is not live and whose Init is past is skipped by every later colouring; a coloured
-  web's later preference events are no-ops; PREF creation order is compared by rank. A changed edge or copy is
-  read no more once either web is gone for good. If equal, the unedited run's remaining colourings and inferred
-  lines are appended.
-- **Source edits** no longer copy the whole priority state per candidate: an overlay holds the edited vars, a P
-  change reaches the other vars' priorities through per-block coefficients, and only the vars Color can pop are
-  sorted. Kill estimates, block presence, initial avail sets, labels, merged neighbour/partner lists and each
-  web's pop item are computed once.
+coloured values has about 2·n² of them (b250.c, 1,360 colourings: 4.78 million for one target, of which 1.07
+million are source edits). They are evaluated on all cores (`par_map` in combo.rs; `RASIM_THREADS=N` to limit, 1 =
+serial; the report is in the same order), and a change between two values that are both coloured after the last
+target is not run at all (it cannot reach a target; it is counted as tried with nothing moved, and is run if picked
+for a pair; an undecidable one among them is not counted in the "not decidable" lines). What makes one run cheap
+(code: `Model::trace`, `Model::run_diff`, `Dr`, `Dx` in choose.rs; `Uni::quick`, `Ctx::prep` in combo.rs):
+- **Differences from the unedited run, not a run.** The unedited run is simulated once per step order (the traced
+  order, and the order `Uni::steps` computes, which edits use) and recorded: every web's state after each step that
+  changed it, the webs each step changed, and every step that touches each web and how (`Model::touches`: queued,
+  benefit, coloured or restricted, a Spillcosts preference for it, the source of one, a neighbour or partner of the
+  web being coloured). A candidate's state is that recording with the webs whose state differs laid over it
+  (`Ov`). Only the steps that touch such a web, or that the change concerns (an added or removed edge or copy, a
+  changed benefit or register set, an extended range), are simulated; every other step is the trace's, and its
+  colourings and inferred lines are referenced, not copied. A web leaves the overlay as soon as it behaves as the
+  trace's again (equal, PREF nodes in the same order; or coloured alike and no longer live). There is no
+  convergence test and no saved state to copy: when the overlay is empty and the change concerns nothing later, the
+  rest is the trace's.
+- **The colouring from the trace's.** A step that colours a web whose own state is the trace's starts from the
+  trace's weights and corrects them by the differing neighbours only (each one's weight with its state minus with
+  the trace's); if the register is the trace's, only the differing webs are written. Only when the register changes
+  is the step simulated in full (a real cascade).
+- **Orders as runs.** A candidate order is matched against the trace's (`align`: the common head and tail, a greedy
+  match in between; one moved colouring is placed directly): aligned runs, steps the trace takes elsewhere (their
+  writes are laid over), steps only the candidate takes here.
+- **Source edits** (`Uni::quick`, one `ref:`, `unref:` or `extend:` at a time): the edited var's new priority from
+  the changed blocks only, the other vars' through per-block coefficients; if every changed priority keeps its
+  neighbours in the colouring order the step order is the unedited one, otherwise the few changed vars are merged
+  into the unedited order. The vars an extension meets come from per-var presence intervals. The description lines
+  are made only for printed answers. `RASIM_QCHECK=1` compares every such edit with the overlay path (`Ov`, which
+  pairs and descriptions use) and aborts on a difference.
+- Outcomes are compared as differences too: which registers move, and whether any colouring's candidates or weights
+  differ, from the overlaid webs and the referenced ranges.
 
-The output is byte-identical to the previous implementation (its binary run side by side): on 102 snapshots (the
-rasim snapshots under work/ and the earlier scratch ones, traces of several c2 builds) for `check`, `check
---predict`, `regs`, `need reg:` on three targets, a two-target `need --depth 3 --pool 30`, `need` with a given
-change, `want`, `need 'A>B'` and `regs` with each of the first answers `need` printed (about 2,700 commands); on
-five larger ones (b100, s250, b250.c, cs, csn) for `check`, `check --predict`, `regs` and `need 'A>B'`; and for
-csn's `need reg:t261=esi`. `RASIM_REF=1` runs the reference path in the same binary (a full state copy and a full run
-per candidate; `regs` always uses it); tests/run_tests.py checks that both print the same for four searches on eA.
+Output is byte-identical to the previous implementation, run side by side (the binary of git 52ff20c, and the
+pre-fast-path binary the previous change was checked against, on the first set): on 204 snapshots under work/ and the scratch
+directories (1,505 distinct rasim snapshots exist; every 14th of those under 300 KB, two disjoint sets) for
+`check`, `check --predict`, `regs`, `need reg:` on three targets, a two-target `need --depth 3 --pool 30`, `need`
+with a given change, `want`, `need 'A>B'` and `regs` with each of the first answers `need` printed (5,679
+commands, with `RASIM_QCHECK=1`); on the 62 snapshots of 300 KB to 5 MB (1,801
+commands); and for the larger runs in the table. The only differences were x87 lines of `check` (FPColor, a concurrent change of fpcolor.rs).
+`RASIM_REF=1` runs the reference path in the same binary (a full state copy and a full run per candidate; `regs`
+always uses it); tests/run_tests.py checks that both print the same for four searches on eA, with the quick edits
+self-checked.
 
-| snapshot | coloured | before: wall / CPU | after: wall / CPU |
+| snapshot | coloured | HEAD before (52ff20c): wall / CPU | now: wall / CPU |
 |---|---|---|---|
-| M&B `CharSheet::init_screen` (csn.json, 13.10), `need reg:t261=esi` | 308 | 3 min 44 s / 413 s (9 min 08 s / 489 s on one core) | 6.6 s to 21 s / 17 s to 21 s |
-| b25.c (13.10, 13.10.3052, 14.00 traces), `need` with one or two targets | 147 | 51 s to 2 min 15 s / 137 s to 176 s | 2 s to 6 s / 5.2 s to 7.5 s |
-| 0x00c7e9a0 v_match, `want` (3 wanted, 3 pinned) | 77 | 3.2 s / 2.8 s | 0.6 s / 0.6 s |
-| 0x00e0a0b0 (e2.json), `need reg:this=eax` | 26 | 0.41 s / 0.66 s | 0.21 s / 0.24 s |
+| b600.c (14.00, `c2trace.py regs --export`), `need reg:i@p1619=edi` (26.1 million candidates, 5.1 million of them source edits; the ones after the target are not run) | 3,237 | not run | 23 min 42 s / 5,314 s |
+| b250.c (rasim_combo/out/b250.json), `need reg:i@p681=edi` | 1,360 | 8 min 0 s / 2,299 s | 2 min 14 s / 391 s |
+| b250.c, `need reg:t28513=ecx reg:i@p681=edi --depth 3 --pool 30` | 1,360 | 14 min 44 s / 2,566 s | 2 min 8 s / 396 s |
+| b100.c (port1310), one target / two targets `--depth 3` | 542 | 51 s / 173 s; 51 s / 173 s | 13 s / 37 s; 14 s / 38 s |
+| M&B `CharSheet::init_screen` (csn.json), `need reg:t261=esi` | 308 | 6.1 s / 17 s | 1.9 s / 5.5 s |
 
-Wall times on a 10-core machine at load 35 to 160 (other agents' compiles), so they spread; on an idle machine the
-wall time is about CPU / 10. The rest of the time is mostly `extend:` edits that lower a value's priority so far that it moves
-to the end of the colouring order: the value stays a live neighbour of everything coloured in between, the orders
-differ up to the end, and such a run never converges. Pruning was not widened beyond the rule above: a candidate
-that is not run gets "nothing moves", which differs from a real run where its other registers move (the pair pool
-and the "closest" list rank by that). `regs`, `check` and `need 'A>B'` are as fast as before. **[C]**
+Wall times on the 10-core Mac (rasim runs locally; only traced compiles go to the laptop), shared with other agents
+(load 25 to 200), so they spread. On b250 the time is now spread over all kinds of change (shares of the run time, one target): `extend:` 42 %, `ref:`/`unref:` 20 %, order
+changes 24 %, interference and copy 12 %. It is still short of a minute: most of what is simulated is a web that
+differs only in its available registers or benefit, in a way the colourings that touch it cannot see (two thirds of
+the differing webs looked at). Keeping such webs as a register/benefit delta that is woken only where the delta can
+show (precomputed from the recorded states) was tried and was slower: the wake-ups and re-materialisations cost more
+than the visits they saved. Memoising source edits by their resulting mods and order was tried too: few hits
+(each block gives a different order). **[C]**
 
 ### Combined what-ifs: source-level edits in the register model, pairs, `want`
 
@@ -1045,7 +1091,7 @@ snapshot has no decision events ...)".
 
 | Replayed | c2 function | What it would take |
 |---|---|---|
-| the pieces of a split round: how many, their blocks, costs, benefit, avail set, PREFs | ColProcessSplitGlobregs, Spillcosts | the split points (below) and per-instruction liveness |
+| the pieces of a split round: how many, their blocks, costs, benefit, avail set, PREFs | ColProcessSplitGlobregs, Spillcosts | now modelled from the round's IL (`regs --pieces`, `rasim pieces`, `check --predict --pieces`); avail set and PREFs still replayed |
 | the neighbours and copy partners of each colouring | InsertSplitPoints, `_UpdatePrefsBv` | per-instruction liveness |
 | InsertSplitPoints' own split set (webs cut for register pressure) | InsertSplitPoints | the live count at every instruction |
 | byte-register restrictions of queued webs | InsertSplitPoints, CmdProcessBytePressure | the same, for byte values |
@@ -1115,6 +1161,68 @@ and the exit of `@GrgNewGlobreg@4`. The `regs` report itself is unchanged.
   (OrderGlobregs), RestrictToReg's `nrefs == 3` exception. The rules are in the model; they have no test.
 - A state difference seen twice (bitvect.c `SbvAnd`): `fl5 & 4` becomes set while the web is queued. The model
   reports it and takes the trace's value.
+
+### `rasim pieces SNAP`: what the pieces of a split round look like (regalloc.md 3.6.11)
+
+```sh
+uv run tools/c2trace.py regs tu.c --func F --pieces --export snap.json -- <cl args>   # any build: --c2 13.10 | 15.00
+rasim pieces snap.json [-v]            # each round from the IL c2 had at that round
+rasim pieces snap.json --chain         # each later round from the model's own IL (first round's input onwards)
+rasim check snap.json --predict --pieces [--chain]   # the decisions with the pieces' records from the model
+```
+
+`regs --pieces` adds one hook, `@ColProcessSplitGlobregs@12`, whose spec dumps the whole function as the globreg view
+(`^`, DLL_SRC `dumpg` in c2trace.py; snapshot key `gdumps`, one per split round, with `npass`, `cls`, `after_pop`):
+blocks with their predecessors, successors, live-in / live-out / present SBVs, loop and loop level (`T G B`), every
+instruction with each REG leaf's GLOBREG number and the flags c2 keeps on it (`T G I`: tie index, last use, bottom
+piece, airlock, store-needed, the leaf's type), split points with their webs (`T G S`), every GLOBREG record (`T G R`:
+colour, flags, blocks, nEnter, prio, benefit, defOrd, symbol kind, loop index, an immediate's value),
+`_NewGlobregs` (`T G N`) and every loop (`T G O`: enclosing loop, header, exits, reference set). On 14.00 two probes in
+Spillcosts (10b109b7, 10b10ff9) also log the cost of every reference (`refcosts`), which `rasim pieces` checks
+reference by reference. A build table supplies the layout (`dll`: `gdump`, `gsbv32`, `gloop`, `gloopp`, `grhash`,
+`gnew`, `gspb`/`gsps`/`gspl`); the compile server's older c2trace.dll lacks the view, so `--pieces` compiles locally
+(the tool says so). The export is large for big functions (b25.c: 5.7 MB on 14.00, 25 MB on 15.00; b250.c: 10 MB).
+
+`rasim pieces` runs ColProcessSplitGlobregs as c2 does (pieces.rs; the rules are regalloc.md 3.6.11) with the round's
+split set (RemoveSplitGlobregs' webs) and the record numbers c2 handed out in that round, then Spillcosts on the
+pieces, and compares with the trace:
+
+```text
+$ rasim pieces f4.json          # tests/data/splitnum.c f4, 14.00
+pieces: _f4: 2 split rounds dumped (c2 14.00)
+  round  pass parents    pieces    blocks     terms     nrefs   benefit  last def      prio     exact
+      1     2       8         8       1/1       8/8       8/8       8/8       8/8       8/8       8/8
+      2     3       1         1       1/1       1/1       1/1       1/1       1/1         -       1/1
+  all: 2 rounds; piece sequence 2/2; blocks walked 2/2; per-block terms 9/9; nrefs 9/9; benefit 9/9; last def 9/9; priority 8/8; nEnter/single/airlock 8/8; pieces exact 9/9
+```
+
+Columns: `pieces` = records handed out (`*` = the sequence of site / parent / number differs from c2's); `blocks` =
+Spillcosts walks the same blocks (airlock blocks the model makes are matched by position) with the same w and P;
+`terms` = every per-block term of the piece as c2's (cost and P·w term, also live-through ones); `nrefs`, `benefit`,
+`last def` = SpillObvious' inputs; `prio`, and (in the summary) nEnter / single block / airlock flag = the record
+InsertNewGlobregs inserts; `exact` = all of it. Also checked: the enterloads and exitsaves of every piece, block by
+block, against the next round's dump.
+
+`--chain` carries the model's IL: the next round starts from the model's own result of the previous round, and only
+what happens at the pops in between comes from that round's dump: the colours and flags of every record, the
+records retired (a spilled web's operands become memory operands), and the split points the pops made (put after
+the same instruction). `check --predict --pieces` replaces, for every record a split round puts in the list, the
+trace's benefit, priority, nrefs, single-block flag, nEnter, airlock flag and last def with the model's, so each
+decision after the first round is made from modelled pieces (avail sets and PREFs still come from the trace).
+
+**Results [C]** (regalloc.md 3.6.11 has the table): the record sequence of every round as c2's on all four builds
+(splitnum f4 / f6, b25.c, b250.c, v_match, M&B Terrain::tessellate, the Spore slice s0059f510); every piece exact on b250.c (14.00: 3133/3133 in 33 rounds, 13453 of 13453 reference costs as Spillcosts' probes), b25.c
+(14.00: 450/450, 13.10.3077 and 3052: 413/413), v_match 35/35 and splitnum on 14.00 / 15.00; the misses elsewhere are
+all one rule, the cost of a two-address dst (CmdCanDirectSubstitute's accept rule, regalloc.md 3.6.11 item 9).
+`check --predict --pieces` on b25.c (14.00): 291 of 291 piece records from the model and every decision as with the
+trace's records (list head 430/430, spill/defer 283/283, register 147/147, SpillObvious 620/620); the same on
+v_match (31 of 31 records; 98/98, 77/77) and b25.c on 13.10 (271 of 271; 420/420, 273/273); on Terrain::tessellate
+(77 of 77 records) the tied-dst cost misses move the list head at 13 of 117 pops (branch 116/117, spill/defer and
+register every one).
+
+**Limits.** Integer class only. Split points made at the pops come from the trace; the pieces' avail sets and PREFs
+come from the trace; 13.10's loop record offsets inside the loop (+8 enclosing, +0x14 header, +0x24 exits) are 14.00's
+and were checked only through Spillcosts' +0x38 test and the results.
 
 ### `rasim fold SNAP VAR`: does a reload fold into the variable (regalloc.md 3.6.10)
 

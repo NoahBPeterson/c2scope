@@ -7,20 +7,20 @@ code. `tools/realize.py` applies the table to a function: it places every catalo
 lines of the block the edit names, compiles and traces each variant, and says whether the edit happened.
 
 Back ends: cl 14.00.50727.762 (default), 13.10.3077, 13.10.3052, 15.00.30729.1. **[C]** = measured here from two
-traced compiles (probe file named); **[I]** = inferred. Probe sources: `work/scratch/realize/p1.cpp` .. `p4.cpp`
+traced compiles (probe file named); **[I]** = inferred. Probe sources: `work/scratch/realize/p1.cpp` .. `p10.cpp` (p5..p10: merges after Color, equal arms, statement order)
 (recorded outputs `work/scratch/realize/out/<probe>_<build>.txt`), regression file `tests/data/realize.cpp`.
 Every row below was measured on 14.00 and repeated on 13.10.3077 and 15.00 with the same result unless a build is
 named; `tests/data/realize.cpp` also on 13.10.3052.
 
 ## 0. Summary for a decompiler
 
-1. **A value that is never modified cannot get a no-code reference.** Eighteen do-nothing uses (`(void)V;`,
-   `if (V) { }`, `__assume`, `__noop`, empty inline helpers by value and by reference, dead reads, dead compares,
-   aliases, reference bindings without a use, dead stores to a local, a dead ternary, an empty if/else) leave
-   nothing at Color in seven contexts (free function, loop with a call, loop without, `this` after a loop, EH
-   frame, inside an inline helper, inside an inline helper of an EH function) on all three builds. So
-   `ref:this:B` has no code-neutral spelling; the cheapest real one is a store (one instruction). **[C: p1]**
-2. **A value that is modified later can.** `T k = V;` written before V's next modification, with the later
+1. **A value that is never modified gets a no-code reference only through IL that is deleted after Color.**
+   Eighteen do-nothing uses (`(void)V;`, `if (V) { }`, `__assume`, `__noop`, empty inline helpers by value and by
+   reference, dead reads, dead compares, aliases, reference bindings without a use, dead stores to a local, a dead
+   ternary, an empty if/else) leave nothing at Color in seven contexts on all three builds **[C: p1]**, and a copy
+   with two definitions from the same value (`q = p;` again in an arm) is propagated away like one with one
+   **[C: p5 cp2, cpl2]**. What works is code that reaches Color and is merged after it (rule 8). **[C: p5..p9]**
+2. **A value that is modified later can.**2. **A value that is modified later can.** `T k = V;` written before V's next modification, with the later
    uses spelled `k`, reaches Color as a copy between two candidates and is coalesced away: the code is identical,
    and at allocation V has two more references in the block of the copy, that block has one more candidate, and
    V's range ends there. The block is the one the statement is in, so it can be chosen. The same thing happens
@@ -28,6 +28,11 @@ named; `tests/data/realize.cpp` also on 13.10.3052.
    `for (T k = V; ...)`. **[C: p2 cpmod/cpptr, p3 cpl/cpf/wk/lp, tests/data/realize.cpp]**
 3. **A statement at the head of both arms of an if/else counts in the arms**, not in the block of the test:
    head merging runs after Color (il_fg.md rule 12). Same instructions; the references move. **[C: p2 hdup, p3 hds]**
+   The same holds at the tail: the statement after an if written at the end of both arms (an `else` is made for
+   it when there is none) is tail-merged after Color, and its references count in the arms instead of the join;
+   with an implicit `this` (member reads and stores) as with a pointer. It stays code-neutral for arithmetic and
+   stores; a call or a push in the copy keeps the arms apart (their stack offsets or scratch registers differ).
+   **[C: p5 tdup/tdc/ta/td, p6 tst/tne/hs/hc/tl, p7]**
 4. **`extend:V:B` on an address-taken local is a callee's body**, per parameter (callee.md). `realize.py` writes
    the stubs from the declarations in the unit; which pattern is true has to come from the original's callee
    (`calleesum.py`). It is code-neutral when the uses after the call read memory anyway. **[C: Fallout 3
@@ -42,9 +47,30 @@ named; `tests/data/realize.cpp` also on 13.10.3052.
    initialisation. All with identical code in the probe on 14.00 and 15.00 (13.10: the unnamed temporary
    changed code). **[C: p4]** A reference or pointer local is +1 but changed the x87 code on 14.00 and 15.00.
    There is no construct for the optimiser's hash-class keys (2.6).
-7. **What has no code-neutral realisation here**: a reference to an unmodified value (rule 1), a register
-   preference, an interference or a copy partner on their own (they come only as side effects of the constructs
-   above, or with code: tracer.md's pairs table), and `unref:` of a value whose reads the original's code has.
+7. **What has no code-neutral realisation here**: a copy partner on its own, a register preference without the
+   references of the statement that carries it (rule 8: equal arms around a fastcall call add one `pref:` event
+   and S's references), a reference at a block that has no register-local assignment or call statement to wrap
+   (and, on 13.10, where V is not in a register: the memory compare stays), and `unref:` of a value whose reads the
+   original's code has. An interference or a defOrd tie alone: two independent statements of a block exchanged
+   (rule 9), when the scheduler gives the old order back.
+8. **Equal arms: `if ((int)V & 1) S; else S;`** around an existing statement S of block B. At Color the block is
+   split in four (the test, two arms, the join): V has one more reference (the test), S's variables one more
+   each (the arms), and P follows. In `dop2_FinalFlowOpts` (FgDoLateFlowOpts mode 2) the arms are head-merged,
+   the jumps go and so does the test, so the code is that of the source without the if. This is a code-neutral
+   `ref:V:B` (also `extend:V:B`) for `this` and for read-only parameters, the edit rule 1 had no spelling for.
+   Conditions: S must reach Color, i.e. be an assignment to a register local that is not a single-definition copy,
+   a call statement, or a store whose value comes from a call or `new` (a plain store or a single-definition copy
+   is merged or propagated before Color and the construct vanishes); S must not be between a call and the next
+   call of its block (the split keeps the first call's `add esp` apart: one instruction more); S must not need a
+   scratch register (the two arms get different rotation picks and stop merging); the condition must set no
+   equality fact S depends on (`if (s)` around `s ^= a` folds the else arm), and `if (this)` is folded before
+   Color. 14.00 and 15.00 delete every test; 13.10 (3077 and 3052) deletes a register-only test (`test reg, imm`,
+   `cmp reg, imm`) and keeps one that reads memory (one instruction). **[C: p8, p9, p10; tests/data/realize.cpp
+   on all four builds]** It closed Mount & Blade `CharSheet::init_screen` (§4.2).
+9. **Statement order inside a block** is an allocation input with no reference change: two independent
+   statements exchanged flip the defOrd tie of equal-priority values (`tie:A>B` in the difference) and can drop an
+   interference. The scheduler runs after Color but keeps source order for independent instructions in most
+   probes, so the instructions are the same (bag 0) and their order usually differs. **[C: p6 sw/sst/sad/sgl, p10]**
 
 ## 1. How a construct is measured
 
@@ -71,6 +97,7 @@ first integer Spillcosts pass (blocks numbered as `regs --why` numbers them) and
 | `P:B:+n` | the block's pressure changed |
 | `blocks:-a+b` | the block list changed; blocks are then aligned on weight and source lines (`nK` = a new block) |
 | `interf:A:B`, `copy:A:B`, `pref:A:REG:+n` | relations among named values: neighbours and copy partners as ChoosePhysReg listed them (symmetric closure), register preferences Spillcosts recorded |
+| `tie:A>B` | A and B have equal priority in both traces and their defOrd order flipped: A now pops first (the order-only change of a statement exchange) |
 
 Code cost, three numbers: `code` = aligned diff of the two listings with registers masked and operands kept
 (labels, `$T` names, block-scoped suffixes and the printed form of narrow immediates normalised); `bag` = the
@@ -97,6 +124,14 @@ builds the same unless said); *limits*; probe. "B" is the block the statement is
 | statement before `if/else` written at the head of both arms (`headdup`) | `ref:V:arm:+2` in each arm, `drop:V:B` or `ref:V:B:-2` in the block of the test | P of the three blocks follows; the registers moved in the probes (the arms' P rose) | bag 0 (the read is merged back above the branch after Color); with the registers the prolog order changed (code 4) | the statement must not feed the condition; both copies must get the same registers to merge | p2 hdup, p3 hds; tests |
 | the reverse (`headhoist`) | the reverse | | | | |
 | `g = V;` (a store; `rz_keep(V)` in the tool) | `ref:V:B:+2` = | none (a preference can go: `pref:this:ecx:-1` in 0x00a89680) | +1 instruction | always available: it shows what the reference would do | p1 store |
+| `if ((int)V & 1) S; else S;` around a statement S of B (construct `eqif`; §0 rule 8) | `ref:V:B:+2` (the test; B is split, so the difference shows `extend:V:nK` on the new blocks or B's number lost) | S's variables +2 each in the arms, P of the new blocks, `blocks:-1+4` or `-0+3` | 0 on 14.00 / 15.00; 13.10 0 when V is in a register, +1 (`cmp` with memory) otherwise | S: register-local assignment (not a single-definition copy), call statement, or store of a call / `new` result; not between two calls of the block; no scratch pick in S; `if (this)` folds | p8, p9, p10; tests eqt; §4.2 init_screen |
+| the statement after an if written at the end of both arms (`taildup`; an `else` is made when there is none) | `ref:V:arm:+2` in each arm, `ref:V:join:-2` | S's other variables the same way; P of the arms +1; with a new else arm `blocks:-0+1` | 0 for arithmetic and stores (`s += p->a`, `p->c = s`, a member store with implicit this: registers move, bag 0); a call in the copy: not merged (+8: stack offsets differ) | statement must not leave; no call or push | p5 tdup/tdc/ta/td, p6 tst/tne/tl, p7 tn; tests tdup |
+| the reverse (`tailhoist`) | the reverse | | as taildup read backwards (p5 tdh: the hoisted call merged differently, code 26) | | p5 tdh |
+| the statement before an if without else written into both arms (`headdup` making an else) | `ref:V:then:+2`, a new else block with the copy | `blocks:-0+1` | 0 (registers move) | as headdup | p7 hne, hn |
+| headdup with a call (`s += g(p->a)` into both arms) | the references move | | **not neutral** (+4: the pushes' scratch registers differ per arm) | | p6 hc |
+| headdup into the cases of a switch (jump table or compare chain) | the references move to every case | | **not neutral** (+4, −2) | | p6 swc, sws |
+| `S* q = p;` with a second `q = p;` in an arm, in both arms, after the join, in a redundant `if`, in a loop | nothing (the copy is propagated: all reaching definitions are the same copy) | | 0 | | p5 cp2, cpl2, cp |
+| `if (C) S; else S;` with S a plain store (`p->c = s`, `gi = s`) or a single-definition copy | nothing (merged before Color) | | 0 | | p7 rif/rnf/rin, p8 st/gl |
 | 18 do-nothing uses of V | nothing | | 0 | 7 contexts, 3 builds. `__assume(p != 0)` inside an inline helper is not harmless: it changes the helper's code (p1 inl/ehinl) | p1 |
 | `int x = V->m;` used by both arms, written once before the test instead (`hcmp`) | `ref:V:B` moves, a named value appears | | code changes (a reload) | not neutral | p2 hcmp |
 | `int* pc = &V->m;` before a loop with a call, the loop reading `*pc` | `extend:V:preheader`, `P:+1` there | block list changes | bag 0, code 6 | not neutral | p2 lea |
@@ -112,6 +147,7 @@ spelled `V`), hoist a common head statement. A reference that the original's ins
 | a body for a same-unit callee that only **reads** through the parameter receiving `&V` (construct `callee`) | `extend:V:` from the call back to V's definition: one web across the call, no reload after it | V interferes with everything live across the call | 0 when V's uses after the call are memory operands (0x00a89680: regdiff 16 → 0); otherwise V moves into a register (probe: −5 instructions, a callee-saved register more) | the callee must really be in the unit and really only read (callee.md; `calleesum.py` reads it from the executable). A body for a callee of another file breaks a match | p2 ext; tests; §4 |
 | bodies for **all** callees that receive `&V`, each writing through it but not keeping the pointer | V does not escape: loads before and after later external calls become one value | several values merge | 0 in 0x004da900 (regdiff 31 → 0) | every callee that gets the address needs its body; one alone changes nothing | §4 |
 | a real use of V at B | `extend:V:B` = | | the use | | tracer.md int_ext, iv_ext |
+| equal arms on V at B (`eqif`) | `extend:V:B` when V was dead there | V interferes with what is live at B; S's references as in 2.1 | 0 in the probes where V stays in its register; where the longer range costs V its register the code changes (p10 ex: +2) | | p9, p10 ex |
 | the copy of 2.1 | `drop:V:` after the copy | see 2.1 | 0 | | |
 
 ### 2.3 Candidates: `var:NAME:B`, `P:B:+1`, `P:B:-1`
@@ -127,17 +163,20 @@ spelled `V`), hoist a common head statement. A reference that the original's ins
 | ternary as an argument instead of a named result | the named value becomes an anonymous one | none (no P change) | 0 | | p2 tern |
 | a named `bool` for a condition; `x = 0; x = E;`; split declaration; `&&` as nested ifs; `while` / `for` / `if + do-while` | nothing | | 0 | | p2 boolm, dinit, nest; p3 lp |
 | a second variable instead of reusing one after its last use | nothing but the name (one candidate per lifetime either way) | | 0, same registers | | p2 web |
+| equal arms around a statement of B (`eqif`, 2.1) | the block split: `P` of the test, the arms and the join, one more reference to each of S's variables | as 2.1 | 0 (14.00, 15.00) | as 2.1 | p8, p9 |
 
 ### 2.4 Order, interference, preference, copy partners
 
 `before:A:B` / `after:A:B` are priority edits: ask `rasim need SNAP 'A>B'` for the `ref:` / `unref:` form and take
-it to 2.1 or 2.3. For the others no construct was found that realises one of them alone without code:
+it to 2.1 or 2.3. A tie (equal priorities, decided by defOrd) is also an order of statements:
 
 | Edit | What realises it | Code |
 |---|---|---|
+| `tie:A>B`, `nointerf:A:B` | two adjacent independent statements of one block exchanged (`swap`, rwsweep's family): no reference moves, defOrd and the overlap at that point do | bag 0; code 0 in p6 sad / p10 sw (14.00, 15.00; 13.10 the order of two instructions changed), otherwise the scheduler keeps the new order (p6 sw, sst, sgl: code 2..6) |
 | `copy:A:B` | the copy of 2.1 makes k and V partners (and it is what makes k take V's register) | 0, but it is a side effect |
-| `interf:A:B` / `nointerf:A:B` | `extend:` / `drop:` of one of them (2.2); a callee body | as 2.2 |
-| `pref:A:REG` | a copy with a fixed register: return value, fastcall or thiscall argument, call result | changes code (tracer.md pairs fc_pref, h_ret) |
+| `interf:A:B` / `nointerf:A:B` | `extend:` / `drop:` of one of them (2.2, including equal arms on V); a callee body; the exchange above | as 2.2 |
+| `pref:A:REG:+1` | equal arms around a statement that copies A to or from a fixed register: a fastcall argument (`s += gf(n, s)`: `pref:s:edx:+1`, code 0 on all three builds). The same around a cdecl call result or a thiscall `this` did not merge (the arms' argument loads took different scratch registers: +5, +13) | 0 for the fastcall probe; S's references come with it |
+| `pref:A:REG` otherwise | a copy with a fixed register: return value, fastcall or thiscall argument, call result | changes code (tracer.md pairs fc_pref, h_ret) |
 | `noreg:A:REG` / `canreg:A:REG` | A lives (no longer lives) across a call, shift, division | changes code, or 2.2 |
 
 ### 2.5 Scratch picks: `rasim scratch SSNAP drop:N` / `ins:N`
@@ -179,10 +218,42 @@ code cost differs where said (its operand sort sees memory leaves, symkeys.md se
 | three float locals in the helper; `const P& a = *this;` | +3; +1 per expansion | no form gives exactly +8 per expansion with the code kept |
 
 **Hash class** (`add:hash@V:n`): the optimiser's value-numbering temporaries (`$o..`, made by `HshInsertEntry`)
-have their own key class, and for an operand reached through one only `key & 3` enters the sort weight. No
-construct is catalogued that adds one without code. The one known source is code the compiler itself generates
-at a point: the constructor loop (`??_H`) of a class array declared there made the 3 temps the matching draft
-has. `realize.py` accepts the edit and says so; it generates nothing for it.
+have their own key class, and for an operand reached through one only `key & 3` enters the sort weight. Two
+sources are known. Code the compiler itself generates at a point: the constructor loop (`??_H`) of a class array
+declared there made the 3 temps the matching draft has. And **equal arms** (§0 rule 8): the condition's
+operators are value-numbered before Color and the arms leave no code, so `if (E) S; else S;` adds hash temps at
+S's position; the number follows the operators of E. Measured on Fallout 3 0x00806ab0 (`jp18.cpp`, regdiff 44,
+of which 28 are the four `$o`-sorted crosses vC10, vC11, vC20, vC21 and the rest the jump table's data), one
+`if (E) hitEdge = 0; else hitEdge = 0;` anywhere between vC00 and vC10 (36 sites, same result at each):
+`(int)pExtents & 1` 48, `& 3) == 1` 48, two operators (`((int)pExtents ^ 5) & 1`, `* 3`, `^ (int)axes`, ..: 18
+spellings) 32, three with a constant (`(((int)pExtents ^ 5) * 3) & 1`) **28**, four 44 (the base: mod 4),
+three with two pointers 78 (`work/scratch/realize/e/806/`, `results*.txt`). At 28 all four hash sites come out as in
+the original; three x87 sites earlier in the function (listing lines 329, 910, 2352, operand order of `$T`/`tv`
+temporaries) flip, so the condition also adds keys of another class. Not a match, and jp18 keeps its 18 padding
+locals. **[C: plain compiles, regdiff only; the key classes are inferred]** `realize.py` still generates nothing
+for `add:hash@..`; the equal-arms spelling has to be chosen by hand (the operator count).
+
+Hash-class constructs measured per temp (symkeys.md section 8; probes `work/scratch/hashkeys/p1.cpp`..`p4.cpp`
+with `pr.py`, regression `tests/data/symkeys_hash.cpp`). "walk" = numbered at that statement in HshBuildTable's
+walk, "tail" = an assignment entry numbered after the whole walk, "later" = after HshBuildTable. Every row is
+code-neutral where it says 0; the counts are exact:
+
+| Construct | hash temps | Code | Builds | Probe |
+|---|---|---|---|---|
+| one more pair of parentheses around a float subexpression that is not a bare variable or load (`((A) + (B))`, `d + (m * v)`) | walk +1 at that statement; `((e))` +2, `(((e)))` +3 | 0 | all four | hk p2 b1_v2/v3, p4 c1_v1..v3 |
+| one pair fewer around a product in a sum (`(a * b) + c` → `a * b + c`) | walk −1 per pair | 0 (13.10: shape 2 in one probe) | all four | hk p2 b1_v4, p4 c1_v4/v5 |
+| `(float)` cast of a float expression | walk +1 | 0 | all four | hk p4 c1_v6 |
+| a float sum through a `double` local | walk +1 (13.10: +3) | 0 | all four | hk p4 c1_v11 |
+| inline `float(fabs(x))` helper instead of `(float)fabs(x)` | walk +2..+3 per use (13.10: +1) | 0 | all four | hk p2 b1_v6/v7, p4 c1_v8 |
+| a `bool` flag for a float compare | walk +1, tail +2, later +1 | 0 | all four | hk p1 a1_v4, p4 c1_v10 |
+| a reference / pointer alias or a copy of a float parameter used in the compares | tail +1, later +15..+34 (13.10: +9..+26) | 0 on 14.00/15.00 | all four | hk p1 a1_v1/v2/v8/v11 |
+| parentheses around variables or loads, int parentheses, dead expressions, a repeated spelling | 0 | 0 | all four | hk p2 b1_v1/v11, p3 |
+| Fallout 3 0x00806ab0 (jp18): one more pair around the radius sums of C00, C01, C02; none around C22's two radius products and its four `(maxTime) * (fC22Vel)` | walk +3 in the window (vC00 to the vC10 cross), −3 after it | regdiff 45 → 17, byte compare **0 of 4406** differ | 14.00 | symkeys.md 8.4 |
+
+A hash edit has to be compensated **exactly** after the range it should move (net 0, not 0 mod 4): the later
+temps and the pass-2 temporaries that reuse freed hash keys see the whole count (symkeys.md 8.1). The three
+x87 flips of the equal-arms spelling above are probably that, +3 without the −3 **[I]** (measured: +3 in the
+window with +1 after it, net +4, leaves two radius products different; +3 / −3 leaves none).
 
 **An anchor inside an inline expansion** (`add:frame@_r@Cls::Helper#2:n`) has no statement of its own. The tool
 offers two different placements and names them: n locals at the call site of the k-th `Helper(` (reader-phase
@@ -221,8 +292,10 @@ uv run tools/realize.py pairs probes.cpp [--keys] [--diff] -- FLAGS
 **`edit`.** The base is compiled with the `regs` trace. Block B is mapped to source lines through the trace's
 line numbers (the `src` column of `regs --why`), and to the statement boundaries on those lines. For the edit's
 kind the constructs of section 2 are generated there (`--list` prints them without compiling): `copy`,
-`uncopy`, `headdup`, `headhoist`, `callee`, `store`, and from `rwsweep` the `const`, `guard` and `wrap` families
-restricted to those lines. Rewrites add no line, so line numbers stay comparable. Every variant is compiled and
+`uncopy`, `headdup` (also into an if without else, with `this` used implicitly through members), `headhoist`,
+`taildup`, `tailhoist`, `eqif` (for `ref:` / `extend:`; the statements of the block's line range are tried, a
+declaration `T x = e;` is split into `T x;` and the assignment), `callee`, `store`, and from `rwsweep` the `const`,
+`guard` and `wrap` families restricted to those lines. Rewrites add no line, so line numbers stay comparable. Every variant is compiled and
 traced once (`--jobs`), compared with the base as in section 1, and gets a verdict:
 
 ```text
@@ -248,11 +321,13 @@ Three stages, stopping at the first variant that matches (regdiff 0 with `--asm-
 registers with `bag 0`):
 
 1. each answer made only of source-level edits, each edit through its code-neutral constructs (a store is tried
-   only with `--with-store`: it costs an instruction and can only confirm the model);
+   only with `--with-store`: it costs an instruction and can only confirm the model). `ref:this:B` and the
+   references of read-only parameters now have one (`eqif`), so these answers are tried instead of skipped;
 2. every structural code-neutral construct that touches a block any answer names (`guard`, `const`, `headdup`,
-   `headhoist`, `uncopy`, `copy` of every variable, and `helperbind`: `&p->m` in the inline helpers through a
-   bound reference), singly; then those that changed the allocation's inputs without changing an instruction
-   together, per family and all at once (priorities add);
+   `headhoist`, `taildup`, `tailhoist`, `swap`, `uncopy`, `copy` of every variable, `eqif` for the `ref:` /
+   `extend:` targets that `rasim need 'A>B'` names for an order answer, and `helperbind`: `&p->m` in the inline
+   helpers through a bound reference), singly; then those that changed the allocation's inputs without changing
+   an instruction together, per family and all at once (priorities add);
 3. stub bodies for every bodiless callee that receives the address of a local: per parameter "only reads", for
    all callees "reads and writes, keeps nothing", and "reads only everywhere".
 
@@ -339,7 +414,7 @@ guard family only): the model's cheapest answer is the order `after:t969:t1644` 
 pattern, `delete[] (T*)p; p = 0;`). Singly: `factions` 106 → 56, `parties` 96, `troops` and `quests` 106, each
 with changed instructions (the store moves, as frontend.md says). Together, all four: **regdiff 46, not 0**, and
 the two that helped alone give the same 46. So the pipeline prints `NOT FOUND` with that variant as the closest.
-Not established: whether the reference copy this draft was made from (`work/scratch/immcand/mb/game_2.cpp`)
+(Corrected in 4.3: with the regdiff fixed, the four guards give 0, so the 46 was the comparer.) Not established then: whether the reference copy this draft was made from (`work/scratch/immcand/mb/game_2.cpp`)
 compiles to regdiff 0 with the flags and include directories used here; they were taken from the neighbouring
 `cs.sh`, not from the Mount & Blade build, and the reference was not compiled in this run. Until that is checked,
 46 can be the tool's shortfall or the setup's.
@@ -350,6 +425,45 @@ matching variant was generated and confirmed by a plain compile; 1 is out of the
 realisation of an `extend:` answer, two from stage 3). No run was closed by realising one of the model's `ref:` /
 `unref:` answers code-neutrally: on these drafts the values the model wants referenced are never modified
 (`this`, compiler temporaries), which is the case section 0 rule 1 excludes.
+
+### 4.3 The pipeline again, with equal arms, tail duplication and the exchange (2026-11-12)
+
+The same drafts and originals, the new constructs in stages 1 and 2, and the regdiff without printing noise
+(tracer.md: symbol names, three-operand `imul`, alignment padding), so some base numbers are lower than in 4.2.
+Outputs: `work/scratch/realize/out/pipe2_*.txt`, variants in `work/realize/pipe2_*/`.
+
+| Function | Base regdiff | Result | Compiles |
+|---|---|---|---|
+| Fallout 3 0x00a89680 (14.00) | 16 | **found**, stage 1, answer 4 (`extend:p0:9`, the callee body, as before). The first three answers (`ref:this:1`, `ref:this:10:4`, `ref:this:8:4`) are now tried: `eqif` at block 1 wraps `end = in->m_elements + ..` and changes code (36: a scratch pick in S), `taildup` of the `FUN_00e0a950` call does not merge (40). Blocks 12 and 4 offer no S that works: `pMid = mid` is a single-definition copy (the arms vanish), `int quadrant = 0` changed the loop (20) | 6 |
+| Fallout 3 0x006dc990 (14.00) | 27 | **found**, stage 3 (callee body, as before), after 4 stage-2 rewrites | 7 |
+| Mount & Blade `CharSheet::init_screen` (13.10.3077) | 5 (102 with the old regdiff) | **found**, stage 1, first answer `ref:this:28`: `if ((int)this & 1) skills = new text_box; else skills = new text_box;`. regdiff 0: the joined `new` result comes out in esi (`jmp; xor esi, esi; mov ebx, esi`), one `mov eax, esi` fewer, nothing else changes | 1 |
+| Fallout 3 0x004da900, merged return (14.00) | 31 | **found**, stage 3 (the two-callee stub `cb_006`, as 4.2 confirmed by hand; this time the run finished: traced compiles on the compile server). Stages 1 and 2 had nothing to try (3 answers, none at source level) | 8 |
+| Mount & Blade `Game::load_game_data` (13.10.3077) | 60 (106 before) | **found**, stage 2: the four `guard` rewrites together (`guard_every`), regdiff 0; the two that helped alone (`factions`, `parties`) also give 0. Nothing new was needed: the 46 that 4.2 reported for the same variant was the comparer's padding and symbol-name noise. The new constructs (`swap`, `taildup`, ..) generated 56 of the 62 compiles and none of them helped | 62 |
+
+load_game_data was compiled against the Mount & Blade headers of commit a0f446b4 (2026-11-11 23:00, extracted
+with `git archive` outside the tree): `lgd_nat.cpp` no longer compiles against the current headers (`NavData::verts`
+is a vector now).
+
+init_screen in detail (`work/scratch/realize/out/pipe2_csn.txt`; the variant also by hand in
+`work/scratch/realize/e/cs/v_new.cpp`): RESULTS2.md's model answer was "a reference to `this` inside the new
+expression that leaves no code"; rasim's first answer is exactly that, and the equal-arms construct around the
+statement that holds the `new` realises it on 13.10 because `this` is in a register (`test ebx, 1`, deleted in
+FinalFlowOpts). The arms each hold the allocation, the constructor call and the null arm; head and tail merging
+after Color fold them back into one. It is a decompiler's spelling, not the original programmer's; the code is
+the original's (regdiff 0; not byte-compared). Two other spellings around the neighbouring statements changed
+code (`float skills_x` / `skills_y` assigned in equal arms: 175 and 145 with the old regdiff: an x87 value or a
+ternary in S does not merge).
+
+Fallout 3 0x00806ab0 (§2.6): no pipeline run (a key-class edit, not an allocation edit). By hand, equal arms
+supply the missing hash-class temps of jp18 (all four `$o` sites right) but move three tmp-class sites: 44 → 28.
+j1 (no padding) was not tried with them; it still lacks the 17/18 frame keys, which no construct supplies.
+
+Count, the same five functions as 4.2 plus init_screen and 0x00806ab0: **5 of 7 printed `FOUND`** (before: 2 of 5
+printed it, 1 more confirmed by hand; init_screen had no run). Found: 0x00a89680, 0x006dc990, 0x004da900 (callee
+bodies, as before), load_game_data (guards, which 4.2 had already generated: the fix was the comparer), init_screen
+(equal arms, new). Not found: 0x004da900's earlier draft (out of reach by construction, not re-run) and
+0x00806ab0 (key classes; 44 → 28 by hand). init_screen is the first function closed by realising a `ref:` answer
+for a never-modified value (`this`) code-neutrally.
 
 Not run: Fallout 3 0x008e7d40 (its draft unit did not compile here on its own); the cl.exe functions of `src/cl/`
 (looked up in the git history: their fixes are block-layout and tail-merge spellings, e.g. `get_message`,
@@ -364,9 +478,8 @@ Not run: Fallout 3 0x008e7d40 (its draft unit did not compile here on its own); 
 - `headdup` was only seen merging back when both copies got the same registers; when they do not, the code
   differs (not probed separately).
 - `copy` on 13.10.3052 and the key table on 13.10.3052: only `tests/data/realize.cpp` was run there.
-- 13.10 compiles: `c2trace.py` sends a 13.10 traced compile to the Mount & Blade compile server when
-  `~/.config/mb-compile-token` exists. `C2TRACE_REMOTE=0` keeps it on local wine. The 13.10 numbers in this file
-  were first obtained through that default and then repeated with `C2TRACE_REMOTE=0 CCACHE=0` (p1 to p4 and
+- 13.10 compiles: the 13.10 numbers in this file were first obtained on a remote compile server
+  (`~/.config/c2trace-remote`) and then repeated locally with `C2TRACE_REMOTE=0 CCACHE=0` (p1 to p4 and
   `tests/data/realize.cpp`: the same edit lists and key counts; `out/*_local.txt`).
 - The x87 class: `Delta` reads the first integer Spillcosts pass. x87 and XMM candidates are not compared, and
   13.10's FPColor is outside it.
@@ -375,6 +488,16 @@ Not run: Fallout 3 0x008e7d40 (its draft unit did not compile here on its own); 
 - `helperbind` (stage 2) has not closed a function yet: 0x008e7d40, where it is the known answer
   (`helpersweep.py` found it), could not be run.
 - Stage 2's combination rules have produced an improvement (Mount & Blade, 106 → 46) but no match yet.
+- Equal arms (`eqif`): measured in small probes and in init_screen. Which pass deletes the dead test was read in
+  the IL only to the phase (`dop2_FinalFlowOpts`, both 14.00 and 13.10); that 13.10 keeps a test with a memory
+  operand is from three probe shapes. The rule "S must not need a scratch register" comes from two failures (p10
+  pr, pt) and the a89680 block-1 site; a three-pick S might merge again (tailmerge.c r2), not tried.
+- `taildup` / `headdup` making an else arm, and `swap`, have not closed a function; in load_game_data the 56
+  candidates they added changed nothing that mattered.
+- The `tie:` item reports only flips among named values of equal priority in both traces.
+- rasim features (JSON answers, `--only`, `var:new` in `need reg:`) were not added: with `eqif` the pipeline
+  tries the `ref:this` answers it used to skip, and its text parsing was enough for these runs. The list below is
+  unchanged.
 - rasim features that would shorten the loop, described for whoever owns `tools/rasim/src/`:
   1. `want` / `need reg:` printing, for each `before:` / `after:` answer, the cheapest `ref:` / `unref:` /
      `var:new` realisations inline (today realize.py runs `need 'A>B'` again for the first three);

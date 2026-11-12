@@ -15,11 +15,15 @@
 //! Commands:
 //!   rasim check SNAP                       verify the model against the trace (every term, every total, the order
 //!                                          of every pass up to its first deviation, and the re-pops)
+//!   rasim check SNAP --predict [-v] [--pieces [--chain]]   (--pieces: split pieces' records from pieces.rs)
 //!   rasim check SNAP --predict [-v]        run Color's loop as a model (predict.rs): predict every spill, deferral,
 //!                                          split-round and register decision from the model's own state and
 //!                                          report, per round, where prediction and trace diverge
-//!                                          (cl 13.10: both also replay FPColor's x87 list, fpcolor.rs, and
-//!                                          `need A>B` on x87 webs answers from that list)
+//!                                          (cl 13.10: both also replay FPColor's x87 list, fpcolor.rs, predict
+//!                                          FPCheckColorability from the snapshot's x87 view, and `need A>B` on
+//!                                          x87 webs answers from that list)
+//!   rasim need SNAP stack:V                cl 13.10: what keeps x87 web V on the stack (its blockers at
+//!                                          FPCheckColorability, and whether popping V before each would keep it)
 //!   rasim order SNAP [--pass N] [--top K] [EDIT...]
 //!                                          priority order of pass N, after the edits; changes are marked
 //!   rasim need SNAP [--pass N] [EDIT...] A>B [A>B...] [--edits K]   (EDITs are applied first, as givens)
@@ -38,6 +42,8 @@
 //!                                          the same, with the targets read from `c2trace.py regmap` output
 //!                                          (WANTS rows; with regmap --all the ok rows are pinned) or VAR=REG lines
 //!
+//!   rasim pieces SNAP [-v] [--chain]       what the pieces of each split round look like (pieces.rs, regalloc.md
+//!                                          3.6.11): blocks, references, costs, from the round's IL (`regs --pieces`)
 //!   rasim fold SNAP VAR                    does a reload (OPENTERLOAD web, a split piece) fold into VAR, and the
 //!                                          single edit that would make it fold (fold.rs, regalloc.md 3.6.10)
 //!
@@ -69,6 +75,7 @@ mod choose;
 mod combo;
 mod fpcolor;
 mod fold;
+mod pieces;
 mod predict;
 mod scratch;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1254,6 +1261,9 @@ fn main() {
     if args[0] == "scratch" {
         return scratch::main(&args[1..]);
     }
+    if args[0] == "pieces" {
+        return pieces::main(&args[1], &args[2..]);
+    }
     if args[0] == "fold" {
         return fold::main(&args[1], args.get(2).map(|x| x.as_str()).unwrap_or_else(|| die("fold: give SNAP VAR")));
     }
@@ -1271,6 +1281,12 @@ fn main() {
             "--pool" => pool = it.next().and_then(|x| x.parse().ok()).unwrap_or(pool),
             "--depth" => depth = it.next().and_then(|x| x.parse().ok()).unwrap_or(depth),
             _ => rest.push(a.clone()),
+        }
+    }
+    if args[0] == "need" {
+        // cl 13.10 x87: what keeps a web on the stack (FPCheckColorability, fpcolor.rs)
+        if let Some(v) = rest.iter().find_map(|c| c.strip_prefix("stack:")) {
+            return fpcolor::cmd_need_stack(&args[1], v);
         }
     }
     if args[0] == "need" && !rest.iter().any(|c| c.starts_with("reg:")) {
@@ -1295,7 +1311,8 @@ fn main() {
     }
     match args[0].as_str() {
         "check" if rest.iter().any(|a| a == "--predict") => {
-            predict::main(&args[1], rest.iter().any(|a| a == "-v"), false);
+            let pm = rest.iter().any(|a| a == "--pieces").then(|| rest.iter().any(|a| a == "--chain"));
+            predict::main_with(&args[1], rest.iter().any(|a| a == "-v"), false, pm);
             fpcolor::cmd_check(&args[1], true, rest.iter().any(|a| a == "-v"));
         }
         "check" => {

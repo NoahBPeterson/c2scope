@@ -74,25 +74,51 @@ def listing_instrs(path, func):
 
 def orig_instrs(path):
     """Lines 'VA  mnemonic  operands' (capstone-style disassembly of the original function)."""
-    out = []
+    out, va = [], []
     for ln in open(path):
         p = ln.split(None, 2)
         if len(p) >= 2:
             out.append((p[1], p[2].strip() if len(p) > 2 else ""))
+            va.append(p[0].lower())
+    # a long alignment pad is `jmp` over the padding (the listing's npad 5..): `jmp X; lea r, [r]; X:` is one npad
+    for i in range(len(out) - 2):
+        if out[i][0] != "jmp" or _key(out[i + 1]) != ("npad", ()):
+            continue
+        k = i + 1
+        while k < len(out) and _key(out[k]) == ("npad", ()):
+            k += 1
+        if k < len(out) and out[i][1].lower().replace("0x", "").lstrip("0") == va[k].replace("0x", "").lstrip("0"):
+            out[i] = ("npad", "")
     return out
 
 
 def _key(ins):
     if ins[0] in ("rep", "repe", "repne"):          # capstone spells out the implicit operands of rep movsd/stosd
         return (ins[0], ins[1].split()[0].lower() if ins[1] else "")
-    return (ins[0], tuple(REG.findall(ins[1].lower())))
+    regs = tuple(REG.findall(re.sub(r"[\w?@$]*[?@$][\w?@$]*", " ", ins[1]).lower()))   # not inside symbol names
+    if ins[0] == "imul" and len(regs) == 2 and regs[0] == regs[1] and ins[1].count(",") == 2:
+        regs = regs[:1]                             # capstone `imul r, r, imm` is the listing's `imul r, imm`
+    if ins[0] == "npad" or (ins[0] == "lea" and len(regs) == 2 and regs[0] == regs[1] and
+                            re.fullmatch(r"\s*\w+\s*,\s*(?:dword ptr\s*)?\[\s*\w+\s*(?:\+\s*0x0*0?\s*|\+\s*0\s*)?\]\s*",
+                                         ins[1].lower())):
+        return ("npad", ())                         # alignment padding: the listing's npad, decoded as lea r, [r]
+    if ins[0] == "nop" or ins[0] == "mov" and regs == ("edi", "edi"):
+        return ("npad", ())                         # npad 2
+    return (ins[0], regs)
 
 
 def regdiff(ours, orig):
     """Aligned difference: instructions (mnemonic + registers) not matched by a longest-common-subsequence style
     alignment, counted on both sides (a substitution counts 2, an insertion 1). Our trailing lines past the last
     match are ignored: our listing may carry EH funclets the original's function range lacks."""
-    a, b = [_key(x) for x in ours], [_key(y) for y in orig]
+    def keys(lst):                                  # one alignment pad may decode as several instructions
+        out = []
+        for x in lst:
+            k = _key(x)
+            if not (k == ("npad", ()) and out and out[-1] == k):
+                out.append(k)
+        return out
+    a, b = keys(ours), keys(orig)
     sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
     blocks = [m for m in sm.get_matching_blocks() if m.size]
     if not blocks:

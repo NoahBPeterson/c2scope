@@ -17,7 +17,8 @@ keys     one row per symbol in key order: key, pool class, kind, name (user vari
          field view; `$T<fekey>` a c1xx temporary, named as in the /FAsc listing; `$tN` / `$fN` unnamed temp / frame
          symbol), the inline expansion it was made in (`Callee#k`, k-th expansion), the line offset (relative to the
          function's first line) current when it was made, the OptHashNode hash (32*key folded to 16 bits) and key mod 8
-         (what a pointer's member operands hash by), and the c2 function that made it.  Default: symbols still alive at
+         (what a pointer's member operands hash by), and the c2 function that made it (a value-numbering temp:
+         `/walk`, `/assign` or `/later`, where in the optimiser it was numbered, symkeys.md section 8).  Default: symbols still alive at
          the first OptFuncExpr that are named, field views or user-made; --all adds temporaries and freed symbols.
          The header says `replay: N/N keys reproduced`: the allocator model below reproduces every traced key.
 sites    every two-operand commutative sort (OptLeftWeightTree: x87 / integer operand order, x87.md rule 2) of the
@@ -94,6 +95,11 @@ HOOKS = {
     "sort3": "10bb6635=ebp>0x28>0>0>8,ebp>0x28>0>0>0x10,ebp>0x28>0>0>0x18>0x1c,ebp>0x28>0>0>0x28>8,"
              "ebp>0x28>0>0>0x28>0x18>0x1c,ebp>0x28>0>0>0x2c>0x18>0x1c,ebp>0x28>0>0>0x28,ebp>0x28>0>0>0>8,"
              "ebp>0x28>0>0>0>0x10,ebp>0x28>0>0>0>0x18>0x1c,ebp>0x28>0>0>0>0x2c>0x18>0x1c,ebp>0x28>0>0>0>0>8",
+    # value numbering (docs/c2/symkeys.md section 8): HshBuildTable's walk numbers every expression of the function in
+    # tuple order, then every OPASSIGN (HshEnterAssign) after the walk; a hash temp made inside the first is "walk",
+    # inside both "assign", any other "later" (assertions, sweeps, loops).  Optional: without them hph stays None.
+    "hshwalk": "@HshBuildTable@4/xeax",
+    "hshasg": "@HshEnterAssign@8/xeax",
     # optional roles (13.10): "free2" a second chain-free loop (same specs as free), "equivp" a probe right after a
     # member SYM is made where SymNewEquiv is inlined: new sym, base, offset.  13.10's "sort" also logs at entry
     # (a1-a10 after the return address): weight, kind, memory base key, displacement of the first two list members,
@@ -125,7 +131,7 @@ def h16(key):
 
 class Sym:
     __slots__ = ("idx", "cls", "kind", "key", "ptr", "name", "creator", "line", "inl", "base", "off", "phase",
-                 "freed", "user", "ssr", "fe")
+                 "freed", "user", "ssr", "fe", "hph")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -164,6 +170,7 @@ def parse(text, hooks, img):
     names = {}            # va -> creator name cache
 
     delta = [0]          # runtime base - preferred base (15.00's c2.dll is rebased under wine)
+    hsh = [0, 0, "hshwalk" in ROLE.values()]   # depth in HshBuildTable, HshEnterAssign
 
     def creator(words):
         a = [(int(x, 16) - delta[0]) & 0xffffffff if x != "?" else 0 for x in words]
@@ -217,6 +224,8 @@ def parse(text, hooks, img):
                 if equiv:
                     s.base, s.off = equiv[-1]
                     s.base = live.get(s.base)
+                if s.cls == "hash" and hsh[2]:
+                    s.hph = "assign" if hsh[0] and hsh[1] else "walk" if hsh[0] else "later"
                 live[s.ptr] = s
                 bykey[s.key] = s
                 ev.append(("alloc", s))
@@ -275,6 +284,11 @@ def parse(text, hooks, img):
             ev.append(("mark", "OptFuncExpr"))
         elif hk == "gc":
             ev.append(("mark", "GC"))
+        elif hk in ("hshwalk", "hshasg"):
+            j = 0 if hk == "hshwalk" else 1
+            hsh[j] = max(0, hsh[j] + (1 if ent else -1))
+            if hk == "hshwalk":
+                ev.append(("mark", "HshBuildTable" if ent else "HshBuildTable-end"))
         elif hk == "pool" and not ent:
             ev.append(("pool", int(v[0], 16)))
         elif hk == "sort":
@@ -671,7 +685,8 @@ def print_keys(f, a):
     for s in sorted(rows, key=lambda s: (s.key, s.idx)):
         line = "%5d %-5s %-4d %-28s %-24s %5d %6s %4d %s%s%s" % (
             s.key, s.cls, s.kind, s.name, short(s.inl) if s.inl else "", s.line, "%04x" % shash(s, s.key), s.key % 8,
-            s.creator, " (freed)" if s.freed is not None and (f.optidx is None or s.freed < f.optidx) else "",
+            s.creator + ("/" + s.hph if s.hph else ""),
+            " (freed)" if s.freed is not None and (f.optidx is None or s.freed < f.optidx) else "",
             " (optimiser; in operand sorts)" if s.phase == "opt" and id(s) in sort_syms(f) else
             " (optimiser)" if s.phase == "opt" else "")
         if rx is None or rx.search(line):
@@ -1069,11 +1084,12 @@ def candidate_points(f, target, inline_too=True, opt_too=False):
         elif e[0] == "inl+" and inline_too:
             pts.append(("@#%d" % i, "at the start of inline %s" % short("%s#%d" % (e[1], e[2])), opi))
         if e[0] == "alloc" and opt_too and e[1].phase == "opt" and e[1].cls == "hash":
-            k = ("o", e[1].line)              # the optimiser's value-numbering temps: one point per source line
+            # the optimiser's value-numbering temps: one point per source line and phase (walk / assign / later)
+            k = ("o", e[1].line, e[1].hph)
             if k not in seen:
                 seen.add(k)
-                pts.append(("@" + label(e[1]), "in the optimiser, at the first value-numbering temp of line %d"
-                            % e[1].line, opi))
+                pts.append(("@" + label(e[1]), "in the optimiser, at the first value-numbering temp of line %d%s"
+                            % (e[1].line, HPH_WHERE.get(e[1].hph, "")), opi))
         if e[0] in ("alloc", "free"):
             opi += 1
     return pts
@@ -1086,9 +1102,11 @@ CONSTRUCT = {
            "statement or before it",
     "glob": "one more global (or string literal, static local) referenced for the first time",
     "other": "one more label / call target referenced for the first time",
-    "hash": "one more optimiser value-numbering temporary at that point (a value the optimiser numbers: an "
-            "expression it keeps, e.g. the loop of an array constructor inlined there; dead expressions are removed "
-            "before value numbering)",
+    "hash": "one more optimiser value-numbering temporary at that point: one more distinct value in that statement "
+            "(code-neutral, all builds, symkeys.md 8.2: one more pair of parentheses around a float subexpression "
+            "that is not a bare variable or load, `((e))` +2; a `(float)` cast of a float expression; a float sum "
+            "through a `double` local (+1, 13.10 +3); a `bool` flag for a float compare: +1 here, +2 assignment "
+            "entries after the walk, +1 later); repeated spellings of one value add nothing",
 }
 UNCONSTRUCT = {
     "frame": "one frame symbol fewer: reuse an existing local instead of a new one, drop a dead initialised local or "
@@ -1097,8 +1115,15 @@ UNCONSTRUCT = {
            "expression)",
     "glob": "one global fewer referenced before here",
     "other": "one label / call target fewer before here",
-    "hash": "one optimiser value-numbering temporary fewer before here (an expression it numbers moved later or gone)",
+    "hash": "one optimiser value-numbering temporary fewer before here: one distinct value fewer (code-neutral: drop "
+            "a redundant pair of parentheses around a product in a sum, `(a * b) + c` -> `a * b + c`; spell an "
+            "abs as `(float)fabs(x)` instead of an inline `float(fabs(x))` helper: -2 on 14.00/15.00, -1 on 13.10; "
+            "or make it the same expression as an earlier one)",
 }
+# where in the optimiser a hash point sits (Sym.hph, from the hshwalk / hshasg hooks)
+HPH_WHERE = {"walk": " (HshBuildTable's walk: the value is numbered at its first occurrence in tuple order)",
+             "assign": " (assignment entries, numbered after the whole walk: one per assignment to a variable)",
+             "later": " (made after HshBuildTable: assertions on branch arms, propagation sweeps, loops)"}
 
 
 def _prefix_key(ops, at, ins_cls, n, sign, tidx):

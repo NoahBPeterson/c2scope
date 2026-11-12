@@ -140,7 +140,8 @@ opt --all` all of them, with the c2 function that made them: `HshInsertEntry` va
 Their keys are replayed exactly; what is assumed is that the optimiser makes the same symbols after the edit.
 
 **The hash pool class (value-numbering temporaries).** `HshInsertEntry` makes the optimiser's value-numbering
-temps from the hash pool (blocks of 32, never freed on 14.00/15.00). As a memory base they hash by `64*key`, so
+temps from the hash pool (blocks of 32, no free list of their own; after the optimiser they are freed onto the
+temp list, section 8.1). As a memory base they hash by `64*key`, so
 through the `<< 8` of a memory operand only `key & 3` reaches the weight (`[$o key 8554+0]` h8025, 8557 h4025;
 model: `KEYED_BASE` in symkeys.py); a reader temporary as a base may hash by its single definition and is still
 taken as fixed. Edits: `add:hash@V:n` / `sub:hash@V:n` (V any symbol, `$o<n>` included: the n-th symbol the
@@ -288,7 +289,166 @@ hash (04e2) is tiny and its operand sorts last in the four-operand adds above; a
 to remove is found with `levers`, not by subtraction. The constraint is function-wide and
 coupled across sites, which is what `levers --site` is for.
 
-## 8. Open
+## 8. The optimiser's value-numbering temps (hash class)
+
+Probes `work/scratch/hashkeys/` (`p1.cpp`..`p4.cpp`, `pr.py` prints per function the hash temps made in the walk
+(MW), in the assignment tail (AS) and later (LT), and whether the code is the same; `hk.py` lists each one with
+the pass that made it), regression file `tests/data/symkeys_hash.cpp`. `keys --phase opt --all` now shows the
+phase as `@HshInsertEntry@12/walk`, `/assign` or `/later` (hooks `hshwalk`, `hshasg` on every build).
+
+### 8.1 When a value-numbering temp is made (14.00, code read; the other builds by trace, 8.3)
+
+1. **One walk over the whole function.** `HshBuildTable` 10b5eb30 (GlobalOptimize step 3g, opt.md section 1)
+   follows the tuple list from the first block (`[[FUNC+8]]+0x1c`, layout order at that time, i.e. after dead-store
+   removal, single-use copy propagation, unrolling and branch folding) to the end, and per tuple: **[C]**
+   - first its memory operands (tuple flag +9 bit 0): every `[base+d]` operand (kind 5/6) among the sources
+     (+0x28), then the destinations (+0x2c), gives an `OPBASED (base value, d)` entry, and the operand's symbol
+     (+0x18) becomes that entry's temp. This is the `[$o key K+0]` base of the operand sorts;
+   - then the tuple itself, by kind (+8): an expression (kind 13) without side effects
+     (`TupQuerySideEffectHelper`) becomes `TupMakeHshSym` → `HshEnter(opcode, operand value numbers)`, and its result
+     temp is replaced by the entry's temp (`HshFixDst` 10b5f0f0 frees the reader's temp). `OPSUB x, K` is first
+     rewritten `OPADD x, -K`. `OPARG`: nothing. `OPCMP` feeding a branch: `HshCompareAssertion` 10b5f0a0 makes the
+     entry of the branch's condition (OPLT, OPGE, ...). A call of a pure intrinsic (`fabs`; intrinsic attribute
+     0x20) gives an `OPLOCAL` entry for its argument list (`HshEnterArgList` 10b5f230) and one for the call. Other
+     calls, stores, branches, labels: nothing.
+2. **Then the assignment tail.** After the walk the same list is walked again and every `OPASSIGN` goes through
+   `HshEnterAssign` 10b5f4d0 (an entry per assignment of a value to a variable). So all assignment entries of the
+   function are numbered **after every walk entry** of the function. Then `HshBuildKillLists`. **[C]**
+3. **An entry is new only when no equal one exists**: same opcode, type and source value numbers
+   (`HshGetKey` 10b5f9b0 hashes `(opcode & 0xfff) + type + Σ leaf values` mod 101; `HshGetLeafVal` 10b5f940: a
+   variable or temp is its SYM key, an integer constant its value; `HshFindEntry` 10b5fa00 compares). This is
+   lexical: by symbol, not by the value it holds (an assignment in between does not make `a + 1` a new entry; the
+   kill lists decide what is available). Hence per expression kind: **[C: code; probes p3]**
+
+   | expression | temps |
+   |---|---|
+   | variable, parameter, constant, a global read directly (`gi`: a direct memory leaf) | none |
+   | `a + b`, `a * b` (any operator, first occurrence; commutative operands ordered) | 1; repeated (`(a+b)*(a+b)`, a common subexpression, a compare spelled `b > a`): 0 |
+   | `*p` | 2: `OPBASED [p+0]`, `OPLOAD` |
+   | `p[1]` | 3: `OPADD p, 4`, `OPBASED`, `OPLOAD`; the same load again: 0 |
+   | `a < b` feeding `if` | 1 in the walk (the branch condition) + 1 later (GdfInsertAssertions: the other arm) |
+   | float arithmetic on 14.00/15.00 | each float→double `OPCONVERT` of an x87 operand is an entry (13.10 has none: fewer temps) |
+   | parentheses around a float expression that is not a bare variable or load | 1 `OPPAREN` per pair (`/fp:precise` keeps them); none for ints |
+   | `(float)fabs(x)` | `OPPAREN` of x, convert, `OPLOCAL`, the intrinsic, convert, parens of the call expression |
+   | an inline helper's body | as if written at the call: its parameters are substituted before (the caller's value numbers), its locals give assignment entries |
+   | dead code, `(void)(a + b)`, a dead local, `x + 0` | none (gone before the walk) |
+   | a CSE candidate that is later not used, a value later folded | counted: the walk sees everything that reached it |
+   | a single-use named local (`int c = a + b; return c;`) | none (propagated before the walk) |
+   | a local used twice; `gi = c` | +1 assignment entry per assignment |
+   | a `const T&` bound to a temporary | +1 walk, +2 assignment entries |
+
+4. **Later passes add more**, all after the walk and its tail: `GdfInsertAssertions` 10b35240 (assertions on
+   branch arms), the propagation sweeps (`GoptOptimizeBlock` → `GoptRehashLexicalHelper` 10b50900: a new entry for
+   every expression and assignment copy or constant propagation rewrote; `GoptRehashMemRefs` 10b50630: `OPBASED`
+   for rewritten memory operands), the loop phase (`LoptInit`, `LoptMakeIVorRC` induction values,
+   `LoptReplaceInductionVariable` 10b42f50 calls `SymMakeHashVar` itself), `GoptRemoveAssumes`. A loop typically
+   adds 10-16 such temps (p3 `i0_v20`). In 0x00806ab0 (j1): 6242 = 2633 walk + 374 tail + 3235 later
+   (assertions and sweep 1 about 2700, the loop phase about 450; `hk.py --sum`). **[C: trace]**
+5. **Pool and freeing.** `HshInsertEntry` 10b5f880 → `SymMakeHashVar` 10bef720 → `SymAlloc` kind 15: class hash,
+   its own blocks of 32, no free list, so **key mod 32 = the temp's rank among the function's hash temps, and
+   key & 3 = (number of hash temps made before it) mod 4**. `SymMakeHashVar` then sets the SYM's kind byte to 3
+   (temporary). After the optimiser's last one, `GoptCleanUp` / `HshFreeSymsAndLeafTuples` 10b5ea60 free nearly all
+   of them, and because of that kind byte they go on the **temp** class's LIFO list: the temporaries of pass 2
+   (the OptFuncExpr of PreLowerGlobalOpts) are handed those keys. 0x00806ab0: 6198 of 6242 freed, 8985 temp
+   allocations reuse a hash key. **[C: code, trace; replay exact]**
+6. **Per statement and per block nothing is reset**; the table is per function (`HshInit`). A statement's temps
+   are its distinct new values in tuple order; a block's are its statements'.
+
+Consequences for steering:
+- A walk temp's key depends on the walk entries before it in tuple order (and on the class's blocks, i.e. only on
+  that count); an assignment-tail or later temp depends on the **whole** walk of the function and the tail before
+  it. In 0x00806ab0 the four `[$o] * $T` cross sites (source 1191, 1265, 1412, 1486) are walk temps
+  (`OPADD this, 8`, the address of a member); the sorts of lines 65-68 and 167-202 that a +3 also flips use later
+  temps (keys 13.6k-13.9k).
+- One more temp at a point moves every later hash key by one, later temps included, and with them the pass-2
+  temporaries that reuse freed hash keys. To move only a range, compensate after it, **exactly** (net 0, not
+  0 mod 4): 0x00806ab0 with +3 in the window and +1 after it (`c3`, net +4) still had two x87 differences (a
+  temporary key in two radius products), +3 / −3 (`x5`) has none.
+
+### 8.2 Levers (code-neutral constructs, measured with pr.py on all four builds)
+
+| construct (at the statement where the temps should come) | 14.00 | 15.00 | 13.10.3077 | 13.10.3052 | code |
+|---|---|---|---|---|---|
+| one more pair of parentheses around a float subexpression that is not a bare variable or load: `((A) + (B))` for `(A) + (B)`, `d + (m * v)` for `d + m * v` | walk +1 | +1 | +1 | +1 | same (all builds) |
+| two / three more pairs `((e))`, `(((e)))` (nested pairs are new values each) | +2 / +3 | same | same | same | same |
+| parentheses around a variable, a load, an `int` expression | 0 | 0 | 0 | 0 | same |
+| one pair fewer around a product in a sum, `(a * b) + c` → `a * b + c`; both products in `(e0 * f0) + (e1 * f1)` | −1; −2 | same | same | same | same (13.10: `d + m*d` shape 2) |
+| `(float)` cast of a float expression | +1 | +1 | +1 | +1 | same |
+| a float sum computed into a `double` local, then `(float)` | +1 | +1 | +3 | +3 | same |
+| an inline `float Abs(float f) { return float(fabs(f)); }` instead of `(float)fabs(x)` | +2 per use (p2), +3 (p4) | same | +1 | +1 | same |
+| parentheses around an inline call's result `(a.Dot(b))` | +1 | +1 | +1 | +1 | 14.00/15.00: shape 2; 13.10 same |
+| a `bool` flag for a float compare (`bool hit = d > r; if (hit)`) | walk +1, tail +2, later +1 | same | same | same | same |
+| a reference or pointer alias (`const V& aa = a;`, `const V* pb = &b;`) or a copy of a float parameter used in the compares | tail +1, later +15..+34 | same | tail +1, later +9..+26 | same | same (14.00/15.00) |
+| dead expressions, dead locals, folded constants, a compare spelled reversed, a repeated spelling of a value | 0 | 0 | 0 | 0 | same |
+
+The parenthesis rows are the cleanest: they add or remove exactly one walk temp at that statement and nothing
+else (no frame, temp, global key; `whatif` can follow them as `add:hash@$oN:k` / `sub:hash@$oN:k` with `$oN` the
+first value-numbering temp after the statement). `levers` prints these constructs for hash edits and says
+whether the point is in the walk, the assignment tail or later (`/walk`, `/assign`, `/later`).
+
+### 8.3 Other builds
+
+| | 14.00 | 15.00.30729.1 | 13.10.3077 | 13.10.3052 |
+|---|---|---|---|---|
+| `HshBuildTable` | 10b5eb30 | 510ad6a0 | 107637f3 | 107a556f |
+| `HshEnterAssign` | 10b5f4d0 | 510ae0d0 | 107617b5 | 1076f051 |
+| `HshInsertEntry` | 10b5f880 | 510ae4a0 | 10761516 | 1076eecc |
+| `SymMakeHashVar` | 10bef720 | 5113e460 | 107615bc | 1076ed2c |
+| `HshGetKey` / `HshFindEntry` | 10b5f9b0 / 10b5fa00 | 510ae5d0 / 510ae630 | 10761253 / 10761176 | 1076ec25 / 1076eb09 |
+| `GdfInsertAssertions` | 10b35240 | 51081f10 | 10762ea1 | 1077ea99 |
+| `HshFreeSymsAndLeafTuples` | 10b5ea60 | 510ad5d0 | 107950e4 | 10798dd0 |
+| walk, tail, later; kind 15, own blocks of 32, key mod 32 = rank; freed keys reused by temps | yes (code) | yes (trace) | yes (trace) | yes (trace) |
+| counts per construct (8.2, tests/data/symkeys_hash.cpp) | | = 14.00 | = 14.00 except no float→double converts (fewer temps per float expression) and the `double` local / Abs rows | = 3077 |
+
+Addresses from the PDB indexes (`work/index/*/c2.dll.csv`); on 15.00 and 13.10 only the behaviour was traced
+(hooks at these addresses; every probe gives the same walk / tail / later split as 14.00), the code was read on
+14.00. **[C: 14.00 code; others trace]**
+
+### 8.4 Fallout 3 0x00806ab0: the three temps found in the source
+
+j1 (vDCrossE before the switch, jumps right) needs, against best1, **+3 walk temps from vC00's statements to the
+vC10 cross and −3 before the end of the walk** (best1 has the `??_H` loop's 3 temps right after vC00 and not at
+the switch), plus the +17/18 frame keys. Measured with `work/scratch/hashkeys/ev806.py` (site ranks mod 4, walk
+and total counts; regdiff), variants in `work/scratch/hashkeys/806/`:
+
+| on jp18 (frame part by padding) | sites (Δ mod 4) | walk / all | regdiff | bcmp |
+|---|---|---|---|---|
+| jp18 | 0 | 0 / 0 | 45 | |
+| +1 paren at each of the C00, C01, C02 radius lines (`radius = ((..) + (..));`) and +1 at C22's (`c3`) | 3 | +4 / +4 | 25 | 6 instructions (two radius products) |
+| the same three, and at C22: no parentheses around the two products of `radius` and around `(maxTime) * (fC22Vel)` (4 uses) (`x5`) | 3 | 0 / 0 | **17** | **0 of 4406 differ** |
+| x5 on j1 (no padding) | 3 | 0 / 0 | 39 (from 67): the frame sites | |
+
+The source change (jp18 → `806/jp18_x5.cpp`; j1 → `806/j1_x5j1.cpp`, the same lines one earlier):
+
+```
+-    radius = (pExtents[1] * (float)fabs(axE[2][0])) + (pExtents[2] * ReworkAbs(axE[1][0]));
++    radius = ((pExtents[1] * (float)fabs(axE[2][0])) + (pExtents[2] * ReworkAbs(axE[1][0])));
+     (the same for axE[..][1] (C01) and axE[..][2] (C02))
+ ...
+-    radius = (pExtents[0] * (float)fabs(axE[1][2])) + (pExtents[1] * ReworkAbs(axE[0][2]));
++    radius = pExtents[0] * (float)fabs(axE[1][2]) + pExtents[1] * ReworkAbs(axE[0][2]);
+-                if ((fC22Dot) + ((maxTime) * (fC22Vel)) > (radius))
++                if ((fC22Dot) + (maxTime) * (fC22Vel) > (radius))
+     (and the other three `((maxTime) * (fC22Vel))` of the C22 block)
+```
+
+So the hash part has a natural form: the window's radius sums are written with one more pair of parentheses
+and the C22 block with fewer, i.e. the macro bodies were parenthesised differently. The frame part (+17/18
+between case 1's `center` and the vC01 cross) is still the padding: on j1+x5 pads 17-20 give regdiff 16,
+16 gives 28, 15 gives 52. Tried and rejected (code changes): reference locals in `Dot` and `EdgeCross`
+(`d_*`: 70-141), more locals in the hit-point blocks of the switch (`m_*`: 101-338), float locals in EdgeCross
+(`j1x5_E*`: 34 and worse).
+
+**Model gap.** `compare --from jp18.keys.json` with the c3 placement as hash edits predicts all 794 orders of
+best1; the compile differs in two radius products. Their operands are subtrees whose weight comes through a
+chain of hash temps (paren, convert), which the model takes as unchanged (section 5). For hash edits, `whatif`
+narrows the search; a compile decides. Measured against the traced x5 (`806/jp18_x5.keys.json`), x5 written as
+edits on jp18 (`add:hash@$o20731:1 add:hash@$o20838:1 add:hash@$o20916:1 del:$o21406 del:$o21408 del:$o21415`,
+the three new parens and the three dropped ones): 736 of 738 pass-2 orders predicted (4 of the 6 that really
+change); of the 251 symbols whose key moved only 18 exactly, because the optimiser's own symbols after the edit
+are not the same ones (`$o~k` pairing). **[C: compare run]**
+
+## 9. Open
 
 - Natural constructs that give exactly +16 frame keys in 0x00806ab0's switch were not searched exhaustively.
 - Whether frame-slot seeds and Color ties follow keys anywhere else than through GLOBREG numbering: not checked.

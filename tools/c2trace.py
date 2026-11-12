@@ -79,6 +79,7 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
  *                 (extended dump only: ext / labtup / brcc / ehop / ulabop, see dumpilx); fename 1 = the plain dump
  *                 prints a CODEADDR leaf (call target) by the front-end name at sym+4 (13.10; logs "# fename 1")
  *   op <hex> <name>   name of an opcode the build's own table lacks (after `set opcount`)
+ *   set fpdump 1 writes "# fpdump 1" (this DLL has the '&' dump); set bbin / bbstk: its BB offsets (13.10: 48, 60)
  * spec := base { '>' off } [ '#' n ]
  *   base: eax ecx edx ebx esp ebp esi edi | sN (stack word N at entry: s0 = return address, s1 = first stack arg)
  *         | aN (entry stack word N, saved, usable at exit) | gHEX (c2 VA, e.g. a global; rebased if c2 moved)
@@ -88,6 +89,7 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
  *   '%'    v is a tuple: dump the tuple stream from it as "T ..." lines after the event (IL dump)
  *   '!'    the same for the one tuple v.  T I lines: T I <tuple> <opcode> <line offset> <+0x1c byte> | dst <- src
  *   '%+' '!+'  the extended dump (dumpilx below): the same lines plus notes after " ;" and the P/C/A line kinds
+ *   '&'    v is a tuple: the x87 view of the stream from it as "T X" lines (dumpfp below; cl 13.10 layout)
  * Log lines:  E <seq> <depth> <id> eax ecx edx ebx ebp esi edi esp | specs...
  *             X <seq> <depth> <id> eax edx | specs...
  */
@@ -153,6 +155,8 @@ static const char *regn[8] = { "edi", "esi", "ebp", "esp", "ebx", "edx", "ecx", 
 
 static DWORD pend_il; static int pend_max; static int ilmax = 2000000;
 static int pend_x;            /* '%+' / '!+': extended dump (dumpilx) */
+static DWORD pend_fp;         /* '&': x87 view (dumpfp, 13.10 FPColor) */
+static DWORD pend_g;          /* '^': globreg view (dumpg: split pieces, docs/c2/regalloc.md 3.6.11) */
 static void emit(Spec *s, int ns, Regs *r, DWORD *stk, Frame *f) {
     int i, j, k;
     for (i = 0; i < ns; i++) {
@@ -165,6 +169,8 @@ static void emit(Spec *s, int ns, Regs *r, DWORD *stk, Frame *f) {
             ok = s[i].tbl[j] ? readd((DWORD)s[i].der[j] + delta + 4 * v, &v) : readd(v + s[i].der[j], &v);
         if (!ok) { out(" ?"); continue; }
         if (s[i].n <= -2 && s[i].n >= -5) { out(" IL"); pend_il = v; pend_x = s[i].n < -3; pend_max = s[i].n & 1 ? 1 : ilmax; continue; }
+        if (s[i].n == -6) { out(" FP"); pend_fp = v; continue; }
+        if (s[i].n == -7) { out(" GV"); pend_g = v; continue; }
         if (s[i].n < 0) {           /* '$': C string at v */
             char c[80]; int m = 0; DWORD w = 0;
             while (m < 79 && readd(v + m, &w) && (c[m] = (char)w) != 0) { if (c[m] <= ' ' || c[m] > '~' || strchr("[]|\"", c[m])) c[m] = '.'; m++; }
@@ -360,6 +366,203 @@ static void dumpilx(DWORD t, int max, const char *pf) {
     }
 }
 
+/* ---- x87 view ('&' spec, cl 13.10 FPColor; docs/c2/x87.md section 11, tools/c2regs.py _fpil): v is the first tuple.
+ * T X B <tuple> <bb> <bb+0x18> <bb+0x1c> <bb+0x20> in=<sbv> out=<sbv> u=<sbv> stk=<8 words at bb+BBSTK> p=<pred bbs> s=<succ bbs>
+ *   (sbv = base:bits,... from bb+BBIN, +4, +8; 13.10 nodes {base, next, bits}; pred edge {?, next +4, bb +8},
+ *   succ edge {next, .., bb +0xc})
+ * T X L <tuple>                                           a label
+ * T X N <tuple> <kind> <op>                               any other tuple that is not an instruction
+ * T X I <tuple> <op> <kind> <type word> <b16> <b17> <line> |<dst leaves> |<src leaves>   (b16/b17: bytes LLEN, LLEN+1)
+ *   leaf: k<kind>[n] (not a register leaf; n: a code address whose SYM has +0x20 & 0x10000) or r[f][x].<sym>[.R]: f = x87 type (0x4000), x = dies (+0x15 & 0x10),
+ *   sym = the globreg (kind-2 SYM) and c when coloured (+0x10), s<kind> another SYM, 0 none; .R: +0x18 is a register
+ * T X W <globreg> <num> <colour> <+4 dword> <first bb +0x28> <last bb +0x2c> d=<def tuples +0x38> e=<end tuples +0x3c>
+ *   once per globreg seen in an x87 leaf */
+static int BBIN = 0x48, BBSTK = 0x60;
+static void fpsbv(const char *nm, DWORD h) {
+    int n = 0; DWORD x = h ? rd(h) : 0;
+    out(" %s=", nm);
+    while (x && n++ < 4096) { if (rd(x + 8)) out(n > 1 ? ",%x:%x" : "%x:%x", rd(x), rd(x + 8)); x = rd(x + 4); }
+}
+static DWORD fpseen[4096]; static int nfpseen;
+static void fpleaf(DWORD l) {
+    BYTE k = rb(l + 8); DWORD s, r;
+    if (k != 1) {          /* a code address whose symbol has +0x20 & 0x10000 (a callee that leaves the x87 stack alone) */
+        out(" k%d%s", k, k == 4 && (s = rd(l + 0x18)) != 0 && (rd(s + 0x20) & 0x10000) ? "n" : "");
+        return;
+    }
+    s = rd(l + 0x1c); r = rd(l + 0x18);
+    out(" r%s%s.", (rd(l + 8) >> 16 & 0xf000) == 0x4000 ? "f" : "", rb(l + 0x15) & 0x10 ? "x" : "");
+    if (!s) out("0");
+    else if (rb(s + 4) == 2) {
+        int i;
+        out("%x%s", s, rd(s + 0x10) ? "c" : "");
+        if ((rd(l + 8) >> 16 & 0xf000) == 0x4000) {
+            for (i = 0; i < nfpseen && fpseen[i] != s; i++) ;
+            if (i == nfpseen && nfpseen < 4096) fpseen[nfpseen++] = s;
+        }
+    } else out("s%d", rb(s + 4));
+    if (r && rb(r + 4) == 1) out(".R");
+}
+static void fplist(const char *nm, DWORD x) {
+    int n = 0;
+    out(" %s=", nm);
+    while (x && n++ < 4096) { out(n > 1 ? ",%x" : "%x", rd(x + 4)); x = rd(x); }
+}
+static void dumpfp(DWORD t) {
+    int n = 0, i; DWORD bb, l;
+    nfpseen = 0;
+    while (t && n++ < ilmax) {
+        BYTE k = rb(t + 8), f = rb(t + 9);
+        if (k == 26 && (bb = rd(t + LBLK)) != 0) {
+            out("T X B %x %x %x %x %x", t, bb, rd(bb + 0x18), rd(bb + 0x1c), rd(bb + 0x20));
+            fpsbv("in", rd(bb + BBIN)); fpsbv("out", rd(bb + BBIN + 4)); fpsbv("u", rd(bb + BBIN + 8));
+            out(" stk=");
+            l = rd(bb + BBSTK);
+            for (i = 0; i < 8; i++) out(i ? ",%x" : "%x", l ? rd(l + 4 * i) : 0);
+            out(" p=");
+            for (i = 0, l = rd(bb + 8); l && i < 4096; i++, l = rd(l + 4)) out(i ? ",%x" : "%x", rd(l + 8));
+            out(" s=");
+            for (i = 0, l = rd(bb + 0xc); l && i < 4096; i++, l = rd(l)) out(i ? ",%x" : "%x", rd(l + 0xc));
+            out("\n");
+        } else if (k == 27) out("T X L %x\n", t);
+        else if (!(f & 1)) out("T X N %x %d %x\n", t, k, rd(t + 4));
+        else {
+            out("T X I %x %x %d %x %d %d %d |", t, rd(t + 4), k, rd(t + 8) >> 16 & 0xffff, rb(t + LLEN), rb(t + LLEN + 1),
+                rd(t + 0x14) & 0xffff);
+            for (i = 0, l = rd(t + 0x2c); l && i < 16; i++, l = rd(l)) fpleaf(l);
+            out(" |");
+            for (i = 0, l = rd(t + 0x28); l && i < 16; i++, l = rd(l)) fpleaf(l);
+            out("\n");
+        }
+        if (blen > (int)sizeof buf - 1024) flush();
+        t = rd(t);
+    }
+    for (i = 0; i < nfpseen; i++) {
+        DWORD g = fpseen[i];
+        out("T X W %x %d %x %x %x %x", g, rd(g + 0x1c), rd(g + 0x10), rd(g + 4), rd(g + 0x28), rd(g + 0x2c));
+        fplist("d", rd(g + 0x38)); fplist("e", rd(g + 0x3c));
+        out("\n");
+        if (blen > (int)sizeof buf - 1024) flush();
+    }
+}
+
+/* ---- globreg view ('^' spec; split pieces, docs/c2/regalloc.md 3.6.11, tools/c2regs.py `--pieces`): v is the first
+ * tuple of the function.  Every line starts "T G":
+ * T G B <tuple> <bb> <loop level> <bb+0x18> p=<pred bbs> s=<succ bbs> i=<bb+0x48> o=<bb+0x4c> n=<bb+0x50>
+ *   (SBVs of GLOBREG numbers; pred edge {?, next +4, bb +8}, succ edge {next, .., bb +0xc}; loop level = word at
+ *   bb+GLOOP: 14.00 / 15.00 0x17e, 13.10 0xa6)
+ * T G I <tuple> <opcode hex> <kind> <+9 byte> <+0x1c dword> | <dst leaves> | <src leaves>
+ *   leaf: g<num>[=<self num>]/<type word +0xa>/<+0x10>/<+0x14 byte>/<+0x15 byte>/<1 if (sym+0x10 ^ type) & 0xfff == 0>
+ *         (a REG leaf of a GLOBREG), r<reg>/<type>/<+0x15> (a physical register), m(<base>,<index>)/<type> (memory),
+ *         (memory: m<kind>(..)/<type>/<1 if it has a symbol or displacement>),
+ *         s<+0x10>/<type> (a SYM leaf, kind 2 or 3: +0x10 = the globreg number of its home), K (register set),
+ *         .<kind> (any other)
+ * T G S <tuple> <+0x1c byte> <webs>        a split point (kind 0x1c): its SBV at +0x20 (or, once processed, the list
+ *                                          at +0x24)
+ * T G L <tuple>                            a label;   T G P <tuple> <opcode> <kind>: another non-instruction tuple
+ * T G R <num> <record> <self num> <+4 dword> <colour reg> <nrefs> <first bb> <last bb> <nEnter> <prio> <benefit>
+ *       <defOrd> <sym kind> <sym key> a=<avail>       every GLOBREG of _GlobregHash (GRHASH, 0x400 chains at +0x30)
+ * T G N <class> <webs>                     _NewGlobregs[class] (GNEW, 7 SBV pointers) */
+static int GLOOPP = 0x16c;          /* BB -> its loop (13.10 0x9c): the loop's +0x38 SBV holds the variables it references */
+static int GSBV32 = 0, GLOOP = 0x17e, GSPB = 0x1c, GSPS = 0x20, GSPL = 0x24;   /* split point: done byte, SBV, list (13.10: 0x16, 0x18, 0x1c) */
+static DWORD GRHASH = 0x10d15090, GNEW = 0x10d12278;     /* 14.00.50727.762 */
+static void gsbv(const char *nm, DWORD h) {      /* h: SBV header, first chunk at [h] */
+    int n = 0, any = 0, b; DWORD x = h ? rd(h) : 0;
+    out(nm);
+    while (x && n++ < 65536) {
+        DWORD base = rd(x);
+        if (GSBV32) {
+            DWORD w = rd(x + 8);
+            for (b = 0; b < 32; b++) if (w >> b & 1) out(any++ ? ",%x" : "%x", base + b);
+            x = rd(x + 4);
+        } else {
+            DWORD lo = rd(x + 4), hi = rd(x + 8);
+            for (b = 0; b < 32; b++) if (lo >> b & 1) out(any++ ? ",%x" : "%x", base + b);
+            for (b = 0; b < 32; b++) if (hi >> b & 1) out(any++ ? ",%x" : "%x", base + 32 + b);
+            x = rd(x + 0xc);
+        }
+    }
+}
+static void gleaf(DWORD l, int depth) {
+    BYTE k; DWORD x, y, ty;
+    if (!l) { out("-"); return; }
+    k = rb(l + 8); ty = rd(l + 8) >> 16 & 0xffff;
+    if (k == 1) {
+        x = rd(l + 0x1c);
+        if (x && rb(x + 4) == 2) {
+            y = rd(x + 8);
+            out("g%x", rd(x + 0x1c));
+            if (y && y != x) out("=%x", rd(y + 0x1c));
+            out("/%x/%x/%x/%x/%d", ty, rd(l + 0x10), rb(l + 0x14), rb(l + 0x15),
+                ((rd(rd(l + 0x18) + 0x10) ^ ty) & 0xfff) == 0);
+        } else if (x && rb(x + 4) == 1) out("r%d/%x/%x", rd(x + 0x1c), ty, rb(l + 0x15));
+        else out("r?/%x", ty);
+    } else if ((k == 5 || k == 6) && depth < 3) {
+        out("m%d(", k); gleaf(rd(l + LMEM + 8), depth + 1); out(","); gleaf(rd(l + LMEM + 12), depth + 1);
+        out(")/%x/%d", ty, rd(l + LMEM) != 0 || rd(l + LMEM + 4) != 0);
+    } else if (k == 2 || k == 3) out("s%x/%x", rd(l + 0x10), ty);
+    else if (k == 11) out("K");
+    else out(".%d", k);
+}
+static DWORD loops[4096]; static int nloops;
+static void dumpg(DWORD t) {
+    int n = 0, i; DWORD bb, l, g;
+    nloops = 0;
+    while (t && n++ < ilmax) {
+        BYTE k = rb(t + 8), f = rb(t + 9);
+        if (k == 26 && (bb = rd(t + LBLK)) != 0) {
+            out("T G B %x %x %d %x p=", t, bb, rd(bb + GLOOP) & 0xffff, rd(bb + 0x18));
+            for (i = 0, l = rd(bb + 8); l && i < 4096; i++, l = rd(l + 4)) out(i ? ",%x" : "%x", rd(l + 8));
+            out(" s=");
+            for (i = 0, l = rd(bb + 0xc); l && i < 4096; i++, l = rd(l)) out(i ? ",%x" : "%x", rd(l + 0xc));
+            gsbv(" i=", rd(bb + 0x48)); gsbv(" o=", rd(bb + 0x4c)); gsbv(" n=", rd(bb + 0x50));
+            if ((l = rd(bb + GLOOPP)) != 0) {       /* the loop and its enclosing loops (+8), once each */
+                out(" L=%x", l);
+                for (g = l; g && nloops < 4096; g = rd(g + 8)) {
+                    for (i = 0; i < nloops && loops[i] != g; i++) ;
+                    if (i == nloops) loops[nloops++] = g;
+                }
+            }
+            out("\n");
+        } else if (k == 27) out("T G L %x\n", t);
+        else if (f & 1) {
+            out("T G I %x %x %d %x %x |", t, rd(t + 4), k, f, rd(t + 0x1c));
+            for (i = 0, l = rd(t + 0x2c); l && i < 16; i++, l = rd(l)) { out(" "); gleaf(l, 0); }
+            out(" |");
+            for (i = 0, l = rd(t + 0x28); l && i < 16; i++, l = rd(l)) { out(" "); gleaf(l, 0); }
+            out("\n");
+        } else if (k == 0x1c) {
+            out("T G S %x %d", t, rb(t + GSPB));
+            if (rb(t + GSPB)) {
+                out(" ");
+                for (i = 0, l = rd(t + GSPL); l && i < 4096; i++, l = rd(l)) out(i ? ",%x" : "%x", rd(rd(l + 4) + 0x1c));
+            } else gsbv(" ", rd(t + GSPS));
+            out("\n");
+        } else if (k >= 13) out("T G P %x %x %d\n", t, rd(t + 4), k);
+        if (blen > (int)sizeof buf - 1024) flush();
+        t = rd(t);
+    }
+    for (i = 0; i < 0x400; i++)
+        for (n = 0, g = rd(GRHASH + delta + 4 * i); g && n < 65536; n++, g = rd(g + 0x30)) {
+            DWORD sy = rd(g), y = rd(g + 8), c = rd(g + 0x10);
+            out("T G R %x %x %x %x %d %d %x %x %d %d %d %d %d %d", rd(g + 0x1c), g, y ? rd(y + 0x1c) : 0, rd(g + 4),
+                c ? rd(c + 0x1c) : 0, rd(g + 0x24), rd(g + 0x28), rd(g + 0x2c), rb(g + 0x34), rd(g + 0xc), rd(g + 0x40),
+                rd(g + 0x44), sy ? rb(sy + 4) : 0, sy ? rd(sy + 0x1c) : 0);
+            gsbv(" a=", rd(g + 0x20));
+            if (sy && rd(sy + 0x34)) out(" x=%x", rd(rd(sy + 0x34)));
+            if (sy && rb(sy + 4) == 0xd && rd(sy + 0x28)) out(" k=%d,%d", rb(rd(sy + 0x28) + 8), rd(rd(sy + 0x28) + 0x18));
+            out("\n");
+            if (blen > (int)sizeof buf - 1024) flush();
+        }
+    for (i = 0; i < 7; i++) { out("T G N %d", i); gsbv(" ", rd(GNEW + delta + 4 * i)); out("\n"); }
+    for (i = 0; i < nloops; i++) {        /* T G O <loop> <enclosing> <header bb +0x14> e=<exit bbs +0x24 list> r=<+0x38> */
+        out("T G O %x %x %x e=", loops[i], rd(loops[i] + 8), rd(loops[i] + 0x14));
+        for (n = 0, l = rd(loops[i] + 0x24); l && n < 4096; n++, l = rd(l + 4)) out(n ? ",%x" : "%x", rd(l));
+        gsbv(" r=", rd(loops[i] + 0x38));
+        out("\n");
+    }
+}
+
 /* called from the entry trampoline: pushfd; pushad; push esp; push i; call */
 static void __cdecl on_entry(int i, Regs *r) {
     Hook *h = &hooks[i];
@@ -381,6 +584,8 @@ static void __cdecl on_entry(int i, Regs *r) {
         emit(h->e, h->ne, r, stk, f);
         out("\n");
         if (pend_il) { if (pend_x) dumpilx(pend_il, pend_max, "T "); else dumpil(pend_il, pend_max); pend_il = 0; }
+        if (pend_fp) { dumpfp(pend_fp); pend_fp = 0; }
+        if (pend_g) { dumpg(pend_g); pend_g = 0; }
         if (eachflush) flush();
     }
     seq++;
@@ -422,6 +627,8 @@ static int parsespec(const char *t, Spec *s) {
     else if (*t == '$') s->n = -1;
     else if (*t == '%') s->n = t[1] == '+' ? -4 : -2;
     else if (*t == '!') s->n = t[1] == '+' ? -5 : -3;
+    else if (*t == '&') s->n = -6;
+    else if (*t == '^') s->n = -7;
     return 1;
 }
 
@@ -439,6 +646,18 @@ static void setvar(const char *nm, DWORD v) {
     else if (!strcmp(nm, "ehop")) OPEH = v;
     else if (!strcmp(nm, "ulabop")) OPULAB = v;
     else if (!strcmp(nm, "fename")) { FENAME = (int)v; out("# fename %d\n", FENAME); }  /* marker: this DLL knows it */
+    else if (!strcmp(nm, "fpdump")) out("# fpdump %d\n", (int)v);             /* marker: this DLL has the '&' dump */
+    else if (!strcmp(nm, "bbin")) BBIN = (int)v;
+    else if (!strcmp(nm, "bbstk")) BBSTK = (int)v;
+    else if (!strcmp(nm, "gdump")) out("# gdump %d\n", (int)v);               /* marker: this DLL has the '^' dump */
+    else if (!strcmp(nm, "gsbv32")) GSBV32 = (int)v;
+    else if (!strcmp(nm, "gloop")) GLOOP = (int)v;
+    else if (!strcmp(nm, "grhash")) GRHASH = v;
+    else if (!strcmp(nm, "gnew")) GNEW = v;
+    else if (!strcmp(nm, "gspb")) GSPB = (int)v;
+    else if (!strcmp(nm, "gloopp")) GLOOPP = (int)v;
+    else if (!strcmp(nm, "gsps")) GSPS = (int)v;
+    else if (!strcmp(nm, "gspl")) GSPL = (int)v;
 }
 
 static void install(BYTE *base) {
@@ -600,6 +819,12 @@ def install():
         _replace(os.path.join(TBIN, "c2trace.dll"), open(os.path.join(d, "c2trace.dll"), "rb").read())
     print("patched %s (entry -> cave at rva %x), built %s" % (os.path.join(TBIN, "c2.dll"), CAVE_RVA,
                                                              os.path.join(TBIN, "c2trace.dll")))
+    hook = os.path.expanduser("~/.config/c2trace-post-install")   # local: e.g. copy the new DLLs to a compile server
+    if os.path.isfile(hook):
+        cmd = open(hook).read().strip()
+        if cmd:
+            print("running %s: %s" % (hook, cmd))
+            subprocess.run(cmd, shell=True, cwd=ROOT)
 
 
 def run_tool(args, trace=True, extra_env=None):
@@ -612,31 +837,47 @@ def run_tool(args, trace=True, extra_env=None):
     return p.returncode, p.stdout + p.stderr
 
 
-# A compile server on a Windows machine, used for every traced compile when it is reachable (C2TRACE_REMOTE=0 turns it
-# off, C2TRACE_REMOTE=PATH names another client). Mount & Blade's client: it needs ~/.config/mb-compile-token and
-# -server, and the traced compiler directories installed on the server (D:\\mb\\rc\\tc\\<trace directory's name>).
-REMOTE_DEFAULT = os.path.join(os.path.dirname(ROOT), "mountandblade-decomp", "tools", "remote", "rcl.py") \
-    if os.path.isfile(os.path.expanduser("~/.config/mb-compile-token")) else ""   # 13.10 builds only (run_remote)
+# Compile servers on a Windows machine, used for every traced compile when one is reachable. The clients come from
+# C2TRACE_REMOTE (one path; "0" turns remote compiles off) or from the local file ~/.config/c2trace-remote: one client
+# per line, tried in order, each optionally followed by the build prefixes it serves (`/path/client.py 13.10`).
+# A client takes cl's arguments, MB_RC_TC (the traced compiler directory's name), MB_RC_TRACE_CFG and MB_RC_TRACE_LOG,
+# and exits with cl's status, 75 (busy) or 76 (cannot compile this here). No client configured: compile locally.
+def _remote_clients():
+    path = os.path.expanduser("~/.config/c2trace-remote")
+    out = []
+    try:
+        for line in open(path):
+            parts = line.split()
+            if parts and not parts[0].startswith("#"):
+                out.append((os.path.expanduser(parts[0]), parts[1:]))
+    except OSError:
+        pass
+    return out
+
+
+REMOTE_CLIENTS = _remote_clients()
+REMOTE_DEFAULT = REMOTE_CLIENTS[0][0] if REMOTE_CLIENTS else ""
 
 
 def run_remote(args, cfg, log):
-    """The traced compile on a Windows machine instead of under wine, or None to compile here.
-
-    C2TRACE_REMOTE names the client of a compile server that has this traced compiler installed (for Mount & Blade:
-    ../mountandblade-decomp/tools/remote/rcl.py, whose server holds D:\\mb\\rc\\tc\\<the trace directory's name>). The
-    client ships the source, the headers it reaches and the hook list, and writes the listing, object and trace log
-    back to the paths asked for. It exits 75 (busy or unreachable) or 76 (cannot run there: /Zi, a header it could not
-    ship, an anonymous namespace, a compiler the server lacks); both mean compile here."""
-    client = os.environ.get("C2TRACE_REMOTE", REMOTE_DEFAULT)
+    """The traced compile on a Windows machine instead of under wine, or None to compile here (see REMOTE_CLIENTS).
+    The client ships the source, the headers it reaches and the hook list, and writes the listing, object and trace
+    log back to the paths asked for."""
     if os.environ.get("C2TRACE_REMOTE") == "0":
         return None
-    if not client or not os.path.isfile(client) or any(a in ("/Zi", "/ZI", "/Z7") for a in args):
-        return None
-    if any(a[:3].upper() == "/GL" for a in args):
+    if any(a in ("/Zi", "/ZI", "/Z7") for a in args) or any(a[:3].upper() == "/GL" for a in args):
         return None                                    # /GL objects belong to the local link (c2ltcg)
-    if not c2build.name().startswith("13.10"):
-        return None                                    # the server's INCLUDE holds 13.10 headers only (shipping another
-                                                       # build's headers with /X /I made every compile time out)
+    clients = [(os.environ["C2TRACE_REMOTE"], [])] if os.environ.get("C2TRACE_REMOTE") else REMOTE_CLIENTS
+    for client, builds in clients:
+        if not os.path.isfile(client) or (builds and not any(c2build.name().startswith(b) for b in builds)):
+            continue
+        r = _run_remote_client(client, args, cfg, log)
+        if r is not None:
+            return r
+    return None
+
+
+def _run_remote_client(client, args, cfg, log):
     # not msvc.winpath: it resolves symlinks, and the client tells a toolchain header (already on the server) from a
     # file to ship by the path as written
     wp = lambda q: "Z:" + os.path.abspath(q).replace("/", "\\")
@@ -667,12 +908,13 @@ def run_remote(args, cfg, log):
         return None
     if not _REMOTE_SAID:
         _REMOTE_SAID.append(1)
-        sys.stderr.write("c2trace: traced 13.10 compiles run on the remote compile server (%s); C2TRACE_REMOTE=0 keeps "
+        sys.stderr.write("c2trace: traced compiles run on the remote compile server (%s); C2TRACE_REMOTE=0 keeps "
                          "them local\n" % os.path.basename(client))
     return p.returncode, p.stdout + p.stderr
 
 
 _REMOTE_SAID = []
+_FPDUMP_SAID = []
 
 
 def steal_len(img, va):
@@ -899,7 +1141,26 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
                 shutil.copy(os.path.join(hit, name), dst)
         rc, out = info["rc"], info["out"]
     else:
-        rc, out = run_remote(args, cfg, log) or \
+        r = run_remote(args, cfg, log)
+        if r and any(x.startswith("set fpdump 1") for x in open(cfg)) and \
+                "# fpdump 1" not in open(log, errors="replace").read(4096):
+            # the compile server's c2trace.dll predates the x87 view ('&', `set fpdump`): compile here instead
+            if not _FPDUMP_SAID:
+                _FPDUMP_SAID.append(1)
+                sys.stderr.write("c2trace: the compile server's c2trace.dll has no x87 view ('&' spec): compiled here; "
+                                 "redeploy %s there\n" % TBIN)
+            os.remove(log)
+            r = None
+        if r and any(x.startswith("set gdump 1") for x in open(cfg)) and \
+                "# gdump 1" not in open(log, errors="replace").read(4096):
+            # the same for the globreg view ('^', `set gdump`, c2regs.py --pieces)
+            if not _FPDUMP_SAID:
+                _FPDUMP_SAID.append(1)
+                sys.stderr.write("c2trace: the compile server's c2trace.dll has no globreg view ('^' spec): compiled "
+                                 "here; redeploy %s there\n" % TBIN)
+            os.remove(log)
+            r = None
+        rc, out = r or \
             run_tool(args, extra_env={"C2TRACE_CFG": msvc.winpath(cfg), "C2TRACE_LOG": msvc.winpath(log)})
         if os.path.exists(log):
             ccache.put(k, {"log": log, "asm": asm, "obj": obj}, {"rc": rc, "out": out, "src": os.path.abspath(src)})

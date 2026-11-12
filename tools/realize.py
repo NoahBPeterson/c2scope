@@ -26,6 +26,9 @@ edit     EDIT is one abstract edit in the syntax `rasim need` / `rasim want` pri
          multiset without frame displacements: 0 = the same instructions in another order; `regs`: the diff with
          registers), the registers of --want-regs, and with --asm-vs the regdiff against the original.
          Several EDITs are realised one by one and then together. --list prints the candidates and stops.
+         `ref:V:B` / `extend:V:B` for a V that is never modified (this, a read-only parameter) has one code-neutral
+         form on 14.00 / 15.00: `if ((int)V & 1) S; else S;` around an assignment S of the block (eqif; merged
+         after Color). Differences also list `tie:A>B` (equal priorities whose defOrd order flipped).
 --from-rasim   the pipeline. ANSWERS.txt is the output of `rasim need SNAP reg:..` / `rasim want SNAP regmap.txt`
          (`-`: stdin); `auto` makes it (regmap --all against --asm-vs, then rasim want). Three stages, stopping at
          the first variant that matches (regdiff 0 with --asm-vs, otherwise the wanted registers with bag 0):
@@ -72,6 +75,7 @@ def _norm(op, fname):
     """Listing operands made comparable between two functions / two compiles: labels, COMDAT-local names."""
     op = re.sub(r"\$L[A-Z]*\d+(?:@[\w@?$]+)?", "$L", op)    # 13.10 writes $L123, later builds $LN12@func
     op = re.sub(r"\$T\d+", "$T", op)
+    op = re.sub(r"\btv\d+", "tv", op)                       # the listing's names for compiler temporaries
     op = re.sub(r"\$\d+\b", "$", op)                       # _x$1234 block-scoped locals
     if fname:
         op = op.replace(fname, "F")
@@ -130,10 +134,11 @@ class Fn:
         for r in fn["rows"]:
             if r["cls"] in (0, None) and r["npass"]:
                 self.regs.setdefault(r["name"], []).append(r["out"] or "-")
-        self.prio = {}
+        self.prio, self.dord = {}, {}
         for r in fn["rows"]:
             if r["cls"] in (0, None) and r["npass"]:
                 self.prio.setdefault(r["name"], r["prio"])
+                self.dord.setdefault(r["name"], r.get("dord"))
         # relations among named values (symmetric closure of what ChoosePhysReg saw)
         self.interf, self.copies, self.prefs = set(), set(), {}
         named = lambda n: n and not re.match(r"(t|imm|k\d+_|local)\d+$", n) and n != "?"
@@ -258,6 +263,16 @@ class Delta:
                      if a.regs.get(n) != b.regs.get(n) and not re.match(r"(t|imm|local)\d+$", n)}
         self.prio = {n: (a.prio.get(n), b.prio.get(n)) for n in sorted(set(a.prio) & set(b.prio))
                      if a.prio[n] != b.prio[n] and not re.match(r"(t|imm)\d+$", n)}
+        # ties among named values of equal priority whose defOrd order flipped (the larger defOrd pops first):
+        # what an order-only change (two statements of a block exchanged) does to Color's input
+        named = [n for n in a.prio if n in b.prio and not re.match(r"(t|imm|k\d+_|local)\d+$", n) and n != "?"
+                 and a.dord.get(n) is not None and b.dord.get(n) is not None]
+        self.ties = []
+        for i_, x in enumerate(named):
+            for y in named[i_ + 1:]:
+                if a.prio[x] == a.prio[y] and b.prio[x] == b.prio[y] and \
+                        (a.dord[x] > a.dord[y]) != (b.dord[x] > b.dord[y]) and a.dord[x] != a.dord[y] and b.dord[x] != b.dord[y]:
+                    self.ties.append((x, y) if b.dord[x] > b.dord[y] else (y, x))
         self.interf = (sorted(b.interf - a.interf), sorted(a.interf - b.interf))
         self.copies = (sorted(b.copies - a.copies), sorted(a.copies - b.copies))
         self.prefs = {k: b.prefs.get(k, 0) - a.prefs.get(k, 0) for k in sorted(set(a.prefs) | set(b.prefs))
@@ -289,6 +304,7 @@ class Delta:
         out += ["interf:%s:%s" % p for p in self.interf[0]] + ["nointerf:%s:%s" % p for p in self.interf[1]]
         out += ["copy:%s:%s" % p for p in self.copies[0]] + ["nocopy:%s:%s" % p for p in self.copies[1]]
         out += ["pref:%s:%s:%+d" % (k[0], k[1], v) for k, v in self.prefs.items()]
+        out += ["tie:%s>%s" % t for t in getattr(self, "ties", [])]
         return out
 
     def empty(self):
@@ -329,9 +345,21 @@ def verdict(want, d):
     """(exact | yes | no, the side effects as strings) for one requested edit against a measured Delta."""
     k = want["kind"]
     hit, rest = [], []
+    split = False
+    if k in ("ref", "extend") and d.new and (want["block"] in d.map or want["block"] in d.lost):
+        # the block was split (an equal-arms if, a duplicated head or tail made new blocks): V's references in
+        # the block (or what replaced it) and the new blocks together, against the block alone
+        sa, sb = d.a.state.get(want["var"], {}), d.b.state.get(want["var"], {})
+        before = sa.get(want["block"]) or 0
+        after = (sb.get(d.map[want["block"]]) or 0 if want["block"] in d.map else 0) + sum(sb.get(nb) or 0 for nb in d.new)
+        split = after > before
     for e in d.edits:
         kind, var, blk, amt = e
         mine = False
+        if split and var == want["var"] and kind in ("ref", "extend", "unref", "drop", "through+", "through-") and \
+                (blk == want["block"] or str(blk).startswith("n")):
+            hit.append(e)
+            continue
         if k in ("ref", "extend") and kind in ("ref", "extend") and var == want["var"] and blk == want["block"] \
                 and (amt or 0) > 0:
             mine = kind == k or k == "ref"
@@ -384,6 +412,7 @@ class _Sub:
     def __init__(self, d, edits):
         self.edits, self.tmp, self.P, self.lost, self.new = edits, d.tmp, d.P, d.lost, d.new
         self.interf, self.copies, self.prefs = d.interf, d.copies, d.prefs
+        self.ties = getattr(d, "ties", [])
 
 
 # ---------------------------------------------------------------- symbol keys
@@ -542,6 +571,15 @@ CONSTRUCTS = {
     "guard": "`delete p; p = 0;` guarded or not: the reset store changes block (frontend.md)",
     "helperbind": "`&p->m` in an inline helper (or the function) through a bound reference: one more candidate in "
                   "functions with an EH frame, no code, pick-neutral (frontend.md, tools/helpersweep.py)",
+    "taildup": "the statement after an if written at the end of both arms (an else is made when there is none): "
+               "tail merging after Color joins the copies; its references count in the arms instead of the join. "
+               "Code-neutral for arithmetic and stores; a call in the copy stops the merge (stack offsets)",
+    "tailhoist": "the reverse: a statement that ends both arms written once after the if",
+    "eqif": "`if ((int)V & 1) S; else S;` around a register-local assignment S of the block: one more reference to "
+            "V there and S's references into the arms, merged away after Color (14.00/15.00; 13.10 when V is in "
+            "a register). The construct for a value that is never modified (this, read-only parameters)",
+    "swap": "two adjacent independent statements exchanged: the defOrd tie-break and interference change; the "
+            "scheduler restores the instruction order only sometimes",
     "store": "`rz_keep(V);`: a real store of V. One instruction of code; shows what the reference would do",
     "pad": "n unused locals with initialisers (one frame key each, no code): exact, but padding",
     "helperlocal": "an expression of the window through a by-value inline helper with a local: +1 frame key per use",
@@ -790,7 +828,7 @@ def g_headdup(c, V, sts, lines):
         ie = _ifelse(B, j)
         if not ie or c.rw.DECL.match(B.text, B.toks[i][1]):
             continue
-        if V and V not in [B.toks[x][0] for x in range(i, j)]:
+        if V and not _mentions(c, V, i, j):
             continue
         near = {c.lineoff(i), c.lineoff(ie[1] + 1), c.lineoff(ie[3] + 1)}
         if lines and not (near & lines):
@@ -819,7 +857,7 @@ def g_headhoist(c, V, sts, lines):
         t1, t2 = B.text[B.toks[s1[0]][1]:B.toks[s1[1] - 1][2]], B.text[B.toks[s2[0]][1]:B.toks[s2[1] - 1][2]]
         if re.sub(r"\s+", "", t1) != re.sub(r"\s+", "", t2) or c.rw.DECL.match(B.text, B.toks[s1[0]][1]):
             continue
-        if V and V not in [B.toks[x][0] for x in range(s1[0], s1[1])]:
+        if V and not _mentions(c, V, s1[0], s1[1]):
             continue
         if lines and not ({c.lineoff(j), c.lineoff(s1[0]), c.lineoff(s2[0])} & lines):
             continue
@@ -828,6 +866,268 @@ def g_headhoist(c, V, sts, lines):
         yield ("headhoist", "`%s` (lines +%d, +%d) hoisted above the if" % (t1[:40], c.lineoff(s1[0]), c.lineoff(s2[0])),
                [(B.toks[j][1], B.toks[j][1], t1 + " "), (B.toks[s1[0]][1], B.toks[s1[1] - 1][2], ""),
                 (B.toks[s2[0]][1], B.toks[s2[1] - 1][2], "")], "")
+
+
+def _members(c):
+    """Field and method names of the target's class and its bases (for `this` used implicitly)."""
+    if getattr(c, "_mem", None) is not None:
+        return c._mem
+    names, todo, seen = set(), [c.cls] if c.cls else [], set()
+    while todo:
+        cn = todo.pop()
+        if cn in seen:
+            continue
+        seen.add(cn)
+        for m in re.finditer(r"\b(?:class|struct)\s+%s\b\s*(?::([^{;]*))?\{" % re.escape(cn), c.text):
+            body = c.text[m.end():c.hs.match_brace(c.text, m.end() - 1)]
+            body = re.sub(r"\{[^{}]*\}", ";", body)                 # in-class method bodies
+            names |= set(re.findall(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*(?=[;,=:)]|\()", body))
+            todo += re.findall(r"\b(\w+)\s*(?:,|$)", re.sub(r"\b(public|private|protected|virtual)\b", "", m.group(1) or ""))
+    c._mem = names - set(c.rw.KEYWORDS) - {"operator", cn}
+    return c._mem
+
+
+def _mentions(c, V, i, j):
+    """Do the tokens [i, j) mention V (for V == 'this' also a member of the class named without `this->`)?"""
+    B = c.B
+    toks = [B.toks[k][0] for k in range(i, j)]
+    if V is None or V in toks:
+        return True
+    if V != "this" or not c.cls:
+        return False
+    mem = _members(c)
+    return any(t in mem and t not in B.vars and (k == 0 or toks[k - 1] not in (".", "->", "::"))
+               for k, t in enumerate(toks))
+
+
+def _ifstmt(B, i, rw):
+    """For an `if` at token i (not an `else if`): (cond close, then-start, then-end, else-start, else-end) with the
+    ends one past the arm; else-start/end None when there is no else."""
+    if i >= len(B.toks) - 3 or B.toks[i][0] != "if" or B.toks[i + 1][0] != "(":
+        return None
+    pc = c_pclose(B, i + 1)
+    if pc is None or pc + 1 >= len(B.toks):
+        return None
+    try:
+        e1 = rw.stmt_end(B, pc + 1)
+        if e1 < len(B.toks) and B.toks[e1][0] == "else":
+            return pc, pc + 1, e1, e1 + 1, rw.stmt_end(B, e1 + 1)
+    except (IndexError, KeyError):
+        return None
+    return pc, pc + 1, e1, None, None
+
+
+def _arm(B, a, z):
+    """The arm [a, z) as the text between its braces (a braced block) or the statement itself."""
+    if B.toks[a][0] == "{" and B.close.get(a) == z - 1:
+        return B.text[B.toks[a][2]:B.toks[z - 1][1]].strip()
+    return B.text[B.toks[a][1]:B.toks[z - 1][2]]
+
+
+def _simple(c, i, j):
+    """A statement that may be copied into arms: no declaration, no jump, no case label, no braces."""
+    B = c.B
+    t0 = B.toks[i][0]
+    if t0 in c.rw.KEYWORDS - {"this"} or c.rw.DECL.match(B.text, B.toks[i][1]):
+        return False
+    return not any(B.toks[k][0] in ("return", "break", "continue", "goto", "case", "{", "}") for k in range(i, j))
+
+
+def _later_uses_inside(c, name, lo, hi):
+    return all(lo <= u < hi for u in c.B.uses.get(name, []))
+
+
+def g_headdup2(c, V, lines):
+    """The statement before an if (with or without else, braced or not) at the head of both arms; an if without
+    else gets an else holding the copy. Head merging runs after Color (il_fg.md rule 12), so the copies merge
+    back: the statement's references count in the arms. A declaration may move when every use of the declared
+    name is inside the if."""
+    B, rw = c.B, c.rw
+    for k in range(len(B.starts)):
+        s = rw._stmt(B, k)
+        if not s:
+            continue
+        i, j = s
+        ie = _ifstmt(B, j, rw) if j < len(B.toks) else None
+        if not ie or B.toks[i][0] in ("case", "default", "else", "return"):
+            continue
+        pc, a1, z1, a2, z2 = ie
+        dm = rw.DECL.match(B.text, B.toks[i][1])
+        end = z2 if a2 is not None else z1
+        if dm and not (dm.group(2) in B.uses and _later_uses_inside(c, dm.group(2), j, end)):
+            continue
+        if not dm and not _simple(c, i, j):
+            continue
+        if not _mentions(c, V, i, j):
+            continue
+        near = {c.lineoff(i), c.lineoff(a1)} | ({c.lineoff(a2)} if a2 is not None else set())
+        if lines and not (near & lines):
+            continue
+        if not _cond_safe(B, i, j, j + 1, pc, rw):
+            continue
+        if a2 is not None and B.toks[a1][0] == "{" and B.toks[a2][0] == "{":
+            continue                                   # the plain braced if/else: g_headdup's rewrite
+        txt = B.text[B.toks[i][1]:B.toks[j - 1][2]]
+        cond = B.text[B.toks[j][1]:B.toks[pc][2]]
+        s2 = _arm(B, a2, z2) if a2 is not None else ""
+        new = "%s { %s %s } else { %s %s }" % (cond, txt, _arm(B, a1, z1), txt, s2)
+        yield ("headdup", "`%s` (line +%d) into both arms of the if that follows%s" % (
+            txt[:40], c.lineoff(i), "" if a2 is not None else " (an else arm is made for it)"),
+               [(B.toks[i][1], B.toks[end - 1][2], new + "\n" * B.text.count("\n", B.toks[i][1], B.toks[end - 1][2]))], "")
+
+
+def g_taildup(c, V, lines):
+    """The statement after an if (with or without else) at the end of both arms (an if without else gets an else
+    holding the copy). Tail merging runs after Color (FgTryTailMerge: fall-through against the jump, no size
+    limit), so the copies merge back when they got the same registers and do not address the stack: the
+    statement's references count in the arms instead of the join. Calls and pushes in the copy stop the merge
+    (the arms' stack offsets differ): those variants change code and are reported as such."""
+    B, rw = c.B, c.rw
+    for i in range(1, len(B.toks) - 1):
+        if B.toks[i][0] != "if" or B.toks[i - 1][0] == "else" or B.paren[i]:
+            continue
+        ie = _ifstmt(B, i, rw)
+        if not ie:
+            continue
+        pc, a1, z1, a2, z2 = ie
+        end = z2 if a2 is not None else z1
+        if end >= len(B.toks) or end not in B.starts:
+            continue
+        k = B.starts.index(end)
+        s = rw._stmt(B, k)
+        if not s or not _simple(c, *s) or not _mentions(c, V, *s):
+            continue
+        ti, tj = s
+        near = {c.lineoff(ti), c.lineoff(a1)} | ({c.lineoff(a2)} if a2 is not None else set())
+        if lines and not (near & lines):
+            continue
+        cond = B.text[B.toks[i][1]:B.toks[pc][2]]
+        tail = B.text[B.toks[ti][1]:B.toks[tj - 1][2]]
+        s1 = _arm(B, a1, z1)
+        s2 = _arm(B, a2, z2) if a2 is not None else ""
+        if any(B.toks[q][0] in ("return", "break", "continue", "goto") for q in range(a1, end)):
+            continue                                   # an arm that leaves does not reach the statement
+        new = "%s { %s %s } else { %s %s }" % (cond, s1, tail, s2, tail)
+        yield ("taildup", "`%s` (line +%d) into both arms of the if before it%s" % (
+            tail[:40], c.lineoff(ti), "" if a2 is not None else " (an else arm is made for it)"),
+               [(B.toks[i][1], B.toks[tj - 1][2], new + "\n" * B.text.count("\n", B.toks[i][1], B.toks[tj - 1][2]))], "")
+
+
+def g_tailhoist(c, V, lines):
+    """The reverse of taildup: both braced arms of an if/else end with the same statement; it is written once
+    after the if."""
+    B, rw = c.B, c.rw
+    for i in range(1, len(B.toks) - 1):
+        if B.toks[i][0] != "if" or B.toks[i - 1][0] == "else" or B.paren[i]:
+            continue
+        ie = _ifstmt(B, i, rw)
+        if not ie or ie[3] is None or B.toks[ie[1]][0] != "{" or B.toks[ie[3]][0] != "{":
+            continue
+        pc, a1, z1, a2, z2 = ie
+        lasts = []
+        for a, z in ((a1, z1), (a2, z2)):
+            st = [x for x in B.starts if a < x < z - 1 and B.block[x] == a]
+            if not st:
+                break
+            k = B.starts.index(st[-1])
+            s = rw._stmt(B, k)
+            if not s or s[1] != z - 1:
+                break
+            lasts.append(s)
+        if len(lasts) != 2:
+            continue
+        t1, t2 = (B.text[B.toks[x][1]:B.toks[y - 1][2]] for x, y in lasts)
+        if re.sub(r"\s+", "", t1) != re.sub(r"\s+", "", t2) or not _simple(c, *lasts[0]) or not _mentions(c, V, *lasts[0]):
+            continue
+        if lines and not ({c.lineoff(lasts[0][0]), c.lineoff(lasts[1][0]), c.lineoff(z2 - 1)} & lines):
+            continue
+        yield ("tailhoist", "`%s` (lines +%d, +%d) written once after the if" % (t1[:40], c.lineoff(lasts[0][0]), c.lineoff(lasts[1][0])),
+               [(B.toks[lasts[0][0]][1], B.toks[lasts[0][1] - 1][2], ""), (B.toks[lasts[1][0]][1], B.toks[lasts[1][1] - 1][2], ""),
+                (B.toks[z2 - 1][2], B.toks[z2 - 1][2], " " + t1)], "")
+
+
+SCALAR = r"\b(int|long|short|char|bool|unsigned|signed|size_t|__int64|DWORD|UINT|WORD|BYTE|BOOL|float|double)\b"
+
+
+def _eqif_cond(c, V):
+    """A condition on V that the optimiser cannot fold and that sets no equality fact: `((int)V & 1)`."""
+    if V == "this":
+        return "((int)this & 1)" if c.cls else None
+    if V not in c.B.vars:
+        return None
+    ty = c.B.vars[V][0]
+    if "[" in ty or "&" in ty:
+        return None
+    if "*" in ty:
+        return "((int)%s & 1)" % V
+    if re.search(SCALAR, ty) and not re.search(r"\b(float|double)\b", ty):
+        return "((int)%s & 1)" % V
+    return None
+
+
+def g_eqif(c, V, sts):
+    """`if ((int)V & 1) S; else S;` around a statement S of the block: two equal arms. They reach Color as three
+    new blocks (the test reads V) and are merged away after it (head merge, the jumps to the next instruction,
+    then the dead test: 14.00 / 15.00 always, 13.10 when the test is register-only). So V gets one more
+    reference at the block with no code, also when V is never modified (`this`, a read-only parameter); S's
+    references move into the arms (one more each). S must reach Color: an assignment to a register local (a
+    store to memory is merged before Color and the construct vanishes), and must not sit between a call and the
+    next call of its block (the block boundary keeps the first call's `add esp` apart: one more instruction)."""
+    B = c.B
+    cond = _eqif_cond(c, V)
+    if not cond:
+        return
+    for st in sts:
+        k = B.starts.index(st) if st in B.starts else None
+        s = c.rw._stmt(B, k) if k is not None else None
+        if not s or B.paren[st]:
+            continue
+        i, j = s
+        dm = c.rw.DECL.match(B.text, B.toks[i][1])
+        if dm and dm.group(3) == "=" and "," not in B.text[dm.end():B.toks[j - 1][2]] and not \
+                re.search(r"\bconst\b|&|\[", dm.group(1)) and (re.search(SCALAR, dm.group(1)) or "*" in dm.group(1)):
+            # `T x = e;`: declared first, then assigned in both arms
+            e_ = B.text[dm.end():B.toks[j - 1][1]].strip()
+            yield ("eqif", "`%s %s; if %s %s = .. else ..` at line +%d (equal arms, merged after Color)" % (
+                dm.group(1).strip(), dm.group(2), cond, dm.group(2), c.lineoff(i)),
+                   [(B.toks[i][1], B.toks[j - 1][2], "%s %s; if %s { %s = %s; } else { %s = %s; }" % (
+                       dm.group(1).strip(), dm.group(2), cond, dm.group(2), e_, dm.group(2), e_))], "")
+            continue
+        if not _simple(c, i, j):
+            continue
+        toks = [B.toks[q][0] for q in range(i, j)]
+        txt = B.text[B.toks[i][1]:B.toks[j - 1][2]]
+        calls = "new" in toks or any(re.match(r"[A-Za-z_]", t) and t not in c.rw.KEYWORDS and toks[q + 1] == "("
+                                     for q, t in enumerate(toks[:-1]))
+        eq = next((q for q, t in enumerate(toks) if t in c.rw.ASSIGN or t in ("++", "--")), None)
+        if calls and (eq is None or len(toks[:eq]) != 1 or toks[0] not in B.vars):
+            # a call statement, or a store whose value comes from a call / new: the call keeps the arms apart
+            # until after Color (a plain store is merged before it and the construct vanishes)
+            yield ("eqif", "`if %s %s else ..` at line +%d (equal arms with a call, merged after Color)" % (
+                cond, txt[:40], c.lineoff(i)),
+                   [(B.toks[i][1], B.toks[j - 1][2], "if %s { %s } else { %s }" % (cond, txt, txt))], "")
+            continue
+        if eq is None:
+            continue
+        lhs = toks[:eq] if toks[eq] not in ("++", "--") or eq else toks[1:2]
+        if len(lhs) != 1 or lhs[0] not in B.vars or lhs[0] == "this":
+            continue
+        defs = [u for u in B.uses.get(lhs[0], []) if B.written(u, u + 1)]
+        dpos = B.vars[lhs[0]][1]
+        if dpos >= 0:
+            dd = c.rw.DECL.match(B.text, B.toks[max(x for x in B.starts if x <= dpos)][1])
+            defs += [dpos] if dd and dd.group(3) == "=" else []
+        else:
+            defs += [-1]                               # a parameter: defined at entry
+        if toks[eq] == "=" and len(defs) < 2:
+            continue                                   # a single-definition copy is propagated away, arms and all
+        ty = B.vars[lhs[0]][0]
+        if "&" in ty or "[" in ty or not (re.search(SCALAR, ty) or "*" in ty):
+            continue
+        if any(B.written(q, q + 1) and B.toks[q - 1][0] == "&" for q in B.uses.get(lhs[0], [])):
+            continue                                   # address-taken: the store would stay a store
+        yield ("eqif", "`if %s %s else %s` at line +%d (equal arms, merged after Color)" % (cond, txt[:30], txt[:20], c.lineoff(i)),
+               [(B.toks[i][1], B.toks[j - 1][2], "if %s { %s } else { %s }" % (cond, txt, txt))], "")
 
 
 def g_store(c, V, sts):
@@ -1048,6 +1348,11 @@ def generate(c, w):
             for v in ([V] if V else [x for x in c.B.vars if x != "this"]):
                 out += list(g_copy(c, v, sts))
             out += list(g_headhoist(c, V, sts, lines)) + list(g_headdup(c, V, sts, lines))
+            out += list(g_headdup2(c, V, lines)) + list(g_taildup(c, V, lines))
+            if V and k in ("ref", "extend"):
+                ls_ = [x for x in c.base.lines_of(blk) if x > 0]
+                rng = [st for st in c.B.starts if ls_ and min(ls_) <= c.lineoff(st) <= max(ls_)]
+                out += list(g_eqif(c, V, list(dict.fromkeys(sts + rng)) or c.stmts(blk, 1)))
             if not V:
                 out += list(g_rw(c, "const", lines)) + list(g_guard(c, lines))
                 out += list(g_rw(c, "wrap", lines, lambda d: d.startswith("arg hs_cp") or d.startswith("hs_bind")))
@@ -1056,6 +1361,7 @@ def generate(c, w):
         else:
             out += list(g_uncopy(c, V, sts or c.stmts(blk, 1)))
             out += list(g_headdup(c, V, sts, lines)) + list(g_headhoist(c, V, sts, lines))
+            out += list(g_tailhoist(c, V, lines))
             if not V or k == "P":
                 out += list(g_rw(c, "const", lines)) + list(g_guard(c, lines))
     elif k == "key":
@@ -1200,7 +1506,7 @@ def measure(c, cands, want, tag0):
         res = list(ex.map(one, range(len(cands))))
     order = {"exact": 0, "yes": 1, "no": 2}
     good = [r for r in res if "err" not in r]
-    good.sort(key=lambda r: (order[r["v"]], r["d"].bag, r["d"].code, len(r["side"]), r["k"]))
+    good.sort(key=lambda r: (r["v"] == "no", r["d"].bag > 0, order[r["v"]], r["d"].bag, r["d"].code, len(r["side"]), r["k"]))
     return good, [r for r in res if "err" in r]
 
 
@@ -1391,7 +1697,7 @@ def cmd_pipeline(c, a):
     snap = os.path.join(c.out, "base.json")
     if not os.path.exists(snap):
         json.dump(c.base.snap, open(snap, "w"))
-    norder = 0
+    norder, refwant = 0, []
     for ans in answers:
         if len(ans) == 1 and ans[0].split(":")[0] in ("before", "after") and norder < 3:
             # an order answer: ask the priority model where a reference more or fewer would close the gap
@@ -1399,6 +1705,8 @@ def cmd_pipeline(c, a):
             first, second = (x, y) if k == "before" else (y, x)
             r = subprocess.run([RASIM, "need", snap, "%s>%s" % (first, second)], capture_output=True, text=True)
             got = [int(m.group(1)) for m in re.finditer(r"^\s+deficit\s+-?\d+\s+\w+:[^:\s]+:(\d+)", r.stdout, re.M)]
+            refwant += [(m.group(1).split("@p")[0].split("#")[0], int(m.group(2))) for m in
+                        re.finditer(r"^\s+deficit\s+-?\d+\s+(?:ref|extend):([^:\s]+):(\d+)", r.stdout, re.M)]
             norder += 1
             new = [b for b in dict.fromkeys(got) if b not in blocks][:8]
             print("## order answer %s: `rasim need '%s>%s'` names blocks %s" % (ans[0], first, second, ",".join(map(str, new)) or "-"))
@@ -1411,11 +1719,16 @@ def cmd_pipeline(c, a):
                 continue
             if w["kind"] in SRC_KINDS and w["block"] not in blocks:
                 blocks.append(w["block"])
+            if w["kind"] in ("ref", "extend") and (w["var"], w["block"]) not in refwant:
+                refwant.append((w["var"], w["block"]))
     cands, seen_e = [], set(done)
     for b in blocks[:16]:
         lines, sts = set(c.base.lines_of(b)), c.stmts(b)
         gens = list(g_guard(c, lines)) + list(g_rw(c, "const", lines)) + list(g_headhoist(c, None, sts, lines)) + \
-            list(g_headdup(c, None, sts, lines)) + list(g_uncopy(c, None, sts))
+            list(g_headdup(c, None, sts, lines)) + list(g_uncopy(c, None, sts)) + list(g_headdup2(c, None, lines)) + \
+            list(g_taildup(c, None, lines)) + list(g_tailhoist(c, None, lines)) + list(g_rw(c, "swap", lines))
+        for v in [v for v, bb in refwant if bb == b][:3]:
+            gens += list(g_eqif(c, v, sts[:2]))
         for v in c.B.vars:
             gens += list(g_copy(c, v, sts[:3]))
         for g in gens:

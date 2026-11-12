@@ -16,7 +16,9 @@
 //!   SpillObvious  a new globreg with nrefs < 2 and (benefit <= 0 or a last def that is not an enterload) is spilled
 //!   list order    which web is at the head at every pop, including deferred webs and the pieces of each round
 //! [R] = replayed.  What is still taken from the trace, and why (each needs the IL, which the snapshot does not hold):
-//!   - the pieces a split round creates (how many, their blocks, costs, benefit, avail set, PREFs, flags);
+//!   - the pieces a split round creates (how many, their blocks, costs, benefit, avail set, PREFs, flags), unless
+//!     `--pieces` (a `regs --pieces` snapshot): then pieces.rs gives their benefit, priority, nrefs, blocks, nEnter
+//!     and airlock flag, and only the avail set and PREFs are the trace's;
 //!   - the interfering neighbours and copy partners of each colouring (InsertSplitPoints' nbrs, _UpdatePrefsBv);
 //!   - InsertSplitPoints' own split set (webs cut because more values are live than there are registers);
 //!   - whether CmdSubstDef, FoldAwaySplitGlobreg and BetterToDefer succeed (instruction patterns), and the
@@ -502,6 +504,15 @@ fn pct(a: (usize, usize)) -> String {
 /// `brief`: one summary line (the fourth line of plain `rasim check`); nothing at all for a snapshot without
 /// decision events.
 pub fn main(path: &str, verbose: bool, brief: bool) {
+    main_with(path, verbose, brief, None)
+}
+
+/// `pieces`: Some(chain) = the split pieces' records come from the piece model (pieces.rs; `--pieces`, with
+/// `--chain` carried from the first round) instead of the trace: benefit, priority, nrefs, single block, nEnter,
+/// the airlock flag and the last def SpillObvious looks at.
+pub fn main_with(path: &str, verbose: bool, brief: bool, pieces: Option<bool>) {
+    let model = pieces.and_then(|c| super::pieces::model_pieces(path, c));
+    let mut used = (0usize, 0usize); // (piece records taken from the model, new globregs of split rounds)
     let txt = std::fs::read_to_string(path).unwrap_or_else(|e| super::die(&format!("{}: {}", path, e)));
     let s: PSnap = serde_json::from_str(&txt).unwrap_or_else(|e| super::die(&format!("{}: {}", path, e)));
     let Some(dec) = s.decisions.as_ref() else {
@@ -622,9 +633,11 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
         let mut kept: BTreeSet<&str> = BTreeSet::new();
         for &i in so_idx {
             let d = &dec[i];
-            let nrefs = d.nrefs.unwrap_or(0);
-            let ben = d.ben.unwrap_or(0);
-            let pred_spill = nrefs < 2 && (ben < 1 || d.lastop.map_or(false, |op| op != ops.enterload));
+            let ov = model.as_ref().and_then(|m| m.get(&(n, d.gr.clone())));
+            let nrefs = ov.map_or(d.nrefs.unwrap_or(0), |o| o.nrefs);
+            let ben = ov.map_or(d.ben.unwrap_or(0), |o| o.ben);
+            let lastop = ov.map_or(d.lastop, |o| o.lastop.map(|x| x as i64));
+            let pred_spill = nrefs < 2 && (ben < 1 || lastop.map_or(false, |op| op != ops.enterload));
             let mut tr_spill = false;
             let mut tr_subst = false;
             for e in dec[i + 1..].iter().take_while(|e| e.t != "so" && e.npass == d.npass && e.after_pop == d.after_pop) {
@@ -698,19 +711,24 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
                 super::die("predict: an InsertInList event has no record fields; re-export the snapshot");
             };
             let w = sim.webs.len();
+            let ov = model.as_ref().and_then(|m| m.get(&(n, gr.clone())));
+            if n > n0 {
+                used.1 += 1;
+                used.0 += ov.is_some() as usize;
+            }
             sim.webs.push(Web {
                 gr: gr.clone(),
                 name: x.name.clone().unwrap_or_else(|| "?".into()),
                 num: num_of(i),
                 imm: x.kind.as_deref() == Some("imm"),
-                prio: x.prio.unwrap_or(0),
+                prio: ov.map_or(x.prio.unwrap_or(0), |o| o.prio),
                 def_ord: x.def_ord.unwrap_or(0),
-                ben: i.ben.unwrap_or(0),
-                nrefs: x.nrefs.unwrap_or(0),
+                ben: ov.map_or(i.ben.unwrap_or(0), |o| o.ben),
+                nrefs: ov.map_or(x.nrefs.unwrap_or(0), |o| o.nrefs),
                 fl5: x.fl5 & !2,
-                fl6: x.fl6,
-                single: x.single,
-                nenter: x.nenter.unwrap_or(0),
+                fl6: ov.map_or(x.fl6, |o| (x.fl6 & !1) | o.airlock as u32),
+                single: ov.map_or(x.single, |o| o.single),
+                nenter: ov.map_or(x.nenter.unwrap_or(0), |o| o.nenter),
                 avail: mask(i.avail.as_deref().unwrap_or(&[])),
                 prefs: i.prefs.clone().unwrap_or_default(),
                 pmark: false,
@@ -1277,6 +1295,15 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
         bytepress
     );
     println!("  state: {} places where the model's record differs from c2's (it is then taken from the trace)", tot.state);
+    if pieces.is_some() {
+        println!(
+            "  pieces: {} of the {} records split rounds put in the list come from the piece model (pieces.rs{}): \
+             benefit, priority, nrefs, single, nEnter, airlock flag, last def; avail set and PREFs from the trace",
+            used.0,
+            used.1,
+            if pieces == Some(true) { ", --chain" } else { "" }
+        );
+    }
     let num_misses = numbering(dec, &s.pops);
     if !sim.list.is_empty() {
         println!("  {} webs are left in the model's list at the end", sim.list.len());

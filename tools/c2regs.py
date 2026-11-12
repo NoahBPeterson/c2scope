@@ -126,6 +126,14 @@ DEC_HOOKS = [
     "10b0cf45=g10d12270>0," + _FREEL("10d0d7d8"),  # 26 Color entry: _NextGlobregNum, the _FreeGlobs list (11 ids)
     "@GrgNewGlobreg@4=eax/xeax,eax>0x1c",       # 27 every GLOBREG record handed out (exit: the record, its number)
 ]
+# --pieces (regalloc.md 3.6.11): the globreg view ('^', DLL_SRC dumpg) of the whole function at the entry of every
+# ColProcessSplitGlobregs call; the tuple path is the Color hook's IL dump (CurFunc > FUNC+8 > first BB > first tuple).
+PC0 = None
+PIECE_HOOK = "@ColProcessSplitGlobregs@12=" + [x for x in HOOKS[0].partition("=")[2].split(",") if x.endswith("%")][0][:-1] + "^"
+# and the cost Spillcosts gives each reference (14.00 only; another build: its table's hooks.regs_pieces): the
+# cost, the globreg's number, the tuple; src side 10b109b7, dst side 10b10ff9 (both just before `blkcost += eax`)
+PIECE_COST_HOOKS = ["10b109b7=eax,ebp>0x1c,s17", "10b10ff9=eax,ebp>0x1c,esi"] \
+    if c2trace.c2build.name() == c2trace.c2build.DEFAULT else (c2trace.c2build.get("hooks") or {}).get("regs_pieces", [])
 DEC0 = None
 DECX = {}          # ported build: {regs hook index: decision event} for an event read at that hook's exit
 if len(HOOKS) == len(_HOOKS14) + len(CHOICE_HOOKS) and HOOKS[len(_HOOKS14):] == CHOICE_HOOKS:   # 14.00
@@ -145,7 +153,10 @@ if (c2trace.c2build.get("hooks") or {}).get("regs_fp"):
     FP0 = len(HOOKS)
     HOOKS = HOOKS + c2trace.c2build.get("hooks")["regs_fp"]
 FPEVN = ["blk", "edge", "use", "enter", "def", "ins", "pass", "split", "check", "ce_end", "ce_join", "ce_post",
-         "ce_ext", "press", "init", "rm", "keep"]
+         "ce_ext", "press", "init", "rm", "keep", "csp", "fsp"]
+# check / init entries also carry the x87 view of the function ('&' spec: "T X" lines, c2trace.dll dumpfp), stored per
+# dump in fp["ils"]; csp / fsp: ColMakeSplitPoint / FPMakeSplitPoint (tuple, opcode, line word, [eax,] the set's
+# first 2 SBV chunks), logged inside FPColor only.
 
 
 def _gx(v):
@@ -290,7 +301,7 @@ def _immname(v):
 
 
 def sval(v):
-    return v if v.startswith('"') or v in ("?", "IL") else int(v, 16)
+    return v if v.startswith('"') or v in ("?", "IL", "FP", "GV") else int(v, 16)
 
 
 def _bits(base, lo, hi):
@@ -410,6 +421,18 @@ def _fpev(cur, ev, k, v, grs):
                 cur["rows"].append(row)
                 grs[v[0]] = row
         return
+    if name in ("csp", "fsp"):                      # a split point made inside FPColor (before Color's int passes)
+        if ev == "E" and not cur.get("_npass") and (fp["ev"] or fp.get("il0") is not None):
+            k = 4 if name == "csp" else 3
+            fp["ev"].append(dict(t=name, tup="%x" % v[0] if isinstance(v[0], int) else None,
+                                 op=v[1] if isinstance(v[1], int) else None,
+                                 line=v[2] & 0xffff if isinstance(v[2], int) else None,
+                                 set=_sbvset(v[k:]), after_pop=len(fp["pops"])))
+        return
+    if name == "init" and ev == "E" and "FP" in v:   # FPInitialRegPressure entry: the x87 view before FPColor
+        fp.setdefault("ils", []).append([])
+        fp["il0"] = len(fp["ils"]) - 1
+        return
     if name in ("press", "init"):
         if ev == "X":
             fp["ev"].append(dict(t=name, set=_sbvset(v[1:]) if v and v[0] else [], after_pop=len(fp["pops"])))
@@ -418,6 +441,9 @@ def _fpev(cur, ev, k, v, grs):
         if ev == "E":
             fp["ev"].append(dict(t="check", gr="%x" % v[0] if isinstance(v[0], int) else None, num=v[1], why=[],
                                  after_pop=len(fp["pops"])))
+            if "FP" in v:                           # its x87 view follows ("T X" lines)
+                fp.setdefault("ils", []).append([])
+                fp["ev"][-1]["il"] = len(fp["ils"]) - 1
             if fp["pops"] and fp["pops"][-1]["gr"] == v[0]:
                 fp["pops"][-1]["fpcheck"] = fp["ev"][-1]
         else:
@@ -453,6 +479,15 @@ def parse(log, funcpat):
     for ln in log.splitlines():
         if ln.startswith("T ") and cur is not None and cur.get("il") is not None:
             f = ln.split()
+            if f[1] == "G":                        # the globreg view (--pieces): into the dump opened last
+                if cur.get("gdumps"):
+                    cur["gdumps"][-1]["lines"].append(ln[4:])
+                continue
+            if f[1] == "X":                        # the x87 view (13.10 FPColor): into the dump opened last
+                fpd = cur.get("fp")
+                if fpd is not None and fpd.get("ils"):
+                    fpd["ils"][-1].append(ln[4:])
+                continue
             if f[1] == "B":
                 cur["bb"] = f[2]
                 cur.setdefault("bborder", []).append(f[2])
@@ -476,6 +511,12 @@ def parse(log, funcpat):
             grs, terms, npass = {}, {}, 0
             continue
         if cur is None:
+            continue
+        if PC0 is not None and hk == PC0 and ev == "E":   # --pieces: ColProcessSplitGlobregs, the globreg view
+            cur.setdefault("gdumps", []).append(dict(npass=npass, cls=cls, after_pop=len(cur["rows"]), lines=[]))
+            continue
+        if PC0 is not None and hk in (PC0 + 1, PC0 + 2) and ev == "E":   # --pieces: one reference's cost
+            cur.setdefault("refcosts", []).append([npass, "%x" % v[2], v[1], s32(v[0]), "s" if hk == PC0 + 1 else "d"])
             continue
         if ev == "X" and hk in DECX:                 # a decision event read at a regs hook's exit (15.00)
             cur["_npass"] = npass
@@ -714,6 +755,15 @@ def export(fn):
             # another c2 build: the opcode numbers the decision rules test (absent = 14.00's): enterload =
             # OPENTERLOAD (SpillObvious), last = the first non-machine opcode (RestrictToReg's Opcode_dope bound)
             snap["c2"] = dict(build=c2trace.c2build.name(), ops=OPS)
+    if fn.get("gdumps"):
+        # additive (`--pieces`, rasim pieces.rs, regalloc.md 3.6.11): the function's IL as GLOBREG numbers at every
+        # ColProcessSplitGlobregs call (the input of one split round), in order; npass = the Spillcosts pass being
+        # coloured, cls = its class, after_pop = pops made before it; lines = the "T G" lines of the '^' dump
+        # (format: DLL_SRC dumpg in tools/c2trace.py)
+        snap["gdumps"] = [dict(d, after_pop=max(0, d["after_pop"] - nfp)) for d in fn["gdumps"]]
+    if fn.get("refcosts"):
+        # additive (--pieces): [npass, tuple, globreg number, cost, s|d] for every reference Spillcosts costs
+        snap["refcosts"] = fn["refcosts"]
     if fn.get("ilb"):
         # additive (rasim fold, regalloc.md 3.6.10): the IL at Color's entry, block by block in stream order, each
         # line "I <tuple> <opcode> <line offset> <len> | dsts <- srcs" of the plain dump
@@ -750,7 +800,19 @@ def _fpexport(fn):
                            grs=grs))
     pops = [dict(pop=k + 1, name=r["name"], gr="%x" % r["gr"], prio=r["prio"], ben=r["ben"], defOrd=r["dord"],
                  num=r["id"], kind=r["kind"], out=r["out"], fpass=r.get("fpass")) for k, r in enumerate(fp["pops"])]
-    return dict(passes=passes, events=fp["ev"], pops=pops)
+    out = dict(passes=passes, events=fp["ev"], pops=pops)
+    if fp.get("ils"):
+        # the x87 views ("T X" lines, c2trace.dll dumpfp): ilpool = every distinct line, ils[k] = dump k as indices
+        # into it (a check event's `il` and il0, FPInitialRegPressure's entry, name a dump)
+        pool, at = [], {}
+        out["ils"] = [[at.setdefault(x, len(at)) for x in d] for d in fp["ils"]]
+        pool = [None] * len(at)
+        for x, k in at.items():
+            pool[k] = x
+        out["ilpool"] = pool
+        if fp.get("il0") is not None:
+            out["il0"] = fp["il0"]
+    return out
 
 
 def _immnote(im):
@@ -912,6 +974,8 @@ def main(argv):
     ap.add_argument("--export", help="write a JSON snapshot of the allocation for tools/rasim (of the first function "
                     "matched; a path with %%s writes one per function, %%s = its decorated name)")
     ap.add_argument("--keep")
+    ap.add_argument("--pieces", action="store_true", help="also export the IL as GLOBREG numbers at every split round "
+                    "(snapshot key gdumps: the inputs of rasim's piece model, regalloc.md 3.6.11; large for big functions)")
     ap.add_argument("src")
     cl = []
     if "--" in argv:
@@ -919,7 +983,15 @@ def main(argv):
         argv, cl = argv[:k], argv[k + 1:]
     a = ap.parse_args(argv)
     a.cl = cl
-    img, hooks, rc, out, log = c2trace.run_trace(a.src, HOOKS, a.cl, keep=a.keep)
+    global PC0
+    hooks_ = HOOKS
+    if a.pieces:
+        PC0 = len(HOOKS)
+        hooks_ = HOOKS + [PIECE_HOOK] + PIECE_COST_HOOKS
+    img, hooks, rc, out, log = c2trace.run_trace(a.src, hooks_, a.cl, keep=a.keep)
+    if a.pieces and c2trace.c2build.name() != c2trace.c2build.DEFAULT and "# gdump 1" not in log[:4096]:
+        sys.stderr.write("c2regs: the c2trace.dll that ran this compile has no globreg view ('^'): no gdumps "
+                         "(a compile server's copy? C2TRACE_REMOTE=0 compiles here)\n")
     if rc:
         sys.stdout.write(out)
     if a.raw:

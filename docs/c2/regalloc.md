@@ -621,8 +621,10 @@ piece (the web is dissolved; the round still runs).
 What the model does **not** predict, and takes from the trace (each needs the instructions, which the snapshot
 does not hold):
 
-- **the pieces of a split round**: how many, their blocks, costs, benefit, avail set, PREFs, flags (3.6.5 and
-  3.6.6 say how c2 makes them; the model does not compute them; their record numbers it does predict, 3.6.9);
+- **the pieces of a split round**: how many, their blocks, costs, benefit, avail set, PREFs, flags. *Now
+  modelled* from the round's IL (3.6.11, `rasim pieces`, and `check --predict --pieces` takes the pieces' benefit,
+  priority, nrefs, single-block flag, nEnter, airlock flag and last def from that model); still from the trace: the
+  pieces' avail sets and PREFs, and the split points made at the pops (3.6.11 item 1);
 - the neighbour set and copy-partner set of each colouring (3.3 item 4, 4.3);
 - InsertSplitPoints' own split set `S` (3.6.5 item 1) and the byte-pressure restrictions;
 - whether `CmdSubstDef`, `FoldAwaySplitGlobreg`, `BetterToDefer` and the fold of a queued def succeed, and
@@ -630,7 +632,7 @@ does not hold):
 - `CmdUpdateCost` benefit changes and `_NeedNewLives`.
 
 So the model answers "given these webs, which are spilled, deferred, pinned, cut or split, in which order, and
-when does the next round start"; it does not yet answer "what do the pieces look like after this edit".
+when does the next round start"; what the pieces look like is 3.6.11.
 
 Not exercised by any trace so far: `HandleCurrUncolorable` (no web was popped with an empty avail set), a
 successful `FoldAwaySplitGlobreg` at /O2, `RestrictToReg`'s `nrefs == 3` exception, classes other than int.
@@ -816,6 +818,139 @@ or drop it. `rasim fold SNAP VAR` (tracer.md) lists, from a snapshot's IL at Col
 VAR with its stretch, says whether it folds, names the extra references, gives the edit in rasim's EDIT language
 (`rasim order SNAP unref:S:B ref:VAR:B:2` to see the priorities after it) and reports the tie; it also gives the
 SpillObvious and CmdSubstDef outcome of each of VAR's webs.
+
+#### 3.6.11 What the pieces look like: split points, regions, reloads, stores, costs **[C code on 13.10.3077, 13.10.3052, 14.00, 15.00; C trace]**
+
+A split round turns each web of the split set into pieces. Everything below is mechanical once three inputs are
+known: the IL (with the operand flags c2 keeps on each REG leaf), the split points, and the split set. `rasim pieces`
+(tools/rasim/src/pieces.rs, tracer.md) runs it on the IL c2 had at the round (the `--pieces` export) and compares
+every piece with c2's. Addresses are 14.00 / 15.00 / 13.10.3077 / 13.10.3052; 3052's code is 3077's instruction for
+instruction (same offsets, constants and callees; the 3052 addresses were found from 3077's by context).
+
+**Operand flags** (REG leaf of a globreg): `+0x14 & 0xf` = the src a two-address dst is tied to (1-based; 0 = not
+tied); `+0x15 & 0x10` = last use; `+0x15 & 0x40` = in the block's bottom piece (set by FlagSplitAppears);
+`+0x15 & 0x80` = an airlock enterload (GrgAirlockEnterloads); `+0x10` on a def = the def has a memory home to store to.
+A SYM leaf's `+0x10` = the number of the globreg whose home it reads.
+
+**1. Split points.** A split point is a tuple (opcode 0x2f6 / 0x341 / 0x2c7; kind 0x1c) holding an SBV of webs, put
+*after* a tuple T. `ColMakeSplitPointOne` (10b18700 / 5106a8b0 / 1078bd48 / 107b5c67) makes one for one web,
+`ColMakeSplitPoint` (10b185d0 / 5106a770 / 107967b2 / 107aca0e) one for a set minus the webs T references. Both
+always allocate a new tuple: there is no reuse; several at one T stack up, the newest nearest T. **[C]** Who makes
+them: InitialSplitPoints (before the first Spillcosts: around calls and at loop boundaries **[I: by position in
+the dumps]**), InsertSplitPoints (pressure), InsertAdditionalSplits / BlockSplitsOne (a web with no register left),
+`ForceSingleBlockLives` (10b1b3b0 / 5106d540 / 107278c6 / 107278c9: one at the top of every block of the range
+where the web is live in, after the label, and the block gets `+0x18 |= 0x40000`) and `ForceNoAirlocks` (10b1b280
+/ 5106d410 / 1078bee9 / 107b65aa: for every airlock enterload of the web, a split point at the top of each successor
+where it is live in, and the enterload is deleted; 14.00 and 13.10 go on scanning successors after a match, 15.00
+stops at the first). **[C]** A split point lives one round only: in a block that holds a split web,
+CreateGenAndKill keeps only the webs of this round's split set that are present in the block and deletes a point
+left empty, and RewriteSplitGlobregs deletes the rest; in a block that holds none, ColProcessSplitGlobregs deletes
+the points when the block has `0x40000`. So the points a round uses are the ones made since the previous round
+(plus, in the first round, InitialSplitPoints'). **[C: 10b11fba..10b11fed, 10b11cfe, 10b12e65]**
+
+**2. The block list and the batches** (`ColProcessSplitGlobregs` 10b11b20 / 510640b0 / 1078b2aa / 107b45b2). The
+blocks whose present set (`BB+0x50`) holds a split web, in block order; their live-in / live-out SBVs (`+0x48`,
+`+0x4c`) lose the split webs. Parents in ascending number, 32 per batch, each with one bit; per batch:
+CreateGenAndKill, ComputeNewLiveness, NewLiveRanges, FlagSplitAppears. Then `+0x50 -= split set`, every parent
+`fl5 |= 2`, RewriteSplitGlobregs, and the parents are retired in ascending number. **[C]**
+
+**3. Local sets** (`CreateGenAndKill` 10b11f30 / 510644c0 / 1078b346 / 107b4a47), each block walked backwards:
+a split point kills its webs (and needs their value in memory: `+0x58`); an untied def kills (and, if no kill was
+seen below it, is the downward-exposed reference `+0x2c`); a tied def does neither; a use is upward-exposed (gen)
+until a kill above it and downward-exposed if no kill below it; a last use (`0x10`) and every def end the "memory
+needed" run (`+0x5c`); a memory read of a web's home starts one. The function returns the OR of the defs' `+0x10`.
+15.00 moves `+0x58 / +0x5c` to `+0x5c / +0x60`. **[C]**
+
+**4. Liveness** (`ComputeNewLiveness` 10b122d0 / 51064860 / 1078b51c / 107b4bdc): (a) backward: live-in = gen |
+(live-out & ~kill), live-out = OR of the successors' live-in; (b) forward: reached-in = OR of the predecessors'
+reached-out, & live-in; reached-out = (reached-in & ~kill | downward-exposed) & live-out; the result (`+0x24`,
+`+0x28`) is "reached and live". (c) Only when a def has a memory home (the return value of 3): backward "memory
+needed below" with gen `+0x58`, kill `+0x5c`; its live-out is the start set of FlagSplitAppears. **[C]** So the value
+is live at a point only if a reference reaches it without crossing a split point *and* it is used later.
+
+**5. Pieces = connected regions** (`NewLiveRanges` 10b12480 / 51064a20 / 1078b372 / 107b4e5c), per parent over the
+blocks firstBlk..lastBlk that are in the list: a block live in gets a top component, the union of its predecessors'
+bottom components; when it is live out and not killed, top and bottom are one and the successors' tops join it;
+when it is live out and (not live in or killed), the bottom is the union of the successors' tops. An edge whose two
+ends are reached-and-live joins two regions; a def or a split point inside a block separates its top from its
+bottom. Each root component gets a record (GrgNewGlobreg; `defOrd` = the parent's), **newest component first** (the
+list is LIFO); the piece numbers go into the parent's `+0x20` and into `+0x48 / +0x4c / +0x50` of the blocks where
+the piece is live in / out. **[C; trace: the record sequence below]** That settles the order 3.6.9 left as I.
+
+**6. Stores and flags** (`FlagSplitAppears` 10b129a0 / 51064f70 / 1078b79c / 107b5006), each block walked backwards
+with the live-out set and "memory needed": after a def whose value a split point or a home read below needs in
+memory (def `+0x10` set, parent `fl5 & 0x10` clear), an **OPEXITSAVE** (CmdInsertExit, inserted after the def);
+a dead OPENTERLOAD is deleted; another dead def with no store and the variable's own type writes memory directly
+(CmdSpillSingleDef); `0x40` marks the references of the block's bottom piece; `0x10` is recomputed (last use
+unless the same web is read again later in the instruction). 13.10 tests `0x4000` where 14.00 / 15.00 test
+`0x5000` (the x87 type class). **[C]**
+
+**7. Renaming, reloads** (`RewriteSplitGlobregs` 10b12d20 / 510652f0 / 1078b93a / 107b53f4), each block of the list
+forwards, first `GrgAirlockEnterloads(FUNC, B, 1)`; the set L of live pieces starts as the pieces live into the
+block; a split point removes its parents' pieces from L; a use takes the lowest-numbered piece of its parent in
+L; with none: if it is in the bottom piece (`0x40`), the live-out piece **with a reload** (OPENTERLOAD before the
+instruction); else if it is the last use (and not x87, not tied) it reads memory (CmdSpillSingleUse; an immediate
+becomes the constant, GrgChangeRegToImmed); else **a new piece and a reload** (RewriteSplitGlobregs' "use"
+record). A def takes, if tied, its src's piece; if `0x40`, the live-out piece; else **a new piece** ("def"
+record). **[C]**
+
+**8. Reloads on edges** (`GrgAirlockEnterloads` 10b59320 / 510a78d0 / 1077c1df / 10780c4e), for a block with two or
+more predecessors: for each predecessor P, S = pieces live into the block and not out of P. When P has one
+successor: one OPENTERLOAD per piece of S, ascending number, before P's branch (GetEnterInsertPoint; an
+immediate's before the compare feeding it), P's live-out and present sets grow by S. Else an **airlock block**
+(FgInsertAirlockBlock 10b28ed0 / 510755f0 / 1078f5fb / 10757b3a) is linked just before the block in both the block
+and the tuple order, with B's loop level and loop, live in = B.in & P.out, and gets the reloads; the airlock made
+for the previous predecessor is reused when its reloads are the same set. Every such reload has `+0x15 |= 0x80`.
+**[C]**
+
+**9. How a piece is costed** (Spillcosts, 3.2, on the blocks whose present set holds a new piece): /O2 cost 2 per
+reference of a non-immediate, with two exceptions: a tied dst costs 0 when CmdCanDirectSubstitute accepts it
+(**[C trace; the exact accept rule I]**: in every probe a two-address dst whose other operand is a register cost 0,
+imul's never; `add x, const` cost 2 and `sub x, const` 0); an immediate costs CmdSubCost: 1 when the instruction's
+anchor operand (first dst of a mov, else first src) is a symbol or a memory operand with a symbol or displacement,
+else 0, and 0 for `cmp x, 0`. An OPENTERLOAD costs the piece `CmdLoadCost·w` (2, an immediate 1) and counts as a
+reference for P_B with cost 0; an OPEXITSAVE costs `2·w` and counts in `nEnter`, **except in a loop whose reference
+set does not hold the variable** (BB+0x16c / +0x9c → +0x38, the variable's index at sym+0x34; then only nEnter):
+10b108e1..10b10913 / 3077 1078cb36, 10749f1b. P_B counts the old uncoloured globregs referenced in B, the coloured
+ones, and the new ones referenced (dead or live). **[C]**
+
+**Validation** (`rasim pieces SNAP`: each round from the IL c2 had at that round; "pieces" = the record sequence,
+number, parent and NewLiveRanges / use / def of every record handed out, as c2's; "exact" = sequence, every
+per-block term, nrefs, benefit, last def, priority, nEnter, single and airlock flag as c2's):
+
+| snapshot | build | rounds | piece sequence | terms (pieces) | exact | refs vs Spillcosts' probes | `--chain` exact |
+|---|---|---|---|---|---|---|---|
+| splitnum.c f4, f6 | 14.00, 15.00 | 2 | 2/2 | 9/9 | 9/9 | 29/29 (14.00) | 9/9 |
+| splitnum.c f4, f6 | 13.10.3077, 3052 | 2 | 2/2 | 8/9 | 8/9 | - | 8/9 |
+| b25.c | 14.00 | 16 | 16/16 | 450/450 | 450/450 | 1598/1598 | 443/450 (sequence 6/16) |
+| b25.c | 13.10.3077, 3052 | 7 | 7/7 | 413/413 | 413/413 | - | 413/413 |
+| b25.c | 15.00 | 30 | 30/30 | 1347/1347 | 1346/1347 | - | 799/1258 (sequence 16/30) |
+| v_match FUN_00c7e9a0 | 14.00 | 11 (12 passes) | 11/11 | 35/35 | 35/35 | 156/156 | 35/35 |
+| b250.c | 14.00 | 33 | 33/33 | 3133/3133 | 3133/3133 | 13453/13453 | 1148/3130 (sequence 5/33) |
+| M&B Terrain::tessellate | 13.10.3077 | 13 | 13/13 | 75/88 | 75/88 | - | 41/84 (sequence 10/13) |
+| Spore slice s0059f510 (24 functions, 19 rounds) | 15.00 | 19 | 19/19 | 47/48 | 47/48 | - | 44/48 (sequence 17/19) |
+
+The record sequence (how many pieces, which parent, NewLiveRanges / use / def, which number) was c2's in every
+round of every snapshot. Every miss of the per-round column is one reference of a two-address dst costed 0 where
+c2 costs 2 or the reverse: the accept rule of CmdCanDirectSubstitute (item 9) is the one rule here not read to the
+end. With the rule as read (0 unless the other operand is memory) 14.00 / 15.00 f4 miss `add x, const` (four
+references, 2 in c2); with `add x, const` = 2, Terrain::tessellate (13.10) misses 13 pieces that the read rule gets
+(85/88), and f4 on 13.10 one `sub x, 0` (0 in c2). The `--chain` misses on b25 (14.00) are one extra def piece per
+round from round 3 on: an immediate's airlock reload that c2 no longer has at that round (the model keeps it);
+on tessellate the cost misses carry into the next rounds' IL. A chain diverges for good once one round's IL
+differs (an extra piece renumbers every later record), so `--chain` falls off on the long chains (b250, b25 on
+15.00); per round every b250 piece is exact. `check --predict --pieces` (each round's pieces from the model,
+avail sets and PREFs from the trace): every decision of b250.c (3933 pops, 2094 model records), b25.c on 14.00 and
+13.10 and v_match as with the trace's records; b25.c on 15.00 one spill/defer decision of 359 differs (the one
+benefit miss); Terrain::tessellate 13 list heads of 117 (the tied-dst costs). **[C for everything but item 9's accept rule: I]**
+
+**What is still taken from the trace.** In `--chain` mode only what happens at the pops between two rounds: the
+colour and flags of every record, which records were retired (a spilled web's operands become memory operands),
+instructions deleted at pops, and the split points the pops made (InsertSplitPoints' pressure points,
+InsertAdditionalSplits / BlockSplitsOne, ForceSingleBlockLives, ForceNoAirlocks), put after the same instruction.
+Items 1's ForceSingleBlockLives and ForceNoAirlocks are mechanical from the IL; the other two need the registers
+free at each instruction (the colours of the live webs, fixed registers, call kill sets) and are not modelled.
+Also from the trace: the pieces' avail sets and PREFs (Spillcosts' register side). **[C]**
 
 ---
 

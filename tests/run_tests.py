@@ -175,15 +175,18 @@ out = tool("regs", var, "--func", "?eA@@", *FLAGS)
 real = dict(re.findall(r"^\s+\d+\s+(\S+)\s+\S+\s+-?\d+\s+-?\d+\s+\d+\s+\d+\s+(e[a-ds][xip])\s", out, re.M))
 check("combined what-if vs a real compile: ref:k:1:6 gives the 6 registers of eA with use(k, k, k) added (k esi, h edi)",
       (pred == real, pred.get("k"), pred.get("h"), len(real)), (True, "esi", "edi", 6))
-# need/want's fast path (restart from the unedited run's saved states, stop once converged; tracer.md "Speed of
-# `need reg:`") prints exactly what the reference path prints (RASIM_REF=1: a full state copy and run per candidate)
+# need/want's fast path (differences from the unedited run, Model::run_diff; single source edits from Uni::quick;
+# tracer.md "Speed of `need reg:`") prints exactly what the reference path prints (RASIM_REF=1: a full state copy and
+# run per candidate). RASIM_QCHECK=1 also checks every quick edit against the overlay path (it aborts on a difference).
 same = []
 for args in (["need", snap, "reg:k=esi"], ["need", snap, "reg:k=esi", "reg:h=edi", "--depth", "3"],
              ["want", snap, wantf], ["need", snap, "reg:k=esi", "pref:h:edi"]):
     a = subprocess.run([rasim] + args, capture_output=True, text=True)
     b = subprocess.run([rasim] + args, capture_output=True, text=True, env=dict(os.environ, RASIM_REF="1"))
-    same.append((a.stdout == b.stdout, a.returncode == b.returncode, len(a.stdout) > 100))
-check("rasim need/want: the fast path's output is the reference path's (4 searches on eA)", same, [(True, True, True)] * 4)
+    c = subprocess.run([rasim] + args, capture_output=True, text=True, env=dict(os.environ, RASIM_QCHECK="1"))
+    same.append((a.stdout == b.stdout == c.stdout, a.returncode == b.returncode == c.returncode == 0, len(a.stdout) > 100))
+check("rasim need/want: the fast path's output is the reference path's (4 searches on eA, quick edits self-checked)",
+      same, [(True, True, True)] * 4)
 
 # spill / defer / split decisions predicted (regalloc.md 3.6, tracer.md "rasim check --predict"), on every c2 build
 # (13.10 and 15.00: the decision hooks of their build tables, port-1310.md section 15, port-1500.md section 12)
@@ -230,6 +233,20 @@ int f3(unsigned char *p, int n, int k) { unsigned char a=p[0],b=p[1],c=p[2],d=p[
     check("splitnum.c: reloads after the loop x, y (f4) and y, x (f6); rasim predicts both",
           (order["_f4"], order["_f6"], order["_f4rasim"], order["_f6rasim"]),
           ("xy", "yx", ("9", "9", "1/1"), ("9", "9", "1/1")))
+    # split pieces modelled from the round's IL (regalloc.md 3.6.11, tracer.md "rasim pieces"): f4's two rounds
+    ps = os.path.join(os.path.dirname(snap), "pieces_f4.json")
+    out = tool("regs", SN, "--func", "_f4", "--pieces", "--export", ps)
+    r = subprocess.run([rasim, "pieces", ps], capture_output=True, text=True).stdout
+    m = re.search(r"piece sequence (\S+); blocks walked (\S+); per-block terms (\S+); .*pieces exact (\S+)", r)
+    check("rasim pieces (f4): records, blocks, terms of every piece, from the round's IL",
+          m.groups() if m else None, ("2/2", "2/2", "8/9", "8/9") if BUILD.startswith("13.10") else ("2/2", "2/2", "9/9", "9/9"))
+    r = subprocess.run([rasim, "pieces", ps, "--chain"], capture_output=True, text=True).stdout
+    m2 = re.search(r"piece sequence (\S+); .*pieces exact (\S+)", r)
+    r = subprocess.run([rasim, "check", ps, "--predict", "--pieces"], capture_output=True, text=True).stdout
+    m3 = re.search(r"pieces: (\d+) of the (\d+) records", r)
+    check("rasim pieces --chain and check --predict --pieces (f4): the same from the first round, 8 of 8 records",
+          (m2.groups() if m2 else None, m3.groups() if m3 else None),
+          (("2/2", "8/9" if BUILD.startswith("13.10") else "9/9"), ("8", "8")))
 
 # immediate candidates (docs/c2/immcand.md) and the --func forms (tracer.md)
 IMM = os.path.join(HERE, "tests", "data", "immcand.c")
@@ -403,12 +420,83 @@ def fpcolor_tests():
            "ref:c:2:1" in r.stdout), (True, True))
 
 
+def symkeys_hash_tests():
+    """The optimiser's value-numbering temps (hash class, symkeys.md section 8): numbered in HshBuildTable's walk
+    (one per distinct value), then the assignment tail, then later passes; keys come in blocks of 32 of their own
+    class (key mod 32 = rank), freed keys go to the temp list; parentheses and casts as code-neutral levers."""
+    HS = os.path.join(HERE, "tests", "data", "symkeys_hash.cpp")
+    out = symkeys("keys", HS, "--phase", "opt", "--all", *FLAGS)
+    cnt, hs, tm, cur = {}, {}, {}, None
+    for ln in out.splitlines():
+        m = re.match(r"^#### \?(\w+)@@", ln)
+        if m:
+            cur = m.group(1)
+            cnt[cur], hs[cur], tm[cur] = {}, [], set()
+            continue
+        m = re.match(r"^\s*(\d+) (hash|tmp)\s+\d+\s+\$o(\d+)\s", ln)
+        if m and cur:
+            if m.group(2) == "hash":
+                hs[cur].append((int(m.group(3)), int(m.group(1))))
+                ph = re.search(r"/(walk|assign|later)\b", ln)
+                ph = ph.group(1) if ph else None
+                cnt[cur][ph] = cnt[cur].get(ph, 0) + 1
+            else:
+                tm[cur].add(int(m.group(1)))
+    b = cnt.get("hb", {})
+    d = {k: tuple(c.get(x, 0) - b.get(x, 0) for x in ("walk", "assign", "later")) for k, c in cnt.items()}
+    check("symkeys hash: per construct (walk, assignment tail, later) against hb",
+          [d.get(k) for k in ("hparen1", "hparen3", "hnoparen", "hleaf", "hcast", "hflag", "hdbl")],
+          [(1, 0, 0), (3, 0, 0), (-2, 0, 0), (0, 0, 0), (1, 0, 0), (1, 2, 1),
+           (3, 0, 0) if BUILD.startswith("13.10") else (1, 0, 0)])
+    check("symkeys hash: walk / assign / later counts of hb",
+          tuple(b.get(x, 0) for x in ("walk", "assign", "later")), (51, 4, 6) if BUILD.startswith("13.10") else (65, 4, 6))
+    ranks = [sorted(v) for v in hs.values() if v]
+    check("symkeys hash: key mod 32 = rank among the function's hash temps (own blocks of 32, no reuse in class)",
+          (len(ranks) >= 8, all(key % 32 == i % 32 for r in ranks for i, (_, key) in enumerate(r))), (True, True))
+    check("symkeys hash: freed hash keys are handed out again as temporaries (temp free list)",
+          all(len(tm[k] & {key for _, key in hs[k]}) > 0 for k in hs if hs[k]), True)
+
+
+def fpcheck_tests():
+    """13.10: FPCheckColorability, FPInitialRegPressure and FPUpdateRegisterPressure predicted from the x87 view
+    (c2trace.dll's '&' dump), docs/c2/x87.md section 11.1; tests/data/fpcheck.c has one function per rule."""
+    FC = os.path.join(HERE, "tests", "data", "fpcheck.c")
+    fd = tempfile.mkdtemp()
+    tool("regs", FC, "--all-classes", "--export", os.path.join(fd, "%s.json"))
+    got, fired = {}, {}
+    for f in ("k_call", "k_end", "k_ext", "k_join", "k_depth"):
+        o = subprocess.run([rasim, "check", os.path.join(fd, "_%s.json" % f), "--predict"], capture_output=True,
+                           text=True).stdout
+        m = re.search(r"predicted from the x87 view: (\d+) of (\d+) answers, sub-test calls (\d+) of (\d+), split points "
+                      r"(\d+) of (\d+)", o)
+        n = re.search(r"FPInitialRegPressure (\d+) of (\d+) \((\d+) non-empty\), FPUpdateRegisterPressure \(after a "
+                      r"colouring\) (\d+) of (\d+) \((\d+) non-empty\)", o)
+        got[f] = (m.groups() if m else None, n.groups() if n else None)
+        w = re.search(r"sub-tests that returned 1 \(trace\): (.*)", o)
+        fired[f] = w.group(1) if w else ""
+    check("FPCheckColorability predicted from the view: every answer, sub-test call and split point (fpcheck.c)",
+          [(f, a[0] == a[1] and a[2] == a[3] and a[4] == a[5] and a[1] != "0") if a else (f, None)
+           for f, (a, _) in got.items() if f != "k_call"], [(f, True) for f in got if f != "k_call"])
+    check("the split sets: FPInitialRegPressure (k_call: x at g(), its pieces never popped) and "
+          "FPUpdateRegisterPressure (k_depth) predicted",
+          [(got[f][1][0] == got[f][1][1], got[f][1][2], got[f][1][3] == got[f][1][4], got[f][1][5]) if got[f][1] else None
+           for f in ("k_call", "k_depth")], [(True, "1", True, "0"), (True, "0", True, "1")])
+    check("the rule each probe makes fire (traced): end, ext (CanExtendLifetime), join (SplitAtMismatchedFlowJoinPoints)",
+          [("end" in fired["k_end"]), ("ext" in fired["k_ext"]), ("join" in fired["k_join"])], [True, True, True])
+    r = subprocess.run([rasim, "need", os.path.join(fd, "_k_end.json"), "stack:c"], capture_output=True, text=True)
+    check("rasim need stack:c (k_end): b ends below c; popped before b, c would stay on the stack (+2 priority)",
+          (bool(re.search(r"blocker: b \(web \d+\) ends at src \+2 while c is on the stack above it", r.stdout)),
+           "c would be colourable; it needs +2 priority" in r.stdout), (True, True))
+
+
 if BUILD.startswith("13.10"):
     fpcolor_tests()
+    fpcheck_tests()
 
 if c2build.table() is None or "symkeys" in (c2build.get("hooks") or {}):
     symkeys_tests()
     symkeys_more_tests()
+    symkeys_hash_tests()
 else:
     print("  symkeys: no symkeys hooks in this build table (not ported): skipped")
 
@@ -447,6 +535,15 @@ def realize_tests():
            rows.get(("tch", "store"), (0, 0, 0))[2]), (["(no", "allocation-input", "change)"], True, 1))
     check("realize: a callee body that only reads keeps the address-taken local one web (extend:x:1)",
           has(("ext", "body"), "extend:x:1"), True)
+    check("realize: equal arms on (int)this & 1 split the block at Color (this referenced in the test and the join) "
+          "and are merged away after it: no code",
+          (has(("eqt", "eq"), "extend:this:n5", "extend:this:n8", "blocks:-1+4"), rows.get(("eqt", "eq"), (9,))[0]),
+          (True, 0))
+    check("realize: a statement after the if at the end of both arms counts in the arms (tail merge after Color)",
+          (has(("tdup", "dup"), "extend:p:2", "extend:p:3", "ref:p:4:-2"), rows.get(("tdup", "dup"), (9,))[0]),
+          (True, 0))
+    check("realize: two independent statements exchanged: a defOrd tie flips, same instructions",
+          (has(("swp", "swap"), "tie:q>p", "nointerf:n:p"), rows.get(("swp", "swap"), (9, 9))[1]), (True, 0))
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "edit", RZ, "--func", "cpl__base",
                         "ref:n:3", "--keep", os.path.join(tempfile.mkdtemp(), "rz")] + FLAGS,
                        capture_output=True, text=True, cwd=HERE)
@@ -456,9 +553,32 @@ def realize_tests():
           (bool(re.search(r"^## ref:n:3\s+\(block 3 = source lines \+6,", r.stdout, re.M)),
            bool(re.search(r"^\s+(?:exact|yes)\s+copy\s+code 0 bag 0 regs 0\s+int rz_c = n; at line \+6", r.stdout, re.M))),
           (True, True))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "edit", RZ, "--func", "RzL::eqt__base",
+                        "ref:this:5", "--constructs", "eqif", "--keep", os.path.join(tempfile.mkdtemp(), "rz")] + FLAGS,
+                       capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    check("realize edit ref:this:5 (this is never modified): the equal-arms construct realises it with code 0",
+          bool(re.search(r"^\s+yes\s+eqif\s+code 0 bag 0 regs \d+\s+`if \(\(int\)this & 1\) s \^= k;", r.stdout, re.M)), True)
 
 
 realize_tests()
+
+
+def regdiff_norm_tests():
+    """tsweep.regdiff: printing differences between the listing and capstone are not differences."""
+    import tsweep
+    ours = [("push", "OFFSET FLAT:??_C@_01MIFGBAGJ@?$CL?$AA@"), ("imul", "esi, 44"), ("npad", "7"), ("cmp", "edi, 3"),
+            ("npad", "2"), ("mov", "eax, esi")]
+    path = os.path.join(tempfile.mkdtemp(), "o.s")
+    open(path, "w").write("00000000 push 0x59aa9c\n00000005 imul esi, esi, 0x2c\n00000008 jmp 0xd\n0000000a lea ecx, [ecx]\n"
+                          "0000000d cmp edi, 3\n00000010 mov edi, edi\n00000012 mov eax, esi\n")
+    check("tsweep regdiff: symbol names, imul r, r, imm and alignment padding count as equal",
+          (tsweep.regdiff(ours, tsweep.orig_instrs(path)), tsweep.regdiff(ours[:3] + [("cmp", "esi, 3")] + ours[4:], tsweep.orig_instrs(path))),
+          (0, 2))
+
+
+regdiff_norm_tests()
 
 
 

@@ -12,9 +12,10 @@ first; read `docs/c2/tracer.md` for every tool's details. Every tool prints its 
 - Pass compiler flags literally after `--`: `-- /TP /MT /GS /EHsc /Gy`. In zsh a `$FLAGS` variable arrives as one
   argument and the compile silently uses the wrong flags.
 - `--func` takes a decorated name, a substring of one, `Class::method` or `::free_function`.
-- Traced 13.10 compiles go to a Windows compile server when one is configured (Mount & Blade's: it needs
-  `~/.config/mb-compile-token` and `-server`); the tool says so once per run. `C2TRACE_REMOTE=0` keeps them local,
-  for example when a brief says local only or the source must not leave the machine. Results are identical.
+- Traced compiles can run on a Windows compile server: `c2trace.py` sends them to the clients listed in
+  `~/.config/c2trace-remote` (see the comment above `REMOTE_CLIENTS` in tools/c2trace.py) and says so once per run.
+  `C2TRACE_REMOTE=0` keeps them local, for example when a brief says local only or the source must not leave the
+  machine. Without a configured client everything compiles locally.
 - Compiles are cached by content (source, includes, flags, compiler build). `CCACHE=0` bypasses the cache.
 - The original's disassembly (`orig.s`) is one instruction per line: `VA mnemonic operands`, capstone style.
 - Trust order: a byte comparison against the original, then a traced compile, then a model answer, then a doc
@@ -69,7 +70,11 @@ From `docs/c2/frontend.md`, `immcand.md`, `symkeys.md` and `x87.md`; each is an 
   walks its by-value parameter) is two more references to `n` and one more candidate in the block of the copy
   (`realize.py`, construct `copy`; docs/c2/realize.md).
 - A statement written at the head of both arms of an if/else instead of before it counts in the arms (it is
-  merged back after allocation; construct `headdup`).
+  merged back after allocation; construct `headdup`); the same at the tail (`taildup`), also making an `else`.
+- `if ((int)V & 1) S; else S;` around an existing statement S: one more reference to V there and none in the
+  code, also for `this` and read-only parameters (merged after allocation; 13.10 keeps the test when it reads
+  memory). Construct `eqif`; conditions in docs/c2/realize.md §0 rule 8. It is not what the original had, but it
+  gives the original's code (Mount & Blade `CharSheet::init_screen`).
 
 ## Pitfalls
 

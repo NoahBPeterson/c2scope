@@ -276,3 +276,98 @@ Original bytes from `spore-decomp/work/SporeApp.analysis.bin`. Flags `/O2 /MD /G
 - Spore: which external reference keeps FormatGetDepth and Initialize standard.
 - `rwsweep` / `helpersweep` find the target's definition by `?name@Class@@`, so a member of a namespaced class
   (`rw::graphics::Raster`) is not found (a limit of those tools, LTCG or not); helpersweep through c2ltcg was not run.
+
+## 11. `__usercall` / `__spoils` without LTCG: widberg/msvc8.0_patcher on cl 14.00.50727.42 (RTM) **[C]**
+
+[widberg/msvc8.0_patcher](https://github.com/widberg/msvc8.0_patcher) patches cl/c1/c1xx/c2 of VS2005 **RTM
+(14.00.50727.42)** so that IDA-style `__usercall`/`__userpurge` declarations state a function's register
+parameters and `__spoils` its kill set, i.e. the facts 2 and 3 of section 0 that LTCG derives from the callee's
+body. The front ends encode such a function as `__fastcall` plus a REGS_DATA blob (register list, flags, spoils
+mask in c2 register numbers: bit 1 eax .. bit 8 edi) whose pointer travels through the IL as one integer
+(c1's `lowrite`, c2's `loread`, same process). This section says where c2 implements the three facts for real
+flex params and how the patch reaches the same places; the patch changes are on a local branch
+`usercall-flex-spoils` of `work/scratch/widberg/msvc8.0_patcher`.
+
+**RTM symbols.** RTM's c2.dll has a public PDB: `c2.pdb/28855879633F4DE1A76943DE89CE3D1F1` (961,536 bytes, in
+`work/pdb/14.00.50727.42/`, git-ignored); `tools/pdbindex.py work/scratch/widberg/rtm/orig/c2.dll --pdb ... --out
+work/index/14.00.50727.42/c2.dll.csv` names every function, so nothing had to be matched. RTM was **not** added
+as a tracer build: the ground truth needs only untraced /GL compiles, and `c2ltcg.py asm` runs any toolchain
+directory through `VS8_ROOT` (`work/toolchain/rtm` = widberg/msvc8.0 `main` bin/ + our VS2005 headers and libs).
+Differences from SP1 that matter for patching: the pseudo-opcodes are SP1's minus 9 (OPREG 0x270 / 0x279,
+OPENTERLOAD 0x28c / 0x295, OPASM 0x2c5 / 0x2ce, OPSIDEEFFECT 0x2d0 / 0x2d9; RTM's name table is 0x10ce3fd8);
+RTM's sparse bit vectors have 32-bit chunks (node {base, bits, next}) where SP1's have 64 ({base, lo, hi, next});
+the structure offsets used below are the same.
+
+| what | RTM 14.00.50727.42 | SP1 14.00.50727.762 |
+|---|---|---|
+| `readsym`: fastcall SSR read, extra word (`loread`) | readsym+0x66c 10bb829c | readsym+0x696 10bbb536 |
+| `MdmAlloRegParams`: fastcall register table picked (callee params and call args) | +0x191 10c513b1 (table 10cdb930) | +0x1a2 10c56552 (10ce2b60) |
+| `MdmGenEpilog`: `ret N` byte count from SSR+0x44 | +0x70c 10c4e81c | +0x704 10c53974 |
+| `LoAddCallScratchRegs` 10c3a7a0 / 10c3f5f0: recorded set (local_14) taken, GPR loop starts | +0x155 10c3a8f5 (local_14 [esp+0x10], callee SSR [esp+0x18]) | +0x161 10c3f751 (local_14 in ebx, [esp+0x14]) |
+| the same, per-register test the published patch hooked | +0x1a5 10c3a945 | +0x186 10c3f776 |
+| `MdmFlexParams` entry (FUNC* at [esp+4]) | 10c54090 | 10c59460 |
+| `MdmAllocateFlexParam`: flex register's `_RegUsed` cleared | +0x1c5 10c54e05 | +0x1c5 10c5a1d5 |
+| `SaveCallees` (pushes `(RegAttrib & 3) == 1 && _RegUsed[r]`) | 10c504d0 | 10c55660 |
+| `_RegAttrib`, `_RegUsed` (dword arrays), `_fEBPisParam` | 10ce5598, 10d38a00, 10d077d8 | 10cec9c0, 10d40c40, 10d0f8f0 |
+
+**Item 1, register parameters treated as written.** Callers were already right (tests below: a caller keeps its
+values in ebx/esi/edi across a call that receives them, as under LTCG). The callee was wrong: a `__usercall`
+function saves every callee-saved register it receives a parameter in. The parameter's entry definition (an
+OPSIDEEFFECT with the register as destination) and the copy `mov r, r` that coalescing leaves make register
+allocation mark `_RegUsed[r]`, and SaveCallees pushes it. For a real flex param the same mark comes from the
+entry load, and `MdmAllocateFlexParam` clears `_RegUsed[r]` for a callee-saved register after MdmFlexParams has
+checked that nothing else in the function writes it (a destination seen twice puts it into its "multi-def" set).
+MdmFlexParams runs in `dop2_CodegenUpdate` after register allocation and before StkSetStackAlignment /
+MdmSaveAndRestoreCallees / MdmInsertEntryExit, only under `_Globopt_flag` (so not at /Od), and returns at once
+unless SSR+0xb4 is set (LTCG only). The fix hooks its entry: for a usercall function, each declared callee-saved
+register that no instruction writes except the first OPSIDEEFFECT and self-copies gets `_RegUsed[r] = 0`. Inline
+asm writes are not tuple destinations (a callee with `__asm mov esi, 1` lost its `push esi` until OPASM tuples
+were made to count as writing everything).
+
+**Item 2, `__spoils`.** LoAddCallScratchRegs takes the callee's recorded used set (CGNODE+0x60) only for a callee
+compiled earlier in the same module; otherwise local_14 = 0 and every volatile GPR, XMM and (with the default
+x87 mapping) GF register is killed. The published patch skipped GPRs in the first loop only, so x87/XMM values
+were still killed. The fix stores, per usercall function, a one-node bit vector of its spoils mask and hands it
+to LoAddCallScratchRegs as local_14 (both the [esp+0x10] slot the XMM and x87 loops read and the register the GPR
+loop uses). SP1 trace of the LTCG probe (`c2ltcg.py raw ... -H '@MscCollectUsedRegs@8=g10d123ac>0>0>4$/xeax>0#3'`):
+k_eaxecx's recorded set is `[0 6 0]` = {eax, ecx}, no FP register, which is exactly the synthetic set.
+
+**Item 3, out of band.** The published patch stored the REGS_DATA pointer at SSR+0x10, which is `SSR.sym`, the
+link to the current function's SYM (il_sym.md section 1): `SymMakeUserVar` creates a SYM only when that field is 0
+and SymReset/SymTerm write it. The fix keeps a table keyed by the SSR pointer (open addressing, 16384 entries,
+in the patch section), filled at the readsym hook for every fastcall SSR (so a stale entry at a reused address is
+overwritten) and read with a fastcall-cc check; the call side takes the callee SSR only for a direct call (target
+leaf kind 4). An indirect call through a `__usercall` pointer type used to ICE inside the patch (it read the
+target leaf's SYM as an SSR); it now compiles with the plain fastcall registers (the convention is not carried by
+the type: open). No miscompile caused by the SSR+0x10 overlap was reproduced (same-TU callee bodies, address
+taken, recursion, inline asm `call`).
+
+**Tests** (`tests/data/usercall/`, `uv run tools/usercall_check.py rtm-p0 --nospoils`, `... rtm-before
+rtm-after`; toolchains from `tools/wpatch.py`). Ground truth: the same callers with plain prototypes and the
+callee bodies, /GL + link /LTCG on RTM. Patched: the callers with `__usercall`/`__spoils` declarations, and the
+callee bodies with them, without /GL. Instructions compared with call targets and addresses masked.
+
+| function | what it checks | published msvc8.0p (no `__spoils`) | master 71bd7c2 | branch |
+|---|---|---|---|---|
+| c_ebx, c_ediesi, c_ebxesiedi | caller keeps args in ebx/esi/edi across the call | same | same | same |
+| c_eaxecx | caller keeps `a` in edx across a callee killing {eax, ecx} | different | same | same |
+| c_eax | caller keeps `b` in ecx across a callee killing {eax} | different | same | same |
+| c_ecx | caller keeps eax, edx across a void callee killing {ecx} | different | same | same |
+| c_x87 | caller keeps a double on the x87 stack across a callee killing {eax, ecx} | different | **different** (fstp/fld around the call) | same |
+| k_ebx, k_ediesi, k_ebxesiedi | callee receiving in ebx / edi, esi / ebx, esi, edi does not save them | different | **different** (push/pop) | same |
+
+`tests/data/usercall/edge_uc.c` (no ground truth) checks the saves that must stay: esi reused after the call
+(kept), `__asm mov esi, 1` (kept), a recursive callee that decrements its ebx parameter (ebx kept, esi dropped),
+an ebp parameter (no `push ebp`). The 40 compiles of `tests/data/*.c*` at /O2 and /Od give the same listings with
+the branch's compiler as with the original RTM one.
+
+**Not reproduced / open.** No LTCG probe gave a flex parameter in ebp (with five live values the parameter stays
+on the stack), so the README's ebp item has no ground truth here. A call to a `__usercall`/`__userpurge`
+**member** function ICEs in MdmAlloRegParams+0x380 (10c515a0, the sub-register search) with /Zi or /Z7, in the
+published binaries, master and the branch alike; a free function or the member's definition does not. Not
+analysed. `__spoils` of a callee-saved register has no effect (the kill operand holds volatile registers only).
+**Stack arguments of `__usercall` are not popped by anyone**: the epilog hook makes a `__usercall` callee return
+with `ret` (IDA's meaning: the caller cleans; the README's examples say the opposite), but the caller is still
+generated as for `__fastcall` and does not pop either (`int __usercall __ebx f(int a, int b)` called with b on the
+stack: `push; call f` and no `add esp, 4`; the same in the published binaries, master and the branch).
+`__userpurge` (`ret N`) is consistent.

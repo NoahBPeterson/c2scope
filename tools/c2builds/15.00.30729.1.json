@@ -18,6 +18,9 @@
   "sal": ""
  },
  "dll": {
+  "gdump": "1",
+  "grhash": "5125b9c0",
+  "gnew": "512582c8",
   "regname": "51040080",
   "opname": "5103eb78",
   "fename": "1"
@@ -513,6 +516,8 @@
    "read": "51118d60/xeax",
    "opt": "510fc5f0=g51258400>0>0>4$",
    "gc": "5113f200",
+   "hshwalk": "510ad6a0/xeax",
+   "hshasg": "510ae0d0/xeax",
    "pool": "5113dc40/xeax>4>0x1c",
    "getinl": "510b2a20=s1>4>0x28>0x18>4$,s1>4>0x14/xeax",
    "sort": "510e8a70=a0/xebx>4~5103eb78$,ebx>0x14,eax>8,eax>0x10,eax>0x18>0x1c,eax>0x28>8,eax>0x28>0x18>0x1c,eax>0>8,eax>0>0x10,eax>0>0x18>0x1c,eax>0>0x28>8,eax>0>0x28>0x18>0x1c",

@@ -22,13 +22,23 @@
   "iat_loadlibrarya": "166144"
  },
  "dll": {
+  "gdump": "1",
+  "gsbv32": "1",
+  "gloop": "a6",
+  "grhash": "108807b4",
+  "gnew": "10882154",
+  "gspb": "16",
+  "gsps": "18",
+  "gspl": "1c",
+  "gloopp": "9c",
   "regname": "10867e40",
   "opname": "10874360",
   "opcount": "24a",
   "blk": "18",
   "len": "16",
   "mem": "2c",
-  "fename": "1"
+  "fename": "1",
+  "fpdump": "1"
  },
  "functions": {
   "@FPSpillWorthless@12": [
@@ -450,6 +460,18 @@
    16,
    "high",
    "6030 match (3052); fpcolor probes check"
+  ],
+  "@ColMakeSplitPoint@16": [
+   "aca0e",
+   16,
+   "high",
+   "6030 match (3052); fpcolor2 hooks check"
+  ],
+  "@FPMakeSplitPoint@8": [
+   "1232f8",
+   16,
+   "high",
+   "6030 match (3052); fpcolor2 hooks check"
   ]
  },
  "probes": {
@@ -565,6 +587,8 @@
    "read": "10776d16/xeax",
    "opt": "10774580=g10881d70>0>0>4$",
    "gc": "10773dac",
+   "hshwalk": "107a556f/xeax",
+   "hshasg": "1076f051/xeax",
    "pool": "1076cfcb/xeax>4>0x1c",
    "getinl": "1078e567=s1>4>0x28>0x18>4$,s1>4>0x14/xeax",
    "sort": "10792193=a0,eax>0x10,eax>8,eax>0x34>0x18>0x1c,eax>0x30,eax>0>0x10,eax>0>8,eax>0>0x34>0x18>0x1c,eax>0>0x30,eax>0x28>0>0x34>0x18>0x1c,eax>0>0x28>0>0x34>0x18>0x1c/xedi>4,edi>0x14,eax>8,eax>0x10,eax>0x18>0x1c,eax>0x28>8,eax>0x28>0x18>0x1c,eax>0>8,eax>0>0x10,eax>0>0x18>0x1c,eax>0>0x28>8,eax>0>0x28>0x18>0x1c",
@@ -697,15 +721,17 @@
    "10711946=edi,edi>0x1c,edi>0xc,edi>0x40,edi>0x44,edi>0x24,ebp,edi>0>0>4$,edi>0>0x1c,edi>0>4",
    "@FPSpillcosts@8",
    "@FPRemoveSplitGlobregs@8=eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8,eax>0>4>4>0,eax>0>4>4>8,eax>0>4>4>4>0,eax>0>4>4>4>8",
-   "@FPCheckColorability@12=s2,s2>0x1c/xeax",
+   "@FPCheckColorability@12=s2,s2>0x1c,g10881d70>0>8>0>0x1c&/xeax",
    "@InsertColoredLifetimeEndSplit@16=s1,s1>0x14,s2>0x1c,s3,s3>0x1c,s3>0>0>4$,s3>0>0x1c,s3>0>4/xeax",
    "@SplitAtMismatchedFlowJoinPoints@8=/xeax",
    "@SplitAtPostDefEndPoints@8=/xeax",
    "@CanExtendLifetime@16=/xeax",
    "@FPUpdateRegisterPressure@16=/xeax,eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8",
-   "@FPInitialRegPressure@8=/xeax,eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8",
+   "@FPInitialRegPressure@8=g10881d70>0>8>0>0x1c&/xeax,eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8",
    "1070e2cc=ecx,ecx>0x1c,ecx>0>0>4$,ecx>0>0x1c,ecx>0>4",
-   "1070e28e=esi,esi>0x1c,esi>0>0>4$,esi>0>0x1c,esi>0>4"
+   "1070e28e=esi,esi>0x1c,esi>0>0>4$,esi>0>0x1c,esi>0>4",
+   "@ColMakeSplitPoint@16=ecx,ecx>4,ecx>0x14,eax,s2>0>0,s2>0>8,s2>0>4>0,s2>0>4>8",
+   "@FPMakeSplitPoint@8=ecx,ecx>4,ecx>0x14,s1>0>0,s1>0>8,s1>0>4>0,s1>0>4>8"
   ]
  },
  "opnames": {
