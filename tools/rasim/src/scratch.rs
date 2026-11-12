@@ -24,6 +24,12 @@
 //!   nopref:N        pick N has no preferred register (so it rotates)
 //!   pref:N:REG      pick N prefers REG (as a copy from / lea of that register would)
 //! N is a pick number of the chosen run (default: the body, the run with the most picks).
+//!
+//!   rasim scratch SNAP --target T.json [--top K] [EDIT...]
+//!                   re-alignment scan (written by `c2trace.py scratch --phase ORIG.s`): T gives the original's
+//!                   register for picks read off its disassembly and a group (switch case or block) per pick; every
+//!                   single drop:N / ins:N (on top of the EDITs) is replayed and ranked by how many groups end up
+//!                   with every known pick on the original's register (gained minus lost)
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -265,13 +271,23 @@ pub fn main(args: &[String]) {
     let text = std::fs::read_to_string(&args[0]).unwrap_or_else(|e| crate::die(&format!("{}: {}", args[0], e)));
     let s: Snap = serde_json::from_str(&text).unwrap_or_else(|e| crate::die(&format!("{}: not a scratch snapshot (c2trace.py scratch --export): {}", args[0], e)));
     let (mut run, mut verbose, mut edits) = (None, false, vec![]);
+    let (mut target, mut top) = (None, 25usize);
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--run" => run = it.next().and_then(|x| x.parse::<usize>().ok()),
             "-v" => verbose = true,
+            "--target" => target = it.next().cloned(),
+            "--top" => top = it.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(25),
             _ => edits.push(parse_edit(a)),
         }
+    }
+    if let Some(t) = target {
+        let k = run.map(|k| k.saturating_sub(1)).unwrap_or_else(|| s.runs.iter().position(|r| r.body).unwrap_or(0));
+        if k >= s.runs.len() {
+            crate::die("no such run");
+        }
+        return scan(&s, k, &t, &edits, top);
     }
     if edits.is_empty() {
         check(&s, run, verbose);
@@ -397,4 +413,322 @@ fn whatif(s: &Snap, k: usize, edits: &[Edit]) {
         if end == tend { " (as traced)".to_string() } else { format!(" (traced {})", SCR[tend]) }
     );
     println!("offsets are listing offsets of the traced compile; an edit that changes code size moves them");
+}
+
+
+// ---------------------------------------------------------------- re-alignment scan (--target)
+
+const ALL: [&str; 7] = ["eax", "ecx", "edx", "esi", "edi", "ebx", "ebp"];
+
+fn ri(r: &str) -> u8 {
+    ALL.iter().position(|x| *x == r).map_or(7, |k| k as u8)
+}
+
+/// A pick with its inputs as small integers, for replaying thousands of edits.
+struct FP {
+    int: bool,
+    tmp: u32,
+    phys: u8,
+    live: Vec<(u8, u32)>,
+    conf: u8,
+    avail: u8,
+    pref: Option<u8>,
+    pref_src: Option<u32>,
+    spill: bool,
+    reg: u8,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Occ {
+    Phys,
+    Tmp(u32),
+    New,
+}
+
+#[derive(Clone, Default)]
+struct FEdits {
+    drop: Vec<bool>,
+    ins: Vec<Vec<usize>>,
+    nopref: Vec<bool>,
+    pref: Vec<Option<u8>>,
+}
+
+fn fast_picks(run: &Run) -> (Vec<FP>, usize) {
+    let mut ids: HashMap<String, u32> = HashMap::new();
+    let mut id = |t: &str| -> u32 {
+        let n = ids.len() as u32;
+        *ids.entry(t.to_string()).or_insert(n)
+    };
+    let mask = |v: &[String]| v.iter().fold(0u8, |m, r| { let k = ri(r); if k < 7 { m | 1 << k } else { m } });
+    let mut out = vec![];
+    for p in &run.picks {
+        let mut phys = 0u8;
+        let mut live = vec![];
+        for (r, o) in &p.busy {
+            let k = ri(r);
+            if o == "phys" {
+                if k < 7 {
+                    phys |= 1 << k;
+                }
+            } else if k < 7 {
+                live.push((k, id(o)));
+            }
+        }
+        out.push(FP {
+            int: p.cls == "int",
+            tmp: id(&p.tmp),
+            phys,
+            live,
+            conf: p.conf.as_ref().map_or(0, |c| mask(c)),
+            avail: mask(&p.avail),
+            pref: p.pref.as_deref().map(ri).filter(|k| *k < 7),
+            pref_src: p.pref_src.as_deref().map(|t| id(t)),
+            spill: p.spill,
+            reg: ri(&p.reg),
+        });
+    }
+    let n = ids.len();
+    (out, n)
+}
+
+/// One RegAssign, as `assign`: -> (register, cursor after, modelled).
+fn fassign(p: &FP, pref: Option<u8>, occ: &[Option<Occ>; 8], conf: u8, cur: u8, speed: bool) -> (u8, u8, bool) {
+    let free = |r: u8| occ[r as usize].is_none() && conf & (1 << r) == 0;
+    if let Some(r) = pref {
+        if free(r) && p.avail & (1 << r) != 0 {
+            return (r, cur, true);
+        }
+    }
+    if speed {
+        for k in 0..3u8 {
+            let r = (cur + k) % 3;
+            if free(r) {
+                return (r, (cur + k + 1) % 3, true);
+            }
+        }
+    }
+    let mut n = 5u8;
+    if p.avail & (1 << 5) != 0 {
+        n = 6;
+        if p.avail & (1 << 6) != 0 {
+            n = 7;
+        }
+    }
+    for r in 0..n {
+        if free(r) {
+            return (r, cur, true);
+        }
+    }
+    (p.reg, cur, false)
+}
+
+/// `replay` without resync, on FPs: the register each pick gets (255 for a dropped pick).
+fn freplay(ps: &[FP], ntmp: usize, e: &FEdits, speed: bool) -> Vec<u8> {
+    let mut cur = 0u8;
+    let mut place = vec![255u8; ntmp];
+    let mut dropped = vec![false; ntmp];
+    let mut extra: Vec<(u8, usize)> = vec![];
+    let mut out = Vec::with_capacity(ps.len());
+    let busy = |p: &FP, place: &[u8], dropped: &[bool], extra: &[(u8, usize)]| -> [Option<Occ>; 8] {
+        let mut occ = [None; 8];
+        for r in 0..7 {
+            if p.phys & (1 << r) != 0 {
+                occ[r] = Some(Occ::Phys);
+            }
+        }
+        for &(r, o) in &p.live {
+            if dropped[o as usize] {
+                continue;
+            }
+            let at = if place[o as usize] < 7 { place[o as usize] } else { r } as usize;
+            if occ[at] != Some(Occ::Phys) {
+                occ[at] = Some(Occ::Tmp(o));
+            }
+        }
+        for &(r, _) in extra {
+            if occ[r as usize].is_none() {
+                occ[r as usize] = Some(Occ::New);
+            }
+        }
+        for x in occ.iter_mut() {
+            if *x == Some(Occ::Tmp(p.tmp)) {
+                *x = None;
+            }
+        }
+        occ
+    };
+    let age = |extra: &mut Vec<(u8, usize)>| {
+        for x in extra.iter_mut() {
+            x.1 = x.1.saturating_sub(1);
+        }
+        extra.retain(|x| x.1 > 0);
+    };
+    for (i, p) in ps.iter().enumerate() {
+        for &life in &e.ins[i] {
+            let occ = busy(p, &place, &dropped, &extra);
+            let g = FP { int: true, tmp: u32::MAX, phys: 0, live: vec![], conf: 0, avail: p.avail, pref: None, pref_src: None, spill: false, reg: p.reg };
+            let (r, c2, _) = fassign(&g, None, &occ, 0, cur, speed);
+            cur = c2;
+            if life > 0 {
+                extra.push((r, life));
+            }
+        }
+        if e.drop[i] {
+            dropped[p.tmp as usize] = true;
+            place[p.tmp as usize] = 255;
+            out.push(255);
+            continue;
+        }
+        if !p.int {
+            out.push(p.reg);
+            age(&mut extra);
+            continue;
+        }
+        let occ = busy(p, &place, &dropped, &extra);
+        let mut pref = p.pref;
+        if let Some(t) = p.pref_src {
+            pref = if dropped[t as usize] { None } else if place[t as usize] < 7 { Some(place[t as usize]) } else { pref };
+        }
+        if e.nopref[i] {
+            pref = None;
+        }
+        if let Some(r) = e.pref[i] {
+            pref = Some(r);
+        }
+        let (r, c2, _) = fassign(p, pref, &occ, p.conf, cur, speed);
+        let _ = p.spill;
+        out.push(r);
+        place[p.tmp as usize] = r;
+        cur = c2;
+        age(&mut extra);
+    }
+    out
+}
+
+#[derive(Deserialize)]
+struct Target {
+    /// [pick n, register the original has there]
+    want: Vec<(usize, String)>,
+    /// [pick n, group index]
+    group: Vec<(usize, usize)>,
+    groups: Vec<String>,
+    /// pick numbers to try edits at (default: every integer pick)
+    #[serde(default)]
+    cands: Option<Vec<usize>>,
+}
+
+fn scan(s: &Snap, k: usize, path: &str, given: &[Edit], top: usize) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| crate::die(&format!("{}: {}", path, e)));
+    let t: Target = serde_json::from_str(&text).unwrap_or_else(|e| crate::die(&format!("{}: {}", path, e)));
+    let run = &s.runs[k];
+    let speed = run.speed.unwrap_or(1) != 0;
+    let (ps, ntmp) = fast_picks(run);
+    let np = ps.len();
+    let pos: HashMap<usize, usize> = run.picks.iter().enumerate().map(|(i, p)| (p.n, i)).collect();
+    let at = |n: usize| -> usize { *pos.get(&n).unwrap_or_else(|| crate::die(&format!("run {} has no pick {}", k + 1, n))) };
+    let mut base_e = FEdits { drop: vec![false; np], ins: vec![vec![]; np], nopref: vec![false; np], pref: vec![None; np] };
+    for e in given {
+        match e {
+            Edit::Drop(n) => base_e.drop[at(*n)] = true,
+            Edit::Ins(n, l) => base_e.ins[at(*n)].push(*l),
+            Edit::NoPref(n) => base_e.nopref[at(*n)] = true,
+            Edit::Pref(n, r) => base_e.pref[at(*n)] = Some(ri(r)),
+        }
+    }
+    // the fast replay must agree with the reference one (replay) before any answer is trusted
+    let slow = replay(run, given, false);
+    let fast0 = freplay(&ps, ntmp, &base_e, speed);
+    let slow_regs: Vec<u8> = {
+        let by: HashMap<usize, &Out> = slow.iter().filter(|o| o.n > 0).map(|o| (o.n, o)).collect();
+        run.picks.iter().map(|p| by.get(&p.n).map_or(255, |o| ri(&o.reg))).collect()
+    };
+    let disagree = fast0.iter().zip(&slow_regs).filter(|(a, b)| a != b).count();
+    let want: Vec<(usize, u8)> = t.want.iter().filter_map(|(n, r)| pos.get(n).map(|i| (*i, ri(r)))).collect();
+    let mut grp = vec![usize::MAX; np];
+    for (n, g) in &t.group {
+        if let Some(i) = pos.get(n) {
+            grp[*i] = *g;
+        }
+    }
+    let ng = t.groups.len();
+    let mut nwant = vec![0usize; ng];
+    for (i, _) in &want {
+        if grp[*i] < ng {
+            nwant[grp[*i]] += 1;
+        }
+    }
+    let exact = |regs: &[u8]| -> (Vec<bool>, usize) {
+        let mut bad = vec![false; ng];
+        let mut hit = 0;
+        for (i, r) in &want {
+            let ok = regs[*i] == 255 || regs[*i] == *r;
+            if ok {
+                hit += 1;
+            } else if grp[*i] < ng {
+                bad[grp[*i]] = true;
+            }
+        }
+        ((0..ng).map(|g| nwant[g] > 0 && !bad[g]).collect(), hit)
+    };
+    let (ex0, hit0) = exact(&fast0);
+    let nex0 = ex0.iter().filter(|x| **x).count();
+    let ngw = nwant.iter().filter(|x| **x > 0).count();
+    println!("{} run {}: re-alignment scan, {} picks, {} with the original's register known, {} groups with known picks",
+             s.func, k + 1, np, want.len(), ngw);
+    if disagree > 0 {
+        println!("warning: the fast replay differs from the reference replay at {} picks: answers are unreliable", disagree);
+    }
+    let bad = slow.iter().zip(&run.picks).filter(|(o, p)| p.cls == "int" && (o.reg != p.reg || !o.modelled)).count();
+    if bad > 0 && given.is_empty() {
+        println!("warning: the model misses {} traced picks without any edit (rasim scratch SNAP)", bad);
+    }
+    println!("baseline: {} of {} known picks on the original's register; {} of {} groups exact", hit0, want.len(), nex0, ngw);
+    let cands: Vec<usize> = match &t.cands {
+        Some(c) => c.iter().filter_map(|n| pos.get(n).copied()).collect(),
+        None => (0..np).filter(|i| ps[*i].int).collect(),
+    };
+    let mut res = vec![];
+    for &i in &cands {
+        for kind in 0..2 {
+            if kind == 0 && (base_e.drop[i] || !ps[i].int) {
+                continue;
+            }
+            let mut e = base_e.clone();
+            if kind == 0 {
+                e.drop[i] = true;
+            } else {
+                e.ins[i].push(0);
+            }
+            let regs = freplay(&ps, ntmp, &e, speed);
+            let (ex, hit) = exact(&regs);
+            let gained: Vec<usize> = (0..ng).filter(|g| ex[*g] && !ex0[*g]).collect();
+            let lost: Vec<usize> = (0..ng).filter(|g| !ex[*g] && ex0[*g]).collect();
+            if gained.is_empty() && lost.is_empty() && hit == hit0 {
+                continue;
+            }
+            let moved = regs.iter().zip(&fast0).filter(|(a, b)| a != b).count();
+            res.push((gained.len() as i64 - lost.len() as i64, hit as i64 - hit0 as i64, i, kind, gained, lost, moved));
+        }
+    }
+    res.sort_by(|a, b| b.0.cmp(&a.0).then(a.5.len().cmp(&b.5.len())).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    println!("{} single edits tried; {} change a known pick; best (groups gained - lost, then picks):", cands.len() * 2, res.len());
+    let names = |v: &[usize]| -> String {
+        let mut s: Vec<String> = v.iter().take(8).map(|g| t.groups[*g].clone()).collect();
+        if v.len() > 8 {
+            s.push(format!("... {} more", v.len() - 8));
+        }
+        s.join(", ")
+    };
+    for (net, dh, i, kind, gained, lost, moved) in res.iter().take(top) {
+        let p = &run.picks[*i];
+        let g = if grp[*i] < ng { t.groups[grp[*i]].clone() } else { "-".into() };
+        println!("edit {}:{} group {} {}  net {:+}  gains {} loses {}  picks {:+} ({} picks change)",
+                 if *kind == 0 { "drop" } else { "ins" }, p.n, g, off(p), net, gained.len(), lost.len(), dh, moved);
+        if !gained.is_empty() {
+            println!("    gains: {}", names(gained));
+        }
+        if !lost.is_empty() {
+            println!("    loses: {}", names(lost));
+        }
+    }
 }

@@ -4,8 +4,12 @@
 usage: c2trace.py install                      build c2trace.dll and patch the traced toolchain copy's c2.dll
        c2trace.py il <src> --func S [--at P,P] [--grep RE | --count RE] [-- <cl args>]   IL dump at passes (c2il.py)
        c2trace.py il <src> --func S --diff PASS_A,PASS_B [-- <cl args>]   what the passes between A and B changed
+       c2trace.py merges <src> --func S [--pairs] [-- <cl args>]   every tail/head merge and why each pair stopped
+                                     (also `il --merges`; tools/c2merges.py)
        c2trace.py scratch <src> --func S [-- <cl args>]   scratch-register picks -> listing offsets (c2scratch.py)
        c2trace.py regs <src> [--func S] [--why a,b] [-- <cl args>]   register-allocation report (tools/c2regs.py)
+       c2trace.py slots <src> --func S [--what EDIT..] [--orig ORIG.s] [--search] [-- <cl args>]   stack-slot packing:
+                                     colours, elements, replay model, what-if (tools/c2slots.py)
        c2trace.py regmap <src> --func S --asm-vs ORIG.s --asm-func DEC [-- <cl args>]   which register each variable
                                      should have, read off the original's code (tools/regmap.py)
        c2trace.py [options] <src.c> [-- <extra cl args>]
@@ -33,6 +37,7 @@ so the traced copy compiles exactly like the original.
 """
 import argparse, os, re, shutil, struct, subprocess, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import time
 import capstone
 import c2build                # takes --c2 BUILD out of sys.argv; C2_BUILD selects a non-default c2 (port-1310.md)
 from image import Image, ROOT
@@ -71,7 +76,8 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
  *   ilmax <n>     cap on tuples per '%' IL dump (default 2000000; env C2TRACE_ILMAX on the Python side)
  *   set <name> <hex>  another c2 build (tools/c2build.py): base = preferred image base, regname / opname = the
  *                 _RegName / _TupOpcodeName tables, opcount = entries in the latter, blk / len / mem = tuple layout
- *                 (extended dump only: ext / labtup / brcc / ehop / ulabop, see dumpilx)
+ *                 (extended dump only: ext / labtup / brcc / ehop / ulabop, see dumpilx); fename 1 = the plain dump
+ *                 prints a CODEADDR leaf (call target) by the front-end name at sym+4 (13.10; logs "# fename 1")
  *   op <hex> <name>   name of an opcode the build's own table lacks (after `set opcount`)
  * spec := base { '>' off } [ '#' n ]
  *   base: eax ecx edx ebx esp ebp esi edi | sN (stack word N at entry: s0 = return address, s1 = first stack arg)
@@ -89,6 +95,7 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #define MAXHOOK 128
 #define MAXSPEC 12
@@ -187,6 +194,17 @@ static void symname(DWORD x) {
     if (rd(x) && rstr(rd(rd(x) + 4), c, sizeof c)) out("%s", c);
     else out("%c%d", k == 3 ? 't' : k == 0xd ? 'k' : 's', rd(x + 0x1c));
 }
+static int FENAME = 0;         /* `set fename 1` (13.10): CODEADDR leaves print the front-end symbol's name at sym+4 */
+static int cdname(DWORD s) {   /* a call / tail-jump target: its symbol is the front end's, name pointer at +4 ([sym+0]
+                                * is not a name record there: 13.10 printed another symbol's name or s0) */
+    char c[80]; DWORD p, t;
+    if (!s) return 0;
+    t = rd(s + 0x33);
+    if (t && rb(t + 8) == 27) return 0;                 /* a label (branch target): keep the old text */
+    p = rd(s + 4);
+    if (!p || !rstr(p, c, sizeof c) || !(c[0] == '_' || c[0] == '?' || c[0] == '@' || isalpha((BYTE)c[0]))) return 0;
+    out("%s", c); return 1;
+}
 static void leaf(DWORD l) {
     BYTE k = rb(l + 8);
     DWORD a, b;
@@ -194,7 +212,8 @@ static void leaf(DWORD l) {
     case 1: a = rd(l + 0x18); b = rd(l + 0x1c);
             if (b && b != a && rb(b + 4) == 1) { symname(b); out("="); }
             symname(a); break;
-    case 2: case 3: case 4: symname(rd(l + 0x18)); break;
+    case 4: if (FENAME && cdname(rd(l + 0x18))) break;  /* fall through */
+    case 2: case 3: symname(rd(l + 0x18)); break;
     case 7: out("%d", rd(l + 0x18)); break;
     case 9: out("fconst"); break;
     case 5: case 6:
@@ -419,6 +438,7 @@ static void setvar(const char *nm, DWORD v) {
     else if (!strcmp(nm, "brcc")) LBRCC = (int)v;
     else if (!strcmp(nm, "ehop")) OPEH = v;
     else if (!strcmp(nm, "ulabop")) OPULAB = v;
+    else if (!strcmp(nm, "fename")) { FENAME = (int)v; out("# fename %d\n", FENAME); }  /* marker: this DLL knows it */
 }
 
 static void install(BYTE *base) {
@@ -556,13 +576,20 @@ def patch_c2(data):
     return bytes(data)
 
 
+def _replace(path, data):
+    """Write a file by rename, so a compile that has the old one mapped (another agent's, under wine) keeps it."""
+    tmp = path + ".new%d" % os.getpid()
+    open(tmp, "wb").write(data)
+    os.replace(tmp, path)
+
+
 def install():
     if not os.path.isdir(TRACE):
         sys.exit("missing %s: cp -RL work/toolchain/vs2005 work/toolchain/vs2005-trace" % TRACE)
     orig = open(ORIG_C2, "rb").read()
     if c2build.table() and c2build.sha256(ORIG_C2) != c2build.get("c2_sha256"):
         sys.exit("%s is not c2.dll %s" % (ORIG_C2, c2build.get("version")))
-    open(os.path.join(TBIN, "c2.dll"), "wb").write(patch_c2(orig))
+    _replace(os.path.join(TBIN, "c2.dll"), patch_c2(orig))
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "c2trace.c")
         open(src, "w").write(DLL_SRC)
@@ -570,7 +597,7 @@ def install():
                             "/Fe" + os.path.join(d, "c2trace.dll")], trace=False)
         if rc:
             sys.exit(out)
-        shutil.copy(os.path.join(d, "c2trace.dll"), os.path.join(TBIN, "c2trace.dll"))
+        _replace(os.path.join(TBIN, "c2trace.dll"), open(os.path.join(d, "c2trace.dll"), "rb").read())
     print("patched %s (entry -> cave at rva %x), built %s" % (os.path.join(TBIN, "c2.dll"), CAVE_RVA,
                                                              os.path.join(TBIN, "c2trace.dll")))
 
@@ -583,6 +610,69 @@ def run_tool(args, trace=True, extra_env=None):
     p = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "msvc.py")] + args, env=e,
                        stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
     return p.returncode, p.stdout + p.stderr
+
+
+# A compile server on a Windows machine, used for every traced compile when it is reachable (C2TRACE_REMOTE=0 turns it
+# off, C2TRACE_REMOTE=PATH names another client). Mount & Blade's client: it needs ~/.config/mb-compile-token and
+# -server, and the traced compiler directories installed on the server (D:\\mb\\rc\\tc\\<trace directory's name>).
+REMOTE_DEFAULT = os.path.join(os.path.dirname(ROOT), "mountandblade-decomp", "tools", "remote", "rcl.py") \
+    if os.path.isfile(os.path.expanduser("~/.config/mb-compile-token")) else ""   # 13.10 builds only (run_remote)
+
+
+def run_remote(args, cfg, log):
+    """The traced compile on a Windows machine instead of under wine, or None to compile here.
+
+    C2TRACE_REMOTE names the client of a compile server that has this traced compiler installed (for Mount & Blade:
+    ../mountandblade-decomp/tools/remote/rcl.py, whose server holds D:\\mb\\rc\\tc\\<the trace directory's name>). The
+    client ships the source, the headers it reaches and the hook list, and writes the listing, object and trace log
+    back to the paths asked for. It exits 75 (busy or unreachable) or 76 (cannot run there: /Zi, a header it could not
+    ship, an anonymous namespace, a compiler the server lacks); both mean compile here."""
+    client = os.environ.get("C2TRACE_REMOTE", REMOTE_DEFAULT)
+    if os.environ.get("C2TRACE_REMOTE") == "0":
+        return None
+    if not client or not os.path.isfile(client) or any(a in ("/Zi", "/ZI", "/Z7") for a in args):
+        return None
+    if any(a[:3].upper() == "/GL" for a in args):
+        return None                                    # /GL objects belong to the local link (c2ltcg)
+    if not c2build.name().startswith("13.10"):
+        return None                                    # the server's INCLUDE holds 13.10 headers only (shipping another
+                                                       # build's headers with /X /I made every compile time out)
+    # not msvc.winpath: it resolves symlinks, and the client tells a toolchain header (already on the server) from a
+    # file to ship by the path as written
+    wp = lambda q: "Z:" + os.path.abspath(q).replace("/", "\\")
+    w = []
+    for a in args:
+        if a[:3] in ("/Fd", "-Fd"):
+            continue                                   # only /Zi writes a PDB, and /Zi compiles stay here
+        if a[:2] in ("/I", "-I") and len(a) > 2 and a[2] != "{":
+            a = "/I" + wp(a[2:])
+        elif a[:3] in ("/Fa", "/Fo") and len(a) > 3:
+            a = a[:3] + wp(a[3:])
+        elif a[:1] not in "/-" or os.path.isfile(a):   # a source: an absolute path here starts with "/" like an option
+            a = wp(a)
+        if a[:2] == "/E" and a not in ("/E", "/EP"):
+            a = "-" + a[1:]                            # the client reads every /E... as "preprocess": -EHsc is the same option
+        w.append(a)
+    e = dict(os.environ, MB_RC_TC=os.path.basename(TRACE), MB_RC_TRACE_CFG=cfg, MB_RC_TRACE_LOG=log)
+    for attempt in range(40):                          # 75: every slot there is taken (or a connect timed out); wait, a
+        p = subprocess.run([sys.executable, client] + w, env=e, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           errors="replace")           # compile there is far cheaper than one more wine process here
+        if p.returncode != 75:
+            break
+        time.sleep(0.5 + 0.1 * attempt)
+    if p.returncode in (75, 76) or not os.path.exists(log):
+        if os.environ.get("C2TRACE_REMOTE_DEBUG"):
+            sys.stderr.write("c2trace: remote compile declined (%d), compiling here\n%s" % (
+                p.returncode, (p.stdout + p.stderr)[-1500:]))
+        return None
+    if not _REMOTE_SAID:
+        _REMOTE_SAID.append(1)
+        sys.stderr.write("c2trace: traced 13.10 compiles run on the remote compile server (%s); C2TRACE_REMOTE=0 keeps "
+                         "them local\n" % os.path.basename(client))
+    return p.returncode, p.stdout + p.stderr
+
+
+_REMOTE_SAID = []
 
 
 def steal_len(img, va):
@@ -769,8 +859,20 @@ def listing_proc(text, func):
     raise KeyError("%s PROC not in the listing" % func)
 
 
+def split_cl(argv):
+    """(tool arguments, cl arguments): everything after the first `--` is passed to cl untouched, so the tool's own
+    options may come anywhere before it (before or after the source path)."""
+    if "--" in argv:
+        k = argv.index("--")
+        return argv[:k], argv[k + 1:]
+    return argv, []
+
+
 def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=False):
-    """Compile src with the traced c2; returns (img, hooks, rc, cl output, raw log text)."""
+    """Compile src with the traced c2; returns (img, hooks, rc, cl output, raw log text).
+    Relative `src` and `keep` paths are taken against the caller's cwd (resolved here, before anything runs elsewhere)."""
+    src = os.path.abspath(src)
+    keep = os.path.abspath(keep) if keep else keep
     if open(os.path.join(TBIN, "c2.dll"), "rb").read() == open(ORIG_C2, "rb").read() or \
             not os.path.exists(os.path.join(TBIN, "c2trace.dll")):
         sys.exit("traced toolchain not installed: uv run tools/c2trace.py install")
@@ -797,7 +899,8 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
                 shutil.copy(os.path.join(hit, name), dst)
         rc, out = info["rc"], info["out"]
     else:
-        rc, out = run_tool(args, extra_env={"C2TRACE_CFG": msvc.winpath(cfg), "C2TRACE_LOG": msvc.winpath(log)})
+        rc, out = run_remote(args, cfg, log) or \
+            run_tool(args, extra_env={"C2TRACE_CFG": msvc.winpath(cfg), "C2TRACE_LOG": msvc.winpath(log)})
         if os.path.exists(log):
             ccache.put(k, {"log": log, "asm": asm, "obj": obj}, {"rc": rc, "out": out, "src": os.path.abspath(src)})
     if not os.path.exists(log):
@@ -805,6 +908,10 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
         sys.exit("no log: the compile failed before c2 ran (cl rc %d)" % rc if rc else
                  "no log written: c2trace.dll did not load or C2TRACE_* did not reach wine")
     text = open(log, errors="replace").read()
+    if "\nset fename 1" in "\n" + open(cfg).read() and "# fename 1" not in text[:4096]:
+        sys.stderr.write("c2trace: the c2trace.dll that ran this compile predates `set fename` (a compile server's copy: "
+                         "redeploy %s there, or C2TRACE_REMOTE=0): call-target names in the plain IL dump are the old, "
+                         "wrong ones\n" % TBIN)
     if keep:
         if not quiet:
             print("# kept %s" % d)
@@ -819,6 +926,9 @@ def main():
     if sys.argv[1:2] == ["scratch"]:
         import c2scratch
         return c2scratch.main(sys.argv[2:])
+    if sys.argv[1:2] == ["merges"] or sys.argv[1:2] == ["il"] and "--merges" in split_cl(sys.argv[2:])[0]:
+        import c2merges
+        return c2merges.main(sys.argv[2:])
     if sys.argv[1:2] == ["il"]:
         import c2il
         return c2il.main(sys.argv[2:])
@@ -828,6 +938,9 @@ def main():
     if sys.argv[1:2] == ["regs"]:
         import c2regs
         return c2regs.main(sys.argv[2:])
+    if sys.argv[1:2] == ["slots"]:
+        import c2slots
+        return c2slots.main(sys.argv[2:])
     ap = argparse.ArgumentParser(usage=__doc__.replace("%", "%%"))   # argparse %-formats the usage text
     ap.add_argument("-H", "--hook", action="append", default=[])
     ap.add_argument("--exit", action="store_true")
@@ -835,9 +948,10 @@ def main():
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--keep")
     ap.add_argument("src")
-    ap.add_argument("cl", nargs="*")
-    a = ap.parse_args()
-    img, hooks, rc, out, text = run_trace(a.src, a.hook or DEFAULT_HOOKS, a.cl, a.max, a.keep, a.exit)
+    ap.add_argument("cl", nargs="*")     # cl arguments without `--` (c2ltcg.py raw passes them so)
+    argv, cl = split_cl(sys.argv[1:])    # options anywhere before `--`; everything after it goes to cl unchanged
+    a = ap.parse_args(argv)
+    img, hooks, rc, out, text = run_trace(a.src, a.hook or DEFAULT_HOOKS, a.cl + cl, a.max, a.keep, a.exit)
     sys.stdout.write(out)
     sys.stdout.write(decode(text, hooks, a.raw))
     return rc

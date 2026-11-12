@@ -47,6 +47,11 @@ Read docs/c2/il.md first. It covers BLOCK, TUPLE and the pipeline. Register allo
    such values (3.6.2). A value with fewer than two references never gets a register (3.6.7). `rasim check
    --predict` makes each of these decisions as c2 does on every traced function so far (3.6.8); what the pieces
    of a cut look like is still taken from the trace. **[C]**
+8. **A dword of an address-taken local or a global is read into a register web only when two references share
+   one reload** (between its load and the next instruction that may write it). With one reference, the copy
+   `int t = (int)params[2];` loads t straight from memory; with a second read in that stretch (the optimizer
+   copy-propagates the dword into t's uses before the next call) you get `mov eax,[mem]; mov esi,eax`.
+   `CmdSubstDef` plays no part (3.6.10, `rasim fold`). **[C]**
 
 ---
 
@@ -524,7 +529,8 @@ Webs that were queued and not split keep their priority and benefit (they are no
 
 #### 3.6.7 `SpillObvious` 10b11560 **[C]**
 
-For every new web, in ascending web number:
+For every new web, in ascending web number. "New" includes the first Spillcosts pass of a class: SpillObvious then
+looks at every web of the class, not only at split pieces (`so` events at pass 1 in every trace of 3.6.10). **[C trace]**
 
 - `nrefs < 2` and (`benefit <= 0`, or `lastDef` exists and is not an OPENTERLOAD): `Spill`.
   **[C: the test gives c2's answer for all 4,378 new webs of the validation set and 5,085 of the sweep, 3.6.8]**
@@ -532,6 +538,7 @@ For every new web, in ascending web number:
   (a symbol or an indirection), the next instruction is the use, `CmdCanDirectSubstitute` accepts it and, at
   /O2, that instruction is not opcode 0xd. Then the record is retired. In the sweep of 3.6.8 this succeeded
   twice in 1,489 attempts.
+  A reload (a web defined by an OPENTERLOAD 0x295) never qualifies: see 3.6.10 for when a reload folds instead.
 - anything else stays.
 
 Benefit <= 0 is **not** a reason here: a piece with two references and benefit 0 goes into the list and is
@@ -730,6 +737,85 @@ uses need a reload (the IL). Results, every one c2's: b25.c 450 of 450 records o
 (both builds), 1347 of 1347 on 15.00, reload groups 87/87, 74/74, 68/68; b250.c 3133 of 3133 (14.00) and 2735 of
 2735 (13.10), reload groups 716/716 and 692/692 (5463 and 5415 reloads); M&B Terrain::tessellate 93 of 93,
 18/18 groups; M&B slice s0040a640 42 of 42; Spore slice s0059f510 50 of 50.
+
+#### 3.6.10 When a reload folds into its variable **[C code on 14.00 and 13.10; C trace on 13.10.3077, 13.10.3052, 14.00, 15.00]**
+
+The shape (M&B `Operation::execute`, the open split-web cases): `int t = (int)params[2];` where `params` is address-taken (a
+local array passed to a call; the same holds for globals and address-taken parameters, the aliased candidates of
+section 7). One output is `mov eax,[params+16]; mov esi,eax` with the uses before the next call reading eax, the
+other `mov esi,[params+16]`: the dword's load goes straight into the variable. Which one comes out is decided
+**before Color**, by `Enterloads`, and the threshold is **one** reference besides the reload, not two.
+
+1. **`Enterloads`** (14.00 10b588e0, 13.10.3077 1077f00c, 13.10.3052 10782b4f, 15.00 510a6ea0; run by `Globregs`,
+   regalloc_cost.md §1). Per block, forward over the instructions, with a set L of candidates now held in a
+   register and a set M of candidates whose reload has had one reference so far:
+   - a reference of an aliased candidate that is not in L gets an OPENTERLOAD in front of it (`CmdInsertEnter`,
+     10b58c06) and goes into L and M; if it was still in M from an earlier stretch, that earlier reload is undone
+     first (`UndoRegCandidate` 10b597e0, call at 10b58afa);
+   - a reference while it is in L takes it out of M (the reload has a second reference and stays);
+   - an instruction whose destination points-at set (`pas` operand) may write the candidate takes it out of L, and
+     `GrgKillerTuple` 10b5bfe0 empties L (tuples of kind 0x15 or opcode 0x2c1 and a table above it; which IL
+     instructions those are was not identified);
+   - at the end of the block, every candidate still in M and not in BLOCK+0x4c (`SbvMinus` at 10b5915b; that +0x4c
+     is the live-out set is **I**, consistent with probe fe) is undone: `UndoRegCandidate` puts the memory operand
+     back, so its single reference reads memory.
+   So **a stretch (from the reload to the next write of the memory or the block end) with exactly one reference has
+   no reload web**: `mov t <- s12` stays a load into t's register. With two or more references the reload is a web
+   and the copy a register move. **[C code 14.00. 13.10: the 3077 and 3052 functions are the 6030 one by an exact
+   instruction-multiset match (port-1310.md §3), with the same callees (GrgAirlockEnterloads, SbvCopy, CmdInsertEnter,
+   UndoRegCandidate at three sites, SbvMinus); probes identical on all four builds]**
+2. The extra reference comes from the optimizer: before regalloc the dword is copy-propagated into the variable's
+   uses up to the first instruction that may write it (a call, once the array's address has escaped), so a use of
+   `t` before the next call reads `s12`, a use after it reads `t` (IL at `@Globregs@4`, probes fa, fb). **[C trace;
+   the escape reasoning I]** A store through an `int *` parameter did not end the stretch (probe fc: two references,
+   reload kept). **[C trace]**
+3. **`CmdSubstDef` never folds a reload.** It is called only by SpillObvious (14.00 10b11630, 13.10.3077 10782b1d,
+   13.10.3052 1078421d; one call site each), only for `nrefs == 2`, and it first requires the web's def
+   (GLOBREG+0x3c) to have opcode 1, `mov` (14.00 `cmp [edi+4],1` at 10c25dfb; 3077 `cmp [ebx+4],1` at 107820c0, the
+   rest of its 387 bytes scattered by BBT from 1078c249). A reload's def is OPENTERLOAD 0x295, so the call returns at
+   once. The 13.10 function is the same as 14.00's test for test: mov def, a dst leaf with +0x10, the next tuple an
+   instruction using the web (`RegFindInSrcList`), src kind 2 (SYM) or 6 (INDIR), `CmdCanDirectSubstitute`, not the
+   use's first source when `_Opcode_dope` has 0x40, not opcode 0xd at /O2, then the size checks and
+   `SymMakeEquiv`/`TupMakeIndir`, `TupReplaceSrc`, `TupRemove`, `ColRemoveGlobregFromHashTable`. **[C code, both]**
+   The M&B reading ("CmdSubstDef needs a piece with exactly 2 references") is right about CmdSubstDef, but
+   CmdSubstDef is not what removes a reload. nrefs does not count the OPENTERLOAD: a reload with the copy and one more
+   read shows `refs 2` in `regs` (probe fa). **[C trace]**
+4. **Split pieces.** A piece made by a split round whose def is a reload is spilled by SpillObvious when `nrefs < 2`
+   and benefit <= 0 (3.6.7). A reload costs `CmdLoadCost·w` (3.6.6), so a piece with one use behind its reload has
+   benefit 0 and is spilled: its one use, the copy into the variable, reads the slot. That is the same fold in a
+   split round. With two uses CmdSubstDef is tried and refuses (item 3) and the benefit is positive, so it is
+   coloured. **[C code; the SpillObvious rule is validated on 9,463 webs, 3.6.8. b25.c on 14.00: all 92 reload
+   pieces with one reference and benefit <= 0 spilled, all 66 with two references went to CmdSubstDef and none
+   was folded (nor any of the 67 `mov`-defined ones)]**
+5. **The tie is not a lever.** The reload is the instruction just before the copy, and defOrd numbers each block
+   backwards (3.4), so the reload's defOrd is the copy's plus one: in an exact priority tie (same block, two
+   references each) the reload pops first, every time (fa: local5 19 / t 18; p2: local12 48 / t 47, local11 46 / p
+   45, the "piece, variable, piece, variable" pattern). The order decides registers, not the fold: a reload that
+   exists has a reference after the copy, so it interferes with the variable and the two cannot share a register in
+   either order (`rasim regs SNAP before:t:local12` on p2: 0 of 10 registers change). The record number (first
+   mention) breaks only ties of priority *and* defOrd (3.4), so it cannot reorder this pair either. **[C model; no
+   spelling flips the defOrd without changing the IL, so not compiled]**
+
+**Probes** (`work/scratch/fold/p4.cpp`, `p6.cpp`, `p2.cpp`; fa and fb are `tests/data/fold.cpp`, checked on every
+build). The globreg tables and listings are the same on 13.10.3077, 13.10.3052, 14.00 and 15.00:
+
+| probe | source after `fill(params); if (chk((int)params[2])) {` | dword's stretch | result |
+|---|---|---|---|
+| fa | `int t = (int)params[2]; use(t); mark(); use(t);` | copy + `push s5` | reload web local5 (eax): `mov eax,[params+16]; push esi; push eax; mov esi,eax` |
+| fb | `int t = (int)params[2]; mark(); use(t); use(t);` | the copy only | no web: `mov esi,[params+16]` |
+| fc | fa with `*q = 0;` after the copy | copy + push (the store does not write the dword) | reload web, as fa |
+| fe | `int t = ...; if (*q) use(t); mark(); use(t);` | the copy only, but read again in the next block | reload web (live out), `mov eax,[..]; mov esi,eax` |
+| ff | `int t = ...; q[0] = t; q[1] = t; q[2] = t; mark(); use(t);` | copy + 3 stores | reload web, refs 4 |
+| p2 f2 | M&B `party_count_members_of_type`: `int t = (int)params[2], p = (int)params[1]; int n = cnt(t, p, 1); use(n + cnt(t, p, 0));` | copy + push, for both dwords | `mov eax,[params+16]; ... push eax; mov edi,eax`: ours in M&B |
+
+**For matching.** If the original loads the variable straight from the dword and yours goes through a scratch
+register, the dword has a second reference between the reload and the next call in yours: count the reads of the
+dword (and of the variable before the call: they are the same after copy propagation) in that stretch. One edit
+folds it when there is exactly one extra: move that read past the next call (or anything that may write the array),
+or drop it. `rasim fold SNAP VAR` (tracer.md) lists, from a snapshot's IL at Color's entry, every reload copied into
+VAR with its stretch, says whether it folds, names the extra references, gives the edit in rasim's EDIT language
+(`rasim order SNAP unref:S:B ref:VAR:B:2` to see the priorities after it) and reports the tie; it also gives the
+SpillObvious and CmdSubstDef outcome of each of VAR's webs.
 
 ---
 
@@ -992,6 +1078,10 @@ Consequences, each seen in the traces **[C]**:
   than one entry and change the number of rotation picks between the last forced pick and it; `rasim scratch
   SNAP ins:N` / `drop:N` gives the picks that move.
 - The picks are in IL order, per block; the listing order differs (sched.md), so use the `off` column.
+- In a large switch the cursor carries from case to case, so one case with a pick more or fewer shifts every
+  later case up to the next forced pick (and can change which identical tails merge). `c2trace.py scratch
+  --phase orig.s` reads the original's picks, prints the phase per case and scans every single `ins:N`/`drop:N`
+  for the one that re-aligns the most cases (tracer.md).
 
 `/O1`: `_Speed` is 0, step 2 is skipped, every pick is first fit. Tested with t4.c,
 `x1 = s[0]; ... x5 = s[4];`: /O2 gives eax, ecx, edx, eax, ecx; /O1 gives eax five times. **[C]**

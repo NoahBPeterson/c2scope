@@ -1,4 +1,17 @@
 {
+ "symkeys_sort_ret": "107712e6",
+ "symkeys_skip": {
+  "1076cde6": 2,
+  "1076ed2c": 2,
+  "1079770b": 3,
+  "1079f8e7": 3
+ },
+ "symkeys_free_by": "kind",
+ "symkeys_nofree": [
+  "hash",
+  "glob",
+  "other"
+ ],
  "version": "13.10.3052",
  "c2_sha256": "d440f00231efe276cf001cf6257b4568469c72c3033eb28d5323e6ac91f19972",
  "image_base": "10700000",
@@ -14,7 +27,8 @@
   "opcount": "24a",
   "blk": "18",
   "len": "16",
-  "mem": "2c"
+  "mem": "2c",
+  "fename": "1"
  },
  "functions": {
   "@FPSpillWorthless@12": [
@@ -394,6 +408,48 @@
    45,
    "medium",
    "calls match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@FPRemoveSplitGlobregs@8": [
+   "e293",
+   16,
+   "high",
+   "6030 match (3052); fpcolor probes check"
+  ],
+  "@InsertColoredLifetimeEndSplit@16": [
+   "11cc1",
+   16,
+   "high",
+   "6030 match (3052); fpcolor probes check"
+  ],
+  "@SplitAtMismatchedFlowJoinPoints@8": [
+   "122e5a",
+   16,
+   "high",
+   "6030 match (3052); fpcolor probes check"
+  ],
+  "@SplitAtPostDefEndPoints@8": [
+   "1251c",
+   16,
+   "high",
+   "6030 match (3052); fpcolor probes check"
+  ],
+  "@CanExtendLifetime@16": [
+   "123b20",
+   16,
+   "high",
+   "6030 match (3052); fpcolor probes check"
+  ],
+  "@FPUpdateRegisterPressure@16": [
+   "11ba0",
+   16,
+   "high",
+   "6030 match (3052); fpcolor probes check"
+  ],
+  "@FPInitialRegPressure@8": [
+   "10856",
+   16,
+   "high",
+   "6030 match (3052); fpcolor probes check"
   ]
  },
  "probes": {
@@ -445,7 +501,15 @@
   "107b6afe": "@RewriteSplitGlobregs@12+usepiece",
   "107b68ff": "@RewriteSplitGlobregs@12+defpiece",
   "1078fc7d": "@GrgAirlockEnterloads@12+enter",
-  "10780c8a": "@Color@4+entry"
+  "10780c8a": "@Color@4+entry",
+  "10711102": "@FPSpillcosts@8+fpblk",
+  "10710fee": "@FPSpillcosts@8+fpedge",
+  "10711246": "@FPSpillcosts@8+fpuse",
+  "10711773": "@FPSpillcosts@8+fpenter",
+  "10711b29": "@FPSpillcosts@8+fpdef",
+  "10711946": "@FPAddToPriorityList@8+fpins",
+  "1070e2cc": "@FPRemoveSplitGlobregs@8+fprm",
+  "1070e28e": "@FPSpillWorthless@12+fpkeep"
  },
  "globals": {
   "_CurFunc": "10881d70",
@@ -461,7 +525,52 @@
   "_RegMap": "108a74ec",
   "_regAvail1": "108a7b18"
  },
+ "slots": {
+  "sbv": {
+   "bits": 32,
+   "next": 4,
+   "words": 3
+  },
+  "v13": true
+ },
  "hooks": {
+  "slots": [
+   "1079d16a=g10881d70>0>0>4$,s1,g108a789c>0,g108a7898>0,s2",
+   "1079d2d9={SYM:eax},eax>0>0x1c,eax>0>0x18",
+   "1079d235={LOD:eax}",
+   "1079d3a5=edi,ebp,esi>4",
+   "10734868=edi,{SYM:s4}",
+   "107348bf={LOD:eax}",
+   "1079dac6={SYM:s1},g108a7888>0,s3",
+   "107ad452=edi,ebx>4",
+   "107ad49f=edi",
+   "107ad4d7={LOD:eax}",
+   "1079db64={LOD:eax}",
+   "10722fa3=edi",
+   "107b8ab8=ebx",
+   "1079d424=s7,s5,s9,s8",
+   "107349db=s7",
+   "1079d487=ebx,edi,ebp,g108a7898>0,g108a9124>0>0x50,g108a9124>0>0x8c,g108a7884>0,g1088336c>0>0x1ea,g108a9214>0,g108a9124>0>0x3c,g108a91cc>0",
+   "1079d51c=s6,s7,eax",
+   "1079d53d=esi,esi>0x3c,ecx"
+  ],
+  "symkeys": {
+   "init": "107798a6",
+   "alloc": "1076c2c5=eax,g108a911c>0,a0,a1,a2,a3,a4,a5,a6,a7,a8/xeax>0x1c,eax",
+   "free": "1076ce97=esi>0x1c,esi>4",
+   "free2": "107a89fc=esi>0x1c,esi>4",
+   "uservar": "10776b83=eax>4$,eax,eax>0x28/xeax",
+   "equivp": "10791d7f=eax,ebx,s6",
+   "splice": "1078ebc4=s6>0x28>0x18>4$,s6>0x14/xeax",
+   "read": "10776d16/xeax",
+   "opt": "10774580=g10881d70>0>0>4$",
+   "gc": "10773dac",
+   "pool": "1076cfcb/xeax>4>0x1c",
+   "getinl": "1078e567=s1>4>0x28>0x18>4$,s1>4>0x14/xeax",
+   "sort": "10792193=a0,eax>0x10,eax>8,eax>0x34>0x18>0x1c,eax>0x30,eax>0>0x10,eax>0>8,eax>0>0x34>0x18>0x1c,eax>0>0x30,eax>0x28>0>0x34>0x18>0x1c,eax>0>0x28>0>0x34>0x18>0x1c/xedi>4,edi>0x14,eax>8,eax>0x10,eax>0x18>0x1c,eax>0x28>8,eax>0x28>0x18>0x1c,eax>0>8,eax>0>0x10,eax>0>0x18>0x1c,eax>0>0x28>8,eax>0>0x28>0x18>0x1c",
+   "sortx": "107701d4/xeax>0x28>0x28>8,eax>0x28>0x28>0x18>0x1c,eax>0x28>0x28>0x34>0x18>0x1c,eax>0x28>0x28>0x30,eax>0x28>0x28>0>8,eax>0x28>0x28>0>0x18>0x1c,eax>0x28>0>0x28>8,eax>0x28>0>0x28>0x18>0x1c,eax>0x28>0>0x28>0x34>0x18>0x1c,eax>0x28>0>0x28>0x30,eax>0x28>0>0x28>0>8,eax>0x28>0>0x28>0>0x18>0x1c",
+   "sort3": "10770243=edi>0x28>0>0>8,edi>0x28>0>0>0x10,edi>0x28>0>0>0x18>0x1c,edi>0x28>0>0>0x28>8,edi>0x28>0>0>0x28>0x18>0x1c,edi>0x28>0>0>0x34>0x18>0x1c,edi>0x28>0>0>0x30,edi>0x28>0>0>0>8,edi>0x28>0>0>0>0x10,edi>0x28>0>0>0>0x18>0x1c,edi>0x28>0>0>0>0x34>0x18>0x1c,edi>0x28>0>0>0>0>8"
+  },
   "default": [
    "@Color@4=s1",
    "@Spillcosts@12=s1,s2,s3"
@@ -578,6 +687,25 @@
    "1078fc7d=esi,esi>0x1c,eax",
    "10780c8a=g10882150>0,g108a92d4>0>0x1c,g108a92d4>0>0x30>0x1c,g108a92d4>0>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c",
    "@GrgNewGlobreg@4=eax/xeax,eax>0x1c"
+  ],
+  "regs_fp": [
+   "10711102=ebp,s6",
+   "10710fee=esi,esi>0x1c,s6,s7,ebp>0xc",
+   "10711246=edi,edi>0x1c,edi>0xc,ecx,s6,s5,s5>4,ebp>0x14",
+   "10711773=esi,esi>0x1c,eax,ebp,edi,edi>4",
+   "10711b29=esi,esi>0x1c,eax,ebp,edi,edi>4",
+   "10711946=edi,edi>0x1c,edi>0xc,edi>0x40,edi>0x44,edi>0x24,ebp,edi>0>0>4$,edi>0>0x1c,edi>0>4",
+   "@FPSpillcosts@8",
+   "@FPRemoveSplitGlobregs@8=eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8,eax>0>4>4>0,eax>0>4>4>8,eax>0>4>4>4>0,eax>0>4>4>4>8",
+   "@FPCheckColorability@12=s2,s2>0x1c/xeax",
+   "@InsertColoredLifetimeEndSplit@16=s1,s1>0x14,s2>0x1c,s3,s3>0x1c,s3>0>0>4$,s3>0>0x1c,s3>0>4/xeax",
+   "@SplitAtMismatchedFlowJoinPoints@8=/xeax",
+   "@SplitAtPostDefEndPoints@8=/xeax",
+   "@CanExtendLifetime@16=/xeax",
+   "@FPUpdateRegisterPressure@16=/xeax,eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8",
+   "@FPInitialRegPressure@8=/xeax,eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8",
+   "1070e2cc=ecx,ecx>0x1c,ecx>0>0>4$,ecx>0>0x1c,ecx>0>4",
+   "1070e28e=esi,esi>0x1c,esi>0>0>4$,esi>0>0x1c,esi>0>4"
   ]
  },
  "opnames": {

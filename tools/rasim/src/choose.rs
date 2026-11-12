@@ -124,6 +124,11 @@ pub struct Model {
     radj: Vec<BTreeSet<usize>>, // reverse of adj
     rpadj: Vec<BTreeSet<usize>>,
     pub notes: Vec<String>,
+    nbl: Vec<Vec<(usize, bool)>>, // adj[x] and radj[x] merged, ascending, with "in adj[x]"
+    ptl: Vec<Vec<(usize, bool)>>, // padj[x] and rpadj[x] merged, ascending, with "in padj[x]"
+    bylabel: HashMap<String, usize>, // label(w) -> w for each coloured web that `find_scan` resolves so
+    labels: Vec<String>,             // label(w), once the webs are final
+    pop_at: Vec<usize>,              // per web: the item that colours it as traced (usize::MAX: none)
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +215,59 @@ pub struct Mods {
     pub ext: Vec<(usize, Vec<usize>)>,
 }
 
+impl Mods {
+    fn dben(&self, w: usize) -> i64 {
+        self.ben.iter().filter(|x| x.0 == w).map(|x| x.1).sum()
+    }
+    fn kill(&self, w: usize) -> u32 {
+        self.kills.iter().filter(|x| x.0 == w).fold(0, |k, x| k | x.1)
+    }
+    fn give(&self, w: usize) -> u32 {
+        self.gives.iter().filter(|x| x.0 == w).fold(0, |k, x| k | x.1)
+    }
+    fn ext_of(&self, w: usize) -> Option<&Vec<usize>> {
+        self.ext.iter().find(|x| x.0 == w).map(|x| &x.1)
+    }
+}
+
+/// out = the union of `a` (ascending, unique) and `add`, ascending and unique: what sorting and deduplicating
+/// their concatenation gives.
+fn merge_into(a: &[(usize, bool)], add: impl Iterator<Item = (usize, bool)>, out: &mut Vec<(usize, bool)>) {
+    let mut b: Vec<(usize, bool)> = add.collect();
+    b.sort_unstable();
+    b.dedup();
+    out.clear();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        let x = match (a.get(i), b.get(j)) {
+            (Some(&p), Some(&q)) if p < q => {
+                i += 1;
+                p
+            }
+            (Some(&p), Some(&q)) if q < p => {
+                j += 1;
+                q
+            }
+            (Some(&p), Some(_)) => {
+                i += 1;
+                j += 1;
+                p
+            }
+            (Some(&p), None) => {
+                i += 1;
+                p
+            }
+            (None, Some(&q)) => {
+                j += 1;
+                q
+            }
+            (None, None) => unreachable!(),
+        };
+        out.push(x);
+    }
+}
+
+#[derive(Clone)]
 pub struct PopOut {
     pub web: usize,
     pub avail: u32,
@@ -221,6 +279,123 @@ pub struct Outcome {
     pub colour: Vec<Option<u32>>,
     pub pops: Vec<PopOut>,
     pub inferred: Vec<String>, // relations used that the trace only shows from the other side
+}
+
+/// The free simulation's state of one web.
+#[derive(Clone)]
+struct WebSt {
+    avail: u32,
+    init_av: u32,
+    piece: bool, // an extended web after its split: only the extension's overlaps remain
+    live: bool,  // queued and not coloured
+    colour: Option<u32>,
+    ben: i64,
+    prefs: [i64; NREG],
+    born: [u32; NREG], // creation order of each PREF node
+}
+
+/// The free simulation's state between two steps.
+#[derive(Clone)]
+pub struct RunSt {
+    ws: Vec<WebSt>,
+    // a web the trace split is coloured whole in this what-if: its traced pieces (same name, later pass) do not exist
+    whole: Vec<(String, u32)>,
+    tick: u32,
+    nbuf: Vec<usize>,         // scratch: the neighbours of the web being coloured
+    mbuf: Vec<(usize, bool)>, // scratch: a neighbour or partner list with a change's additions
+}
+
+impl RunSt {
+    fn new(n: usize) -> RunSt {
+        let w = WebSt { avail: 0, init_av: 0, piece: false, live: false, colour: None, ben: 0, prefs: [0; NREG], born: [0; NREG] };
+        RunSt { ws: vec![w; n], whole: vec![], tick: 0, nbuf: vec![], mbuf: vec![] }
+    }
+
+    fn colours(&self) -> Vec<Option<u32>> {
+        self.ws.iter().map(|w| w.colour).collect()
+    }
+
+    /// `hint`: the web the last failed comparison stopped at (it is compared first; on a failure, set to where
+    /// this one stopped).
+    fn same(&self, o: &RunSt, look: &[(usize, u8)], hint: &mut Option<usize>) -> bool {
+        if self.whole != o.whole {
+            return false;
+        }
+        if let Some(h) = *hint {
+            if let Ok(i) = look.binary_search_by_key(&h, |x| x.0) {
+                if !self.same_web(o, look[i].0, look[i].1) {
+                    return false;
+                }
+            }
+        }
+        for &(w, f) in look {
+            if !self.same_web(o, w, f) {
+                *hint = Some(w);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn same_web(&self, o: &RunSt, w: usize, f: u8) -> bool {
+        let (core, pref, adj) = (f & L_CORE != 0, f & L_PREF != 0, f & L_ADJ != 0);
+        if f & L_COLOUR != 0 && self.ws[w].colour != o.ws[w].colour {
+            return false;
+        }
+        if (core || adj) && self.ws[w].live != o.ws[w].live {
+            return false;
+        }
+        if !(core || (pref && self.ws[w].colour.is_none()) || (adj && self.ws[w].live)) {
+            return true;
+        }
+        if self.ws[w].avail != o.ws[w].avail
+            || self.ws[w].live != o.ws[w].live
+            || self.ws[w].ben != o.ws[w].ben
+            || self.ws[w].init_av != o.ws[w].init_av
+            || self.ws[w].piece != o.ws[w].piece
+            || self.ws[w].prefs != o.ws[w].prefs
+        {
+            return false;
+        }
+        let (p, a, b) = (&self.ws[w].prefs, &self.ws[w].born, &o.ws[w].born);
+        for r in 1..NREG {
+            if p[r] <= 0 {
+                continue;
+            }
+            for s in r + 1..NREG {
+                if p[s] > 0 && a[r].cmp(&a[s]) != b[r].cmp(&b[s]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+const L_CORE: u8 = 1; // set up or coloured later
+const L_PREF: u8 = 2; // a later preference event for it
+const L_ADJ: u8 = 4; // a later neighbour or partner, or a later benefit (read only while live)
+const L_COLOUR: u8 = 8; // its colour is read later
+
+const T_INIT: usize = 0;
+const T_CORE: usize = 1;
+const T_PREF: usize = 2;
+const T_SRC: usize = 3;
+const T_ADJ: usize = 4;
+const T_BEN: usize = 5;
+const NT: usize = 6;
+
+/// The unedited free simulation over one step order, kept for `Model::run_fast`.
+pub struct Trace {
+    order: Vec<usize>,
+    pub k: usize,             // a checkpoint every k steps
+    cps: Vec<RunSt>,          // cps[j]: the state before step j*k
+    pops_at: Vec<usize>,      // per step: colourings before it
+    inf_at: Vec<usize>,       // per step: inferred-relation lines before it
+    out: Outcome,
+    first: Vec<[usize; NT]>,  // per web and touch kind (T_*): the first step (usize::MAX: none)
+    last1: Vec<[usize; NT]>,  // per web and touch kind: 1 + the last step (0: none)
+    look: Vec<Vec<(usize, u8)>>, // per checkpoint j: the webs a step from j*k on reads, with L_* flags
 }
 
 #[derive(Default)]
@@ -247,7 +422,21 @@ impl Model {
                 .map(|x| x.1)
                 .unwrap_or_else(|| "?".into())
         };
-        let mut m = Model { webs: vec![], items: vec![], init_seen: vec![], adj: vec![], padj: vec![], radj: vec![], rpadj: vec![], notes: vec![] };
+        let mut m = Model {
+            webs: vec![],
+            items: vec![],
+            init_seen: vec![],
+            adj: vec![],
+            padj: vec![],
+            radj: vec![],
+            rpadj: vec![],
+            notes: vec![],
+            nbl: vec![],
+            ptl: vec![],
+            bylabel: HashMap::new(),
+            labels: vec![],
+            pop_at: vec![],
+        };
         let mut cur: HashMap<String, usize> = HashMap::new();
         let mut done: Vec<bool> = vec![];
         let mut inited: Vec<bool> = vec![];
@@ -422,28 +611,71 @@ impl Model {
                 }
             }
         }
+        let merged = |a: &BTreeSet<usize>, b: &BTreeSet<usize>| -> Vec<(usize, bool)> {
+            a.union(b).map(|&y| (y, a.contains(&y))).collect()
+        };
+        m.nbl = (0..n).map(|x| merged(&m.adj[x], &m.radj[x])).collect();
+        m.ptl = (0..n).map(|x| merged(&m.padj[x], &m.rpadj[x])).collect();
+        // label_scan for every web, from per-name counts
+        let mut cnt: HashMap<&str, (usize, usize)> = HashMap::new(); // (coloured, seen with an avail set)
+        for (i, x) in m.webs.iter().enumerate() {
+            let c = cnt.entry(x.name.as_str()).or_default();
+            c.0 += x.pop.is_some() as usize;
+            c.1 += m.init_seen[i] as usize;
+        }
+        m.labels = (0..n)
+            .map(|w| {
+                let x = &m.webs[w];
+                let (col, seen) = cnt[x.name.as_str()];
+                match x.pop {
+                    None if seen > 1 => format!("{}#{}", x.name, x.gr),
+                    Some(p) if col > 1 => format!("{}@p{}", x.name, p),
+                    _ => x.name.clone(),
+                }
+            })
+            .collect();
+        debug_assert!((0..n).all(|w| m.labels[w] == m.label_scan(w)));
+        m.pop_at = vec![usize::MAX; n];
+        for (i, it) in m.items.iter().enumerate() {
+            if let Item::Pop { web, traced: Some(_), .. } = it {
+                if m.pop_at[*web] == usize::MAX {
+                    m.pop_at[*web] = i;
+                }
+            }
+        }
+        for w in 0..n {
+            if m.webs[w].pop.is_some() {
+                let l = m.label(w);
+                if m.find_scan(&l) == Ok(w) {
+                    m.bylabel.insert(l, w);
+                }
+            }
+        }
         Ok(m)
     }
 
     /// A coloured web by `name`, `name@pN` (the one popped as pop N) or `name#grptr`.
     pub fn find(&self, sel: &str) -> Result<usize, String> {
-        let col: Vec<usize> = (0..self.webs.len()).filter(|&i| self.webs[i].pop.is_some()).collect();
+        if let Some(&w) = self.bylabel.get(sel) {
+            return Ok(w);
+        }
+        self.find_scan(sel)
+    }
+
+    fn find_scan(&self, sel: &str) -> Result<usize, String> {
+        let col = || (0..self.webs.len()).filter(|&i| self.webs[i].pop.is_some());
         if let Some((n, p)) = sel.split_once("@p") {
             let p: u32 = p.parse().map_err(|_| format!("bad pop number in {}", sel))?;
-            return col
-                .iter()
-                .copied()
+            return col()
                 .find(|&i| self.webs[i].name == n && self.webs[i].pop == Some(p))
                 .ok_or(format!("pop {} is not a colouring of {}", p, n));
         }
         if let Some((n, g)) = sel.split_once('#') {
-            return col
-                .iter()
-                .copied()
+            return col()
                 .find(|&i| self.webs[i].name == n && self.webs[i].gr == g)
                 .ok_or(format!("no coloured globreg {}", sel));
         }
-        let hits: Vec<usize> = col.iter().copied().filter(|&i| self.webs[i].name == sel).collect();
+        let hits: Vec<usize> = col().filter(|&i| self.webs[i].name == sel).collect();
         match hits.len() {
             0 => Err(format!("no coloured globreg named {}", sel)),
             1 => Ok(hits[0]),
@@ -488,6 +720,13 @@ impl Model {
 
     /// Shortest selector that `find` (or `find_any`) resolves to this web.
     pub fn label(&self, w: usize) -> String {
+        match self.labels.get(w) {
+            Some(l) => l.clone(),
+            None => self.label_scan(w),
+        }
+    }
+
+    fn label_scan(&self, w: usize) -> String {
         let x = &self.webs[w];
         if x.pop.is_none() {
             let same = (0..self.webs.len()).filter(|&i| self.init_seen[i] && self.webs[i].name == x.name).count();
@@ -520,9 +759,12 @@ impl Model {
 
     fn pop_item(&self, order: &[usize], w: usize) -> Option<usize> {
         let n = self.items.len();
-        order.iter().position(|&i| {
-            i == n + w || (i < n && matches!(&self.items[i], Item::Pop { web, traced: Some(_), .. } if *web == w))
-        })
+        match self.pop_at.get(w) {
+            Some(&p) => order.iter().position(|&i| i == n + w || i == p),
+            None => order.iter().position(|&i| {
+                i == n + w || (i < n && matches!(&self.items[i], Item::Pop { web, traced: Some(_), .. } if *web == w))
+            }),
+        }
     }
 
     /// The item order after the moves. Anything but a pop between the two positions is a Spillcosts pass (a split
@@ -611,75 +853,70 @@ impl Model {
 
     /// Free simulation: every register is the model's own choice.
     pub fn run(&self, mods: &Mods) -> Result<Outcome, String> {
-        let n = self.webs.len();
         let mut moved = vec![];
         let order = self.order(mods.order.as_ref(), &mods.moves, &mut moved)?;
-        let dben = |w: usize| -> i64 { mods.ben.iter().filter(|x| x.0 == w).map(|x| x.1).sum() };
-        let kill = |w: usize| -> u32 { mods.kills.iter().filter(|x| x.0 == w).fold(0, |k, x| k | x.1) };
-        let give = |w: usize| -> u32 { mods.gives.iter().filter(|x| x.0 == w).fold(0, |k, x| k | x.1) };
-        let ext_of = |w: usize| mods.ext.iter().find(|x| x.0 == w).map(|x| &x.1);
-        let mut init_av = vec![0u32; n];
-        let mut piece = vec![false; n]; // an extended web after its split: only the extension's overlaps remain
-        // a web the trace split is coloured whole in this what-if: its traced pieces (same name, later pass) do not exist
-        let mut whole: Vec<(String, u32)> = vec![];
-        let mut avail = vec![0u32; n];
-        let mut prefs = vec![[0i64; NREG]; n];
-        let mut ben = vec![0i64; n];
-        let mut live = vec![false; n]; // queued and not coloured
-        let mut born = vec![[0u32; NREG]; n]; // creation order of each PREF node
-        let mut tick = 0u32;
-        macro_rules! addpref {
-            ($w:expr, $r:expr) => {{
-                if prefs[$w][$r as usize] == 0 {
-                    tick += 1;
-                    born[$w][$r as usize] = tick;
-                }
-                prefs[$w][$r as usize] += 1;
-            }};
-        }
-        let mut colour: Vec<Option<u32>> = vec![None; n];
+        let mut st = RunSt::new(self.webs.len());
         let mut out = Outcome { colour: vec![], pops: vec![], inferred: moved };
-        let has = |v: &[(usize, usize)], a: usize, b: usize| v.iter().any(|&(x, y)| (x, y) == (a, b) || (x, y) == (b, a));
         for (x, r, c) in &mods.prefs {
-            prefs[*x][*r as usize] += c;
+            st.ws[*x].prefs[*r as usize] += c;
         }
         for &i in &order {
-            let x = if i >= self.items.len() {
-                let x = i - self.items.len();
-                if !live[x] {
-                    continue;
+            self.step(mods, i, &mut st, &mut out)?;
+        }
+        out.colour = st.colours();
+        Ok(out)
+    }
+
+    /// One step of the free simulation: item i of the order (or items.len() + web: a colouring the trace does not
+    /// have).
+    fn step(&self, mods: &Mods, i: usize, st: &mut RunSt, out: &mut Outcome) -> Result<(), String> {
+        let has = |v: &[(usize, usize)], a: usize, b: usize| v.iter().any(|&(x, y)| (x, y) == (a, b) || (x, y) == (b, a));
+        let RunSt { ws, whole, tick, nbuf, mbuf } = st;
+        macro_rules! addpref {
+            ($w:expr, $r:expr) => {{
+                if ws[$w].prefs[$r as usize] == 0 {
+                    *tick += 1;
+                    ws[$w].born[$r as usize] = *tick;
                 }
-                out.inferred.push(format!(
-                    "{} is coloured here although the trace split it before its turn; its neighbours are those that listed it",
-                    self.label(x)
-                ));
-                x
-            } else {
-                match &self.items[i] {
+                ws[$w].prefs[$r as usize] += 1;
+            }};
+        }
+        let x = if i >= self.items.len() {
+            let x = i - self.items.len();
+            if !ws[x].live {
+                return Ok(());
+            }
+            out.inferred.push(format!(
+                "{} is coloured here although the trace split it before its turn; its neighbours are those that listed it",
+                self.label(x)
+            ));
+            x
+        } else {
+            match &self.items[i] {
                 Item::Init { web, avail: a, ben: b } => {
                     if whole.iter().any(|(nm, p)| *nm == self.webs[*web].name && self.webs[*web].pass > *p) {
-                        continue;
+                        return Ok(());
                     }
-                    avail[*web] = (*a | give(*web)) & !kill(*web);
-                    init_av[*web] = avail[*web];
-                    ben[*web] = *b + dben(*web);
-                    live[*web] = true;
-                    continue;
+                    ws[*web].avail = (*a | mods.give(*web)) & !mods.kill(*web);
+                    ws[*web].init_av = ws[*web].avail;
+                    ws[*web].ben = *b + mods.dben(*web);
+                    ws[*web].live = true;
+                    return Ok(());
                 }
                 Item::Ben { web, ben: b } => {
-                    ben[*web] = *b + dben(*web);
-                    continue;
+                    ws[*web].ben = *b + mods.dben(*web);
+                    return Ok(());
                 }
-                Item::Requeue { .. } => continue,
+                Item::Requeue { .. } => return Ok(()),
                 Item::Pref { web, reg, src, .. } => {
-                    if colour[*web].is_some() {
-                        continue; // Spillcosts gives preferences to uncoloured globregs only
+                    if ws[*web].colour.is_some() {
+                        return Ok(()); // Spillcosts gives preferences to uncoloured globregs only
                     }
                     let r = match src {
                         None => Some(*reg),
                         Some(sw) if has(&mods.del_c, *web, *sw) => None,
                         Some(sw) => {
-                            if colour[*sw].is_none() {
+                            if ws[*sw].colour.is_none() {
                                 out.inferred.push(format!(
                                     "the copy between {} and {} gives no preference: {} is not coloured yet",
                                     self.label(*web),
@@ -687,19 +924,19 @@ impl Model {
                                     self.label(*sw)
                                 ));
                             }
-                            colour[*sw]
+                            ws[*sw].colour
                         }
                     };
                     if let Some(r) = r {
                         addpref!(*web, r);
                     }
-                    continue;
+                    return Ok(());
                 }
-                Item::Restrict { web } => match Self::restrict(avail[*web], &prefs[*web], &born[*web]) {
+                Item::Restrict { web } => match Self::restrict(ws[*web].avail, &ws[*web].prefs, &ws[*web].born) {
                     Some(r) => {
-                        avail[*web] = 1 << r;
-                        ben[*web] = 1;
-                        continue;
+                        ws[*web].avail = 1 << r;
+                        ws[*web].ben = 1;
+                        return Ok(());
                     }
                     None => {
                         return Err(format!(
@@ -710,132 +947,357 @@ impl Model {
                     }
                 },
                 Item::Pop { web, traced, .. } => {
-                    if traced.is_none() || !live[*web] {
-                        continue; // spilled, deferred or split: as traced; or a piece that does not exist here
+                    if traced.is_none() || !ws[*web].live {
+                        return Ok(()); // spilled, deferred or split: as traced; or a piece that does not exist here
                     }
                     *web
                 }
-                }
-            };
-            if i >= self.items.len() {
-                whole.push((self.webs[x].name.clone(), self.webs[x].pass));
             }
-            {
-                {
-                    let mut nb = vec![];
-                    let mut nbw = vec![];
-                    // ascending and unique, as a set would give them (a sorted Vec: this loop is the hot path of
-                    // `need reg:`, which runs the model once per candidate change)
-                    let mut cand: Vec<usize> = self.adj[x]
-                        .iter()
-                        .chain(self.radj[x].iter())
-                        .copied()
-                        .chain(mods.add_e.iter().filter(|e| e.0 == x || e.1 == x).map(|e| if e.0 == x { e.1 } else { e.0 }))
-                        .collect();
-                    cand.sort_unstable();
-                    cand.dedup();
-                    for y in cand {
-                        if y == x || !live[y] || has(&mods.del_e, x, y) {
-                            continue;
-                        }
-                        // a split piece of an extended web keeps only the overlaps the extension added
-                        if piece[y] && !ext_of(y).map_or(false, |v| v.contains(&x)) {
-                            continue;
-                        }
-                        if piece[x] && !ext_of(x).map_or(false, |v| v.contains(&y)) {
-                            continue;
-                        }
-                        if !self.adj[x].contains(&y) && !has(&mods.add_e, x, y) {
-                            out.inferred.push(format!(
-                                "{} is taken as a neighbour of {} because the trace has {} as a neighbour of {}",
-                                self.label(y),
-                                self.label(x),
-                                self.label(x),
-                                self.label(y)
-                            ));
-                        }
-                        nb.push((ben[y], avail[y], prefs[y]));
-                        nbw.push(y);
-                    }
-                    let w = Self::weights(&nb, &prefs[x]);
-                    let Some(r) = Self::pick(avail[x], &w) else {
-                        if ext_of(x).is_some() {
-                            // the extended web is uncolourable at its turn: c2 splits it (HandleCurrUncolorable).
-                            // Its pieces are not modelled; the other values go on without it.
-                            out.inferred.push(format!(
-                                "{} has no register left at its turn: c2 splits it; its pieces are not modelled",
-                                self.label(x)
-                            ));
-                            out.pops.push(PopOut { web: x, avail: 0, w, reg: None });
-                            live[x] = false;
-                            continue;
-                        }
-                        return Err(format!("{} is left without a register (c2 would split or spill; not modelled)", self.label(x)));
-                    };
-                    out.pops.push(PopOut { web: x, avail: avail[x], w, reg: Some(r) });
-                    colour[x] = Some(r);
-                    live[x] = false;
-                    for y in nbw {
-                        avail[y] &= !(1 << r);
-                        if avail[y] != 0 {
-                            continue;
-                        }
-                        // An uncoloured neighbour without a register left is split by c2 (InsertAdditionalSplits).
-                        // Splits are not simulated, with one exception [I]: a web whose range a what-if extended is
-                        // continued as the piece covering the extension. That piece starts from the web's initial
-                        // set, minus the register just taken, minus the registers of the coloured values the
-                        // extension overlaps (c2 re-costs a piece and subtracts what is live at its defs).
-                        match ext_of(y) {
-                            Some(over) if !piece[y] => {
-                                piece[y] = true;
-                                let mut a = init_av[y] & !(1 << r);
-                                for &z in over {
-                                    if let Some(c) = colour[z] {
-                                        a &= !(1 << c);
-                                    }
-                                }
-                                avail[y] = a;
-                                out.inferred.push(format!(
-                                    "{} runs out of registers when {} takes {}: c2 splits it; modelled as one piece over \
-                                     the extended range with {} left",
-                                    self.label(y),
-                                    self.label(x),
-                                    rname(r),
-                                    mask_names(a)
-                                ));
-                                if a == 0 {
-                                    live[y] = false;
-                                }
-                            }
-                            Some(_) => live[y] = false, // the piece runs dry too: gone (split again or left in memory)
-                            None => {}
-                        }
-                    }
-                    let mut part: Vec<usize> = self.padj[x]
-                        .iter()
-                        .chain(self.rpadj[x].iter())
-                        .copied()
-                        .chain(mods.copies.iter().filter(|e| e.0 == x || e.1 == x).map(|e| if e.0 == x { e.1 } else { e.0 }))
-                        .collect();
-                    part.sort_unstable();
-                    part.dedup();
-                    for y in part {
-                        if y == x || !live[y] || has(&mods.del_c, x, y) {
-                            continue;
-                        }
-                        if !self.padj[x].contains(&y) && !has(&mods.copies, x, y) {
-                            out.inferred.push(format!(
-                                "{} is taken as a copy partner of {} because the trace has the reverse",
-                                self.label(y),
-                                self.label(x)
-                            ));
-                        }
-                        addpref!(y, r);
+        };
+        if i >= self.items.len() {
+            whole.push((self.webs[x].name.clone(), self.webs[x].pass));
+        }
+        // the weights are summed as the neighbours are visited (Self::weights, in the same order)
+        let mut w = [0i64; NREG];
+        let mut nbw = std::mem::take(nbuf);
+        nbw.clear();
+        // ascending and unique, as a set would give them; the trace's lists are merged once (Model::build), a
+        // change's added edges here (this loop is the hot path of `need reg:`, which runs the model once per
+        // candidate change)
+        let extra = mods.add_e.iter().any(|e| e.0 == x || e.1 == x);
+        let mut merged = std::mem::take(mbuf);
+        if extra {
+            let add = mods.add_e.iter().filter(|e| e.0 == x || e.1 == x).map(|e| if e.0 == x { e.1 } else { e.0 });
+            merge_into(&self.nbl[x], add.map(|y| (y, self.adj[x].contains(&y))), &mut merged);
+        }
+        for &(y, in_adj) in if extra { &merged[..] } else { &self.nbl[x][..] } {
+            if y == x || !ws[y].live || has(&mods.del_e, x, y) {
+                continue;
+            }
+            // a split piece of an extended web keeps only the overlaps the extension added
+            if ws[y].piece && !mods.ext_of(y).map_or(false, |v| v.contains(&x)) {
+                continue;
+            }
+            if ws[x].piece && !mods.ext_of(x).map_or(false, |v| v.contains(&y)) {
+                continue;
+            }
+            if !in_adj && !has(&mods.add_e, x, y) {
+                out.inferred.push(format!(
+                    "{} is taken as a neighbour of {} because the trace has {} as a neighbour of {}",
+                    self.label(y),
+                    self.label(x),
+                    self.label(x),
+                    self.label(y)
+                ));
+            }
+            let (b, a) = (ws[y].ben, ws[y].avail);
+            if b > 0 {
+                for r in 1..NREG {
+                    if a >> r & 1 == 1 {
+                        w[r] += ws[y].prefs[r];
                     }
                 }
+                if a.count_ones() == 1 {
+                    w[a.trailing_zeros() as usize] += 100 * b;
+                }
+            }
+            nbw.push(y);
+        }
+        for r in 1..NREG {
+            w[r] -= ws[x].prefs[r];
+        }
+        let Some(r) = Self::pick(ws[x].avail, &w) else {
+            if mods.ext_of(x).is_some() {
+                // the extended web is uncolourable at its turn: c2 splits it (HandleCurrUncolorable).
+                // Its pieces are not modelled; the other values go on without it.
+                out.inferred.push(format!(
+                    "{} has no register left at its turn: c2 splits it; its pieces are not modelled",
+                    self.label(x)
+                ));
+                out.pops.push(PopOut { web: x, avail: 0, w, reg: None });
+                ws[x].live = false;
+                *nbuf = nbw;
+                *mbuf = merged;
+                return Ok(());
+            }
+            return Err(format!("{} is left without a register (c2 would split or spill; not modelled)", self.label(x)));
+        };
+        *mbuf = merged;
+        out.pops.push(PopOut { web: x, avail: ws[x].avail, w, reg: Some(r) });
+        ws[x].colour = Some(r);
+        ws[x].live = false;
+        for &y in &nbw {
+            ws[y].avail &= !(1 << r);
+            if ws[y].avail != 0 {
+                continue;
+            }
+            // An uncoloured neighbour without a register left is split by c2 (InsertAdditionalSplits). Splits are
+            // not simulated, with one exception [I]: a web whose range a what-if extended is continued as the piece
+            // covering the extension. That piece starts from the web's initial set, minus the register just taken,
+            // minus the registers of the coloured values the extension overlaps (c2 re-costs a piece and subtracts
+            // what is live at its defs).
+            match mods.ext_of(y) {
+                Some(over) if !ws[y].piece => {
+                    ws[y].piece = true;
+                    let mut a = ws[y].init_av & !(1 << r);
+                    for &z in over {
+                        if let Some(c) = ws[z].colour {
+                            a &= !(1 << c);
+                        }
+                    }
+                    ws[y].avail = a;
+                    out.inferred.push(format!(
+                        "{} runs out of registers when {} takes {}: c2 splits it; modelled as one piece over the \
+                         extended range with {} left",
+                        self.label(y),
+                        self.label(x),
+                        rname(r),
+                        mask_names(a)
+                    ));
+                    if a == 0 {
+                        ws[y].live = false;
+                    }
+                }
+                Some(_) => ws[y].live = false, // the piece runs dry too: gone (split again or left in memory)
+                None => {}
             }
         }
-        out.colour = colour;
+        *nbuf = nbw;
+        let extra = mods.copies.iter().any(|e| e.0 == x || e.1 == x);
+        let mut merged = std::mem::take(mbuf);
+        if extra {
+            let add = mods.copies.iter().filter(|e| e.0 == x || e.1 == x).map(|e| if e.0 == x { e.1 } else { e.0 });
+            merge_into(&self.ptl[x], add.map(|y| (y, self.padj[x].contains(&y))), &mut merged);
+        }
+        for &(y, in_padj) in if extra { &merged[..] } else { &self.ptl[x][..] } {
+            if y == x || !ws[y].live || has(&mods.del_c, x, y) {
+                continue;
+            }
+            if !in_padj && !has(&mods.copies, x, y) {
+                out.inferred.push(format!(
+                    "{} is taken as a copy partner of {} because the trace has the reverse",
+                    self.label(y),
+                    self.label(x)
+                ));
+            }
+            addpref!(y, r);
+        }
+        *mbuf = merged;
+        Ok(())
+    }
+
+    /// Every web step i reads or writes (the colouring's neighbour and partner lists as the trace has them, both
+    /// directions). A change confined to webs that a step does not touch cannot alter that step.
+    /// f(web, kind) for every web step i reads or writes, by how: T_INIT its queueing, T_BEN its benefit, T_CORE its colouring or RestrictToReg, T_PREF a Spillcosts preference for it (a no-op once it is coloured),
+    /// T_SRC the preference's source (its colour is read), T_ADJ a neighbour or partner of the web being coloured
+    /// (read and written only while live). A change confined to webs a step does not touch cannot alter it.
+    fn touches(&self, i: usize, f: &mut impl FnMut(usize, usize)) {
+        let n = self.items.len();
+        let x = if i >= n {
+            i - n
+        } else {
+            match &self.items[i] {
+                Item::Init { web, .. } => return f(*web, T_INIT),
+                Item::Ben { web, .. } => return f(*web, T_BEN),
+                Item::Requeue { .. } => return,
+                Item::Restrict { web } => return f(*web, T_CORE),
+                Item::Pref { web, src, .. } => {
+                    f(*web, T_PREF);
+                    if let Some(s) = src {
+                        f(*s, T_SRC);
+                    }
+                    return;
+                }
+                Item::Pop { web, .. } => *web,
+            }
+        };
+        f(x, T_CORE);
+        for y in self.adj[x].iter().chain(&self.radj[x]).chain(&self.padj[x]).chain(&self.rpadj[x]) {
+            f(*y, T_ADJ);
+        }
+    }
+
+    /// The unedited free simulation over `order` (None: the traced order), with its state saved every K steps, for
+    /// `run_fast`.
+    pub fn trace(&self, order: Option<Vec<usize>>) -> Result<Trace, String> {
+        let mods = Mods { order, ..Default::default() };
+        let mut moved = vec![];
+        let order = self.order(mods.order.as_ref(), &[], &mut moved)?;
+        let n = self.webs.len();
+        let k = (order.len() / 256).max(8);
+        let mut st = RunSt::new(n);
+        let mut out = Outcome { colour: vec![], pops: vec![], inferred: moved };
+        let (mut cps, mut pops_at, mut inf_at) = (vec![], vec![], vec![]);
+        let mut first = vec![[usize::MAX; NT]; n];
+        let mut last1 = vec![[0usize; NT]; n];
+        for (p, &i) in order.iter().enumerate() {
+            if p % k == 0 {
+                cps.push(st.clone());
+            }
+            pops_at.push(out.pops.len());
+            inf_at.push(out.inferred.len());
+            self.touches(i, &mut |w, t| {
+                first[w][t] = first[w][t].min(p);
+                last1[w][t] = p + 1;
+            });
+            self.step(&mods, i, &mut st, &mut out)?;
+        }
+        if order.len() % k == 0 {
+            cps.push(st.clone());
+        }
+        pops_at.push(out.pops.len());
+        inf_at.push(out.inferred.len());
+        out.colour = st.colours();
+        let look = (0..cps.len())
+            .map(|j| {
+                let q = j * k;
+                (0..n)
+                    .filter_map(|w| {
+                        let later = |t: usize| last1[w][t] > q;
+                        let mut f = 0u8;
+                        if later(T_INIT) || later(T_CORE) {
+                            f |= L_CORE | L_COLOUR;
+                        }
+                        if later(T_PREF) {
+                            f |= L_PREF | L_COLOUR;
+                        }
+                        if later(T_SRC) {
+                            f |= L_COLOUR;
+                        }
+                        if later(T_ADJ) || later(T_BEN) {
+                            f |= L_ADJ;
+                        }
+                        (f != 0).then_some((w, f))
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(Trace { order, k, cps, pops_at, inf_at, out, first, last1, look })
+    }
+
+    /// `run` with the same result, from a saved state of the unedited simulation: it starts at the last checkpoint
+    /// before the first step the changes can affect (a step that reads a changed web's changed property, or the
+    /// first position where the orders differ), and stops at the first checkpoint after the last such step where
+    /// everything a later step reads equals the unedited state (the remaining steps are then the unedited ones).
+    pub fn run_fast(&self, mods: &Mods, tr: &Trace) -> Result<Outcome, String> {
+        let mut moved = vec![];
+        let order = self.order(mods.order.as_ref(), &mods.moves, &mut moved)?;
+        // Per changed web: the touches from which on the change can matter (they read or write what the change
+        // alters; an Init or Ben before them is patched into the restored state below), the touches that read the
+        // change itself (it matters until the last of these), and the touches that read it only while the web is
+        // live (they do not matter once it is not live and its Init is past: nothing makes it live again).
+        struct Ch {
+            web: usize,
+            from: &'static [usize],
+            reads: &'static [usize],
+            live: &'static [usize],
+        }
+        let mut changed: Vec<Ch> = vec![];
+        let ch = |web: usize, from: &'static [usize], reads: &'static [usize], live: &'static [usize]| Ch { web, from, reads, live };
+        // PREF counts: added to the state at the start; read by the colouring, a preference event, a neighbour
+        for x in &mods.prefs {
+            changed.push(ch(x.0, &[T_CORE, T_PREF, T_ADJ], &[], &[]));
+        }
+        // neighbours and copy partners: read when either web is coloured, and only if the other one is live then
+        // (see `edges` below)
+        let mut edges: Vec<(usize, usize)> = vec![];
+        for v in [&mods.add_e, &mods.del_e, &mods.copies] {
+            for e in v.iter() {
+                changed.push(ch(e.0, &[T_CORE], &[], &[]));
+                changed.push(ch(e.1, &[T_CORE], &[], &[]));
+                edges.push(*e);
+            }
+        }
+        // a copy removed: also its Spillcosts preference event
+        for e in &mods.del_c {
+            for w in [e.0, e.1] {
+                changed.push(ch(w, &[T_CORE, T_PREF, T_SRC], &[T_CORE, T_PREF, T_SRC], &[]));
+            }
+        }
+        // benefit: applied at Init and Ben, read by a neighbour's colouring (while live), overwritten by
+        // RestrictToReg; patched into the state at the start when an Init or Ben came before
+        for x in &mods.ben {
+            changed.push(ch(x.0, &[T_CORE, T_ADJ], &[T_INIT], &[T_BEN]));
+        }
+        // killed and given registers: applied at Init (patched in when it came before the start)
+        for x in mods.kills.iter().chain(&mods.gives) {
+            changed.push(ch(x.0, &[T_CORE, T_ADJ], &[T_INIT], &[]));
+        }
+        // an extended web: its colouring, and a neighbour's colouring that leaves it without registers
+        for x in &mods.ext {
+            changed.push(ch(x.0, &[T_CORE, T_ADJ], &[T_CORE], &[T_ADJ]));
+        }
+        let (ne, nb) = (order.len(), tr.order.len());
+        let d = order.iter().zip(&tr.order).position(|(a, b)| a != b).unwrap_or(ne.min(nb));
+        let same_tail = order.iter().rev().zip(tr.order.iter().rev()).take_while(|(a, b)| a == b).count();
+        let (mut t0, mut free) = (d, 0usize);
+        for c in &changed {
+            for &t in c.from {
+                t0 = t0.min(tr.first[c.web][t]);
+            }
+            for &t in c.reads {
+                free = free.max(tr.last1[c.web][t]);
+            }
+        }
+        let start = (t0 / tr.k) * tr.k;
+        let mut st = tr.cps[start / tr.k].clone();
+        // No step before t0 reads or writes what a change alters, so the changes can be applied to the state here:
+        // PREF counts are still the initial ones; a benefit, avail set or initial set is still what Init or Ben
+        // last set (without the change) if one came before.
+        for (x, r, c) in &mods.prefs {
+            st.ws[*x].prefs[*r as usize] += c;
+        }
+        let before = |w: usize, t: usize| tr.first[w][t] < start;
+        for &(w, d) in &mods.ben {
+            if before(w, T_INIT) || before(w, T_BEN) {
+                st.ws[w].ben += d;
+            }
+        }
+        let mut done: Vec<usize> = vec![];
+        for &(w, _) in mods.kills.iter().chain(&mods.gives) {
+            if before(w, T_INIT) && !done.contains(&w) {
+                done.push(w);
+                st.ws[w].avail = (st.ws[w].avail | mods.give(w)) & !mods.kill(w);
+                st.ws[w].init_av = st.ws[w].avail;
+            }
+        }
+        let mut out = Outcome { colour: vec![], pops: tr.out.pops[..tr.pops_at[start]].to_vec(), inferred: moved };
+        out.inferred.extend(tr.out.inferred[..tr.inf_at[start]].iter().cloned());
+        let tail_from = ne - same_tail; // order[tail_from..] == tr.order[tail_from + nb - ne..]
+        let mut hint = None;
+        for p in start..ne {
+            if p > start && p >= tail_from {
+                let q = p + nb - ne;
+                if q >= free
+                    && q % tr.k == 0
+                    && q / tr.k < tr.cps.len()
+                    && changed.iter().all(|c| {
+                        c.live.iter().all(|&t| tr.last1[c.web][t] <= q)
+                            || (!st.ws[c.web].live && tr.last1[c.web][T_INIT] <= q)
+                    })
+                    // an edge or copy change is read no more once both colourings are past, or once either web is
+                    // not live for good (its colouring is skipped, and the other's skips it)
+                    && edges.iter().all(|&(a, b)| {
+                        let dead = |w: usize| !st.ws[w].live && tr.last1[w][T_INIT] <= q;
+                        (tr.last1[a][T_CORE] <= q && tr.last1[b][T_CORE] <= q) || dead(a) || dead(b)
+                    })
+                    && st.same(&tr.cps[q / tr.k], &tr.look[q / tr.k], &mut hint)
+                {
+                    let rest = &tr.out.pops[tr.pops_at[q]..];
+                    for x in rest {
+                        if let Some(r) = x.reg {
+                            st.ws[x.web].colour = Some(r);
+                        }
+                    }
+                    out.pops.extend(rest.iter().cloned());
+                    out.inferred.extend(tr.out.inferred[tr.inf_at[q]..].iter().cloned());
+                    out.colour = st.colours();
+                    return Ok(out);
+                }
+            }
+            self.step(mods, order[p], &mut st, &mut out)?;
+        }
+        out.colour = st.colours();
         Ok(out)
     }
 

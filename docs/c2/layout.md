@@ -194,6 +194,18 @@ target but merged in yours (or the reverse), look at the first instructions of t
 independent stores in all arms flips the result, and so does a store of a different size (an immediate
 that fits in a byte, a register source instead of an immediate).
 
+**Where the walk stops, and which copy survives** (il_fg.md §7.5; `c2trace.py merges` prints both per pair):
+
+- The walk back stops at the first instruction pair that differs in any operand, after register allocation:
+  a call to another symbol (two functions with identical bodies are two symbols until the linker folds them),
+  or a different register (the scratch rotation can give every arm its own `lea REG / push REG` register).
+  Only what lies between that point and the jump counts for the 20-byte rule. **[C]** tests/data/tailmerge.c.
+- The kept copy is the one at the jump that comes first in the label's reference list; the other jump is
+  retargeted into it and its copy deleted. In the three-arm probe that is the **last** arm on 14.00 (the
+  earlier arms jump forward into it) and the **first** arm on 13.10.3077 / 3052 (the later arms jump back),
+  which is also what M&B found on 13.10 for widget_mgr::set_size ("the earlier jump keeps its copy").
+  **[C for that shape; I in general]**
+
 ## 7. Open
 
 - The sparse-switch split: settled in §3.2 (it is c2's reader; isel.md §9.4 has the pivot rule).

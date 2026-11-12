@@ -1,4 +1,4 @@
-//! rasim: what-if simulator for c2's register-allocation priorities (VS2005 SP1 c2.dll 14.00.50727.762).
+//! rasim: what-if simulator for c2's register allocation (c2.dll 13.10, 14.00 and 15.00; the snapshot carries the build).
 //!
 //! Input: a snapshot from `uv run tools/c2trace.py regs SRC --func F --export snap.json -- <cl args>`.
 //! The model is c2's Spillcosts formula (docs/c2/regalloc.md section 3.2), applied to the measured block x globreg
@@ -18,6 +18,8 @@
 //!   rasim check SNAP --predict [-v]        run Color's loop as a model (predict.rs): predict every spill, deferral,
 //!                                          split-round and register decision from the model's own state and
 //!                                          report, per round, where prediction and trace diverge
+//!                                          (cl 13.10: both also replay FPColor's x87 list, fpcolor.rs, and
+//!                                          `need A>B` on x87 webs answers from that list)
 //!   rasim order SNAP [--pass N] [--top K] [EDIT...]
 //!                                          priority order of pass N, after the edits; changes are marked
 //!   rasim need SNAP [--pass N] [EDIT...] A>B [A>B...] [--edits K]   (EDITs are applied first, as givens)
@@ -35,6 +37,9 @@
 //!   rasim want SNAP REGMAP.txt [CHANGE|EDIT...]
 //!                                          the same, with the targets read from `c2trace.py regmap` output
 //!                                          (WANTS rows; with regmap --all the ok rows are pinned) or VAR=REG lines
+//!
+//!   rasim fold SNAP VAR                    does a reload (OPENTERLOAD web, a split piece) fold into VAR, and the
+//!                                          single edit that would make it fold (fold.rs, regalloc.md 3.6.10)
 //!
 //!   rasim scratch SSNAP [--run K] [-v] [drop:N ins:N[:LIFE] nopref:N pref:N:REG ...]
 //!                                          scratch-register picks (scratch.rs): predict them from a
@@ -62,6 +67,8 @@ use serde::Deserialize;
 
 mod choose;
 mod combo;
+mod fpcolor;
+mod fold;
 mod predict;
 mod scratch;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -290,6 +297,12 @@ impl State {
     fn order(&self) -> Vec<(usize, i64)> {
         let mut o: Vec<(usize, i64)> =
             self.vars.iter().enumerate().filter(|(_, v)| !v.removed).map(|(i, v)| (i, self.prio(v))).collect();
+        self.sort_order(&mut o);
+        o
+    }
+
+    /// `order`'s sort, for (var, prio) pairs listed in ascending var order (the sort is stable).
+    fn sort_order(&self, o: &mut [(usize, i64)]) {
         let tie = |v: &Var| {
             v.num.map(|n| {
                 if v.pass <= 1 {
@@ -304,7 +317,6 @@ impl State {
                 .then(self.vars[b.0].def_ord.cmp(&self.vars[a.0].def_ord))
                 .then(tie(&self.vars[a.0]).cmp(&tie(&self.vars[b.0])))
         });
-        o
     }
 
     fn find(&self, sel: &str) -> Result<usize, String> {
@@ -1242,6 +1254,9 @@ fn main() {
     if args[0] == "scratch" {
         return scratch::main(&args[1..]);
     }
+    if args[0] == "fold" {
+        return fold::main(&args[1], args.get(2).map(|x| x.as_str()).unwrap_or_else(|| die("fold: give SNAP VAR")));
+    }
     let s = load(&args[1]);
     let mut n = None;
     let mut top = 30usize;
@@ -1258,6 +1273,15 @@ fn main() {
             _ => rest.push(a.clone()),
         }
     }
+    if args[0] == "need" && !rest.iter().any(|c| c.starts_with("reg:")) {
+        // x87 webs on cl 13.10 (FPColor's own list, fpcolor.rs)
+        let cons: Vec<(String, String)> =
+            rest.iter().filter_map(|c| c.split_once('>').map(|(a, b)| (a.to_string(), b.to_string()))).collect();
+        if fpcolor::handles(&args[1], &cons) {
+            let pre: Vec<String> = rest.iter().filter(|c| !c.contains('>')).cloned().collect();
+            return fpcolor::cmd_need(&args[1], &cons, &pre, top);
+        }
+    }
     if n.is_none() {
         // no --pass: follow the variables the command names (their class, the pass that decides between them)
         let named: Vec<String> = match args[0].as_str() {
@@ -1270,12 +1294,16 @@ fn main() {
         n = default_pass(&s, &named);
     }
     match args[0].as_str() {
-        "check" if rest.iter().any(|a| a == "--predict") => predict::main(&args[1], rest.iter().any(|a| a == "-v"), false),
+        "check" if rest.iter().any(|a| a == "--predict") => {
+            predict::main(&args[1], rest.iter().any(|a| a == "-v"), false);
+            fpcolor::cmd_check(&args[1], true, rest.iter().any(|a| a == "-v"));
+        }
         "check" => {
             cmd_check(&s);
             choose::cmd_check(&s);
             combo::cmd_check(&s);
             predict::main(&args[1], false, true);
+            fpcolor::cmd_check(&args[1], false, rest.iter().any(|a| a == "-v"));
         }
         "regs" => combo::cmd_regs(&s, &rest),
         "need" if rest.iter().any(|c| c.starts_with("reg:")) => {

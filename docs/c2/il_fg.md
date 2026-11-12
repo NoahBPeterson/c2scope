@@ -78,6 +78,15 @@ These rules predict output. The sections after this one give the evidence for ea
     variable read in a duplicated head is credited by Spillcosts in **each** arm (regalloc.md §3.2), even though
     the final code reads it once. Writing the source with the read hoisted changes the branch tree, so it is not
     a fix; the priority has to be balanced somewhere else.
+13. **A tail merge compares instructions after register allocation, operand by operand: call targets by
+    symbol, registers by number.** Two arms that call two different functions with identical bodies (which
+    the linker later folds with /OPT:ICF, so the exe shows one address) stop the backward walk at the call;
+    a forwarder that makes both arms call one symbol lets the walk run back past it. Arms that differ only in
+    a scratch register (`lea REG, [slot]; push REG`, the register from the rotation of regalloc.md §6) stop
+    there too, so the rotation decides which arms share code. Which copy survives: the jump that comes
+    first in the label's reference list keeps it (14.00: the lexically last arm; 13.10: the first one).
+    `c2trace.py merges` lists every pair and why it stopped. §7.5. CONFIRMED (code on all four builds;
+    probe tests/data/tailmerge.c on 14.00, 13.10.3077, 13.10.3052, 15.00).
 
 ---
 
@@ -508,6 +517,98 @@ both assignments. The result is `d = s1; j!cc L2; d = s2; L2:`. CONFIRMED in cod
   size/predecessor ratio check (`(_Speed+1)*4 <= ...`). INFERRED details.
 * `FgReturnValueMerge` 10b2be20 (dop2_Codegen) and tail-recursion-to-loop (`FgEliminateTailRecursions`
   10b2aed0 → `FgConvertTailRecursionToLoop` 10b2b270, at setup) are not mapped in detail.
+
+### 7.5 The instruction compare, survivors, the 13.10 functions and `c2trace.py merges`
+
+**The compare, `FgMdInstrsMatch`** (14.00 10b29e90, eax = t1, ebx = t2; 13.10.3077 107b6bf8 and 3052 1078d0b8,
+eax = t1, [esp+4] = t2, `ret 4`; 15.00 510765b0, eax/ebx as 14.00). Every tail and head merge goes through it
+(FgDoCommonTailMerge's walk, FgTryTailMerge's DAG match, FgDoCommonHeadMerge, FgDoHeadMerge). It requires the
+same opcode (+4) and kind (+8), then by kind (14.00 jump table 10b2a03c, 13.10.3077 107b6bd0, read in both):
+instruction 0x0d and return 0x10: type bits (+0xa & 0xfff) and both operand lists; call 0x0f: both operand lists
+and the call word +0x30; branch 0x12: the condition nibble and the same target label; switch 0x14: never.
+Then, with `_FCantMergeStackRef` set, an instruction that references esp (`TupHasStackSymRef`) is refused. The
+operand lists go through `TupLeafListsAreEquivalent` → `TupAreSameFinalLeaf` (14.00 10bf6fe0, 13.10.3077
+1078755c; table 10787740): same leaf kind, compatible types, then **REG (1): the physical register number
+(+0x1c)**; SYM / DATAADDR (2, 3): `SymCmpSym`; **CODEADDR (4): the symbol pointer (+0x18), by identity**;
+EA / INDIR (5, 6): symbol, displacement, base, index and scale (14.00; not re-read in 13.10); ICONST (7): the
+value. **[C]** in 14.00 and 13.10.3077 (kinds 1 and 4 read in both); 13.10.3052 is the 3077 code (`sig` match,
+identical masked bytes); 15.00 by trace.
+
+Consequences, each probed in `tests/data/tailmerge.c` (three arms jumping to one join that is too long for
+FgCodeMotion to copy back; /O2; same result on 14.00, 13.10.3077, 13.10.3052 and 15.00 unless stated) **[C]**:
+
+| function | arms | result | why |
+|---|---|---|---|
+| c1 | `w_k = 11; s1 = 7; f(&gv); b1 = 21;` | 2 of 2 pairs merged (15.00: none) | the walk passes the call; 9 + 5 + 5 + 3 + 7 > 20 (layout.md §6). 15.00 stores the short constant through a scratch register (`mov ax, 7`), so its arms stop at a register |
+| c2 | arm 2 calls `f2`, arms 1 and 3 `f1` (twins: identical bodies elsewhere) | arms 1 and 3 merged; arm 2 stops at the call (`call target _f2 / _f1`), 15 <= 20 | CODEADDR leaves compare by symbol. The linker's /OPT:ICF folds f1 and f2 later, so the exe shows two arms calling one address that the compiler did not merge |
+| c3 | c2 with arm 2 calling `f2fwd`, an inline forwarder to `f1` | as c1 | after inlining every arm calls `_f1`: one symbol. This is the M&B fix (three cases of Operation::execute) |
+| r1 | `f(&a)` with a local `a`: `lea REG, a; push REG`, one scratch pick per arm | no pair merged; every pair stops at the push (`register ecx / edx` ...) | the rotation (regalloc.md §6) gives the three arms eax, ecx, edx |
+| r2 | two more scratch picks before the `lea` in every arm | 2 of 2 merged | three picks per arm: each lea gets the same register |
+
+So which arms share a tail depends on everything that moves the scratch rotation before them (an extra or
+missing pick anywhere earlier in the function shifts the register of every later arm by one), and on the call
+targets being one symbol. For matching: a duplicated tail in yours that is shared in the original (or the
+reverse) is first a register question when the tails differ in one `lea/push` register, and a symbol
+question when they differ at a call whose target the exe shows as one address. The distance from the jump
+back to the first difference also decides the size rule (layout.md §6): the matched part alone must exceed
+20 bytes (with the jump's 5).
+
+**Which copy survives.** `FgTryCommonTailMerge` takes the label's references in list order; for each jump A
+it pairs every later reference B and calls `FgDoCommonTailMerge(B, A)` (§7.2); unless the roles swap
+(J1's walk passed J2's label), A (J2) keeps the code and B's copy is deleted, B being retargeted into A's
+copy. In tailmerge.c c1 the reference list starts with the lexically last arm on 14.00 (the last arm keeps
+the shared code, the earlier arms jump forward into it) and with the first arm on 13.10.3077 and 3052 (the
+first arm keeps it, the later arms jump back). **[C: trace (`merges` J1/J2 and the listing) on both]** M&B's
+own reading on 13.10, "the earlier jump keeps its copy" (widget_mgr::set_size), agrees with the 13.10 result;
+the reference order for other shapes (a label referenced from a jump table, jumps made by different passes)
+was not probed. **[I beyond these shapes]**
+
+**The 13.10 functions.** No PDB (port-1310.md §3); the names come from the 6030 PDB by code matching. The
+merge functions, read in 3077 and placed in 3052 by the index (`sig`/`calls`) and, for the probes, by the
+unique masked byte context **[C]**:
+
+| function | 3077 | 3052 | arguments (13.10) | 14.00 |
+|---|---|---|---|---|
+| `@FgDoLateFlowOpts@8` | 107b211d | 107786ed | eax = mode, ecx = FUNC | same |
+| `@FgDoLateFlowOptsOnce@8` | 10775ec7 | 10778724 | | `@20` |
+| `@FgTryCommonTailMerge@4` | 107b62d3 | 1078ce34 | [esp+4] = label | `@8`, [esp+4] = label |
+| `@FgDoCommonTailMerge@16` | 107b89a9 | 107ac80c | [esp+4] = J1 (B), [esp+8] = J2 (A), [esp+0xc] = pass, [esp+0x10] = &out; returns eax != 0 when merged; `ret 0x10` | `@20`: ecx = J1, edx = J2, [esp+4] = pass, [esp+8] = &out |
+| walk end (probe) | 107b8aac | 107ac90f | [esp+0x18] = matches, esi / ebx = the J1 / J2 tuples where the walk stopped, [esp+0x24] / [esp+0x28] = whole-block point | 10b30a1f: [esp+0x24], edi / esi, [esp+0x30] / [esp+0x34] |
+| size rule (probe) | 1079f7c5 | 107afab8 | ebp = size + credit, edi = _Speed (limit 20, or 2) | 10b30b6a: ebp, ebx |
+| `@FgMdInstrsMatch@8` | 107b6bf8 | 1078d0b8 | eax = t1, [esp+4] = t2 | eax, ebx |
+| `@FgTryTailMerge@4` | 107b6ddd | 1079aa64 | [esp+4] = the jmp; builds both DAGs itself | `@16`: [esp+4] = jmp, plus the two DAG contexts |
+| `@FgCrossJumpRemove@4` | 107b719a | 1079adde | [esp+4] = jmp | same |
+| `@FgTryCommonHeadMerge@4` | 107b6344 | 1078cdb5 | edx = label | same |
+| `@FgDoCommonHeadMerge@8` | 1078ea60 | 107ac958 | [esp+4], [esp+8] = the two jumps | same |
+| `@FgTryHeadMerge@4` | 107b6ae3 | 1078ceb5 | [esp+4] = the jcc | `@16` |
+
+`FgDoCommonTailMerge@16` fires in every 13.10 probe here (`work/scratch/layout/tm.c`, tailmerge.c), so a hook
+that "never fired" was on another address or another build; an entry hook that reads ecx/edx (the 14.00
+convention) sees unrelated values. The walk and the size rule are the 14.00 code (same tests, same order: the
+whole-block point, `FgTailMergeWithoutCheck` 1079f6ec, `decode` with one opcode (0x1c4) special-cased, the
+larger of the two credits at tuple +0x16). FgTryTailMerge is `@4` in 13.10: the DAG contexts that 14.00 passes in are built
+inside (`FgDagInitializeGraph`, `DagBuildGraph`). 15.00 (PDB names): `FgDoCommonTailMerge(ecx = A, edx = B,
+[pass, &out])`, walk end 5107d4bd ([ebp-0x5c] matches, esi = B side, ebx = A side), size 5107d609 (ecx, edi).
+
+**`c2trace.py merges SRC --func F -- FLAGS`** (also `il --merges`; tools/c2merges.py) hooks the functions above
+plus the two probes and prints, per `FgDoLateFlowOptsOnce` iteration of the mode-2 run, every tail pair with
+its two jumps (tuple, source line offset, listing offset or `gone`), the number of matched instructions, the
+verdict (`merged`, or `stop:` call target / register / operand / instruction / same text / other jump /
+whole block) with the two instructions where it stopped, and the size rule's total. Fall-through tails
+(FgTryTailMerge), cross jumps and head merges are listed when they merged (all with `--pairs`); `--off` keeps
+what involves given listing offsets (one case of a big switch). Example (13.10.3077, c2):
+
+```text
+tail Lc83160: 2 pair(s), 1 merged
+  J1 c82d18 l2 @0005e  J2 c828a0 l1 @00030: 2 matched: stop: call target _f2 / _f1; size 15 <= 20
+      J1 side c82b88 l1 @0004f: call pas5:6000 regset:0 cc:8000 <- _f2:1004 pas5:6000 esp:1004
+      J2 side c82710 l1 @00021: call pas5:6000 regset:0 cc:8000 <- _f1:1004 pas5:6000 esp:1004
+  J1 c83190 l2 @0006f  J2 c828a0 l1 @00030: 5 matched: merged; size 22 > 20
+```
+
+Cost: a 300-case switch (work/scratch/tailmerge/big.c) took 58 s under wine with an 8 MB log. The verdict
+for a call is read at the compare (the name at the CODEADDR symbol +4), not from the dump, so it holds with an
+older c2trace.dll too.
 
 ---
 

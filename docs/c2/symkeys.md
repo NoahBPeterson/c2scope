@@ -1,6 +1,6 @@
 # Symbol keys: which number orders x87 operands, how it is assigned, and how to move it
 
-Back end `c2.dll` of cl 14.00.50727.762 (VS2005 SP1); section 7 covers 13.10.3077 and 15.00.30729.1. Tool:
+Back end `c2.dll` of cl 14.00.50727.762 (VS2005 SP1); section 7 covers 13.10.3077, 13.10.3052 and 15.00.30729.1. Tool:
 `tools/symkeys.py` (tracer.md, `symkeys`). Probes: `work/scratch/symkeys/` (`p1.cpp`, `c1.cpp`..`c4.cpp`,
 `tu_a.cpp`/`tu_b.cpp`), regression file `tests/data/symkeys.cpp`. **[C]** = read in the code at the address given or
 seen in a traced compile of the named probe; **[I]** = inferred. il_sym.md describes the symbol records themselves;
@@ -70,7 +70,7 @@ The tool hooks (14.00 VAs; tracer.md has the 13.10/15.00 equivalents):
 
 `replay()` in symkeys.py is the allocator: classes, blocks of 32, per-class LIFO free lists (13.10: temp and frame
 only). On every traced compile so far it reproduces **every** key: 0x00806ab0 48 486/48 486, 0x005c6320 6 504/6 504, all
-probe functions, on all three builds. **[C]**
+probe functions, on all four builds. **[C]**
 
 ## 3. The hash and the order (what to aim for)
 
@@ -86,6 +86,17 @@ equal SU and count (two loads, two field views, two `(double)` conversions of lo
 | conversion / negation of x | `hash(x) + opcode - 0x274` |
 
 `symkeys.py sites --line L --pass 2` prints each sort with both operands, their keys and weights.
+
+**Sorts of more than two operands.** The optimiser flattens associative chains, so `a + b + c + d` and an address
+such as `&scene[vs].visitors[p0].troop` (`base + vs*size + p0*8 + d`) reach OptLeftWeightTree as one OPADD with a
+list of three or four operands, which `MscMergeSort` sorts by the same weight, descending; the merge sort is stable.
+The `sort3` probe (right after the call: 14.00 0x10bb6635, 13.10.3077 0x1075d977, 3052 0x10770243, 15.00
+0x51103975) logs the third and fourth sorted operands and the fifth one's kind, and the model re-sorts the whole
+list (operands whose weights stay equal keep the traced order: the input order is not traced). Probe
+tests/data/symkeys_nary.cpp: `kn4` sorts `_a _b _c _d` (keys 4..1); in `kcall3` referencing `c` first
+(`int c = f3();` before a and b) turns `c b a` into `b a c`, predicted by `swap:_c,_a` (`compare`: 1 of 1, all
+four builds). In Mount & Blade's Operation::execute the `scene(vs)->visitors[p0]` adds are four-operand sorts
+(`[$o58791 key 24043+0]`, `(?g_visitor_scene key 4135 ..)`, `$o53502`, a constant; lines 1260-1269). **[C]**
 
 ## 4. Constructs: what takes a key (probes `c1.cpp` .. `c4.cpp`, 14.00, the same on 15.00)
 
@@ -120,19 +131,66 @@ uv run tools/symkeys.py levers --from a.json --var 'X' --hash-below 0x9b41 [--ma
 uv run tools/symkeys.py compare --from a.json 'add:frame@_r:1' --vs variant.json  # prediction vs a real compile
 ```
 
+Also (tracer.md): `whatif --batch FILE|-` (one edit set per line, one load; stdin doubles as a persistent mode),
+`levers --site LINE:A>B` (several wanted orders at once, below), and optimiser symbols as `$o<n>`: every symbol
+made after the first OptFuncExpr is named by its rank among the optimiser's allocations (`$o34` = the 34th), which
+an edit before it does not change while `$t<key>` would; `keys` shows those an operand sort depends on (`--phase
+opt --all` all of them, with the c2 function that made them: `HshInsertEntry` value-numbering temps, `GdfInstrSdsu`,
+`OptRebuildTuples`, `TupMakeTmpBinary`), whatif and compare follow them, and `levers --var '$o34'` targets one.
+Their keys are replayed exactly; what is assumed is that the optimiser makes the same symbols after the edit.
+
+**The hash pool class (value-numbering temporaries).** `HshInsertEntry` makes the optimiser's value-numbering
+temps from the hash pool (blocks of 32, never freed on 14.00/15.00). As a memory base they hash by `64*key`, so
+through the `<< 8` of a memory operand only `key & 3` reaches the weight (`[$o key 8554+0]` h8025, 8557 h4025;
+model: `KEYED_BASE` in symkeys.py); a reader temporary as a base may hash by its single definition and is still
+taken as fixed. Edits: `add:hash@V:n` / `sub:hash@V:n` (V any symbol, `$o<n>` included: the n-th symbol the
+optimiser made), and `levers` tries hash edits at the first value-numbering temp of every source line (for
+`--match` over the whole function, since those temps come after any reader target; `--classes` picks the
+classes). `compare` and `levers --match` name optimiser symbols `$o~k` (the k-th one a sort depends on), so a
+hash-class difference now counts. Fallout 3 0x00806ab0 (work/scratch/f3/keywall/RESULTS.md): jp18 against best1
+differs only in 3 value-numbering temps made at line offset 218 in best1; `whatif --from 806/jp18.keys.json
+'add:hash@$o20695:3'` (the first hash temp of line 218) moves the site-1 temp `$o20956` from 8554 to 8557, the
+key measured in best1, and flips exactly the four `[$o] * $T` crosses (lines 439, 513, 660, 734 = source 1191,
+1265, 1412, 1486). It also flips 12 later sorts (lines 65-68, 167-202) whose `$o` temps (keys 13.6k-13.9k) the
+three extra temps shift; in jp18 the same three temps are made later rather than not at all, so the edit that
+stands for moving vDCrossE back is `add:hash@$o20695:3` plus a `sub:hash@..:3` where jp18 makes them. **[C keys;
+I: which later sorts best1 keeps]**
+
+`levers --match` and `levers --site` evaluate their edits in parallel (`--jobs`, default min(8, cores)) from the
+allocator snapshot (`FastKeys`), and evaluate only one insertion point per equivalence class: two points with no
+op of the edited class and no new block of 32 between them give every symbol the same key (exact; checked on 116
+samples of 0x00806ab0, 0 differ). On 0x00806ab0 (94k events, 792 sorts) an edit costs about 0.1 s of CPU;
+`levers --match jp18 --n 17,18 --classes frame` (664 edits after pruning) took 30 s on 8 workers, so 14 n values
+with frame and tmp is a few minutes. On M&B Operation::execute (186k events, 1909 pass-2 sorts) `levers --site`
+with three g_visitor_scene sites and `--classes glob --n 1,2,4,8 --depth 2`: 2029 points pruned to 1296 single
+edits in 128 s, 120 pairs in 35 s more (a loaded machine), 187 edit sets satisfying all three; the wanted
+direction in that run was a guess, not the original's.
+
+**Several sites at once.** `levers --site '1260:(?g_visitor_scene>[$o' --site ...` takes the wanted order at N
+sorts (A and B substrings of two operands as `sites` prints them), tries every single add/sub of the chosen
+classes (`--classes`, default frame,tmp,glob; `--n`) at every insertion point before the last symbol the sites
+depend on, then pairs (and with `--depth 3` triples) of the `--pool` best, and ranks by sites satisfied, then
+other pass-2 orders flipped (computed for the best candidates only), then size; partial solutions are listed with
+the sites they miss. The single evaluations replay only from a snapshot of the allocator before the edit up to
+the last dependency (`FastKeys`, equal to the full replay on the M&B export).
+
 Predictive mode is a replay of the traced stream with edits (add/sub n allocations of a class at a point, delete a
 symbol, swap two first references); the sort model recomputes every two-operand weight whose hash depends on a key it
-can follow (named leaves, field views, multi-def temps, member operands, the first two sources of a subtree). Pure
+can follow (named leaves, field views, multi-def temps, member operands, the first two sources of a subtree). `compare` and `levers --match` pair
+the sorts of two compiles by opcode and operand set (the k-th sort of that set), not by visit order, which a flip
+upstream changes (before this the table's first and last rows counted 788 and 131 pairs). Pure
 source analysis is not attempted: the temp counts come from the reader and the optimiser. The cheapest input is one
 traced compile (3-5 s for 0x00806ab0). Measured accuracy, prediction vs a traced compile of the edited source:
 
 | edit (function) | keys predicted exactly | pass-2 operand orders predicted |
 |---|---|---|
-| 3 dead locals before `vC01` (0x00806ab0) | 468/468 (411 moved) | 788/788 (12 changed) |
+| 3 dead locals before `vC01` (0x00806ab0) | 468/468 (411 moved) | 794/794 (12 changed) |
 | 15 dead locals before `vC01` | 468/468 (411 moved) | 794/794 (20 changed) |
 | the decompiler's padded helper (16 locals in `EC`), as `add:frame@_r@EdgeCross#2:16` | 460/460 (191 moved) | 792/792 (4 changed) |
-| swap first references of `left`/`right` (0x005c6320) | 239/239 | 131/131 (1 changed) |
-| tests/data/symkeys.cpp (dead local in a function and in an inline helper) | all | all, on all three builds |
+| swap first references of `left`/`right` (0x005c6320) | 239/239 | 133/133 (1 changed) |
+| tests/data/symkeys.cpp (dead local in a function and in an inline helper) | all | all, on all four builds |
+| 13.10 member operands: 6 unused parameters between `p` and `q` in `p->x * q->x` (`work/scratch/symkeys/mem1310/l0`, `l6`), as `add:frame@_p:6` | 5/5 | 1/1 (1 changed: `fld [q]` first, as the listing) |
+| the same in `p->x * q->y + p->z * q->x` (`m0`, `m6`): the flip is the outer OPADD, through a second source `[p+0]` | 5/5 | 5/5 (1 changed) |
 
 The edit is only as right as its translation of the source change: a construct that also adds temps or reorders
 first references needs those edits too, and a different helper (another inline body) is not modelled (it changes which
@@ -181,21 +239,61 @@ mod 4, i.e. on the number of reader temporaries before them; not pursued further
 
 ## 7. Other builds
 
-| | 13.10.3077 | 14.00 | 15.00.30729.1 |
+| | 13.10.3077 / 13.10.3052 | 14.00 | 15.00.30729.1 |
 |---|---|---|---|
 | blocks of 32, four initial blocks, same order | yes | yes | yes |
 | free lists | temp and frame only; SymFree puts every non-temp chain on the frame list | per class | per class |
 | key order of the probes in tests/data/symkeys.cpp, c3.cpp | same (fewer field views: 13.10 makes one view per field read, no `b0` rest views; c2-made globals have no name) | | identical to 14.00 |
 | replay exact | yes | yes | yes |
-| operand-sort hash (OptHashNode) | same code shape | | same |
+| operand-sort hash (OptHashNode) | same code shape; memory operand `fold(d) + opcode - 0x24a + (hash(base) << 8)` (3052 0x10753452: d +0x30, base +0x34) | | same |
+| member operands in `sites` / `whatif` | `[_p key 2+0]`: base and displacement of a memory leaf, base of a subtree's second source | `([_p key 3+0] ..)` | as 14.00 |
 
 Hooks are in the build tables (`"hooks": {"symkeys": {...}}`, `symkeys_*` options). 13.10's `SymNewEquiv` is inlined;
-a probe at 0x10769fe9 names the views. 13.10's sort operands are memory leaves (no float to double conversion), shown
-as `mem` without the base key, so the flip model treats them as fixed there. **[C: runs; I: that no other 13.10 site
-creates views]**
+a probe at 0x10769fe9 names the views. 13.10's sort operands are memory leaves (no float to double conversion), not
+subtrees as on 14.00; the trace's `MscMergeSort` exit has no room left (MAXSPEC 12), so the hook's entry logs for the
+first two list members weight, kind, memory base key (+0x34 > +0x18 > +0x1c), displacement (+0x30) and the base key of
+the second source, and the parser pairs them with the sorted operands by kind and weight (the sort is stable). The
+model then moves a member operand's weight by `(hash(new) - hash(old)) << 8` (`<< 9` through a second source), as on
+14.00. Probe `work/scratch/symkeys/mem1310/l0.cpp` (`return p->x * q->x;`) and `l6.cpp` (6 unused parameters between):
+`sites` shows `[_p key 2+0] h4008` before `[_q key 1+0] h2008`, and in l6 `[_q key 1+0]` before `[_p key 8+0] h0008`;
+`whatif add:frame@_p:6` on l0 predicts that flip and `compare --vs l6` scores 5/5 keys, 1/1 orders; the /FAs listings
+change from `fld [p]; fmul [q]` to `fld [q]; fmul [p]`; the same on 3052. 13.10.3052 has the same hooks as 3077, found
+by unique byte context and read side by side (port-1310.md section 16). Not modelled (as on 14.00): a member operand
+whose base is an address temporary with one definition (`[t64+0]`, hash from its definition). **[C: runs; I: that no
+other 13.10 site creates views]**
+
+### 7.1 What a global costs in keys (13.10.3077, probe tests/data/symkeys_glob.cpp) **[C]**
+
+Measured as allocations per class against a function that names no global (Mount & Blade's measurements, each
+checked; tests/run_tests.py checks the row on 13.10):
+
+| construct (S a struct global, i a parameter) | global keys | frame keys | 14.00 |
+|---|---|---|---|
+| `(void)gs;` (bare mention) | 1 (the symbol) | 0 | same |
+| `gi + i` (scalar global) | 1 | 0 | same |
+| `gs.a` (offset-0 field) | 2: the symbol at first use + 1 view `+0` | 0 | same (`+0.i4`) |
+| `gs.b` (field at offset 4); `gs.b + gs.b` | 3: symbol + 2 views `+4` (14.00: `+4.b0` and `+4.i4`) | 0 | same |
+| `gs.m()` (member call) | 2: symbol + view `+0` | 0 | 1 (no view) |
+| `gs.arr[i]` (variable index) | 2: symbol + view `+8` | 0 | same (`+8.b0`) |
+| `gs.arr[3]` (constant index) | 3: symbol + `+8` + `+20` | 0 | same |
+| `S* p = &gs; p->b` or `S& r = gs; r.b` | 1 (the symbol) | 1 (p / r) | 1 + a view made later |
+
+So a field read through a pointer or reference local costs no global key beyond the struct's own one, and each
+further field (offset, or array base) is one or two more global keys the first time it is named. Global keys come
+from their own pool (class glob, blocks of 32) in first-reference order, so removing or adding globals before a
+global moves its key by that many; the hash is periodic (rule 2): g_visitor_scene in Operation::execute was the
+72nd global, key 4135 (`keys` on work/from-mb/lane_sib/base.cpp reproduces it), just past the 4096 wrap, so its
+hash (04e2) is tiny and its operand sorts last in the four-operand adds above; a key just below 4096 hashes high
+(4095: ffe1). Keys move by whole blocks of 32 when a block boundary is crossed (rule 6), so the number of globals
+to remove is found with `levers`, not by subtraction. The constraint is function-wide and
+coupled across sites, which is what `levers --site` is for.
 
 ## 8. Open
 
 - Natural constructs that give exactly +16 frame keys in 0x00806ab0's switch were not searched exhaustively.
 - Whether frame-slot seeds and Color ties follow keys anywhere else than through GLOBREG numbering: not checked.
-- 13.10: member-operand bases in `sites`; the `free2` probe is the only path for non-temp frees seen.
+- n-ary sorts: the fifth and later operands of a list are not logged (shown by kind; such a sort is not
+  re-sorted). The input order of a list is not traced, so operands that end with equal weights are taken in the
+  traced order.
+- 13.10: the `free2` probe is the only path for non-temp frees seen. Member operands based on single-definition
+  address temporaries (`[t+d]`) are taken as fixed on every build.

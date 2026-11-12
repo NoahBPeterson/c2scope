@@ -469,6 +469,8 @@ exceed the real frame slightly, and that can move the 112 and 128 thresholds [C 
 
 ### 4.7 Ordering [C]
 
+(All four builds, their differences, the `slots` report and the replay model: docs/c2/slots.md.)
+
 `bEbp = (FUNC+0x64 == &_RegSym[ebp])`, i.e. locals addressed from ebp.
 
 ```

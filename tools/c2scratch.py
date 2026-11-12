@@ -2,6 +2,8 @@
 """Scratch-register (tmpreg) picks for one function, mapped to listing offsets.  Doc: docs/c2/tracer.md (`scratch`)
 
 usage: c2trace.py scratch <src> --func SUBSTR [--why] [--all] [--export snap.json] [--keep DIR] [-- <cl args>]
+       c2trace.py scratch <src> --func SUBSTR --phase ORIG.s [--asm-func DEC] [--by case|block] [--top K]
+                      [--no-scan] [--brief] [-- <cl args>]
 
 regasg's RegSimpleAssignBody runs after Color and gives every short-lived temporary a register, one RegAssign call
 per tmpreg operand (regalloc.md §6): its preferred register (a copy from / lea of a register) if free, else at /O2 the
@@ -22,6 +24,15 @@ free in _RegMap and not in the temp's conflict set), and for every pick that is 
 by rotation" the reason (preference taken / preference refused / register busy with which temp or coloured
 variable / conflict). --all lists every RegSimpleAssignBody run (EH funclets, then the body) instead of the body
 only. --export writes all of it as JSON for `rasim scratch` (predict the picks, what-if: tracer.md).
+
+--phase ORIG.s (the original's disassembly, 'VA mnemonic operands' lines; or a /FAs listing NAME.asm of another
+compile, read with --asm-func) reads the original's register for every
+pick: our listing is aligned to ORIG.s (regmap's alignment) and the register in the position where our instruction
+has the pick's register is the original's pick. Per group (a switch case: the code from one jump-table target to the
+next in our layout; --by block: an IL block) it prints our picks against the original's, the cursor phase (how many
+rotation steps the original is ahead of us: 0, +1, -1) and the first pick where they differ; then the runs of cases
+in one phase, and (unless --no-scan) every single inserted / removed pick ranked by how many groups it re-aligns
+(`rasim scratch SNAP --target`: the pick rule replayed with drop:N / ins:N).
 """
 import argparse, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -292,12 +303,22 @@ def main(argv):
     ap.add_argument("--why", action="store_true")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--export")
+    ap.add_argument("--phase", metavar="ORIG.s")
+    ap.add_argument("--asm-func")
+    ap.add_argument("--by", choices=("case", "block"), default="case")
+    ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--no-scan", action="store_true")
+    ap.add_argument("--brief", action="store_true", help="--phase: only groups that differ")
     ap.add_argument("src")
     cl = []
     if "--" in argv:
         k = argv.index("--")
         argv, cl = argv[:k], argv[k + 1:]
     a = ap.parse_args(argv)
+    if a.phase:
+        import tempfile
+        a.keep = a.keep or tempfile.mkdtemp(prefix="scratch_phase_")
+        a.export = a.export or os.path.join(a.keep, "scratch_snap.json")
     ext = a.why or a.all or bool(a.export)
     if ext and c2trace.c2build.table() is not None and "scratch_x" not in c2trace.c2build.get("hooks", {}):
         sys.exit("scratch --why/--all/--export: the probes are not ported to c2 %s (no hooks.scratch_x in its table)"
@@ -316,6 +337,9 @@ def main(argv):
             annotate(s)
     if a.export:
         export(a.export, a.func, segs, pos)
+    if a.phase:
+        asm = os.path.join(a.keep, os.path.splitext(os.path.basename(a.src))[0] + ".asm")
+        return phase(a, segs[body]["picks"], pos, asm, a.export, body)
     for k, s in enumerate(segs):
         if k != body and not a.all:
             continue
@@ -346,6 +370,223 @@ def main(argv):
     if a.export:
         print("# wrote %s (%d runs, %d picks): rasim scratch %s" % (a.export, len(segs), sum(len(s["picks"]) for s in segs), a.export))
     return rc
+
+
+# ---------------------------------------------------------------- --phase: our picks against the original's
+
+PREG = re.compile(r"\b(?:e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp|e?sp)\b")
+
+
+def listing_groups(asm, func):
+    """-> ([(offset, name)] case starts in layout order, from the jump tables of our listing; source line text per
+    offset {offset: 'NN: text'}).  A case is named by its jump-table entries ('case[3]', or the byte-table indices
+    that lead to it when the switch uses a byte table first) and its first source line."""
+    text = open(asm, errors="replace").read()
+    i, j = c2trace.listing_proc(text, func)
+    lines = text[i:j].splitlines()
+    labels, pending, tables, cur_tab, srcl = {}, [], {}, None, {}
+    last_src, src_pending = None, None
+    for ln in lines:
+        m = re.match(r"^(\$?[\w@$?]+):\s*$", ln)
+        if m:
+            pending.append(m.group(1))
+            cur_tab = m.group(1)
+            continue
+        m = re.match(r"^; (\d+)\s*:\s?(.*)$", ln)
+        if m:
+            src_pending = "%s: %s" % (m.group(1), m.group(2).strip())
+            continue
+        m = re.match(r"\s+([0-9a-f]{5})\t[0-9a-f ]+\t+ (\w+)\s*(.*)$", ln)
+        if not m:
+            continue
+        off, mn, ops = int(m.group(1), 16), m.group(2), re.sub(r"\s*;.*", "", m.group(3)).strip()
+        if mn in ("DD", "DB"):
+            if cur_tab is not None:
+                tables.setdefault(cur_tab, (mn, []))[1].append(ops)
+            pending = []
+            continue
+        cur_tab = None
+        for l in pending:
+            labels[l] = off
+        pending = []
+        if src_pending:
+            srcl[off] = src_pending
+            src_pending = None
+    dd = {k: v[1] for k, v in tables.items() if v[0] == "DD" and all(x in labels for x in v[1])}
+    db = {k: [int(x, 0) if not x.endswith("H") else int(x[:-1], 16) for x in v[1]] for k, v in tables.items() if v[0] == "DB"}
+    starts = {}
+    for tab, ents in dd.items():
+        names = {}
+        for k, l in enumerate(ents):
+            names.setdefault(l, []).append(k)
+        via = None
+        for btab, idx in db.items():          # a byte table indexing this DD table: name cases by its indices
+            if idx and max(idx) < len(ents):
+                via = btab
+        for l, ks in names.items():
+            if via is not None:
+                ks = [b for b, k in enumerate(db[via]) if k in ks]
+            starts.setdefault(labels[l], []).extend(ks)
+    out = []
+    for off in sorted(starts):
+        ks = sorted(set(starts[off]))
+        nm = "case[%s]" % _ranges(ks)
+        out.append((off, nm))
+    return out, srcl
+
+
+def _ranges(ks):
+    r, k = [], 0
+    while k < len(ks):
+        e = k
+        while e + 1 < len(ks) and ks[e + 1] == ks[e] + 1:
+            e += 1
+        r.append("%d" % ks[k] if e == k else "%d-%d" % (ks[k], ks[e]))
+        k = e + 1
+    if len(r) > 4:
+        r = r[:4] + ["+%d" % (len(r) - 4)]
+    return ",".join(r)
+
+
+def orig_regs(picks, pos, asm, func, orig_path):
+    """{pick n: (the original's register at the aligned instruction or None, why)}."""
+    import regmap, tsweep
+    lst = tsweep.listing_offsets(asm, func)
+    offs = sorted(lst)
+    ours = [regmap.norm((lst[o].split()[0], lst[o].split(None, 1)[1] if " " in lst[o] else "")) for o in offs]
+    if orig_path.lower().endswith(".asm"):      # another compile's /FAs listing (a variant draft) as the "original"
+        ol = tsweep.listing_offsets(orig_path, func)
+        src = [(ol[o].split()[0], ol[o].split(None, 1)[1] if " " in ol[o] else "") for o in sorted(ol)]
+        src = [x for x in src if x[0] not in ("DD", "DB")]
+    else:
+        src = tsweep.orig_instrs(orig_path)
+    orig = [regmap.norm(x) for x in src]
+    pair = dict(regmap.align(ours, orig))
+    at = {o: k for k, o in enumerate(offs)}
+    res = {}
+    for p in picks:
+        x = pos.get(p["instr"])
+        if x is None:
+            res[p["n"]] = (None, "gone")
+            continue
+        i = at.get(x[0])
+        if i is None or i not in pair:
+            res[p["n"]] = (None, "unaligned")
+            continue
+        ra = [regmap.wide(r) for r in PREG.findall(ours[i][1])]
+        rb = [regmap.wide(r) for r in PREG.findall(orig[pair[i]][1])]
+        if len(ra) != len(rb) or p["reg"] not in ra:
+            res[p["n"]] = (None, "no register operand to compare")
+            continue
+        res[p["n"]] = (rb[ra.index(p["reg"])], "")
+    return res, len(pair), len(ours), len(orig)
+
+
+def phase(a, picks, pos, asm, snap, body):
+    func = a.asm_func or a.func
+    got, npair, nours, norig = orig_regs(picks, pos, asm, func, a.phase)
+    starts, srcl = listing_groups(asm, func) if a.by == "case" else ([], {})
+    by = a.by if starts else "block"
+    names, gof = [], {}
+    import bisect
+    soffs = [o for o, _ in starts]
+    for p in picks:
+        x = pos.get(p["instr"])
+        if by == "case":
+            k = bisect.bisect_right(soffs, x[0]) - 1 if x is not None else -1
+            g = starts[k][1] if k >= 0 else "entry"
+        else:
+            g = "block %d" % p.get("block", 0)
+        if g not in names:
+            names.append(g)
+        gof[p["n"]] = names.index(g)
+    # first source line of each case
+    first = {}
+    if by == "case":
+        so = sorted(srcl)
+        for off, nm in starts:
+            k = bisect.bisect_left(so, off)
+            if k < len(so) and (k + 1 >= len(so) or True):
+                first[nm] = srcl[so[k]][:60]
+    print("# %s: %d picks; %d of our %d instructions aligned to %d of the original's; groups: %s (%d)" % (
+        a.func, len(picks), npair, nours, norig, "switch cases (jump-table targets, layout order)" if by == "case"
+        else "IL blocks", len(names)))
+    print("# per group: our picks / the original's ('.' = not readable there), cursor phase of the rotation picks "
+          "(original minus ours, in steps; ? = unknown), first pick that differs")
+    print("%-18s %-6s %-30s %-30s %-6s %s" % ("group", "status", "ours", "original", "phase", "first difference"))
+    want, rows = [], []
+    for gi, nm in enumerate(names):
+        ps = [p for p in picks if gof[p["n"]] == gi and p.get("cls", "int") == "int"]
+        if not ps:
+            continue
+        ours = [p["reg"] or "?" for p in ps]
+        theirs = [got[p["n"]][0] for p in ps]
+        ph = []
+        diff = None
+        for p, o in zip(ps, theirs):
+            if o is None:
+                continue
+            if o in SCR:
+                want.append((p["n"], o))
+            if o != p["reg"] and diff is None:
+                diff = p
+            if p.get("how", _how(p)) == "ROT" and o in SCR and p["reg"] in SCR:
+                ph.append((SCR.index(o) - SCR.index(p["reg"])) % 3)
+        known = sum(1 for o in theirs if o is not None)
+        st = "-" if not known else ("exact" if diff is None else "DIFF")
+        if ph:
+            c = collections_counter(ph)
+            top, n = c.most_common(1)[0]
+            phs = ["0", "+1", "-1"][top] + ("" if n == len(ph) else "~")
+        else:
+            phs = "?"
+        rows.append((nm, st, phs))
+        if a.brief and st != "DIFF":
+            continue
+        fd = "" if diff is None else "pick %d %s block %d: ours %s, original %s" % (
+            diff["n"], "+%05x" % pos[diff["instr"]][0] if pos.get(diff["instr"]) else "gone", diff.get("block", 0),
+            diff["reg"], got[diff["n"]][0])
+        print("%-18s %-6s %-30s %-30s %-6s %s" % (nm[:18], st, _seq(ours), _seq([t or "." for t in theirs]), phs, fd))
+        if first.get(nm) and not a.brief:
+            print("%18s line %s" % ("", first[nm]))
+    known = [r for r in rows if r[1] != "-"]
+    print("# %d groups with readable picks: %d exact, %d differ" % (len(known), sum(1 for r in known if r[1] == "exact"),
+                                                                 sum(1 for r in known if r[1] == "DIFF")))
+    runs, cur = [], None
+    for nm, st, phs in known:
+        p0 = phs.rstrip("~")
+        if cur and cur[0] == p0:
+            cur[2], cur[3] = nm, cur[3] + 1
+        else:
+            cur = [p0, nm, nm, 1]
+            runs.append(cur)
+    print("# phase runs (consecutive groups in one cursor phase): " + "; ".join(
+        "%s %s..%s (%d)" % (r[0], r[1], r[2], r[3]) for r in runs[:30]) + (" ..." if len(runs) > 30 else ""))
+    fdiff = next((r for r in known if r[1] == "DIFF"), None)
+    if fdiff:
+        print("# first group that differs: %s" % fdiff[0])
+    if a.no_scan:
+        return 0
+    tgt = os.path.splitext(snap)[0] + "_target.json"
+    json.dump(dict(want=want, group=[(p["n"], gof[p["n"]]) for p in picks], groups=names), open(tgt, "w"))
+    rasim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rasim", "target", "release", "rasim")
+    import subprocess
+    r = subprocess.run([rasim, "scratch", snap, "--run", str(body + 1), "--target", tgt, "--top", str(a.top)],
+                       capture_output=True, text=True)
+    print("# re-alignment: every single inserted (ins:N) or removed (drop:N) pick, replayed with the pick rule")
+    sys.stdout.write(r.stdout + r.stderr)
+    print("# snapshot %s, target %s: rasim scratch %s --target %s [EDIT..] scans on top of EDITs" % (snap, tgt, snap, tgt))
+    return 0
+
+
+def collections_counter(x):
+    import collections
+    return collections.Counter(x)
+
+
+def _seq(rs):
+    s = " ".join(r[1] if r in SCR else r for r in rs)       # eax ecx edx -> a c d
+    return s if len(s) <= 30 else s[:27] + "..."
 
 
 if __name__ == "__main__":

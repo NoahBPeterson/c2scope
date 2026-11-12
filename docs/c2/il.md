@@ -411,7 +411,8 @@ These are gathered from the four families. Each per-family page has the details.
   under /Od, and are 0x80/0x2000 really inline/__forceinline?
 - MODULE+0x41c's single reader (decompile 10be0000.c:7724).
 - Whether `MscRecordInterProcRegInfo` (CGNODE+0x60) changes a caller's register choice outside LTCG. A test
-  needs a caller that keeps a value in ecx/edx across a call to a static callee.
+  needs a caller that keeps a value in ecx/edx across a call to a static callee. Answered in docs/c2/ltcg.md section 3: yes, for static and extern callees
+  of the same unit (13.10 and 14.00).
 - Whether c1's IL differs between /O1 and /O2 beyond the `_Speed` bit (-Oi, -Os/-Ot shaping).
 - The source of FUNC.flags 0x2000 (#pragma optimize? naked?) and of the other SSR+0x50-derived bits.
 - MODULE+0x454 bit 0x10 (0x10d0d158, default on, no switch sets it).

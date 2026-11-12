@@ -42,6 +42,8 @@ to fix it; run the same command again and it continues where it stopped.
 For the other compilers, after the setup above: `uv run tools/c2build.py setup --c2 13.10` (or `--c2 15.00`),
 then add the same `--c2` option to any tool command. `tools/c2build.py` explains where it looks for each toolchain.
 
+Coding agents: read `AGENTS.md` first (which tool for which symptom, and the rules that avoid wrong answers).
+
 ## Quick start
 
 ```sh

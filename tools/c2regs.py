@@ -138,6 +138,14 @@ elif (c2trace.c2build.get("hooks") or {}).get("regs_dec"):
     HOOKS = HOOKS + c2trace.c2build.get("hooks")["regs_dec"]
     DECX = {int(k): v for k, v in (c2trace.c2build.get("hooks").get("regs_dec_exit") or {}).items()}
 OPS = {k: int(v, 16) for k, v in (c2trace.c2build.get("regs_ops") or {}).items()}   # build's opcode numbers
+# 13.10: FPColor's costing and list (docs/c2/port-1310.md section 12): table key hooks.regs_fp, after regs_dec.
+# Event k is hook FP0 + k; the names are FPEVN (decoded in _fpev).  None on builds without FPColor events.
+FP0 = None
+if (c2trace.c2build.get("hooks") or {}).get("regs_fp"):
+    FP0 = len(HOOKS)
+    HOOKS = HOOKS + c2trace.c2build.get("hooks")["regs_fp"]
+FPEVN = ["blk", "edge", "use", "enter", "def", "ins", "pass", "split", "check", "ce_end", "ce_join", "ce_post",
+         "ce_ext", "press", "init", "rm", "keep"]
 
 
 def _gx(v):
@@ -311,6 +319,133 @@ def _grname(sn, key, knd):
     return nm or "?"
 
 
+def _sbvset(v):
+    """Web numbers in an SBV logged as (base, bits) chunk pairs (13.10: 32-bit chunks); stops at the first '?'."""
+    out = []
+    for i in range(0, len(v) - 1, 2):
+        if not isinstance(v[i], int) or not isinstance(v[i + 1], int):
+            break
+        out += [v[i] + k for k in range(32) if v[i + 1] >> k & 1]
+    return out
+
+
+def _fpev(cur, ev, k, v, grs):
+    """One FPColor event (13.10, table key hooks.regs_fp; FPEVN[k]) -> cur['fp'].
+    fp = {n: costing pass, passes: [{n, blocks: {b: (w, BB)}}], terms: {gr: (pass, [term])}, ev: [event], pops}.
+    A term is (b, w, None, cost, delta, BB, kind, succ): kind use / def / enter (an enterload, a negative cost) /
+    edge (the web is live out of block b but not into its successor succ: popped on that edge, -w(succ))."""
+    fp = cur.setdefault("fp", dict(n=0, passes=[], terms={}, ev=[], pops=[], blk=None))
+    name = FPEVN[k]
+    order = {b: i + 1 for i, b in enumerate(cur.get("bborder", []))}
+    bnum = lambda bb: order.get("%x" % bb) if isinstance(bb, int) else None
+    if name == "pass":
+        fp["n"] += 1
+        fp["passes"].append(dict(n=fp["n"], blocks={}, after_pop=len(fp["pops"])))
+        fp["blk"] = None
+        fp["ev"].append(dict(t="pass", n=fp["n"], after_pop=len(fp["pops"])))
+        return
+    if name == "blk":
+        b = bnum(v[0])
+        if b is None:                      # a block the Color-entry dump did not list (made by an FP split)
+            b = 1000 + len(order) + len(fp["passes"][-1]["blocks"]) if fp["passes"] else 0
+        fp["blk"] = (b, v[1], "%x" % v[0])
+        if fp["passes"]:
+            fp["passes"][-1]["blocks"][b] = (v[1], "%x" % v[0])
+        return
+    if name in ("edge", "use", "enter", "def"):
+        g = v[0]
+        if not isinstance(g, int) or fp["blk"] is None:
+            return
+        b, w, bb = fp["blk"]
+        succ = None
+        if name == "edge":
+            w = v[2]
+            cost, delta, succ = None, -v[2], bnum(v[4])
+        elif name == "use":
+            delta = s32(v[3]) - s32(v[2])
+            cost = delta // v[4] if v[4] else delta
+            w = v[4]
+        else:
+            cost = -s32(v[2]) if name == "enter" else s32(v[2])
+            delta = cost * v[3]
+            w = v[3]
+        p, lst = fp["terms"].get(g, (None, None))
+        if p != fp["n"]:
+            lst = []
+            fp["terms"][g] = (fp["n"], lst)
+            fp.setdefault("byp", {}).setdefault(fp["n"], {})[g] = lst
+        extra = dict(num=v[1])
+        if name == "use":
+            extra.update(op=v[6] if isinstance(v[6], int) else None,
+                         dies=bool(v[7] >> 12 & 1) if isinstance(v[7], int) else None)
+        elif name != "edge":
+            extra.update(op=v[5] if isinstance(v[5], int) else None)
+        if name == "use" and extra.get("op") is not None and "enterload" in OPS and extra["op"] == OPS["enterload"] + 1:
+            name = "store"                  # the leave-store of a split piece (OPENTERLOAD + 1): a negative cost
+        lst.append((b, w, None, cost, delta, bb, name, succ, extra))
+        return
+    if name == "ins":
+        fp["ev"].append(dict(t="ins", npass=fp["n"], gr="%x" % v[0], num=v[1], prio=s32(v[2]), ben=s32(v[3]),
+                             defOrd=v[4], nrefs=v[5], head=("%x" % v[6]) if v[6] else None,
+                             name=_grname(*v[7:10]), kind=KIND.get(v[9] & 0xff, "k%d" % (v[9] & 0xff))
+                             if isinstance(v[9], int) else None, after_pop=len(fp["pops"])))
+        return
+    if name == "split":
+        fp["ev"].append(dict(t="split", set=_sbvset(v), after_pop=len(fp["pops"])))
+        return
+    if name in ("rm", "keep"):      # a member of the split set leaves the list / a worthless web stays (initial set)
+        fp["ev"].append(dict(t=name, gr="%x" % v[0], num=v[1], name=_grname(*v[2:5]), after_pop=len(fp["pops"])))
+        if name == "rm":
+            # a web split before it was popped (at a call: FPInitialRegPressure; or for stack depth after another
+            # web's colouring: FPUpdateRegisterPressure) gets a report row of its own
+            gs = "%x" % v[0]
+            k = max((i for i, e in enumerate(fp["ev"]) if e["t"] == "ins" and e["gr"] == gs), default=None)
+            if k is not None and not any(e["t"] in ("pop", "drop") and e["gr"] == gs for e in fp["ev"][k:]):
+                e = fp["ev"][k]
+                prev = [x["t"] for x in fp["ev"][:-1] if x["t"] in ("pop", "press", "init", "kept", "nocolor")]
+                why = "call" if not any(t == "pop" for t in prev) else "depth" if prev and prev[-1] in ("press", "kept") else "?"
+                row = dict(gr=v[0], cls=1, name=e["name"], kind=e["kind"], prio=e["prio"], ben=e["ben"], refs=e["nrefs"],
+                           dord=e["defOrd"], id=v[1], cands=[], out="split (%s)" % why, pop=len(cur["rows"]) + 1,
+                           npass=0, fpass=e["npass"], terms=fp["terms"].get(v[0], (None, []))[1])
+                cur["rows"].append(row)
+                grs[v[0]] = row
+        return
+    if name in ("press", "init"):
+        if ev == "X":
+            fp["ev"].append(dict(t=name, set=_sbvset(v[1:]) if v and v[0] else [], after_pop=len(fp["pops"])))
+        return
+    if name == "check":
+        if ev == "E":
+            fp["ev"].append(dict(t="check", gr="%x" % v[0] if isinstance(v[0], int) else None, num=v[1], why=[],
+                                 after_pop=len(fp["pops"])))
+            if fp["pops"] and fp["pops"][-1]["gr"] == v[0]:
+                fp["pops"][-1]["fpcheck"] = fp["ev"][-1]
+        else:
+            for e in reversed(fp["ev"]):
+                if e["t"] == "check":
+                    e["ok"] = v[0]
+                    break
+        return
+    if name.startswith("ce_"):                      # a sub-test of FPCheckColorability and what it returned
+        chk = next((e for e in reversed(fp["ev"]) if e["t"] == "check"), None)
+        if chk is None or "ok" in chk:
+            return
+        if ev == "E":
+            if name == "ce_end" and len(v) >= 8:        # InsertColoredLifetimeEndSplit(instr, web, coloured web)
+                chk["why"].append(dict(test="end", at="%x" % v[0] if isinstance(v[0], int) else None,
+                                       line=v[1] & 0xffff if isinstance(v[1], int) else None, web=v[2],
+                                       c=("%x" % v[3]) if isinstance(v[3], int) and v[3] else None,
+                                       cnum=v[4] if isinstance(v[3], int) and v[3] else None,
+                                       cname=_grname(*v[5:8]) if isinstance(v[3], int) and v[3] else None))
+            else:
+                chk["why"].append(dict(test=name[3:]))
+            return
+        for w in reversed(chk["why"]):
+            if w["test"] == name[3:] and "ret" not in w:
+                w["ret"] = v[0]
+                break
+
+
 def parse(log, funcpat):
     funcs, cur, cls, grs, pend = [], None, None, {}, None
     ch = None                             # the row ChoosePhysReg is colouring (choice events 13..17)
@@ -320,6 +455,7 @@ def parse(log, funcpat):
             f = ln.split()
             if f[1] == "B":
                 cur["bb"] = f[2]
+                cur.setdefault("bborder", []).append(f[2])
             elif f[1] == "I" and cur.get("bb"):
                 cur["lines"].setdefault(cur["bb"], set()).add(int(f[4]))
                 cur["ilb"].setdefault(cur["bb"], []).append(ln[2:])
@@ -345,6 +481,9 @@ def parse(log, funcpat):
             cur["_npass"] = npass
             _decision(cur, "E", DECX[hk], f, v)
             continue
+        if FP0 is not None and hk >= FP0:             # 13.10: FPColor's costing, list and colourability
+            _fpev(cur, ev, hk - FP0, v, grs)
+            continue
         if DEC0 is not None and hk >= DEC0:           # spill / defer / split decisions
             cur["_npass"] = npass
             _decision(cur, ev, hk - DEC0, f, v)
@@ -353,6 +492,9 @@ def parse(log, funcpat):
         if x and x[0] == "out":
             if grs.get(v[0]) is not None:
                 grs[v[0]]["out"] = x[1]
+            if cur.get("fp") is not None:
+                cur["fp"]["ev"].append(dict(t="kept" if x[1] == "x87 stack" else "nocolor", gr="%x" % v[0],
+                                            after_pop=len(cur["fp"]["pops"])))
             continue
         if x:
             cls, hk = x[1], 2                        # a pop of class x[1], with the outcome x[2] if it is final
@@ -382,6 +524,14 @@ def parse(log, funcpat):
             grs[gp] = row
             cur["rows"].append(row)
             pend = row
+            if x:                                     # an FPColor pop or drop: its terms come from FPSpillcosts
+                fp = cur.get("fp")
+                if fp is not None:
+                    row["fpass"] = fp["n"]
+                    row["terms"] = fp["terms"].get(gp, (None, []))[1]
+                    fp["ev"].append(dict(t="drop" if x[2] else "pop", gr="%x" % gp, num=gid,
+                                         after_pop=len(fp["pops"])))
+                    fp["pops"].append(row)
             if x and x[2]:
                 row["out"] = x[2]
         elif ev == "E" and hk == 7:
@@ -394,6 +544,9 @@ def parse(log, funcpat):
             if npass == 1:
                 cur["bbs"].append(blk)
             cur.setdefault("blkP", {})[(npass, nblk)] = (blk[1], blk[2])
+            cur.setdefault("blkbb", {})[(npass, nblk)] = blk[3]     # BB* of block nblk in this pass (numbers shift
+            if npass == 1 and blk[3]:                               # after split rounds: later passes walk only
+                cur.setdefault("bbnum1", {}).setdefault(blk[3], nblk)   # the blocks a split touched)
         elif ev == "E" and hk in (9, 10, 11) and blk:
             g = v[0]
             delta = s32(v[1]) * v[2] if hk != 11 else -v[1]
@@ -489,6 +642,12 @@ def export(fn):
     fn = dict(fn, rows=[r for r in fn["rows"] if r["npass"]])   # (13.10); left out, pops renumbered from 1
     for np_ in sorted({k[0] for k in fn.get("blkP", {})}):
         blocks = [dict(b=b, w=w, P=P) for (pp, b), (w, P) in sorted(fn["blkP"].items()) if pp == np_]
+        for d in blocks:          # additive: the block's BB and its number in pass 1 (what `regs --blocks` lists)
+            bb = fn.get("blkbb", {}).get((np_, d["b"]))
+            if bb:
+                d["bb"] = bb
+                if bb in fn.get("bbnum1", {}):
+                    d["b1"] = fn["bbnum1"][bb]
         grs = {}
         for (pp, b), lst in fn.get("byblock", {}).items():
             if pp != np_:
@@ -509,6 +668,8 @@ def export(fn):
         if r.get("imm"):
             q["imm"] = r["imm"]
     snap = dict(func=fn["name"], passes=passes, pops=pops)
+    if fn.get("fp") is not None:
+        snap["fp"] = _fpexport(fn)
     if any("choice" in r for r in fn["rows"]) or fn.get("inserts"):
         # Register choice (regalloc.md section 4).  Register numbers are c2's (regnames maps the integer ones).
         #   pops[i].choice: what ChoosePhysReg saw when it coloured this globreg: its avail set and PREF list
@@ -553,7 +714,43 @@ def export(fn):
             # another c2 build: the opcode numbers the decision rules test (absent = 14.00's): enterload =
             # OPENTERLOAD (SpillObvious), last = the first non-machine opcode (RestrictToReg's Opcode_dope bound)
             snap["c2"] = dict(build=c2trace.c2build.name(), ops=OPS)
+    if fn.get("ilb"):
+        # additive (rasim fold, regalloc.md 3.6.10): the IL at Color's entry, block by block in stream order, each
+        # line "I <tuple> <opcode> <line offset> <len> | dsts <- srcs" of the plain dump
+        snap["il"] = dict(order=[bb for bb in fn.get("bborder", []) if bb in fn["ilb"]],
+                          blocks={bb: lines for bb, lines in fn["ilb"].items()})
     return snap
+
+
+def _fpexport(fn):
+    """13.10: FPColor's passes, terms and events for rasim (tools/rasim/src/fpcolor.rs).
+    passes[k]: n, blocks (b, w, bb) and grs {gr: {name, num, terms: [{b, kind, cost, w, delta, succ}]}}: every
+    FPSpillcosts term (kind use / store / def / enter / edge; delta = cost * w, an edge -w(succ)).
+    events, in order: pass (an FPSpillcosts call), init (FPInitialRegPressure's split set), ins (FPAddToPriorityList
+    puts a web in the list: npass, prio, ben, defOrd, head = the list it is inserted into), drop (FPSpillWorthless),
+    pop, check (FPCheckColorability: ok, why = the sub-tests that ran and what they returned), kept / nocolor,
+    press (FPUpdateRegisterPressure's split set after a colouring), split (FPRemoveSplitGlobregs: the split set, its
+    first 4 SBV chunks only), rm (one member of it leaves the list), keep (FPSpillWorthless keeps a web of benefit
+    <= 0 because it is in FPInitialRegPressure's set).
+    Web numbers (num) are GLOBREG +0x1c, as in the sets."""
+    fp = fn["fp"]
+    passes = []
+    for p in fp["passes"]:
+        grs = {}
+        for g, lst in fp.get("byp", {}).get(p["n"], {}).items():
+            e = grs.setdefault("%x" % g, dict(name=None, num=None, terms=[]))
+            for (b, w, _, cost, d, bb, kind, succ, extra) in lst:
+                e["num"] = extra.get("num")
+                e["terms"].append(dict(b=b, kind=kind, cost=cost, w=w, delta=d, succ=succ, op=extra.get("op"),
+                                       dies=extra.get("dies")))
+        for e in fp["ev"]:
+            if e["t"] == "ins" and e["npass"] == p["n"] and e["gr"] in grs:
+                grs[e["gr"]]["name"] = e["name"]
+        passes.append(dict(n=p["n"], blocks=[dict(b=b, w=w, bb=bb) for b, (w, bb) in sorted(p["blocks"].items())],
+                           grs=grs))
+    pops = [dict(pop=k + 1, name=r["name"], gr="%x" % r["gr"], prio=r["prio"], ben=r["ben"], defOrd=r["dord"],
+                 num=r["id"], kind=r["kind"], out=r["out"], fpass=r.get("fpass")) for k, r in enumerate(fp["pops"])]
+    return dict(passes=passes, events=fp["ev"], pops=pops)
 
 
 def _immnote(im):
@@ -566,32 +763,96 @@ def _whysel(r, why):
     return r["name"] in why or "*" in why or (r.get("imm") is not None and "imm=" + r["imm"]["text"] in why)
 
 
-def blocks(fn, lo, hi):
+def _p1(fn, np_, b, bb):
+    """'' when block b of Spillcosts pass np_ has the same number in pass 1, else ' [p1 block K]' (the number
+    `regs --blocks` lists by default; later passes walk only the blocks a split round touched, so they renumber)."""
+    if not np_ or np_ == 1 or not bb:
+        return ""
+    k = fn.get("bbnum1", {}).get(bb)
+    return "" if k == b else " [p1 block %s]" % (k if k is not None else "-")
+
+
+def _passnums(fn, bb):
+    """'pass 2: block 4, pass 3: block 1' -- the numbers this BB has in the passes after the first."""
+    return ", ".join("pass %d: block %d" % k for k, v in sorted(fn.get("blkbb", {}).items()) if v == bb and k[0] > 1)
+
+
+def blocks(fn, lo, hi, npass=1):
+    """The IL (at Color entry) of blocks lo..hi, numbered as in Spillcosts pass `npass` (1: the full walk)."""
     out = []
-    for b, wb, pb, bb in fn["bbs"]:
-        if lo <= b <= hi:
-            out.append("  block %d  w=%d P=%d  (BB %s)" % (b, wb, pb, bb))
-            out.extend("      " + l for l in fn["ilb"].get(bb, []))
+    sel = [(b, w, P, fn.get("blkbb", {}).get((np_, b))) for (np_, b), (w, P) in sorted(fn.get("blkP", {}).items())
+           if np_ == npass and lo <= b <= hi] if npass != 1 else [x for x in fn["bbs"] if lo <= x[0] <= hi]
+    if npass != 1 and not sel:
+        return "  (Spillcosts pass %d walked no block numbered %d..%d)" % (npass, lo, hi)
+    for b, wb, pb, bb in sel:
+        k1 = fn.get("bbnum1", {}).get(bb)
+        other = _passnums(fn, bb)
+        extra = ([] if npass == 1 else ["pass 1: block %s" % (k1 if k1 is not None else "- (not walked)")]) + \
+                ([other] if other and npass == 1 else [])
+        out.append("  block %d%s  w=%d P=%d  (BB %s%s)" % (b, "" if npass == 1 else " of pass %d" % npass, wb, pb, bb,
+                                                         "; " + "; ".join(extra) if extra else ""))
+        out.extend("      " + l for l in fn["ilb"].get(bb, []))
     return "\n".join(out)
 
 
-def block_view(fn, want):
+def block_view(fn, want, npass=None):
     """Every globreg with a term in block `want`, per Spillcosts pass: the values competing there (P counts the
-    referenced ones), their cost in the block and the term they get."""
+    referenced ones), their cost in the block and the term they get.  Block numbers are per pass (rasim's, --why's);
+    with npass only that pass is shown.  Each header names the BB and its pass-1 number (`--blocks`)."""
     out = []
     for (np_, b), lst in sorted(fn.get("byblock", {}).items()):
-        if b != want:
+        if b != want or (npass is not None and np_ != npass):
             continue
         refd = [t for t in lst if t[2] is not None]
         w, P = fn.get("blkP", {}).get((np_, b), (0, 0))
-        out.append("  block %d, Spillcosts pass %d: w=%d P=%d (P counts every referenced globreg, coloured ones too; "
+        bb = fn.get("blkbb", {}).get((np_, b))
+        out.append("  block %d, Spillcosts pass %d%s: w=%d P=%d (P counts every referenced globreg, coloured ones too; "
                    "listed: the %d uncoloured referenced + %d live-through ones whose prio changes)" % (
-                       b, np_, w, P, len(refd), len(lst) - len(refd)))
+                       b, np_, (" (BB %s%s)" % (bb, "; pass 1: block %s" % _p1(fn, np_, b, bb)[11:-1]
+                                if _p1(fn, np_, b, bb) else "")) if bb else "", w, P, len(refd), len(lst) - len(refd)))
         for nm, g, cost, d in sorted(lst, key=lambda t: (t[2] is None, -(t[3] or 0))):
             im = fn.get("immof", {}).get((np_, g))
             out.append("      %-28s gr %-8x %s%s" % (nm, g, ("cost %d -> %+d" % (cost, d)) if cost is not None
                                                      else "live through -> %+d" % d, _immnote(im)))
     return "\n".join(out) or "  (no terms recorded for block %d)" % want
+
+
+def _fpwhy(fn, r):
+    """--why lines of an FPColor web (13.10): per block, the FPSpillcosts terms (cost * w, no pressure factor)."""
+    out, byb = [], {}
+    for t in r["terms"]:
+        byb.setdefault((t[0], t[6] == "edge", t[7] if t[6] == "edge" else None), []).append(t)
+    for (b, edge, succ), ts in sorted(byb.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or 0)):
+        d = sum(t[4] for t in ts)
+        if edge:
+            what = "live out, not into block %s: popped on the edge" % succ
+        else:
+            parts = {}
+            for t in ts:
+                parts.setdefault(t[6], []).append(t[3])
+            what = ", ".join("%s %s" % ({"enter": "enterload"}.get(k, k), "+".join(map(str, c)))
+                             for k, c in sorted(parts.items(), key=lambda kv: ("enter", "def", "use", "store").index(kv[0])))
+        ls = sorted(fn["lines"].get(ts[0][5], ()))
+        where = ("src +%d..+%d" % (ls[0], ls[-1]) if ls[0] != ls[-1] else "src +%d" % ls[0]) if ls and not edge else ""
+        out.append("      block %3d  w=%-2d  %-49s %s" % (b, ts[0][1], "%s -> %+d" % (what, d), where))
+    chk = r.get("fpcheck")
+    if chk is not None and chk.get("ok") == 0:
+        said = set()
+        for w in chk["why"]:
+            if not w.get("ret") or (w["test"], w.get("cname"), w.get("line")) in said:
+                continue
+            said.add((w["test"], w.get("cname"), w.get("line")))
+            if w["test"] == "end" and w.get("cname"):
+                out.append("      not colourable: coloured web %s ends at src +%s while %s is on the x87 stack above it "
+                           "(InsertColoredLifetimeEndSplit: split there)" % (w["cname"], w.get("line"), r["name"]))
+            elif w["test"] == "end":
+                out.append("      not colourable: a coloured web defined at src +%s, while %s is live, outlives %s "
+                           "(InsertColoredLifetimeEndSplit at that def: split there)" % (w.get("line"), r["name"], r["name"]))
+            else:
+                out.append("      not colourable: %s returned %s" % ({"join": "SplitAtMismatchedFlowJoinPoints (defs at "
+                           "different stack depths)", "post": "SplitAtPostDefEndPoints", "ext": "CanExtendLifetime"}.get(
+                               w["test"], w["test"]), w["ret"]))
+    return out
 
 
 def report(funcs, all_classes, why=()):
@@ -614,13 +875,20 @@ def report(funcs, all_classes, why=()):
                 continue
             tot = sum(t[4] for t in r["terms"])
             out.append("  why %s%s (pop %d): prio %s = %s%s" % (r["name"], _immnote(r.get("imm")).replace("   = ", " = "), r["pop"], r["prio"], tot,
-                       "" if tot == r["prio"] else "  (FPColor: per-block terms are not traced)" if not r["npass"] else
+                       "" if tot == r["prio"] else "  (FPColor: no costing terms were traced for this web)" if not r["npass"] else
                        "  (MISMATCH: terms do not add up; split or recomputed range)"))
+            if r.get("fpass") is not None:
+                out.extend(_fpwhy(fn, r))
+                continue
+            if r["npass"] and r["npass"] > 1 and r["terms"]:
+                out.append("      (block numbers of Spillcosts pass %d, as rasim and --block use them; [p1 block K] = the "
+                           "number --blocks lists)" % r["npass"])
             for b, wb, pb, cost, d, bb in r["terms"]:
                 ls = sorted(fn["lines"].get(bb, ()))
                 where = ("src +%d..+%d" % (ls[0], ls[-1]) if ls[0] != ls[-1] else "src +%d" % ls[0]) if ls else ""
-                out.append("      block %3d  w=%-2d P=%-2d  %-44s %s" % (b, wb, pb, "refs cost %d -> %+d" % (cost, d)
-                                                                if cost is not None else "live through, unreferenced -> %+d" % d, where))
+                out.append(("      block %3d  w=%-2d P=%-2d  %-44s %s" % (b, wb, pb, "refs cost %d -> %+d" % (cost, d)
+                            if cost is not None else "live through, unreferenced -> %+d" % d, where)).rstrip()
+                           + _p1(fn, r["npass"], b, bb))
         for var in sorted(why):
             for np_, tot in sorted(fn.get("passes", {}).items()):
                 hits = ["%d (gr %x)" % (t, g) for (nm, g), t in tot.items() if nm == var]
@@ -635,10 +903,14 @@ def main(argv):
     ap.add_argument("--func")
     ap.add_argument("--all-classes", action="store_true")
     ap.add_argument("--block", type=int, help="N: list every value competing in block N (per Spillcosts pass)")
-    ap.add_argument("--blocks", help="LO-HI: print the IL (at Color entry) of blocks LO..HI as numbered by --why")
+    ap.add_argument("--blocks", help="LO-HI: print the IL (at Color entry) of blocks LO..HI (pass-1 numbers, or "
+                    "--pass N's)")
+    ap.add_argument("--pass", dest="npass", type=int, help="N: --blocks and --block number blocks as Spillcosts pass N "
+                    "does (--why and rasim --pass N use the pass a web was costed in; later passes renumber)")
     ap.add_argument("--why", default="", help="comma-separated variable names (or *) to break their prio down by block")
     ap.add_argument("--raw", action="store_true")
-    ap.add_argument("--export", help="write a JSON snapshot of the allocation for tools/rasim")
+    ap.add_argument("--export", help="write a JSON snapshot of the allocation for tools/rasim (of the first function "
+                    "matched; a path with %%s writes one per function, %%s = its decorated name)")
     ap.add_argument("--keep")
     ap.add_argument("src")
     cl = []
@@ -658,15 +930,21 @@ def main(argv):
     print(report(funcs, a.all_classes, set(filter(None, a.why.split(",")))))
     if a.export:
         import json
-        json.dump(export(funcs[0]), open(a.export, "w"), indent=0)
-        print("# exported %s (%s)" % (a.export, funcs[0]["name"]))
+        if "%s" in a.export:            # one snapshot per function: %s = the decorated name, made file-safe
+            for fn in funcs:
+                path = a.export % re.sub(r"[^\w@$]+", "_", fn["name"])[:120]
+                json.dump(export(fn), open(path, "w"), indent=0)
+                print("# exported %s (%s)" % (path, fn["name"]))
+        else:
+            json.dump(export(funcs[0]), open(a.export, "w"), indent=0)
+            print("# exported %s (%s)" % (a.export, funcs[0]["name"]))
     if a.block is not None:
         for fn in funcs:
-            print(block_view(fn, a.block))
+            print(block_view(fn, a.block, a.npass))
     if a.blocks:
         lo, _, hi = a.blocks.partition("-")
         for fn in funcs:
-            print(blocks(fn, int(lo), int(hi or lo)))
+            print(blocks(fn, int(lo), int(hi or lo), a.npass or 1))
     return rc
 
 

@@ -119,3 +119,55 @@ class Image:
                     if self.in_image(v):
                         m.update(range(i.address + at, i.address + at + 4))
         return m
+
+    def paired_mask(self, va, n, mine, rmask):
+        """reloc_mask(va, n), widened against our code `mine` whose relocated byte offsets are `rmask` (an .obj's
+        relocations, or a linked image's .reloc). Without a .reloc table the original's mask is only a guess from
+        image-address operands, and masking our side but not theirs makes an instruction (or a jump-table entry)
+        look different although it is the same relocation: every case of a switch that jumps into a shared block,
+        a jump table capstone cannot reach. So an original instruction is treated as relocated when it holds an
+        image address and ours has a relocated instruction of the same masked shape, and a run of two or more
+        image-address dwords (a jump table) is masked when ours has a run of relocated dwords. With a real .reloc
+        table the plain mask is returned. docs/c2/tracer.md (checker trap)."""
+        m = self.reloc_mask(va, n)
+        if self.relocs or not rmask:
+            return m
+        import capstone
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        theirs = self.read(va, n)
+
+        def sweep(code):                      # linear sweep that steps over undecodable bytes
+            pos = 0
+            while pos < len(code):
+                i = next(md.disasm(bytes(code[pos:pos + 16]), pos, 1), None)
+                k = i.size if i is not None else 1
+                yield pos, k
+                pos += k
+
+        shapes = set()
+        for pos, k in sweep(mine):
+            if any(pos + j in rmask for j in range(k)):
+                shapes.add(bytes(0 if pos + j in rmask else mine[pos + j] for j in range(k)))
+        if not shapes:
+            return m
+        img = lambda o: o + 4 <= n and self.in_image(int.from_bytes(theirs[o:o + 4], "little"))
+        for pos, k in sweep(theirs):
+            win, j = set(), 0
+            while j + 4 <= k:
+                if img(pos + j):
+                    win.update(range(pos + j, pos + j + 4))
+                    j += 4
+                else:
+                    j += 1
+            if win - m and bytes(0 if pos + j in win or pos + j in m else theirs[pos + j] for j in range(k)) in shapes:
+                m |= win
+        if any(all(x + d in rmask for d in range(8)) for x in rmask):          # ours has a table of relocated dwords
+            o = (-(va + 0)) % 4
+            while o + 8 <= n:
+                if img(o) and img(o + 4):
+                    while o + 4 <= n and img(o):
+                        m.update(range(o, o + 4))
+                        o += 4
+                else:
+                    o += 4
+        return m

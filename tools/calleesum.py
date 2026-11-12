@@ -194,6 +194,7 @@ class Summary:
         self.warn = []
         self.bad_stack = False
         self.returns = None                         # True/False from --proto; None: unknown
+        self.regs = None                            # custom register parameters (ltcgstub.py), else None
 
     def nparams(self):
         return self.nreg + self.nstack
@@ -207,8 +208,8 @@ class Analyzer:
     def in_tu(self, va):
         return self.tu is not None and self.tu[0] <= va < self.tu[1]
 
-    def summarize(self, va, conv=None, nparams=None, level=0):
-        key = (va, conv, nparams)
+    def summarize(self, va, conv=None, nparams=None, level=0, regs=None):
+        key = (va, conv, nparams, tuple(regs or ()))
         if key in self.done:
             return self.done[key]
         if va in self.active:
@@ -218,7 +219,7 @@ class Analyzer:
             if conv is None:
                 pop, ecx, edx = self.exe.quick(va)
                 conv = "fastcall" if (ecx and edx) else "thiscall" if ecx else "stdcall" if pop else "cdecl"
-            f = Func(self, va, conv, nparams, level)
+            f = Func(self, va, conv, nparams, level, regs)
             f.run()
             f.run()                                         # second run: the first found which slots are separate objects
             if f.s.bad_stack and f.guessed:                 # an indirect call's cleanup was guessed: try the alternatives
@@ -226,7 +227,7 @@ class Analyzer:
                 for trial in [sites] + [[x] for x in sites]:
                     self.pops = dict(saved)
                     self.pops.update({x: 0 for x in trial})
-                    g = Func(self, va, conv, nparams, level)
+                    g = Func(self, va, conv, nparams, level, regs)
                     g.run()
                     g.run()
                     if not g.s.bad_stack:
@@ -243,11 +244,13 @@ class Analyzer:
 
 
 class Func:
-    def __init__(self, an, va, conv, nparams, level):
+    def __init__(self, an, va, conv, nparams, level, regs=None):
         self.an, self.exe, self.va, self.conv, self.level = an, an.exe, va, conv, level
+        self.regs = list(regs) if regs else None            # custom (/LTCG) register parameters, in order: ltcgstub.py
         self.s = Summary(va)
         self.s.conv = conv
-        self.s.nreg = {"thiscall": 1, "fastcall": 2}.get(conv, 0)
+        self.s.nreg = len(self.regs) if self.regs else {"thiscall": 1, "fastcall": 2}.get(conv, 0)
+        self.s.regs = self.regs
         self.want_nstack = nparams
         self.direct = set()                                 # stack offsets accessed directly: object boundaries
         self.homes = set()                                  # local slots a parameter was reloaded from (spill homes)
@@ -816,9 +819,12 @@ class Func:
         for r in GPR:
             st.regs[r] = ("init", r)
         nreg = self.s.nreg
-        if nreg >= 1:
+        if self.regs:
+            for k, r in enumerate(self.regs):
+                st.regs[r] = ("p", k, 0)
+        elif nreg >= 1:
             st.regs["ecx"] = ("p", 0, 0)
-        if nreg >= 2:
+        if nreg >= 2 and not self.regs:
             st.regs["edx"] = ("p", 1, 0)
         for k in range(self.want_nstack if self.want_nstack is not None else 24):
             st.slots[4 + 4 * k] = ("p", nreg + k, 0)
@@ -865,6 +871,8 @@ class Func:
         keep = (s.warn, s.bad_stack)
         self.s = s = Summary(self.va)
         s.conv, s.nreg = keep and self.conv, {"thiscall": 1, "fastcall": 2}.get(self.conv, 0)
+        if self.regs:
+            s.nreg, s.regs = len(self.regs), self.regs
         states = {self.va: self.entry_state()}
         prolog = self.prologue_end()
         work, steps = [self.va], 0
@@ -1086,7 +1094,17 @@ def parse_proto(proto):
 def param_names(s, proto):
     """name and declared type of every summary parameter index."""
     names = {}
-    if proto:
+    if proto and getattr(s, "regs", None):                  # custom register convention: the first len(regs)
+        allp = ([("this", (proto["cls"] or "?") + "*")] if proto["conv"] == "thiscall" else []) + \
+            [(nm, ty) for ty, nm, _ in proto["params"]]     # parameters (this first) are the registers, in order
+        stack = s.nreg
+        for k, (nm, ty) in enumerate(allp):
+            if k < s.nreg:
+                names[k] = (nm, ty)
+            else:
+                names[stack] = (nm, ty)
+                stack += 1
+    elif proto:
         k = 0
         if proto["conv"] == "thiscall":
             names[0] = ("this", (proto["cls"] or "?") + "*")
@@ -1104,7 +1122,7 @@ def param_names(s, proto):
                 stack += slots
     for i in range(s.nparams()):
         if i not in names:
-            reg = ("ecx", "edx")[i] if i < s.nreg else None
+            reg = (s.regs[i] if s.regs else ("ecx", "edx")[i]) if i < s.nreg else None
             names[i] = (("this" if s.conv == "thiscall" else reg) if reg else "arg%d" % (i - s.nreg), "?")
     return names
 

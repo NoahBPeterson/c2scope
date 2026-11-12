@@ -38,6 +38,10 @@ when c2 knows `*p` is not written, and loses `mov [x], 5` when it knows `*p` is 
    `__declspec(noinline)`, gives c2 the same summary as the real body (28 of 28 checked field by field, section 5).
    `uv run tools/calleesum.py EXE VA --proto '...'` reads the pattern from the original executable and prints
    the stub. **[C]**
+8. **Two callees with identical bodies are still two symbols for the late tail merge.** FgMdInstrsMatch compares
+   a call's target by its symbol, so arms that call twins (which /OPT:ICF folds into one address in the exe)
+   are not merged back past the call, and a forwarder that makes the arms call one symbol lets the merge run.
+   This is about the callee's name, not its summary. **[C]** il_fg.md §7.5, tests/data/tailmerge.c c2/c3
 
 ---
 
@@ -332,7 +336,8 @@ as omitting one here.
 
 - Bits 2 and 3 of `+0x70` separately, and `+0x58`/`+0x5c`.
 - What exactly `noalias` on a bodiless declaration changes (section 3).
-- LTCG (`/GL`): the summary code has `Wpa*` branches; not probed (Fallout 3 is not LTCG).
+- LTCG (`/GL`): the summary code has `Wpa*` branches; not probed (Fallout 3 is not LTCG). Since probed on 13.10.3077: the summary applies across /GL objects
+  (docs/c2/ltcg.md section 4), and `tools/ltcgstub.py` adds the kill set and the calling convention to these stubs.
 - Whether a global's summary is per symbol or per field for struct globals.
 - How often the pre-optimisation/post-optimisation gap (section 5, first limit) occurs in real code.
 - The interaction with stack packing of param homes (frame.md rule 9 mentions the callee's mask): not probed.

@@ -1,8 +1,17 @@
 {
  "symkeys_sort_ret": "1075eeaa",
- "symkeys_skip": {"1075c327": 2, "107615bc": 2, "1076ac42": 3, "1077a016": 3},
+ "symkeys_skip": {
+  "1075c327": 2,
+  "107615bc": 2,
+  "1076ac42": 3,
+  "1077a016": 3
+ },
  "symkeys_free_by": "kind",
- "symkeys_nofree": ["hash", "glob", "other"],
+ "symkeys_nofree": [
+  "hash",
+  "glob",
+  "other"
+ ],
  "version": "13.10.3077",
  "c2_sha256": "bcd28f39b1798b07989c30a1df471cf87fc20e3802d130901a08f83800e6b81e",
  "image_base": "10700000",
@@ -18,7 +27,8 @@
   "opcount": "24a",
   "blk": "18",
   "len": "16",
-  "mem": "2c"
+  "mem": "2c",
+  "fename": "1"
  },
  "functions": {
   "@FPSpillWorthless@12": [
@@ -398,6 +408,48 @@
    45,
    "medium",
    "calls match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@FPRemoveSplitGlobregs@8": [
+   "e293",
+   16,
+   "high",
+   "6030 match (3077); fpcolor probes check"
+  ],
+  "@InsertColoredLifetimeEndSplit@16": [
+   "11cce",
+   16,
+   "high",
+   "6030 match (3077); fpcolor probes check"
+  ],
+  "@SplitAtMismatchedFlowJoinPoints@8": [
+   "122e8a",
+   16,
+   "high",
+   "6030 match (3077); fpcolor probes check"
+  ],
+  "@SplitAtPostDefEndPoints@8": [
+   "12528",
+   16,
+   "high",
+   "6030 match (3077); fpcolor probes check"
+  ],
+  "@CanExtendLifetime@16": [
+   "123b50",
+   16,
+   "high",
+   "6030 match (3077); fpcolor probes check"
+  ],
+  "@FPUpdateRegisterPressure@16": [
+   "11bad",
+   16,
+   "high",
+   "6030 match (3077); fpcolor probes check"
+  ],
+  "@FPInitialRegPressure@8": [
+   "10863",
+   16,
+   "high",
+   "6030 match (3077); fpcolor probes check"
   ]
  },
  "probes": {
@@ -449,7 +501,15 @@
   "107a9b63": "@RewriteSplitGlobregs@12+usepiece",
   "1078bf4b": "@RewriteSplitGlobregs@12+defpiece",
   "1078bb36": "@GrgAirlockEnterloads@12+enter",
-  "107821ac": "@Color@4+entry"
+  "107821ac": "@Color@4+entry",
+  "1071110f": "@FPSpillcosts@8+fpblk",
+  "10710ffb": "@FPSpillcosts@8+fpedge",
+  "10711253": "@FPSpillcosts@8+fpuse",
+  "10711780": "@FPSpillcosts@8+fpenter",
+  "10711b36": "@FPSpillcosts@8+fpdef",
+  "10711953": "@FPAddToPriorityList@8+fpins",
+  "1070e2cc": "@FPRemoveSplitGlobregs@8+fprm",
+  "1070e28e": "@FPSpillWorthless@12+fpkeep"
  },
  "globals": {
   "_CurFunc": "10881d74",
@@ -465,7 +525,35 @@
   "_RegMap": "108a74f0",
   "_regAvail1": "108a7b1c"
  },
+ "slots": {
+  "sbv": {
+   "bits": 32,
+   "next": 4,
+   "words": 3
+  },
+  "v13": true
+ },
  "hooks": {
+  "slots": [
+   "10790ad6=g10881d74>0>0>4$,s1,g108a78a0>0,g108a789c>0,s2",
+   "10790c45={SYM:eax},eax>0>0x1c,eax>0>0x18",
+   "10790ba1={LOD:eax}",
+   "10790d11=edi,ebp,esi>4",
+   "107349c0=edi,{SYM:s4}",
+   "10734a17={LOD:eax}",
+   "10791426={SYM:s1},g108a788c>0,s3",
+   "10791a6a=edi,ebx>4",
+   "10791ab7=edi",
+   "10791aef={LOD:eax}",
+   "107914c4={LOD:eax}",
+   "10722f9b=edi",
+   "107ae176=ebx",
+   "10790d90=s7,s5,s9,s8",
+   "10734b33=s7",
+   "10790df3=ebx,edi,ebp,g108a789c>0,g108a9128>0>0x50,g108a9128>0>0x8c,g108a7888>0,g10883370>0>0x1ea,g108a9218>0,g108a9128>0>0x3c,g108a91d0>0",
+   "10790e88=s6,s7,eax",
+   "10790ea9=esi,esi>0x3c,ecx"
+  ],
   "symkeys": {
    "init": "10776598",
    "alloc": "1075a0c5=eax,g108a9120>0,a0,a1,a2,a3,a4,a5,a6,a7,a8/xeax>0x1c,eax",
@@ -479,8 +567,9 @@
    "gc": "1075fb60",
    "pool": "107603db/xeax>4>0x1c",
    "getinl": "1078d3f9=s1>4>0x28>0x18>4$,s1>4>0x14/xeax",
-   "sort": "1076a2f3=a0/xedi>4,edi>0x14,eax>8,eax>0x10,eax>0x18>0x1c,eax>0x28>8,eax>0x28>0x18>0x1c,eax>0>8,eax>0>0x10,eax>0>0x18>0x1c,eax>0>0x28>8,eax>0>0x28>0x18>0x1c",
-   "sortx": "1075d908/xeax>0x28>0x28>8,eax>0x28>0x28>0x18>0x1c,eax>0x28>0x28>0x34>0x18>0x1c,eax>0x28>0x28>0x30,eax>0x28>0x28>0>8,eax>0x28>0x28>0>0x18>0x1c,eax>0x28>0>0x28>8,eax>0x28>0>0x28>0x18>0x1c,eax>0x28>0>0x28>0x34>0x18>0x1c,eax>0x28>0>0x28>0x30,eax>0x28>0>0x28>0>8,eax>0x28>0>0x28>0>0x18>0x1c"
+   "sort": "1076a2f3=a0,eax>0x10,eax>8,eax>0x34>0x18>0x1c,eax>0x30,eax>0>0x10,eax>0>8,eax>0>0x34>0x18>0x1c,eax>0>0x30,eax>0x28>0>0x34>0x18>0x1c,eax>0>0x28>0>0x34>0x18>0x1c/xedi>4,edi>0x14,eax>8,eax>0x10,eax>0x18>0x1c,eax>0x28>8,eax>0x28>0x18>0x1c,eax>0>8,eax>0>0x10,eax>0>0x18>0x1c,eax>0>0x28>8,eax>0>0x28>0x18>0x1c",
+   "sortx": "1075d908/xeax>0x28>0x28>8,eax>0x28>0x28>0x18>0x1c,eax>0x28>0x28>0x34>0x18>0x1c,eax>0x28>0x28>0x30,eax>0x28>0x28>0>8,eax>0x28>0x28>0>0x18>0x1c,eax>0x28>0>0x28>8,eax>0x28>0>0x28>0x18>0x1c,eax>0x28>0>0x28>0x34>0x18>0x1c,eax>0x28>0>0x28>0x30,eax>0x28>0>0x28>0>8,eax>0x28>0>0x28>0>0x18>0x1c",
+   "sort3": "1075d977=edi>0x28>0>0>8,edi>0x28>0>0>0x10,edi>0x28>0>0>0x18>0x1c,edi>0x28>0>0>0x28>8,edi>0x28>0>0>0x28>0x18>0x1c,edi>0x28>0>0>0x34>0x18>0x1c,edi>0x28>0>0>0x30,edi>0x28>0>0>0>8,edi>0x28>0>0>0>0x10,edi>0x28>0>0>0>0x18>0x1c,edi>0x28>0>0>0>0x34>0x18>0x1c,edi>0x28>0>0>0>0>8"
   },
   "default": [
    "@Color@4=s1",
@@ -598,6 +687,25 @@
    "1078bb36=esi,esi>0x1c,eax",
    "107821ac=g10882154>0,g108a92d8>0>0x1c,g108a92d8>0>0x30>0x1c,g108a92d8>0>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c",
    "@GrgNewGlobreg@4=eax/xeax,eax>0x1c"
+  ],
+  "regs_fp": [
+   "1071110f=ebp,s6",
+   "10710ffb=esi,esi>0x1c,s6,s7,ebp>0xc",
+   "10711253=edi,edi>0x1c,edi>0xc,ecx,s6,s5,s5>4,ebp>0x14",
+   "10711780=esi,esi>0x1c,eax,ebp,edi,edi>4",
+   "10711b36=esi,esi>0x1c,eax,ebp,edi,edi>4",
+   "10711953=edi,edi>0x1c,edi>0xc,edi>0x40,edi>0x44,edi>0x24,ebp,edi>0>0>4$,edi>0>0x1c,edi>0>4",
+   "@FPSpillcosts@8",
+   "@FPRemoveSplitGlobregs@8=eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8,eax>0>4>4>0,eax>0>4>4>8,eax>0>4>4>4>0,eax>0>4>4>4>8",
+   "@FPCheckColorability@12=s2,s2>0x1c/xeax",
+   "@InsertColoredLifetimeEndSplit@16=s1,s1>0x14,s2>0x1c,s3,s3>0x1c,s3>0>0>4$,s3>0>0x1c,s3>0>4/xeax",
+   "@SplitAtMismatchedFlowJoinPoints@8=/xeax",
+   "@SplitAtPostDefEndPoints@8=/xeax",
+   "@CanExtendLifetime@16=/xeax",
+   "@FPUpdateRegisterPressure@16=/xeax,eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8",
+   "@FPInitialRegPressure@8=/xeax,eax>0>0,eax>0>8,eax>0>4>0,eax>0>4>8",
+   "1070e2cc=ecx,ecx>0x1c,ecx>0>0>4$,ecx>0>0x1c,ecx>0>4",
+   "1070e28e=esi,esi>0x1c,esi>0>0>4$,esi>0>0x1c,esi>0>4"
   ]
  },
  "opnames": {

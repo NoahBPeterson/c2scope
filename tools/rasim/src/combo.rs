@@ -50,6 +50,14 @@ pub struct Uni {
     sup: Vec<Option<u32>>,         // record costed again in this pass
     tail: Vec<usize>,
     pub exact: Result<(), String>,
+    // Precomputed for the fast path of `Ctx::eval` (same results as the direct computations they replace):
+    init_av: Vec<Option<u32>>,                 // per web: init_avail
+    kill_tab: BTreeMap<u32, Vec<(usize, bool, u32)>>, // per block k: the first-pass vars spanning k (var, lives through k, initial avail)
+    pres: BTreeMap<u32, Vec<usize>>,           // per block: the first-pass vars present there, ascending
+    prio0: Vec<i64>,                           // per var: its unedited priority
+    elig: Vec<usize>,                          // the vars `steps` can pop, ascending
+    elig_at: Vec<usize>,                       // per var: its index in elig (usize::MAX: none)
+    bcoef: BTreeMap<u32, Vec<(usize, i64)>>,   // per block b: (index in elig, d prio / d P_b) of the first-pass vars
 }
 
 fn range(v: &Var) -> Option<(u32, u32)> {
@@ -120,6 +128,24 @@ impl Uni {
             sup,
             tail: vec![],
             exact: Ok(()),
+            init_av: {
+                // init_avail for every web, in one pass
+                let mut v = vec![None; m.webs.len()];
+                for it in &m.items {
+                    if let Item::Init { web, avail, .. } = it {
+                        if v[*web].is_none() {
+                            v[*web] = Some(*avail);
+                        }
+                    }
+                }
+                v
+            },
+            kill_tab: BTreeMap::new(),
+            pres: BTreeMap::new(),
+            prio0: vec![],
+            elig: vec![],
+            elig_at: vec![],
+            bcoef: BTreeMap::new(),
         };
         let mut pending: Vec<usize> = vec![];
         let mut pre: Vec<usize> = vec![];
@@ -214,6 +240,43 @@ impl Uni {
         u
     }
 
+    /// The tables the fast path of `Ctx::eval` uses (`need`, `want`).
+    fn prepare(&mut self) {
+        let u = self;
+        for (i, y) in u.base.vars.iter().enumerate() {
+            if y.pass != u.p1 {
+                continue;
+            }
+            for b in y.cost.keys().chain(y.live.iter()) {
+                u.pres.entry(*b).or_default().push(i);
+            }
+            let (Some((a, z)), Some(av)) = (range(y), u.web_of[i].and_then(|w| u.init_av[w])) else { continue };
+            for k in a + 1..z {
+                if present(y, k) {
+                    u.kill_tab.entry(k).or_default().push((i, y.live.contains(&k), av));
+                }
+            }
+        }
+        for l in u.pres.values_mut() {
+            l.sort_unstable();
+            l.dedup();
+        }
+        u.prio0 = u.base.vars.iter().map(|v| u.base.prio(v)).collect();
+        let nv = u.base.vars.len().min(u.ev_of.len());
+        u.elig = (0..nv).filter(|&v| !u.base.vars[v].removed && (u.ev_of[v].is_some() || u.synth[v])).collect();
+        u.elig_at = vec![usize::MAX; u.base.vars.len()];
+        for (i, &v) in u.elig.iter().enumerate() {
+            u.elig_at[v] = i;
+            let x = &u.base.vars[v];
+            let (true, Some(t)) = (x.pass == u.p1, x.own.as_ref()) else { continue };
+            let blocks: BTreeSet<u32> = x.cost.keys().chain(x.live.iter()).copied().collect();
+            for b in blocks {
+                let c = x.cost.get(&b).copied().unwrap_or(0) - x.live.contains(&b) as i64;
+                u.bcoef.entry(b).or_default().push((i, c * t.get(&b).map_or(1, |y| y.0)));
+            }
+        }
+    }
+
     fn alive(&self, v: usize, k: u32) -> bool {
         self.gone_after[v].map_or(true, |r| r >= k) && self.sup[v].map_or(true, |q| q > k)
     }
@@ -222,8 +285,16 @@ impl Uni {
     /// until the pop that ended the round in the trace; then that round's Spillcosts results come in.
     fn steps(&self, m: &Model, st: &State) -> Vec<usize> {
         let ord: Vec<usize> = st.order().iter().map(|x| x.0).collect();
+        self.steps_ord(m, &ord)
+    }
+
+    /// `steps` from the colouring order. Only the order of the vars in `elig` matters.
+    fn steps_ord(&self, m: &Model, ord: &[usize]) -> Vec<usize> {
+        let st = &self.base; // pass and count only: an edit changes neither
         let nv = st.vars.len().min(self.ev_of.len());
         let mut popped = vec![false; st.vars.len()];
+        // ord[..cur] holds nothing round r can pop: popped, or not in the list in this round
+        let (mut cur, mut cur_r) = (0usize, usize::MAX);
         let nr = self.rounds.len();
         let mut out: Vec<usize> = vec![];
         let mut r = 0;
@@ -231,13 +302,22 @@ impl Uni {
         out.extend(&self.lead[0]);
         loop {
             let k = self.rounds[r];
-            let next = ord.iter().copied().find(|&v| {
-                v < nv
+            if cur_r != r {
+                (cur, cur_r) = (0, r);
+            }
+            while cur < ord.len() {
+                let v = ord[cur];
+                if v < nv
                     && !popped[v]
                     && (self.ev_of[v].is_some() || self.synth[v])
                     && st.vars[v].pass <= k
                     && self.alive(v, k)
-            });
+                {
+                    break;
+                }
+                cur += 1;
+            }
+            let next = ord.get(cur).copied();
             match next {
                 None => {
                     if r + 1 >= nr {
@@ -265,10 +345,13 @@ impl Uni {
             }
         }
         // anything the rounds did not reach (a pop whose turn never came): as traced, at the end
-        let have: BTreeSet<usize> = out.iter().copied().collect();
+        let mut have = vec![false; m.items.len() + m.webs.len()];
+        for &i in &out {
+            have[i] = true;
+        }
         for v in 0..nv {
             if let Some(items) = &self.ev_of[v] {
-                out.extend(items.iter().filter(|i| !have.contains(i)));
+                out.extend(items.iter().filter(|&&i| !have[i]));
             }
         }
         out.extend(&self.tail);
@@ -349,14 +432,6 @@ impl Uni {
         }
     }
 
-    fn bump(&self, st: &mut State, b: u32, dp: i64) {
-        for v in st.vars.iter_mut().filter(|v| v.pass == self.p1) {
-            if let Some(t) = v.own.as_mut() {
-                t.entry(b).or_insert((1, 0)).1 += dp;
-            }
-        }
-    }
-
     /// Registers killed in block k (by a call), estimated [I] from the other values of the first pass:
     ///   - if some value lives through k without a reference, the registers none of those may use (they are live
     ///     across everything in the block);
@@ -383,17 +458,58 @@ impl Uni {
         through.unwrap_or(around)
     }
 
-    fn weight(&self, st: &State, v: usize, b: u32) -> i64 {
-        st.vars[v].own.as_ref().and_then(|t| t.get(&b)).map_or(1, |x| x.0)
+    /// `kills` from the precomputed table.
+    fn kills_fast(&self, v: usize, k: u32) -> u32 {
+        let mut through: Option<u32> = None;
+        let mut around = 0u32;
+        for &(u, thr, av) in self.kill_tab.get(&k).map_or(&[][..], |l| &l[..]) {
+            if u == v {
+                continue;
+            }
+            if thr {
+                through = Some(through.unwrap_or(0x1de) & !av & 0x1de);
+            } else {
+                around |= !av & 0xe;
+            }
+        }
+        through.unwrap_or(around)
+    }
+
+    fn kill_est(&self, m: &Model, v: usize, k: u32, fast: bool) -> u32 {
+        if fast {
+            self.kills_fast(v, k)
+        } else {
+            self.kills(m, v, k)
+        }
+    }
+
+    fn iav(&self, m: &Model, w: usize, fast: bool) -> Option<u32> {
+        if fast {
+            self.init_av[w]
+        } else {
+            init_avail(m, w)
+        }
+    }
+
+    fn weight<E: Es>(&self, st: &E, v: usize, b: u32) -> i64 {
+        st.v(v).own.as_ref().and_then(|t| t.get(&b)).map_or(1, |x| x.0)
     }
 
     /// Apply one edit to the priority state and collect what it means for the register model.
-    fn apply(&self, m: &Model, e: &Src, st: &mut State, md: &mut Mods, desc: &mut Vec<String>) -> Result<(), String> {
+    fn apply<E: Es>(
+        &self,
+        m: &Model,
+        e: &Src,
+        st: &mut E,
+        md: &mut Mods,
+        desc: &mut Vec<String>,
+        fast: bool,
+    ) -> Result<(), String> {
         let v = match e {
             Src::Ref(v, ..) | Src::Unref(v, ..) | Src::Drop(v, ..) | Src::Extend(v, ..) => *v,
             Src::NewVar(n, refs) => {
                 for (b, _) in refs {
-                    self.bump(st, *b, 1);
+                    st.bump(self.p1, *b, 1);
                 }
                 desc.push(format!("{}: P += 1 in its blocks; its own register and overlaps are not modelled", n));
                 return Ok(());
@@ -401,7 +517,7 @@ impl Uni {
         };
         let name = self.vlabel(v);
         let web = self.web_of[v];
-        let p0 = st.prio(&st.vars[v]);
+        let p0 = st.prio_of(v);
         let ben = |md: &mut Mods, d: i64| {
             if let Some(w) = web {
                 md.ben.push((w, d));
@@ -409,33 +525,33 @@ impl Uni {
         };
         match e {
             Src::Ref(_, b, c) => {
-                if !present(&st.vars[v], *b) {
+                if !present(st.v(v), *b) {
                     return Err(format!("{} is not live in block {}; use extend:{}:{}", name, b, name, b));
                 }
-                let had = st.vars[v].cost.contains_key(b);
-                *st.vars[v].cost.entry(*b).or_insert(0) += c;
-                st.vars[v].live.remove(b);
+                let had = st.v(v).cost.contains_key(b);
+                *st.vm(v).cost.entry(*b).or_insert(0) += c;
+                st.vm(v).live.remove(b);
                 if !had {
-                    self.bump(st, *b, 1);
+                    st.bump(self.p1, *b, 1);
                 }
                 let w = self.weight(st, v, *b);
                 ben(md, c * w);
             }
             Src::Unref(_, b) => {
-                let Some(c0) = st.vars[v].cost.remove(b) else {
+                let Some(c0) = st.vm(v).cost.remove(b) else {
                     return Err(format!("{} has no reference in block {}", name, b));
                 };
-                self.bump(st, *b, -1);
-                st.vars[v].live.insert(*b);
+                st.bump(self.p1, *b, -1);
+                st.vm(v).live.insert(*b);
                 let w = self.weight(st, v, *b);
                 ben(md, -c0 * w);
             }
             Src::Drop(_, b) => {
-                let Some((lo, hi)) = range(&st.vars[v]) else { return Err(format!("{} has no blocks", name)) };
+                let Some((lo, hi)) = range(st.v(v)) else { return Err(format!("{} has no blocks", name)) };
                 if *b != lo && *b != hi {
                     return Err(format!("block {} is inside {}'s range {}..{}; only an end can be dropped", b, name, lo, hi));
                 }
-                if st.vars[v].cost.keys().all(|k| k == b) {
+                if st.v(v).cost.keys().all(|k| k == b) {
                     return Err(format!("block {} holds {}'s only references", b, name));
                 }
                 // the range now ends at the nearest block that still has a reference: the blocks lived through
@@ -444,49 +560,49 @@ impl Uni {
                 let mut k = *b;
                 loop {
                     k = if *b == lo { k + 1 } else { k - 1 };
-                    if st.vars[v].cost.contains_key(&k) || k == 0 || k > hi {
+                    if st.v(v).cost.contains_key(&k) || k == 0 || k > hi {
                         break;
                     }
-                    if st.vars[v].live.contains(&k) {
+                    if st.v(v).live.contains(&k) {
                         gone.push(k);
                     }
                 }
                 let mut back = 0u32;
                 for k in &gone {
-                    if let Some(c0) = st.vars[v].cost.remove(k) {
-                        self.bump(st, *k, -1);
+                    if let Some(c0) = st.vm(v).cost.remove(k) {
+                        st.bump(self.p1, *k, -1);
                         let w = self.weight(st, v, *k);
                         ben(md, -c0 * w);
                     } else {
-                        back |= self.kills(m, v, *k);
+                        back |= self.kill_est(m, v, *k, fast);
                     }
-                    st.vars[v].live.remove(k);
+                    st.vm(v).live.remove(k);
                 }
                 // registers killed in the blocks it lived through come back unless a block it still spans kills them
                 // [I: the end blocks of the remaining range are taken as not killing them]
-                if let (Some(wv), Some((nlo, nhi))) = (web, range(&st.vars[v])) {
+                if let (Some(wv), Some((nlo, nhi))) = (web, range(st.v(v))) {
                     for k in nlo + 1..nhi {
-                        back &= !self.kills(m, v, k);
+                        back &= !self.kill_est(m, v, k, fast);
                     }
-                    back &= !init_avail(m, wv).unwrap_or(0);
+                    back &= !self.iav(m, wv, fast).unwrap_or(0);
                     if back != 0 {
                         md.gives.push((wv, back));
                     }
                 }
                 let mut lost = vec![];
-                for u in 0..st.vars.len() {
-                    let y = &st.vars[u];
+                for u in 0..st.n() {
+                    let y = st.v(u);
                     if u == v || y.pass != self.p1 || !gone.iter().any(|k| present(y, *k)) {
                         continue;
                     }
-                    let x = &st.vars[v];
+                    let x = st.v(v);
                     let shared = y.cost.keys().chain(y.live.iter()).any(|k| present(x, *k));
                     if let (false, Some(wv), Some(wu)) = (shared, web, self.web_of[u]) {
                         md.del_e.push((wv, wu));
                         lost.push(m.label(wu));
                     }
                 }
-                let (nlo, nhi) = range(&st.vars[v]).unwrap_or((lo, hi));
+                let (nlo, nhi) = range(st.v(v)).unwrap_or((lo, hi));
                 desc.push(format!(
                     "{} range {}..{} -> {}..{}{}{}",
                     name,
@@ -499,12 +615,12 @@ impl Uni {
                 ));
             }
             Src::Extend(_, b) => {
-                let Some((lo, hi)) = range(&st.vars[v]) else { return Err(format!("{} has no blocks", name)) };
+                let Some((lo, hi)) = range(st.v(v)) else { return Err(format!("{} has no blocks", name)) };
                 if (lo..=hi).contains(b) {
                     return Err(format!("{} already reaches block {} (range {}..{}); use ref:", name, b, lo, hi));
                 }
                 let Some(wv) = web else { return Err(format!("{} has no avail set in the trace", name)) };
-                let known = |k: &u32| st.vars[v].own.as_ref().map_or(false, |t| t.contains_key(k));
+                let known = |k: &u32| st.v(v).own.as_ref().map_or(false, |t| t.contains_key(k));
                 if !known(b) {
                     return Err(format!("no block {} in Spillcosts pass {}", b, self.p1));
                 }
@@ -512,28 +628,60 @@ impl Uni {
                 let chain: Vec<u32> = if *b < lo { (*b..=lo).collect() } else { (hi..=*b).collect() };
                 let mut over: Vec<usize> = vec![];
                 let mut kills = 0u32;
-                for u in 0..self.base.vars.len() {
-                    let y = &self.base.vars[u];
-                    if u == v || y.pass != self.p1 {
-                        continue;
+                // the first-pass vars present in a block in between, or in two neighbouring blocks of the chain
+                let meet: Vec<usize> = if fast {
+                    let at = |k: &u32| self.pres.get(k).map_or(&[][..], |l| &l[..]);
+                    let mut mark = vec![false; self.base.vars.len()];
+                    for k in &between {
+                        for &u in at(k) {
+                            mark[u] = true;
+                        }
                     }
-                    let meets = between.iter().any(|k| present(y, *k))
-                        || chain.windows(2).any(|p| present(y, p[0]) && present(y, p[1]));
-                    if let (true, Some(wu)) = (meets, self.web_of[u]) {
+                    for p in chain.windows(2) {
+                        // both lists ascending: their intersection
+                        let (a, b) = (at(&p[0]), at(&p[1]));
+                        let (mut i, mut j) = (0, 0);
+                        while i < a.len() && j < b.len() {
+                            if a[i] < b[j] {
+                                i += 1;
+                            } else if b[j] < a[i] {
+                                j += 1;
+                            } else {
+                                mark[a[i]] = true;
+                                i += 1;
+                                j += 1;
+                            }
+                        }
+                    }
+                    mark[v] = false;
+                    (0..mark.len()).filter(|&u| mark[u]).collect()
+                } else {
+                    (0..self.base.vars.len())
+                        .filter(|&u| {
+                            let y = &self.base.vars[u];
+                            u != v
+                                && y.pass == self.p1
+                                && (between.iter().any(|k| present(y, *k))
+                                    || chain.windows(2).any(|p| present(y, p[0]) && present(y, p[1])))
+                        })
+                        .collect()
+                };
+                for u in meet {
+                    if let Some(wu) = self.web_of[u] {
                         if m.init_seen[wu] && !over.contains(&wu) {
                             over.push(wu);
                         }
                     }
                 }
                 for k in &between {
-                    kills |= self.kills(m, v, *k);
+                    kills |= self.kill_est(m, v, *k, fast);
                 }
-                kills &= init_avail(m, wv).unwrap_or(0);
+                kills &= self.iav(m, wv, fast).unwrap_or(0);
                 for k in between {
-                    st.vars[v].live.insert(k);
+                    st.vm(v).live.insert(k);
                 }
-                st.vars[v].cost.insert(*b, 2);
-                self.bump(st, *b, 1);
+                st.vm(v).cost.insert(*b, 2);
+                st.bump(self.p1, *b, 1);
                 let w = self.weight(st, v, *b);
                 ben(md, 2 * w);
                 let fresh: Vec<String> = over
@@ -561,11 +709,104 @@ impl Uni {
             }
             Src::NewVar(..) => unreachable!(),
         }
-        let p1 = st.prio(&st.vars[v]);
+        let p1 = st.prio_of(v);
         if p1 != p0 {
             desc.push(format!("{} prio {} -> {}", name, p0, p1));
         }
         Ok(())
+    }
+}
+
+/// The priority state an edit works on: `State` (a full copy of the base) or `Ov` (the base with a few vars copied
+/// out and the P changes listed).
+trait Es {
+    fn v(&self, u: usize) -> &Var;
+    fn vm(&mut self, u: usize) -> &mut Var;
+    /// P_b += dp in the block table of every var of pass p1
+    fn bump(&mut self, p1: u32, b: u32, dp: i64);
+    fn n(&self) -> usize;
+    fn prio_of(&self, u: usize) -> i64;
+}
+
+fn bump_var(v: &mut Var, p1: u32, b: u32, dp: i64) {
+    if v.pass == p1 {
+        if let Some(t) = v.own.as_mut() {
+            t.entry(b).or_insert((1, 0)).1 += dp;
+        }
+    }
+}
+
+impl Es for State {
+    fn v(&self, u: usize) -> &Var {
+        &self.vars[u]
+    }
+    fn vm(&mut self, u: usize) -> &mut Var {
+        &mut self.vars[u]
+    }
+    fn bump(&mut self, p1: u32, b: u32, dp: i64) {
+        for v in self.vars.iter_mut() {
+            bump_var(v, p1, b, dp);
+        }
+    }
+    fn n(&self) -> usize {
+        self.vars.len()
+    }
+    fn prio_of(&self, u: usize) -> i64 {
+        self.prio(&self.vars[u])
+    }
+}
+
+/// The base state with the edited vars copied out (their block tables carry every bump) and the bumps listed; an
+/// unedited var's priority is its base priority plus what the bumps add (the priority is linear in each P_b).
+struct Ov<'a> {
+    base: &'a State,
+    prio0: &'a [i64],
+    ed: Vec<(usize, Var)>,
+    bumps: Vec<(u32, u32, i64)>, // (p1, b, dp)
+}
+
+impl<'a> Es for Ov<'a> {
+    fn v(&self, u: usize) -> &Var {
+        self.ed.iter().find(|x| x.0 == u).map_or(&self.base.vars[u], |x| &x.1)
+    }
+    fn vm(&mut self, u: usize) -> &mut Var {
+        let i = match self.ed.iter().position(|x| x.0 == u) {
+            Some(i) => i,
+            None => {
+                let mut v = self.base.vars[u].clone();
+                for &(p1, b, dp) in &self.bumps {
+                    bump_var(&mut v, p1, b, dp);
+                }
+                self.ed.push((u, v));
+                self.ed.len() - 1
+            }
+        };
+        &mut self.ed[i].1
+    }
+    fn bump(&mut self, p1: u32, b: u32, dp: i64) {
+        self.bumps.push((p1, b, dp));
+        for (_, v) in self.ed.iter_mut() {
+            bump_var(v, p1, b, dp);
+        }
+    }
+    fn n(&self) -> usize {
+        self.base.vars.len()
+    }
+    fn prio_of(&self, u: usize) -> i64 {
+        if let Some(x) = self.ed.iter().find(|x| x.0 == u) {
+            return self.base.prio(&x.1);
+        }
+        let v = &self.base.vars[u];
+        let mut p = self.prio0[u];
+        if let Some(t) = v.own.as_ref() {
+            for &(p1, b, dp) in &self.bumps {
+                if v.pass == p1 {
+                    let c = v.cost.get(&b).copied().unwrap_or(0) - v.live.contains(&b) as i64;
+                    p += c * t.get(&b).map_or(1, |x| x.0) * dp;
+                }
+            }
+        }
+        p
     }
 }
 
@@ -597,6 +838,11 @@ pub struct Ctx<'a> {
     s: &'a Snap,
     pub m: Model,
     pub uni: Uni,
+    /// false (RASIM_REF=1, or `rasim regs`): every candidate copies the whole priority state and runs the register
+    /// model from the start (the reference the fast path is checked against; same output)
+    fast: bool,
+    tr_nat: Option<choose::Trace>,   // the unedited run in the traced order (abstract changes only)
+    tr_steps: Option<choose::Trace>, // the unedited run in the order `Uni::steps` computes (with source edits)
 }
 
 pub struct Eval {
@@ -606,9 +852,25 @@ pub struct Eval {
 
 impl<'a> Ctx<'a> {
     pub fn new(s: &'a Snap) -> Ctx<'a> {
+        Self::with(s, false)
+    }
+
+    /// `fast`: the fast path of `eval` (an overlay of the priority state, precomputed tables, and the unedited runs
+    /// kept for `Model::run_fast`); worth its setup only when many candidates are evaluated. RASIM_REF=1 turns it off.
+    pub fn with(s: &'a Snap, traces: bool) -> Ctx<'a> {
         let m = Model::build(s).unwrap_or_else(|e| die(&e));
-        let uni = Uni::build(s, &m);
-        Ctx { s, m, uni }
+        let mut uni = Uni::build(s, &m);
+        let fast = traces && std::env::var("RASIM_REF").map_or(true, |v| v.is_empty() || v == "0");
+        if fast {
+            uni.prepare();
+        }
+        let (tr_nat, tr_steps) = if fast {
+            let st = if uni.exact.is_ok() { m.trace(Some(uni.steps(&m, &uni.base))).ok() } else { None };
+            (m.trace(None).ok(), st)
+        } else {
+            (None, None)
+        };
+        Ctx { s, m, uni, fast, tr_nat, tr_steps }
     }
 
     pub fn label(&self, c: &Cand) -> String {
@@ -635,13 +897,42 @@ impl<'a> Ctx<'a> {
         let srcs: Vec<&Src> = cs.iter().filter_map(|c| if let Cand::Src(e) = c { Some(e) } else { None }).collect();
         if !srcs.is_empty() {
             self.uni.exact.clone()?;
-            let mut st = self.uni.base.clone();
-            for e in srcs {
-                self.uni.apply(&self.m, e, &mut st, &mut md, &mut desc)?;
+            if self.fast {
+                let u = &self.uni;
+                let mut ov = Ov { base: &u.base, prio0: &u.prio0, ed: vec![], bumps: vec![] };
+                for e in srcs {
+                    u.apply(&self.m, e, &mut ov, &mut md, &mut desc, true)?;
+                }
+                // the priorities Ov::prio_of gives, from the per-block coefficients
+                let mut o: Vec<(usize, i64)> = u.elig.iter().map(|&v| (v, u.prio0[v])).collect();
+                for &(p1, b, dp) in &ov.bumps {
+                    debug_assert_eq!(p1, u.p1);
+                    for &(i, c) in u.bcoef.get(&b).map_or(&[][..], |l| &l[..]) {
+                        o[i].1 += c * dp;
+                    }
+                }
+                for (v, x) in &ov.ed {
+                    if u.elig_at[*v] != usize::MAX {
+                        o[u.elig_at[*v]].1 = u.base.prio(x);
+                    }
+                }
+                u.base.sort_order(&mut o);
+                let ord: Vec<usize> = o.into_iter().map(|x| x.0).collect();
+                md.order = Some(u.steps_ord(&self.m, &ord));
+            } else {
+                let mut st = self.uni.base.clone();
+                for e in srcs {
+                    self.uni.apply(&self.m, e, &mut st, &mut md, &mut desc, false)?;
+                }
+                md.order = Some(self.uni.steps(&self.m, &st));
             }
-            md.order = Some(self.uni.steps(&self.m, &st));
         }
-        Ok(Eval { out: self.m.run(&md)?, desc })
+        let tr = if md.order.is_some() { self.tr_steps.as_ref() } else { self.tr_nat.as_ref() };
+        let out = match tr {
+            Some(t) => self.m.run_fast(&md, t)?,
+            None => self.m.run(&md)?,
+        };
+        Ok(Eval { out, desc })
     }
 
     fn side(&self, base: &Outcome, o: &Outcome, tg: &[(usize, u32)]) -> Vec<String> {
@@ -1155,7 +1446,7 @@ fn warn_model(cx: &Ctx) {
 
 /// `rasim need SNAP reg:VAR=REG ... [CHANGE|EDIT...]`
 pub fn cmd_need(s: &Snap, targets: &[(String, String)], given: &[String], opts: &Opts) {
-    let cx = Ctx::new(s);
+    let cx = Ctx::with(s, true);
     warn_model(&cx);
     let tg: Vec<(usize, u32)> = targets
         .iter()
@@ -1172,7 +1463,7 @@ pub fn cmd_need(s: &Snap, targets: &[(String, String)], given: &[String], opts: 
 /// `ours` column (`WANTS r for q`: the pieces that have q); a row `ok` (regmap --all) pins the variable's current
 /// registers; `mixed` rows are skipped.
 pub fn cmd_want(s: &Snap, path: &str, given: &[String], opts: &Opts) {
-    let cx = Ctx::new(s);
+    let cx = Ctx::with(s, true);
     warn_model(&cx);
     let m = &cx.m;
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{}: {}", path, e)));
