@@ -25,6 +25,9 @@
 //!     (ProcessFoldableDefs), the benefit change after a spill (CmdUpdateCost), the re-split of a web whose
 //!     user a spill deleted (_NeedNewLives), the restriction to esi/edi/ebp under byte-register pressure.
 //! After a miss the model is put back on the trace, so every decision is scored against a correct history.
+//! Then `numbering` replays the GLOBREG free list (regalloc.md 3.6.9): every split piece's record number and the
+//! order of the reloads at a block entry.  Every c2 build: 13.10 and 15.00 snapshots carry their opcode numbers
+//! (`c2.ops`); the addresses above are 14.00's.
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -64,7 +67,22 @@ struct PSnap {
     split_rounds: Vec<PSplit>,
     #[serde(default)]
     npasses: Option<u32>, // Spillcosts calls (a round that leaves no piece has no other event)
+    #[serde(default)]
+    c2: Option<PBuild>, // another c2 build (absent: 14.00.50727.762): the opcode numbers its rules test
 }
+#[derive(Deserialize)]
+struct PBuild {
+    #[serde(default)]
+    build: String,
+    ops: POps,
+}
+/// Opcode numbers the decision rules compare with (they differ between builds; port-1310.md, port-1500.md).
+#[derive(Deserialize, Clone, Copy)]
+struct POps {
+    enterload: i64, // OPENTERLOAD: 14.00 0x295, 13.10 0x26a, 15.00 0x2e0 (SpillObvious)
+    last: i64,      // first opcode past the machine opcodes: 0x273, 0x249, 0x2be (RestrictToReg's Opcode_dope bound)
+}
+const OPS14: POps = POps { enterload: 0x295, last: 0x273 };
 #[derive(Deserialize)]
 struct PPass {
     n: u32,
@@ -162,6 +180,13 @@ struct PDec {
     site: Option<String>,
     delta: Option<i64>,
     regs: Option<Vec<u32>>,
+    // GLOBREG record numbers (regalloc.md 3.6.9): remove / new / piece / reload / freelist events
+    num: Option<u64>,
+    pnum: Option<u64>,
+    tup: Option<String>,
+    next: Option<u64>,
+    ids: Option<Vec<u64>>,
+    full: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -285,6 +310,7 @@ impl Tally {
 }
 
 struct Sim {
+    ops: POps,
     webs: Vec<Web>,
     list: Vec<usize>,
     cur: HashMap<String, usize>,
@@ -385,7 +411,7 @@ impl Sim {
         // operand has +0x10 == 0 (10b1b4c1..10b1b4ee)
         if let Some(x) = x {
             let op = x.lastop.unwrap_or(0);
-            if g.nrefs == 3 && op != 0 && op <= 0x272 && x.dope.unwrap_or(0) & 0x40 != 0 && x.dst10 == Some(0) {
+            if g.nrefs == 3 && op != 0 && op < self.ops.last && x.dope.unwrap_or(0) & 0x40 != 0 && x.dst10 == Some(0) {
                 return None;
             }
         }
@@ -484,7 +510,7 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
         }
         println!(
             "predict: not run (this snapshot has no decision events; re-export it with the current tools/c2regs.py \
-             on cl 14.00.50727.762)"
+             on cl 14.00, 13.10 or 15.00)"
         );
         return;
     };
@@ -523,7 +549,8 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
     let pop_index: HashMap<usize, usize> = s.pops.iter().enumerate().map(|(i, p)| (p.pop, i)).collect();
     let start = |n: u32| s.pops.iter().filter(|p| p.npass < n).map(|p| p.pop).max().unwrap_or(0);
 
-    let mut sim = Sim { webs: vec![], list: vec![], cur: HashMap::new(), misses: vec![], notes: vec![] };
+    let ops = s.c2.as_ref().map_or(OPS14, |b| b.ops);
+    let mut sim = Sim { ops, webs: vec![], list: vec![], cur: HashMap::new(), misses: vec![], notes: vec![] };
     let mut rounds: Vec<(u32, Tally)> = vec![];
     let mut subst = (0usize, 0usize);
     let mut folds = (0usize, 0usize);
@@ -597,7 +624,7 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
             let d = &dec[i];
             let nrefs = d.nrefs.unwrap_or(0);
             let ben = d.ben.unwrap_or(0);
-            let pred_spill = nrefs < 2 && (ben < 1 || d.lastop.map_or(false, |op| op != 0x295));
+            let pred_spill = nrefs < 2 && (ben < 1 || d.lastop.map_or(false, |op| op != ops.enterload));
             let mut tr_spill = false;
             let mut tr_subst = false;
             for e in dec[i + 1..].iter().take_while(|e| e.t != "so" && e.npass == d.npass && e.after_pop == d.after_pop) {
@@ -1159,10 +1186,11 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
     }
     println!(
         "predict: {}: {} int pops in {} rounds; each decision is predicted from the model's own state and checked \
-         against the trace",
+         against the trace{}",
         s.func,
         tot.pops,
-        rounds.len()
+        rounds.len(),
+        s.c2.as_ref().map_or(String::new(), |b| format!(" (c2 {})", b.build))
     );
     println!(
         "  {:>5} {:>6} {:>11} {:>11} {:>11} {:>11} {:>9} {:>9} {:>11} {:>12} {:>9}",
@@ -1249,6 +1277,7 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
         bytepress
     );
     println!("  state: {} places where the model's record differs from c2's (it is then taken from the trace)", tot.state);
+    let num_misses = numbering(dec, &s.pops);
     if !sim.list.is_empty() {
         println!("  {} webs are left in the model's list at the end", sim.list.len());
     }
@@ -1262,4 +1291,184 @@ pub fn main(path: &str, verbose: bool, brief: bool) {
     for m in sim.notes.iter().take(if verbose { usize::MAX } else { 3 }) {
         println!("  note: {}", m);
     }
+    for m in num_misses.iter().take(if verbose { usize::MAX } else { 4 }) {
+        println!("  number miss: {}", m);
+    }
+    if !verbose && num_misses.len() > 4 {
+        println!("  ... {} more number misses (-v lists all)", num_misses.len() - 4);
+    }
+}
+
+/// GLOBREG record numbers and the reload order (regalloc.md 3.6.9), replayed over the decision events in log
+/// order.  `_FreeGlobs` is a LIFO list: ColRemoveGlobregFromHashTable pushes a retired record (keeping its number),
+/// GrgNewGlobreg pops the head, or takes `_NextGlobregNum++` when the list is empty (both reset by Globregs).  At
+/// Color's entry the snapshot holds the counter and the first 11 records of the list (event `freelist`).  Checked:
+///   - every record handed out has the number the list predicts (pieces of NewLiveRanges, the use / def pieces of
+///     RewriteSplitGlobregs, others: FPColor's splits, ...);
+///   - NewLiveRanges takes the split parents in ascending number (ColProcessSplitGlobregs links them so);
+///   - the enterloads GrgAirlockEnterloads puts at one place (a block entry after a split point) come in
+///     ascending number of their pieces (SbvNext over the live-in set), with the numbers the list predicts.
+/// What is replayed: which records are retired and when (the decisions themselves are scored above), how many
+/// pieces each parent gets and which piece needs a reload (the IL).  Returns the misses.
+fn numbering(dec: &[PDec], pops: &[PPop]) -> Vec<String> {
+    let mut misses = vec![];
+    if !dec.iter().any(|d| d.t == "new") {
+        return misses;
+    }
+    let mut free: Vec<u64> = vec![]; // top = last
+    let mut bottom_known = false; // the traced list was complete (fewer than 11 records)
+    let mut next: Option<u64> = None;
+    let mut started = false;
+    let (mut hit, mut n, mut unknown) = ([0usize; 4], [0usize; 4], 0usize);
+    let site_ix = |s: Option<&str>| match s {
+        Some("nlr") => 0,
+        Some("use") => 1,
+        Some("def") => 2,
+        _ => 3,
+    };
+    let mut model: HashMap<String, Option<u64>> = HashMap::new(); // piece record -> the model's number
+    let (mut ord_hit, mut ord_n) = (0usize, 0usize); // NewLiveRanges blocks whose parents ascend
+    let (mut grp_hit, mut grp_n, mut grp_pieces) = (0usize, 0usize, 0usize);
+    let last_pop = pops.last().map(|p| p.pop).unwrap_or(0);
+    let mut i = 0;
+    while i < dec.len() {
+        let d = &dec[i];
+        // after the last pop, a record handed out that is not a split piece belongs to the next function's
+        // Globregs (CreateGlobregs; the trace has no Color exit event)
+        if d.t == "new" && d.after_pop >= last_pop && !dec.get(i + 1).map_or(false, |e| e.t == "piece" && e.gr == d.gr) {
+            break;
+        }
+        match d.t.as_str() {
+            "freelist" => {
+                free = d.ids.clone().unwrap_or_default();
+                free.reverse();
+                bottom_known = d.full.unwrap_or(false);
+                next = d.next;
+                started = true;
+            }
+            "remove" if started => {
+                if let Some(x) = d.num {
+                    free.push(x);
+                }
+            }
+            "new" if started => {
+                let site = dec.get(i + 1).filter(|e| e.t == "piece" && e.gr == d.gr).and_then(|e| e.site.as_deref());
+                let k = site_ix(site);
+                let pred = if let Some(x) = free.pop() {
+                    Some(x)
+                } else if bottom_known {
+                    next.map(|x| {
+                        next = Some(x + 1);
+                        x
+                    })
+                } else {
+                    None
+                };
+                let got = d.num;
+                match pred {
+                    None => unknown += 1,
+                    Some(p) => {
+                        n[k] += 1;
+                        if Some(p) == got {
+                            hit[k] += 1;
+                        } else {
+                            misses.push(format!(
+                                "round {}: a {} piece got record {:?}, the free list says {}",
+                                d.npass,
+                                site.unwrap_or("non-split"),
+                                got,
+                                p
+                            ));
+                            // back on the trace: c2's number leaves the list (or the counter passes it)
+                            if let Some(g) = got {
+                                if let Some(j) = free.iter().rposition(|&y| y == g) {
+                                    free.remove(j);
+                                    free.push(p);
+                                } else if next.map_or(false, |x| g >= x) {
+                                    if Some(p) != next.map(|x| x - 1) {
+                                        free.push(p);
+                                    }
+                                    next = Some(g + 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                model.insert(d.gr.clone(), pred);
+            }
+            "piece" if d.site.as_deref() == Some("nlr") && (i == 0 || dec[i - 1].t == "new") => {
+                // one NewLiveRanges block: the consecutive nlr pieces of this ColProcessSplitGlobregs call
+                let mut j = i;
+                let mut parents = vec![];
+                while j < dec.len() && (dec[j].t == "new" || (dec[j].t == "piece" && dec[j].site.as_deref() == Some("nlr"))) {
+                    if dec[j].t == "piece" {
+                        parents.push(dec[j].pnum.unwrap_or(0));
+                    }
+                    j += 1;
+                }
+                if parents.len() > 1 && (i == 1 || !(dec[i - 2].t == "piece" && dec[i - 2].site.as_deref() == Some("nlr"))) {
+                    ord_n += 1;
+                    if parents.windows(2).all(|w| w[0] <= w[1]) {
+                        ord_hit += 1;
+                    } else {
+                        misses.push(format!("round {}: NewLiveRanges takes parents {:?}, not in ascending number", d.npass, parents));
+                    }
+                }
+            }
+            "reload" => {
+                let mut j = i;
+                while j < dec.len() && dec[j].t == "reload" && dec[j].tup == d.tup {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    let traced: Vec<&str> = dec[i..j].iter().map(|e| e.gr.as_str()).collect();
+                    let mut by_model: Vec<(Option<u64>, &str)> =
+                        dec[i..j].iter().map(|e| (model.get(&e.gr).copied().flatten(), e.gr.as_str())).collect();
+                    let known = by_model.iter().all(|x| x.0.is_some());
+                    by_model.sort();
+                    grp_n += 1;
+                    grp_pieces += j - i;
+                    if known && by_model.iter().map(|x| x.1).collect::<Vec<_>>() == traced {
+                        grp_hit += 1;
+                    } else {
+                        let nums: Vec<Option<u64>> = dec[i..j].iter().map(|e| e.num).collect();
+                        misses.push(format!(
+                            "round {}: {} enterloads at one place in record order {:?}; model numbers {:?}",
+                            d.npass,
+                            j - i,
+                            nums,
+                            dec[i..j].iter().map(|e| model.get(&e.gr).copied().flatten()).collect::<Vec<_>>()
+                        ));
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if n.iter().sum::<usize>() + unknown + ord_n + grp_n == 0 {
+        return misses; // no split round handed out a record
+    }
+    let f = |k: usize| pct((hit[k], n[k]));
+    println!(
+        "  record numbers (LIFO _FreeGlobs, regalloc.md 3.6.9): {} of {} records handed out get the number the free list \
+         predicts (NewLiveRanges pieces {}, reload pieces of RewriteSplitGlobregs {}, def pieces {}, other {}){}",
+        hit.iter().sum::<usize>(),
+        n.iter().sum::<usize>(),
+        f(0),
+        f(1),
+        f(2),
+        f(3),
+        if unknown > 0 { format!("; {} beyond the traced free list", unknown) } else { String::new() }
+    );
+    println!(
+        "  split parents taken in ascending number: {}; enterloads at one place in ascending piece number: {} \
+         ({} reloads)",
+        pct((ord_hit, ord_n)),
+        pct((grp_hit, grp_n)),
+        grp_pieces
+    );
+    misses
 }

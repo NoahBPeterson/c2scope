@@ -337,7 +337,9 @@ Consequences, each tested with the tracer and the listing **[C]**:
   and gets defOrd 0x22, against 0xd for a and 9 for c. b is coloured first (esi), a second (edi). c is coloured
   third and gets esi again, because it does not interfere with b.
 - `id` (+0x1c) decides only full ties. Ids are given in `CreateGlobregs` order, which follows the symbol table, not
-  the source. In every probe here they were the *reverse* of definition order.
+  the source. In every probe here they were the *reverse* of definition order. (3.6.9 has the rule as far as it
+  is known: the order of first mention, with records freed before Color reused; and what they decide for split
+  pieces.)
 
 ### 3.5 Deferral, spilling, splitting **[C structure]**
 
@@ -613,7 +615,7 @@ What the model does **not** predict, and takes from the trace (each needs the in
 does not hold):
 
 - **the pieces of a split round**: how many, their blocks, costs, benefit, avail set, PREFs, flags (3.6.5 and
-  3.6.6 say how c2 makes them; the model does not compute them);
+  3.6.6 say how c2 makes them; the model does not compute them; their record numbers it does predict, 3.6.9);
 - the neighbour set and copy-partner set of each colouring (3.3 item 4, 4.3);
 - InsertSplitPoints' own split set `S` (3.6.5 item 1) and the byte-pressure restrictions;
 - whether `CmdSubstDef`, `FoldAwaySplitGlobreg`, `BetterToDefer` and the fold of a queued def succeed, and
@@ -625,6 +627,109 @@ when does the next round start"; it does not yet answer "what do the pieces look
 
 Not exercised by any trace so far: `HandleCurrUncolorable` (no web was popped with an empty avail set), a
 successful `FoldAwaySplitGlobreg` at /O2, `RestrictToReg`'s `nrefs == 3` exception, classes other than int.
+
+**On cl 13.10 (3077, 3052) and 15.00 [C].** The same model, unchanged, predicts every decision on both builds
+once their tables carry the decision hooks (port-1310.md section 15, port-1500.md section 12). The rules
+above were re-read in each build's SpillOrDefer, RestrictToReg, CmdLoadCost, SpillObvious, InsertInList and
+UpdateAffectedGlobregs; the only differences are opcode numbers (OPENTERLOAD 0x26a / 0x295 / 0x2e0, first
+pseudo-opcode 0x249 / 0x273 / 0x2be), which the snapshot carries (`c2.ops`). Results, every column a/a and 0
+state differences: eh_helpers eA, the f3 byte-register test (9 rounds), b25.c (13.10: 420 pops in 8 rounds;
+15.00: 588 pops in 31 rounds), b250.c on 13.10 (3787 pops, 2427 spill/defer decisions), the 25 traced functions
+of M&B slice s0040a640 (`renderer::tessellate`: 27 pops, 6 rounds), M&B `Terrain::tessellate`
+(src/game/mesh_slot/mesh_terrain.cpp, 13.10.3077: 117 pops in 14 rounds) and the 23 functions of Spore slice
+s0059f510 on 15.00. 13.10's x87 values are coloured by FPColor, outside Color's loop: the model does not
+predict FPColor's order or stack slots (as on 14.00 it predicts only the int class), but FPColor's record frees
+and allocations are in the event stream, so 3.6.9 holds through them.
+
+#### 3.6.9 Split pieces: record numbers and the reload order **[C code on 13.10, 14.00, 15.00; C trace]**
+
+Every GLOBREG has a record number (+0x1c). It decides the order InsertNewGlobregs puts a round's pieces into the
+list (3.4: ascending number, so among full ties the higher number wins) and the order of the reloads that
+`GrgAirlockEnterloads` puts at a block entry after a split point. Both follow from four pieces of code, the same
+in all three builds (14.00 / 15.00 / 13.10.3077 addresses):
+
+1. **The numbers.** `Globregs` sets `_NextGlobregNum = 1` and `_FreeGlobs = 0` per function (10b564ae / PDB
+   `Globregs` / 1077c421). `GrgNewGlobreg` (10b5b7b0 / 510a9d10 / 1077c10f) takes the head of `_FreeGlobs` if
+   there is one (the record keeps its old number), else a new record numbered `_NextGlobregNum++`.
+   `ColRemoveGlobregFromHashTable` (10b18790 / 5106a940 / 10784d3b) clears a retired record but keeps its number
+   and pushes it on `_FreeGlobs`. So the free list is **last in, first out**, and a freed number always comes
+   back before a new one. **[C]**
+2. **Who frees, who takes.** Freed: every split parent at the end of its round (below), every spilled web
+   (Spill), a folded or substituted def (CmdSubstDef, BetterToDefer, FoldAwaySplitGlobreg,
+   ProcessFoldableDefs), FoldTooCheapDefs, x87 webs (FPSpillWorthless, FPRewriteAsReal), and before
+   Color CreateGlobregs and SubsumeGlobregs. Taken: the pieces of NewLiveRanges, the pieces RewriteSplitGlobregs
+   makes for a use or a def that no piece reaches, x87 splits, and before Color every candidate (CreateGlobregs,
+   GrgRewriteImmedAsReg, RewriteNewBLTsAsGlobregs). **[C: the callers of both functions in 14.00; in 13.10 and
+   15.00 the split-round callers were read and the rest are I]**
+3. **A split round** (`ColProcessSplitGlobregs` 10b11b20 / 510640b0 / 1078b2aa): the parents are linked in
+   ascending number (SbvNext over the split set, appended), handed to NewLiveRanges 32 at a time in that order,
+   each parent's pieces taken one after another (one per connected region; their order within one parent, the
+   reverse of the regions' creation order, is I); then RewriteSplitGlobregs walks the blocks forward and takes a
+   record for each use (and def) of a parent that no piece reaches; **only then** are the parents retired, in the same ascending order. So
+   a round's pieces never reuse its own parents' numbers; the next round's do, newest first: the next round's
+   first parent takes the previous round's highest parent number. **[C code; trace: parents ascending in every
+   NewLiveRanges call, 27/27 on 15.00 b25.c, 10/10 on M&B Terrain::tessellate]**
+4. **The reloads** (`GrgAirlockEnterloads` 10b59320, called by RewriteSplitGlobregs for each block): for an edge
+   into a block, the pieces live into the block and not live out of the predecessor get an enterload each, in
+   **ascending piece number** (SbvNext over that set), each at the same insertion point, so the listing shows
+   them in that order (CmdInsertEnter inserts before the point). The scheduler keeps their order (M&B c2sched:
+   one region, equal priority). **[C code; C listings below]**
+
+So, for the reloads after a loop: **the order is ascending piece number; pieces get numbers in ascending parent
+number, first from the free list (newest freed first, which after an earlier round is that round's parents
+in descending order), then from the counter in ascending order.** Free-list numbers are smaller than counter
+numbers, so their reloads come first. Neither priorities, definition order nor first use after the loop enter.
+In M&B `Terrain::tessellate` (13.10) the three reloads after the corner loop all came from the free list: cr, x,
+t583 in descending parent number (M&B's own trace, 2026-11-11; the trace of the current mesh_terrain.cpp here
+agrees with the rule in all 18 of its reload groups, the three names were not looked up). **[C]**
+
+**What can move it (source levers).** Only the numbers can: the parents' numbers (the function-wide numbering)
+and what is on the free list when the round runs.
+
+- *The numbering.* CreateGlobregs walks the function's symbol table, so the numbers follow the order in which
+  the compiler first met each local, parameter and temporary, not declaration order: `int y, x;` and `int x, y;`
+  with the same statements give the same numbers (splitnum s3, s4). A declarator with an initializer mentions
+  the declared variable before its initializer (`int x = a[0] + 1`: x before a, s1); an assignment mentions the
+  right-hand side first (`x = a[0] + 1;`: a before x, s4); the parameters came together at the first use of
+  one of them (s1, s4) **[C for these probes; I as a general rule]**. A dead mention counts: `(void)y;` or
+  `if (0) y = 0;` before `x = ...` gives y the lower number (s6, s7), so the order is fixed before dead code
+  goes **[C]** (by the front end's symbol order **[I]**). A value defined by a call result (`int a = g(1)`) may
+  not keep its first-mention number: in t5.c (port1310/p) `a` has 4 although it is mentioned first, and the
+  Color-entry free list holds 1 and 3, i.e. records retired before Color (by SubsumeGlobregs merging the call
+  temporary into the variable, **I**). Temporaries the optimizer makes (tNNN) came after the named ones in every probe here. Any
+  extra candidate mentioned earlier shifts everything after it by one, which reorders nothing; reordering two
+  first mentions swaps two numbers.
+- *Earlier rounds.* One more record freed late in an earlier round (one more spilled web, one more split
+  parent, one more folded def) is the first one the next round's first parent takes; one more piece taken in an
+  earlier round (a parent with one more region, one more use reached by no piece) removes the newest free
+  number. Which source edits do that is what 3.6.1 to 3.6.7 predict (`rasim check --predict` shows each). **[C
+  code; no source probe of this lever was made]**
+
+**Probe pair** (tests/data/splitnum.c, also work/scratch/splitnum/s4.c, s6.c; the regression test checks it on
+every build). f6 is f4 with `(void)y;` before `x = a[0] + 1;`: the same instructions, the numbers of x and y
+swapped (f4: x 6, y 7; f6: y 6, x 7 on 14.00 and 15.00; 5 and 6 on 13.10), so after the loop the reloads swap
+and with them the registers:
+
+```text
+            f4 (x, y)                       f6 (y, x)                       (13.10, 14.00, 15.00 alike)
+  after the loop
+            mov edx, DWORD PTR _x$[esp+36]  mov edx, DWORD PTR _y$[esp+36]
+            mov eax, DWORD PTR _y$[esp+36]  mov eax, DWORD PTR _x$[esp+36]
+  entry     mov edx, [ecx] / mov eax, [ecx+4] become mov eax, [ecx] / mov edx, [ecx+4]
+```
+
+s1 against s2 (`int x = ..., y = ...` against `int y = ..., x = ...`) flips the same reloads on all builds
+(and the loads at entry, whose order the initializers set). **[C]**
+
+**In rasim.** `rasim check --predict` replays the free list over the snapshot's event stream (Color-entry state:
+`_NextGlobregNum` and the first 11 free records, `freelist`; every `remove` pushes, every `new` pops) and
+scores every record handed out, that each NewLiveRanges call takes its parents in ascending number, and that
+every group of enterloads at one place is in ascending order of the model's numbers. What it replays: which
+records are retired when (those are the decisions scored above), how many pieces each parent gets and which
+uses need a reload (the IL). Results, every one c2's: b25.c 450 of 450 records on 14.00, 413 of 413 on 13.10
+(both builds), 1347 of 1347 on 15.00, reload groups 87/87, 74/74, 68/68; b250.c 3133 of 3133 (14.00) and 2735 of
+2735 (13.10), reload groups 716/716 and 692/692 (5463 and 5415 reloads); M&B Terrain::tessellate 93 of 93,
+18/18 groups; M&B slice s0040a640 42 of 42; Spore slice s0059f510 50 of 50.
 
 ---
 

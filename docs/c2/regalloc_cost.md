@@ -47,7 +47,7 @@ are in `work/scratch/glass_rcost_*.txt`.
 ## 2. Global register candidates (globregs.obj)
 
 `EnumerateSymbols` 0x10b568f0 walks `_BESymTab->poolHead` pools in creation order and the 0x60-byte slots in each
-pool in ascending order. That is SYM key order, which for user variables is declaration order (il_sym.md). It
+pool in ascending order. That is SYM key order, which for user variables is first-reference order in the IL, not declaration order (symkeys.md). It
 considers only base SYMs (`sym->base == sym`, kind != 0x10) [C]:
 
 | SYM kind | Candidate? | Notes |

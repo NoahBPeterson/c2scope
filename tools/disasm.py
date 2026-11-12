@@ -19,7 +19,7 @@ except ValueError:
 row = img.func(va)
 n = int(sys.argv[3], 0) if len(sys.argv) > 3 else (row["size"] if row else 256)
 if row:
-    print("; %s  %08x  size %d  %s" % (row["symbol"], va, row["size"], os.path.basename(row["obj"].replace("\\", "/"))))
+    print("; %s  %08x  size %d  %s" % (row["symbol"], va, row["size"], os.path.basename((row.get("obj") or "").replace("\\", "/"))))
 md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
 md.detail = True
 for i in md.disasm(img.read(va, n), va):

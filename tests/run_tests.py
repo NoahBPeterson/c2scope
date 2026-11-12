@@ -121,8 +121,11 @@ real = dict(re.findall(r"^\s+\d+\s+(\S+)\s+\S+\s+-?\d+\s+-?\d+\s+\d+\s+\d+\s+(e[
 check("combined what-if vs a real compile: ref:k:1:6 gives the 6 registers of eA with use(k, k, k) added (k esi, h edi)",
       (pred == real, pred.get("k"), pred.get("h"), len(real)), (True, "esi", "edi", 6))
 
-# spill / defer / split decisions predicted (regalloc.md 3.6, tracer.md "rasim check --predict"); cl 14.00 only:
-# another build's snapshot has no decision events
+# spill / defer / split decisions predicted (regalloc.md 3.6, tracer.md "rasim check --predict"), on every c2 build
+# (13.10 and 15.00: the decision hooks of their build tables, port-1310.md section 15, port-1500.md section 12)
+sys.path.insert(0, os.path.join(HERE, "tools"))
+import c2build
+BUILD = c2build.name()
 if "decisions" in json.load(open(snap)):
     r = subprocess.run([rasim, "check", snap], capture_output=True, text=True).stdout
     m = re.search(r"^decisions: (\d+) of (\d+) predicted .*; (\d+) state differences", r, re.M)
@@ -138,9 +141,31 @@ int f3(unsigned char *p, int n, int k) { unsigned char a=p[0],b=p[1],c=p[2],d=p[
     m = re.search(r"^\s+all\s+\d+\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)", r, re.M)
     check("rasim check --predict: 9 rounds of byte-register code: list head, branch, spill/defer, register, no-reg sets, "
           "cut sets, split rounds, SpillObvious", m.groups() if m else None,
-          ("34/34", "34/34", "24/24", "10/10", "4/4", "4/4", "8/8", "45/45"))
+          ("34/34", "34/34", "24/24", "10/10", "4/4", "4/4", "8/8", "44/44" if BUILD.startswith("13.10") else "45/45"))
     m = re.search(r"state: (\d+) places", r)
     check("rasim check --predict: the model's records never differ from c2's", m.group(1) if m else None, "0")
+    m = re.search(r"record numbers .*?: (\d+) of (\d+) records .*\n.*ascending number: (\S+); enterloads at one place in "
+                  r"ascending piece number: (\S+)", r)
+    check("rasim check --predict: every piece's record number (LIFO free list), parent order, reload order (f3)",
+          m.groups() if m else None, ("28", "28", "3/3", "4/4"))
+    # the reload order after a loop follows the record numbers, which a dead mention of y moves (regalloc.md 3.6.9)
+    SN = os.path.join(HERE, "tests", "data", "splitnum.c")
+    order = {}
+    for fn_ in ("_f4", "_f6"):
+        ns = os.path.join(os.path.dirname(snap), "sn%s.json" % fn_)
+        tool("regs", SN, "--func", fn_, "--export", ns)
+        dec = json.load(open(ns)).get("decisions", [])
+        name = {d["num"]: d.get("name") for d in dec if d["t"] == "so" and d["npass"] == 1}
+        parent = {d["gr"]: d["pnum"] for d in dec if d["t"] == "piece"}
+        order[fn_] = "".join(name.get(parent.get(d["gr"]), "") for d in dec if d["t"] == "reload" and
+                             name.get(parent.get(d["gr"])) in ("x", "y"))
+        r = subprocess.run([rasim, "check", ns, "--predict"], capture_output=True, text=True).stdout
+        m = re.search(r"record numbers .*?: (\d+) of (\d+) records .*\n.*enterloads at one place in ascending piece "
+                      r"number: (\S+)", r)
+        order[fn_ + "rasim"] = m.groups() if m else None
+    check("splitnum.c: reloads after the loop x, y (f4) and y, x (f6); rasim predicts both",
+          (order["_f4"], order["_f6"], order["_f4rasim"], order["_f6rasim"]),
+          ("xy", "yx", ("9", "9", "1/1"), ("9", "9", "1/1")))
 
 # immediate candidates (docs/c2/immcand.md) and the --func forms (tracer.md)
 IMM = os.path.join(HERE, "tests", "data", "immcand.c")
@@ -188,6 +213,60 @@ check("rasim need 's>t' without --pass answers in the XMM pass the two are coste
 r = subprocess.run([rasim, "need", fsnap, "s>n"], capture_output=True, text=True)
 check("rasim need 's>n' (XMM against int) says the classes differ instead of answering",
       "different register classes" in r.stdout + r.stderr, True)
+
+# symbol keys (docs/c2/symkeys.md, tools/symkeys.py), on every c2 build: the assignment rules, the exact replay of the
+# allocator and a what-if prediction checked against a real compile
+def symkeys(*args):
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py")] + list(args),
+                       capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    return r.stdout + r.stderr
+
+
+def symkeys_tests():
+    SK = os.path.join(HERE, "tests", "data", "symkeys.cpp")
+    out = symkeys("keys", SK, "--brief", *FLAGS)
+    row = dict((m.group(1), m.group(2)) for m in re.finditer(r"^\?(k\w+)@\S*\s+(.*?)\s+\[", out, re.M))
+    check("symkeys: parameters in reverse, locals by first reference (q declared first)",
+          " ".join(row.get("kparams", "").split()[1:6]), "_c:1 _b:2 _a:3 _r:4 _q:5")
+    check("symkeys: an unused local takes no key, an initialised dead one does",
+          " ".join(row.get("kdead", "").split()[1:5]), "_b:1 _a:2 _d:3 _r:4")
+    check("symkeys: inlinee this/params take keys 4-6 (freed), its local 7",
+          [w for w in row.get("kthis", "").split() if w.startswith("_r@")], ["_r@S::meth#1:7"])
+    check("symkeys: the 2nd expansion reuses the freed parameter keys, its local is next",
+          [w for w in row.get("kinl", "").split() if w.startswith("_t@")], ["_t@dot#1:8", "_t@dot#2:9"])
+    ka = dict(w.split("@")[0].split(":")[0:1] + [w.rsplit(":", 1)[1]] for w in row.get("kargs", "").split() if w.startswith("_t"))
+    check("symkeys: call arguments are inlined right to left (dB's local before dA's)",
+          int(ka.get("_tB", 99)) < int(ka.get("_tA", 0)), True)
+    out = symkeys("keys", SK, *FLAGS)
+    rep = re.findall(r"replay: (\d+)/(\d+) keys reproduced", out)
+    check("symkeys: the allocator replay reproduces every traced key (all functions)",
+          (len(rep) >= 8, all(a == b for a, b in rep)), (True, True))
+    out = symkeys("sites", SK, "--func", "kx87", "--pass", "2", *FLAGS)
+    check("symkeys sites: [p+0] (p key 3: hash 0x6000+d) is loaded before s (key 1)",
+          bool(re.search(r"1st .*h60[0-9a-f]{2}\n\s+2nd .*_s \(?key 1", out)), True)
+    skd = tempfile.mkdtemp()
+    var = os.path.join(skd, "symkeys_v.cpp")
+    open(var, "w").write(open(SK).read().replace("float d = 0; float r = a * b;", "float d = 0; float e = 1; float r = a * b;")
+                         .replace("{ float t = a.x * b.x; return", "{ float e = 2; float t = a.x * b.x; return"))
+    for src, js in ((SK, "a.json"), (var, "b.json")):
+        symkeys("export", src, "--func", "k", "--out", os.path.join(skd, js), *FLAGS)
+    out = symkeys("compare", "--from", os.path.join(skd, "a.json"), "--func", "kdead", "add:frame@_r:1",
+                  "--vs", os.path.join(skd, "b.json"))
+    m = re.search(r"keys: (\d+) symbols in both; predicted = traced for (\d+)", out)
+    check("symkeys compare: a dead local before r predicted exactly (add:frame@_r:1)", m and m.group(1) == m.group(2), True)
+    out = symkeys("compare", "--from", os.path.join(skd, "a.json"), "--func", "kinl", "add:frame@_t@dot#1:1",
+                  "add:frame@_t@dot#2:1", "--vs", os.path.join(skd, "b.json"))
+    m = re.search(r"keys: (\d+) symbols in both; predicted = traced for (\d+)", out)
+    check("symkeys compare: a dead local in an inline helper (one per expansion) predicted exactly",
+          bool(m) and m.group(1) == m.group(2) and int(m.group(1)) >= 6, True)
+
+
+if c2build.table() is None or "symkeys" in (c2build.get("hooks") or {}):
+    symkeys_tests()
+else:
+    print("  symkeys: no symkeys hooks in this build table (not ported): skipped")
 
 print("%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

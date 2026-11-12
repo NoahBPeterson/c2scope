@@ -298,6 +298,102 @@
    87,
    "high",
    "calls 1.00 from 6030 rva 63e49"
+  ],
+  "@Spill@8": [
+   "8bc69",
+   622,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@CmdSubstDef@12": [
+   "8abf3",
+   32,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@ColRemoveGlobregFromHashTable@8": [
+   "80e09",
+   129,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@RestrictToReg@4": [
+   "9b80c",
+   35,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@ForceSingleBlockLives@4": [
+   "278c9",
+   93,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@ForceNoAirlocks@4": [
+   "b65aa",
+   79,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@BetterToDefer@4": [
+   "405e4",
+   154,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@FoldAwaySplitGlobreg@4": [
+   "41150",
+   45,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@TryToRecalc@4": [
+   "3fbf0",
+   420,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@UpdateAffectedGlobregs@20": [
+   "8533c",
+   507,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@CmdUpdateCost@12": [
+   "494fa",
+   148,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@CmdProcessBytePressure@12": [
+   "308f0",
+   477,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@GrgNewGlobreg@4": [
+   "80a6e",
+   208,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@NewLiveRanges@4": [
+   "b4e5c",
+   426,
+   "high",
+   "sig match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@RewriteSplitGlobregs@12": [
+   "b53f4",
+   216,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3052/c2.dll.csv)"
+  ],
+  "@GrgAirlockEnterloads@12": [
+   "80c4e",
+   45,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3052/c2.dll.csv)"
   ]
  },
  "probes": {
@@ -331,7 +427,25 @@
   "1078a68e": "@RegBuildGlobalConflict@4+ev11",
   "10799242": "@RegBuildGlobalConflict@4+ev12",
   "107993a1": "@RegBuildGlobalConflict@4+ev13",
-  "1079915e": "@RegBuildGlobalConflict@4+ev14"
+  "1079915e": "@RegBuildGlobalConflict@4+ev14",
+  "10784210": "@SpillObvious@16+so",
+  "107b5b7b": "@UpdateAffectedGlobregs@20+isp",
+  "10740a11": "@UpdateAffectedGlobregs@20+nbr8",
+  "107b5d21": "@UpdateAffectedGlobregs@20+nbr",
+  "1078423f": "@InsertInList@8+rec",
+  "107852f8": "@Color@4+poprec",
+  "10712e64": "@Spill@8+needlives",
+  "10740857": "@CmdUpdateCost@12+imm",
+  "107e8f0f": "@CmdUpdateCost@12+imm1",
+  "107e8f60": "@CmdUpdateCost@12+two",
+  "10749581": "@CmdUpdateCost@12+gen",
+  "10730bac": "@CmdProcessBytePressure@12+and",
+  "10736ffe": "@InsertSplitPoints@28+byte",
+  "107b4f83": "@NewLiveRanges@4+piece",
+  "107b6afe": "@RewriteSplitGlobregs@12+usepiece",
+  "107b68ff": "@RewriteSplitGlobregs@12+defpiece",
+  "1078fc7d": "@GrgAirlockEnterloads@12+enter",
+  "10780c8a": "@Color@4+entry"
  },
  "globals": {
   "_CurFunc": "10881d70",
@@ -434,6 +548,36 @@
    "10799242=edi",
    "107993a1=eax",
    "1079915e=ebx>0x1c"
+  ],
+  "regs_dec": [
+   "10784210=eax,eax>0x1c,eax>0x24,eax>0x40,eax>0x3c>4,eax>4,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "@Spill@8=s2,s2>0x1c",
+   "@CmdSubstDef@12=s1/xa1",
+   "@ColRemoveGlobregFromHashTable@8=ebx,ebx>0x1c",
+   "@RestrictToReg@4=s1/xa1",
+   "@ForceSingleBlockLives@4=ebx",
+   "@ForceNoAirlocks@4=s1",
+   "@BetterToDefer@4=s1,ecx/xeax",
+   "@FoldAwaySplitGlobreg@4=s1/xa1",
+   "107b5b7b=esi",
+   "10740a11=esi",
+   "107b5d21=esi",
+   "1078423f=eax,eax>4,eax>0x24,eax>0x28,eax>0x2c,eax>0x34,eax>0xc,eax>0x44,eax>0x3c>4,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "107852f8=ebp,ebp>4,ebp>0x24,ebp>0x28,ebp>0x2c,ebp>0x34,ebp>0x20>0,ebp>0x3c>4,ebp>0x3c>4~10868a80,ebp>0x3c>0x2c>0x10,g108a9204>0",
+   "@TryToRecalc@4=s1",
+   "10712e64=eax",
+   "10740857=esi,eax",
+   "107e8f0f=esi",
+   "107e8f60=esi",
+   "10749581=esi>0x1c,eax",
+   "10730bac=esi,g108b0050>0>0>0,g108b0050>0>0>8,g108b0050>0>0>4>8",
+   "10736ffe=s34,g108b0050>0>0>0,g108b0050>0>0>8,g108b0050>0>0>4>8",
+   "107b4f83=eax,eax>0x1c,esi,esi>0x1c",
+   "107b6afe=eax,eax>0x1c,ebp,ebp>0x1c",
+   "107b68ff=eax,eax>0x1c,ebp,ebp>0x1c",
+   "1078fc7d=esi,esi>0x1c,eax",
+   "10780c8a=g10882150>0,g108a92d4>0>0x1c,g108a92d4>0>0x30>0x1c,g108a92d4>0>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d4>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c",
+   "@GrgNewGlobreg@4=eax/xeax,eax>0x1c"
   ]
  },
  "opnames": {
@@ -590,5 +734,9 @@
    1,
    "spill (worthless)"
   ]
+ },
+ "regs_ops": {
+  "enterload": "26a",
+  "last": "249"
  }
 }

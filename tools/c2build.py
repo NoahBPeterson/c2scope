@@ -21,7 +21,13 @@ A non-default build is described by tools/c2builds/<build>.json:
   probes                  {va hex: label} mid-function hook addresses that are legal for this build
   globals                 {name: va hex}
   hooks                   {tool key: hook list or spec} replacing the 14.00 lists (regs, scratch, sched, il_spec,
-                          il_default, default; scratch_x = c2scratch.HOOKS_X for scratch --why/--export)
+                          il_default, default; scratch_x = c2scratch.HOOKS_X for scratch --why/--export;
+                          regs_dec = c2regs.DEC_HOOKS, the decision events of `regs --export` / `rasim check
+                          --predict`, appended after regs; regs_dec_exit = {regs hook index: decision event} for
+                          an event read at that hook's exit)
+  regs_events             {regs hook index: extra event} (13.10: the FPColor events)
+  regs_ops                {enterload, last}: OPENTERLOAD and the first pseudo-opcode (hex), which the decision
+                          rules compare with (copied into the snapshot as `c2.ops`)
   opsched, sched_delay_cmp  c2sched.py: [cost table VA, rows]; [cmp, test, jcc opcodes] when the build's
                           SchSelectInstrs has the cmp-delay rule (cl 15.00, docs/c2/port-1500.md)
 The toolchain lives in work/toolchain/c2-<build> (VS2005-style layout VC/Bin, VC/INCLUDE, VC/LIB, SDK/Include,

@@ -1,4 +1,8 @@
 {
+ "symkeys_sort_ret": "1075eeaa",
+ "symkeys_skip": {"1075c327": 2, "107615bc": 2, "1076ac42": 3, "1077a016": 3},
+ "symkeys_free_by": "kind",
+ "symkeys_nofree": ["hash", "glob", "other"],
  "version": "13.10.3077",
  "c2_sha256": "bcd28f39b1798b07989c30a1df471cf87fc20e3802d130901a08f83800e6b81e",
  "image_base": "10700000",
@@ -298,6 +302,102 @@
    460,
    "high",
    "sig 1.00 from 6030 rva b19b3"
+  ],
+  "@Spill@8": [
+   "891f3",
+   105,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@CmdSubstDef@12": [
+   "820b7",
+   32,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@ColRemoveGlobregFromHashTable@8": [
+   "84d3b",
+   129,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@RestrictToReg@4": [
+   "89715",
+   35,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@ForceSingleBlockLives@4": [
+   "278c6",
+   89,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@ForceNoAirlocks@4": [
+   "8bee9",
+   79,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@BetterToDefer@4": [
+   "3fea0",
+   154,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@FoldAwaySplitGlobreg@4": [
+   "40941",
+   45,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@TryToRecalc@4": [
+   "3f5ea",
+   420,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@UpdateAffectedGlobregs@20": [
+   "831f7",
+   507,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@CmdUpdateCost@12": [
+   "4c004",
+   148,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@CmdProcessBytePressure@12": [
+   "30760",
+   477,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@GrgNewGlobreg@4": [
+   "7c10f",
+   208,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@NewLiveRanges@4": [
+   "8b372",
+   426,
+   "high",
+   "sig match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@RewriteSplitGlobregs@12": [
+   "8b93a",
+   100,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3077/c2.dll.csv)"
+  ],
+  "@GrgAirlockEnterloads@12": [
+   "7c1df",
+   45,
+   "medium",
+   "calls match from 6030 (work/index/13.10.3077/c2.dll.csv)"
   ]
  },
  "probes": {
@@ -331,7 +431,25 @@
   "10786774": "@RegBuildGlobalConflict@4+ev11",
   "10786651": "@RegBuildGlobalConflict@4+ev12",
   "107874f8": "@RegBuildGlobalConflict@4+ev13",
-  "1078656d": "@RegBuildGlobalConflict@4+ev14"
+  "1078656d": "@RegBuildGlobalConflict@4+ev14",
+  "10782b10": "@SpillObvious@16+so",
+  "107a8bb7": "@UpdateAffectedGlobregs@20+isp",
+  "1074029a": "@UpdateAffectedGlobregs@20+nbr8",
+  "107a9012": "@UpdateAffectedGlobregs@20+nbr",
+  "10782b31": "@InsertInList@8+rec",
+  "10782a63": "@Color@4+poprec",
+  "10712e70": "@Spill@8+needlives",
+  "10740113": "@CmdUpdateCost@12+imm",
+  "107e8f47": "@CmdUpdateCost@12+imm1",
+  "107e8f98": "@CmdUpdateCost@12+two",
+  "1074c08b": "@CmdUpdateCost@12+gen",
+  "10730a1c": "@CmdProcessBytePressure@12+and",
+  "10737276": "@InsertSplitPoints@28+byte",
+  "1078b499": "@NewLiveRanges@4+piece",
+  "107a9b63": "@RewriteSplitGlobregs@12+usepiece",
+  "1078bf4b": "@RewriteSplitGlobregs@12+defpiece",
+  "1078bb36": "@GrgAirlockEnterloads@12+enter",
+  "107821ac": "@Color@4+entry"
  },
  "globals": {
   "_CurFunc": "10881d74",
@@ -348,6 +466,22 @@
   "_regAvail1": "108a7b1c"
  },
  "hooks": {
+  "symkeys": {
+   "init": "10776598",
+   "alloc": "1075a0c5=eax,g108a9120>0,a0,a1,a2,a3,a4,a5,a6,a7,a8/xeax>0x1c,eax",
+   "free": "1075a8d6=esi>0x1c,esi>4",
+   "free2": "1079f40b=esi>0x1c,esi>4",
+   "uservar": "1076f04d=eax>4$,eax,eax>0x28/xeax",
+   "equivp": "10769fe9=eax,ebx,s6",
+   "splice": "1078dc87=s6>0x28>0x18>4$,s6>0x14/xeax",
+   "read": "10770e16/xeax",
+   "opt": "1075fc1c=g10881d74>0>0>4$",
+   "gc": "1075fb60",
+   "pool": "107603db/xeax>4>0x1c",
+   "getinl": "1078d3f9=s1>4>0x28>0x18>4$,s1>4>0x14/xeax",
+   "sort": "1076a2f3=a0/xedi>4,edi>0x14,eax>8,eax>0x10,eax>0x18>0x1c,eax>0x28>8,eax>0x28>0x18>0x1c,eax>0>8,eax>0>0x10,eax>0>0x18>0x1c,eax>0>0x28>8,eax>0>0x28>0x18>0x1c",
+   "sortx": "1075d908/xeax>0x28>0x28>8,eax>0x28>0x28>0x18>0x1c,eax>0x28>0x28>0x34>0x18>0x1c,eax>0x28>0x28>0x30,eax>0x28>0x28>0>8,eax>0x28>0x28>0>0x18>0x1c,eax>0x28>0>0x28>8,eax>0x28>0>0x28>0x18>0x1c,eax>0x28>0>0x28>0x34>0x18>0x1c,eax>0x28>0>0x28>0x30,eax>0x28>0>0x28>0>8,eax>0x28>0>0x28>0>0x18>0x1c"
+  },
   "default": [
    "@Color@4=s1",
    "@Spillcosts@12=s1,s2,s3"
@@ -434,6 +568,36 @@
    "10786651=edi",
    "107874f8=eax",
    "1078656d=ebx>0x1c"
+  ],
+  "regs_dec": [
+   "10782b10=eax,eax>0x1c,eax>0x24,eax>0x40,eax>0x3c>4,eax>4,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "@Spill@8=s2,s2>0x1c",
+   "@CmdSubstDef@12=s1/xa1",
+   "@ColRemoveGlobregFromHashTable@8=ebx,ebx>0x1c",
+   "@RestrictToReg@4=s1/xa1",
+   "@ForceSingleBlockLives@4=ebx",
+   "@ForceNoAirlocks@4=s1",
+   "@BetterToDefer@4=s1,ecx/xeax",
+   "@FoldAwaySplitGlobreg@4=s1/xa1",
+   "107a8bb7=esi",
+   "1074029a=esi",
+   "107a9012=esi",
+   "10782b31=eax,eax>4,eax>0x24,eax>0x28,eax>0x2c,eax>0x34,eax>0xc,eax>0x44,eax>0x3c>4,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "10782a63=ebp,ebp>4,ebp>0x24,ebp>0x28,ebp>0x2c,ebp>0x34,ebp>0x20>0,ebp>0x3c>4,ebp>0x3c>4~10870dc0,ebp>0x3c>0x2c>0x10,g108a9208>0",
+   "@TryToRecalc@4=s1",
+   "10712e70=eax",
+   "10740113=esi,eax",
+   "107e8f47=esi",
+   "107e8f98=esi",
+   "1074c08b=esi>0x1c,eax",
+   "10730a1c=esi,g108b0054>0>0>0,g108b0054>0>0>8,g108b0054>0>0>4>8",
+   "10737276=s34,g108b0054>0>0>0,g108b0054>0>0>8,g108b0054>0>0>4>8",
+   "1078b499=eax,eax>0x1c,esi,esi>0x1c",
+   "107a9b63=eax,eax>0x1c,ebp,ebp>0x1c",
+   "1078bf4b=eax,eax>0x1c,ebp,ebp>0x1c",
+   "1078bb36=esi,esi>0x1c,eax",
+   "107821ac=g10882154>0,g108a92d8>0>0x1c,g108a92d8>0>0x30>0x1c,g108a92d8>0>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g108a92d8>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c",
+   "@GrgNewGlobreg@4=eax/xeax,eax>0x1c"
   ]
  },
  "opnames": {
@@ -590,5 +754,9 @@
    1,
    "spill (worthless)"
   ]
+ },
+ "regs_ops": {
+  "enterload": "26a",
+  "last": "249"
  }
 }

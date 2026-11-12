@@ -357,6 +357,29 @@ also used for the +0x20 word of `P` lines. Not parameterised (edit `dumpilx` if 
 at symbol +4, the EH record {+0, +4, +8, +0xc} and ehinfo {+0x10, +0x14, +0x18, +0x34}, and the IL opcode numbers
 0x2db..0x2e4 / 0x300 that select the EH and `OPUSERLABEL` decoding (13.10's IL opcodes are numbered differently).
 
+## `symkeys.py`: symbol keys, operand-order sites and what-if edits
+
+```sh
+uv run tools/symkeys.py keys   tu.cpp --func F -- /TP /MT /GS /EHsc /Gy           # every symbol's SYM.key and origin
+uv run tools/symkeys.py sites  tu.cpp --func F --line 293-294 --pass 2 -- ...      # x87 / commutative operand orders
+uv run tools/symkeys.py export tu.cpp --func F --out a.json -- ...                 # then any command: --from a.json
+uv run tools/symkeys.py whatif --from a.json 'add:frame@_vC01:3' 'swap:_left,_right'
+uv run tools/symkeys.py levers --from a.json --var '$T5944+0.f4@ReworkPoint::EdgeCross#2' --hash-below 0x9b41 \
+    [--match matching_draft.json] [--n 1,2,16]
+uv run tools/symkeys.py compare --from a.json 'add:frame@_r:1' --vs variant.json   # prediction vs a real compile
+```
+
+The number that decides x87 operand order (and commutative operand order generally) is `SYM.key`; how it is assigned,
+which constructs take keys and the Fallout 3 cases are in docs/c2/symkeys.md. The tool traces every `SymAlloc`
+(class, key, creator, line), every member freed by `SymFree`, each new block of 32 keys, `SymMakeUserVar` names,
+`SymNewEquiv` field views, inline reads (`GetInlinee`, nested `RdrReadProc`) and splices (`InlineInlinee`), and each
+operand sort of `OptLeftWeightTree` (`MscMergeSort` exit: the sorted operands with weight and key; the node again at
+`OptLeftWeightTree` exit for the sources of subtree operands). `keys` replays the allocator from the trace and prints
+`replay: N/N keys reproduced` (always all, on every compile so far). `whatif`/`levers`/`compare` replay it with edits
+and recompute the affected sort weights. Hooks per build: `"hooks": {"symkeys": {role: hook}}` in tools/c2builds/
+(13.10 and 15.00 entries exist; 15.00's c2.dll is loaded rebased under wine, so return addresses are corrected by the
+`# c2trace base` line of the log). **[C]** (tests/run_tests.py, symkeys checks, on all three builds)
+
 ## `scratch`: scratch-register picks, mapped to listing offsets
 
 ```sh
@@ -820,6 +843,20 @@ function of 15 traced compiles (257 functions: list head 4401/4401, spill/defer 
 2338/2338, round starts 270/270, SpillObvious 5085/5085; /O1 and /Oy- included). The per-round tables are in
 regalloc.md §3.6.8.
 
+**Other builds [C]** (`regs --c2 13.10|13.10.3052|15.00 ... --export`; every column a/a, 0 state differences):
+
+| | 13.10.3077 | 13.10.3052 | 15.00.30729.1 |
+|---|---|---|---|
+| eh_helpers eA | 24 of 24 | 24 of 24 | 24 of 24 |
+| f3 (tests, byte registers, 9 rounds) | list head 34/34, SpillObvious 44/44 | the same | 34/34, 45/45 |
+| b25.c | 420 pops, 8 rounds, spill/defer 273/273, register 147/147, SpillObvious 582/582 | identical | 588 pops, 31 rounds, 359/359, 229/229, 1587/1587 |
+| b250.c | 3787 pops, spill/defer 2427/2427, register 1360/1360, SpillObvious 3804/3804 | identical | not run (the traced compile takes over 15 minutes) |
+| real code | M&B slice s0040a640, 25 functions: 120 pops (`renderer::tessellate` 27/27, 6 rounds); M&B `Terrain::tessellate` (mesh_terrain.cpp): 117 pops, 14 rounds | s0040a640: identical | Spore slice s0059f510, 23 functions: 196 pops (`BlockGetAbilities` 81/81) |
+| record numbers (3.6.9) | b25 413/413, b250 2735/2735, Terrain::tessellate 93/93, slice 42/42; reload groups all ascending | identical | b25 1347/1347, slice 50/50 |
+
+Before these tables carried the decision hooks, `--predict` on any of these snapshots printed "not run (this
+snapshot has no decision events ...)".
+
 **What is still replayed, and why.** Each of these needs the instructions, which the snapshot does not hold:
 
 | Replayed | c2 function | What it would take |
@@ -831,12 +868,27 @@ regalloc.md §3.6.8.
 | whether a def is substituted, folded or re-queued, and BetterToDefer's priority | CmdSubstDef, FoldAwaySplitGlobreg, ProcessFoldableDefs, BetterToDefer | instruction patterns, the def's components |
 | benefit changes after a spill, `_NeedNewLives` | CmdUpdateCost, Spill | which globregs share an instruction with the spilled one |
 
+**Record numbers and the reload order** (regalloc.md 3.6.9; two more lines at the end of `--predict`):
+
+```text
+  record numbers (LIFO _FreeGlobs, regalloc.md 3.6.9): 450 of 450 records handed out get the number the free list predicts (NewLiveRanges pieces 187/187, reload pieces of RewriteSplitGlobregs 63/63, def pieces 200/200, other -)
+  split parents taken in ascending number: 5/5; enterloads at one place in ascending piece number: 87/87 (613 reloads)
+```
+
+The model keeps `_FreeGlobs` (last in, first out) and `_NextGlobregNum` from Color's entry and gives every record
+handed out in the trace the number the list says; it checks that each NewLiveRanges call takes its parents in
+ascending number and that the enterloads GrgAirlockEnterloads puts at one place (a block entry after a split
+point: the reloads after a loop) are in ascending order of those numbers. Which records are retired, how many
+pieces a parent gets and which uses need a reload are taken from the trace. The lines are printed when a split
+round handed out a record; `number miss:` lines follow the other misses.
+
 So `--predict` answers "given the webs of each round, what does Color decide", which is what was replayed before;
 it does not answer "what pieces does this split make". A what-if that changes which webs are split (`rasim regs`
 with an edit) therefore still stops at the split and says so.
 
-**Snapshot fields** (added by `regs --export` on the default c2 build; older readers ignore them, and a snapshot
-without them makes `--predict` say so and leaves the fourth `check` line out):
+**Snapshot fields** (added by `regs --export` on every c2 build: 14.00 and, through their build tables, 13.10.3077,
+13.10.3052 and 15.00.30729.1; older readers ignore them, and a snapshot without them makes `--predict` say so and
+leaves the fourth `check` line out):
 
 - `decisions[]`: one entry per event, in order, with `npass` and `after_pop`. `t` is `so` (SpillObvious looks at a
   new globreg: `nrefs`, `ben`, `lastop`), `spill`, `subst` (CmdSubstDef; `ok` = folded), `remove` (a record is
@@ -849,17 +901,30 @@ without them makes `--predict` say so and leaves the fourth `check` line out):
   `avail_empty`, the last def's opcode and `Opcode_dope` word, and `_Speed`.
 - `split_rounds[]`: every RemoveSplitGlobregs set, also of a round whose Spillcosts pass walks no block (such a
   pass has no entry in `passes`); `npasses`: the number of Spillcosts calls.
+- record numbers (regalloc.md 3.6.9), also in `decisions[]`: `freelist` (Color's entry: `next` =
+  `_NextGlobregNum`, `ids` = the first 11 records of `_FreeGlobs`, `full` = the list ended within them), `new`
+  (GrgNewGlobreg returned record `num`), `piece` (`site` `nlr` = NewLiveRanges, `use` / `def` =
+  RewriteSplitGlobregs; `pnum` = the parent's number), `reload` (GrgAirlockEnterloads: an enterload for piece
+  `num` before tuple `tup`). `remove` events carry the number pushed on the free list.
+- `c2` (another build only): `build` and `ops`, the opcode numbers the rules test (`enterload`, `last` = the first
+  pseudo-opcode); absent means 14.00's.
 
-Hooks (`DEC_HOOKS` in tools/c2regs.py, 22 of them, after the choice hooks): a probe in SpillObvious' loop
+Hooks (`DEC_HOOKS` in tools/c2regs.py, 28 of them, after the choice hooks; another build's are its table's
+`hooks.regs_dec`, the same 28 events at its addresses, port-1310.md section 15 and port-1500.md section 12): a probe in SpillObvious' loop
 (10b115b2), `@Spill@8`, `@CmdSubstDef@12`, `@ColRemoveGlobregFromHashTable@8`, `@RestrictToReg@4`,
 `@ForceSingleBlockLives@4`, `@ForceNoAirlocks@4`, `@BetterToDefer@4`, `@FoldAwaySplitGlobreg@4`, the three
 `fl5 |= 2` sites of UpdateAffectedGlobregs (10b156de, 10b158aa, 10b15ab2) and the one in Spill (10b1788f), a third
 probe in InsertInList (10b1197d), a probe after the pop (10b0d350), `@TryToRecalc@4`, the four `benefit +=` sites
-of CmdUpdateCost (10c2435a, 10c24387, 10c243c2, 10c243f9), and the two byte-pressure sites (10c25147, 10b148ec).
-The `regs` report itself is unchanged.
+of CmdUpdateCost (10c2435a, 10c24387, 10c243c2, 10c243f9), the two byte-pressure sites (10c25147, 10b148ec), and
+for the record numbers a probe after each GrgNewGlobreg call of NewLiveRanges (10b12771) and RewriteSplitGlobregs
+(10b1301b, 10b13235), one before GrgAirlockEnterloads' CmdInsertEnter (10b59678), one at Color's entry (10b0cf45)
+and the exit of `@GrgNewGlobreg@4`. The `regs` report itself is unchanged.
 
 **Limits.**
-- Integer class only. /O1 is handled (`_Speed` is in the snapshot), but RestrictToReg's load cost at /O1 is
+- Integer class only, on every build. 14.00 and 15.00 colour x87 values in Color's class loop (class 1), which
+  the model skips; 13.10 colours them in FPColor, outside the loop, whose order and stack slots the model does not
+  predict either (its record frees and allocations are in the event stream, so the record numbers hold through
+  them). /O1 is handled (`_Speed` is in the snapshot), but RestrictToReg's load cost at /O1 is
   approximated (2 for an immediate, 3 otherwise; the real values depend on the constant and on whether ebp is
   free). It was right in the 9 /O1 pins traced.
 - Never exercised by a trace: a web popped with no register (HandleCurrUncolorable), a web that starts with none

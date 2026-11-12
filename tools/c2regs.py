@@ -84,10 +84,12 @@ CHOICE_HOOKS = ["@Spillcosts@12+0x%x=%s" % (o, h) if h.startswith("e") else h
 PREF_SITE = {21: "mov G,gr", 22: "lea G,[gr]", 23: "mov G,reg", 24: "lea gr,[G]", 25: "mov gr,G", 26: "mov reg,G"}
 if HOOKS is _HOOKS14:
     HOOKS = HOOKS + CHOICE_HOOKS
-# Spill / defer / split decisions (regalloc.md section 3.6), for `--export` and `rasim check --predict` only; the
-# report is unchanged.  14.00.50727.762 only (DEC0 is None on a ported build, and the snapshot then has no
-# `decisions`).  Event k below is hook DEC0 + k.
+# Spill / defer / split decisions (regalloc.md section 3.6) and record numbers (3.6.9), for `--export` and `rasim
+# check --predict` only; the report is unchanged.  A ported build lists the same events at its own addresses in its
+# table (hooks.regs_dec; DEC0 is None when a table has none, and the snapshot then has no `decisions`).  Event k
+# below is hook DEC0 + k.
 _GX = "%s>4,%s>0x24,%s>0x28,%s>0x2c,%s>0x34"      # kind/fl5/fl6 dword, nrefs, firstBlk, lastBlk, nEnter
+_FREEL = lambda g: ",".join("g%s>0%s>0x1c" % (g, ">0x30" * k) for k in range(11))   # first 11 ids of a free list
 DEC_HOOKS = [
     "10b115b2=eax,eax>0x1c,eax>0x24,eax>0x40,eax>0x3c>4,eax>4," + _NAME % (("eax",) * 3),
                                                 # 0 SpillObvious looks at one new globreg: nrefs, benefit, lastDef op
@@ -116,11 +118,26 @@ DEC_HOOKS = [
                                                 #    registers without a byte form (_UnByteAbleRegs)
     "10b148ec=s36,g10d0dd54>0>0>0,g10d0dd54>0>0>4,g10d0dd54>0>0>8",
                                                 # 21 InsertSplitPoints: the same for the web being coloured
+    # 22..27 GLOBREG record numbers (regalloc.md 3.6.9): which record each new piece takes, and the reload order
+    "10b12771=eax,eax>0x1c,esi,esi>0x1c",       # 22 NewLiveRanges: a piece (eax) of split parent esi got its record
+    "10b1301b=eax,eax>0x1c,ebx,ebx>0x1c",       # 23 RewriteSplitGlobregs: a use with no live piece: new piece + reload
+    "10b13235=eax,eax>0x1c,edi,edi>0x1c",       # 24 RewriteSplitGlobregs: a def with no live piece: new piece
+    "10b59678=esi,esi>0x1c,eax",                # 25 GrgAirlockEnterloads: an enterload for piece esi before tuple eax
+    "10b0cf45=g10d12270>0," + _FREEL("10d0d7d8"),  # 26 Color entry: _NextGlobregNum, the _FreeGlobs list (11 ids)
+    "@GrgNewGlobreg@4=eax/xeax,eax>0x1c",       # 27 every GLOBREG record handed out (exit: the record, its number)
 ]
 DEC0 = None
+DECX = {}          # ported build: {regs hook index: decision event} for an event read at that hook's exit
 if len(HOOKS) == len(_HOOKS14) + len(CHOICE_HOOKS) and HOOKS[len(_HOOKS14):] == CHOICE_HOOKS:   # 14.00
     DEC0 = len(HOOKS)
     HOOKS = HOOKS + DEC_HOOKS
+elif (c2trace.c2build.get("hooks") or {}).get("regs_dec"):
+    # Another c2 build: the same 28 events at its own addresses (table key hooks.regs_dec, in DEC_HOOKS order;
+    # docs/c2/port-1310.md, port-1500.md), after its regs list (and its build-table events, regs_events).
+    DEC0 = len(HOOKS)
+    HOOKS = HOOKS + c2trace.c2build.get("hooks")["regs_dec"]
+    DECX = {int(k): v for k, v in (c2trace.c2build.get("hooks").get("regs_dec_exit") or {}).items()}
+OPS = {k: int(v, 16) for k, v in (c2trace.c2build.get("regs_ops") or {}).items()}   # build's opcode numbers
 
 
 def _gx(v):
@@ -135,6 +152,10 @@ def _decision(cur, ev, k, f, v):
     dec = cur.setdefault("dec", [])
     at = dict(npass=cur.get("_npass", 0), after_pop=len(cur["rows"]))
     op = lambda x: x if isinstance(x, int) else None
+    if k == 27:                         # GrgNewGlobreg: the record handed out (its exit; the entry is not used)
+        if ev == "X" and isinstance(v[0], int):
+            dec.append(dict(at, t="new", gr=v[0], num=v[1]))
+        return
     if ev == "X":
         ret = int(f[4], 16)
         t = {2: "subst", 4: "restrict", 7: "btd", 8: "fold"}.get(k)
@@ -157,9 +178,22 @@ def _decision(cur, ev, k, f, v):
     elif k in (9, 10, 11, 15):
         dec.append(dict(at, t="mark", site={9: "isp", 10: "nbr8", 11: "nbr", 15: "needlives"}[k], gr=v[0]))
     elif k in (16, 17, 18, 19):
-        dec.append(dict(at, t="bencost", gr=v[0], delta=2 if k == 18 else s32(v[1])))
+        # 17 adds 1 (14.00 logs it in ebx; 13.10 and 15.00 use `inc`, so their probe logs the globreg only)
+        dec.append(dict(at, t="bencost", gr=v[0], delta=2 if k == 18 else 1 if k == 17 and len(v) < 2 else s32(v[1])))
     elif k in (20, 21):
         dec.append(dict(at, t="bytepress", gr=v[0], regs=_bits(*v[1:4])))
+    elif k in (22, 23, 24):
+        dec.append(dict(at, t="piece", site={22: "nlr", 23: "use", 24: "def"}[k], gr=v[0], num=v[1],
+                        parent="%x" % v[2] if isinstance(v[2], int) else None, pnum=v[3]))
+    elif k == 25:
+        dec.append(dict(at, t="reload", gr=v[0], num=v[1], tup="%x" % v[2] if isinstance(v[2], int) else None))
+    elif k == 26:
+        ids = []
+        for x in v[1:]:
+            if not isinstance(x, int):
+                break
+            ids.append(x)
+        dec.append(dict(at, t="freelist", gr=0, next=v[0], ids=ids, full=len(ids) < len(v) - 1))
     elif k == 12:
         ins = cur.get("inserts") or []
         if ins and ins[-1].get("gr") == v[0]:
@@ -306,6 +340,10 @@ def parse(log, funcpat):
             grs, terms, npass = {}, {}, 0
             continue
         if cur is None:
+            continue
+        if ev == "X" and hk in DECX:                 # a decision event read at a regs hook's exit (15.00)
+            cur["_npass"] = npass
+            _decision(cur, "E", DECX[hk], f, v)
             continue
         if DEC0 is not None and hk >= DEC0:           # spill / defer / split decisions
             cur["_npass"] = npass
@@ -501,7 +539,8 @@ def export(fn):
         # force1 / forceair, btd (BetterToDefer; ret 1 = re-queued or folded), fold (FoldAwaySplitGlobreg; ret),
         # mark (UpdateAffectedGlobregs sets fl5 |= 2: site isp = InsertSplitPoints' set, nbr / nbr8 = a neighbour
         # left without a register, needlives = Spill deleted a dead def that used it), recalc, bencost (CmdUpdateCost: benefit += delta), bytepress (CmdProcessBytePressure: avail &= regs).  pops[i].x and inserts[i].x: the GLOBREG record at that moment.
-        snap["decisions"] = [dict(e, gr="%x" % e["gr"], after_pop=e["after_pop"] - nfp) for e in fn.get("dec", [])]
+        # (13.10: an event during FPColor, before the first int pop, counts as made before pop 1)
+        snap["decisions"] = [dict(e, gr="%x" % e["gr"], after_pop=max(0, e["after_pop"] - nfp)) for e in fn.get("dec", [])]
         for r, q in zip(fn["rows"], pops):
             if "x" in r:
                 q["x"] = r["x"]
@@ -510,6 +549,10 @@ def export(fn):
         snap["split_rounds"] = [dict(npass=n, removed=["%x" % g for g in lst])
                                 for n, lst in sorted(fn.get("splitrm", {}).items())]
         snap["npasses"] = max(fn.get("pcls") or [0])     # Spillcosts calls, also those that cost nothing
+        if OPS:
+            # another c2 build: the opcode numbers the decision rules test (absent = 14.00's): enterload =
+            # OPENTERLOAD (SpillObvious), last = the first non-machine opcode (RestrictToReg's Opcode_dope bound)
+            snap["c2"] = dict(build=c2trace.c2build.name(), ops=OPS)
     return snap
 
 

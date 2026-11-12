@@ -1,4 +1,6 @@
 {
+ "symkeys_sort_ret": "51103972",
+ "symkeys_skip": {"5113e3e0": 4, "5113e460": 4, "51143ca0": 4, "51143cd0": 4},
  "version": "15.00.30729.1",
  "c2_sha256": "e3dd31ec4cb066fdf27cea24efc37944bb9d6a2720e6310213217e571f288404",
  "image_base": "51030000",
@@ -307,6 +309,102 @@
    1187,
    "pdb",
    "?RegFixConflict@@YIXPAUtagTUPLE@@K@Z"
+  ],
+  "@Spill@8": [
+   "39660",
+   1431,
+   "pdb",
+   "?Spill@@YIXPAUtagFUNC@@PAUtagSYM@@@Z"
+  ],
+  "@CmdSubstDef@12": [
+   "1cb530",
+   443,
+   "pdb",
+   "?CmdSubstDef@@YIPAUtagBV@@PAUtagSYM@@KPAU1@@Z"
+  ],
+  "@ColRemoveGlobregFromHashTable@8": [
+   "3a940",
+   212,
+   "pdb",
+   "?ColRemoveGlobregFromHashTable@@YIXPAUtagSYM@@H@Z"
+  ],
+  "@RestrictToReg@4": [
+   "3d5c0",
+   273,
+   "pdb",
+   "?RestrictToReg@@YIHPAUtagSYM@@@Z"
+  ],
+  "@ForceSingleBlockLives@4": [
+   "3d540",
+   121,
+   "pdb",
+   "?ForceSingleBlockLives@@YIXPAUtagSYM@@@Z"
+  ],
+  "@ForceNoAirlocks@4": [
+   "3d410",
+   290,
+   "pdb",
+   "?ForceNoAirlocks@@YIXPAUtagSYM@@@Z"
+  ],
+  "@BetterToDefer@4": [
+   "3bf40",
+   238,
+   "pdb",
+   "?BetterToDefer@@YIHPAUtagSYM@@@Z"
+  ],
+  "@FoldAwaySplitGlobreg@4": [
+   "3c040",
+   257,
+   "pdb",
+   "?FoldAwaySplitGlobreg@@YIHPAUtagSYM@@@Z"
+  ],
+  "@TryToRecalc@4": [
+   "3c2f0",
+   4137,
+   "pdb",
+   "?TryToRecalc@@YIXPAUtagSYM@@@Z"
+  ],
+  "@UpdateAffectedGlobregs@20": [
+   "37850",
+   2255,
+   "pdb",
+   "?UpdateAffectedGlobregs@@YIPAUtagBV@@PAUtagFUNC@@W4GLOBREGLASS_ENUM@@PAUtagSYM@@PAU1@3@Z"
+  ],
+  "@CmdUpdateCost@12": [
+   "1c9aa0",
+   321,
+   "pdb",
+   "?CmdUpdateCost@@YIXPAUtagTUPLE@@PAUtagSYM@@PAUtagBLOCK@@@Z"
+  ],
+  "@CmdProcessBytePressure@12": [
+   "1ca800",
+   1030,
+   "pdb",
+   "?CmdProcessBytePressure@@YIPAUtagTUPLE@@PAU1@PAUtagBV@@PAUtagSYM@@@Z"
+  ],
+  "@GrgNewGlobreg@4": [
+   "79d10",
+   220,
+   "pdb",
+   "?GrgNewGlobreg@@YIPAUtagSYM@@PAU1@@Z"
+  ],
+  "@NewLiveRanges@4": [
+   "34a20",
+   1344,
+   "pdb",
+   "?NewLiveRanges@@YIXPAUtagSYM@@@Z"
+  ],
+  "@RewriteSplitGlobregs@12": [
+   "352f0",
+   1723,
+   "pdb",
+   "?RewriteSplitGlobregs@@YIXPAUtagFUNC@@PAUtagCOBLOCKLIST@@PAUtagBV@@@Z"
+  ],
+  "@GrgAirlockEnterloads@12": [
+   "778d0",
+   1077,
+   "pdb",
+   "?GrgAirlockEnterloads@@YIXPAUtagFUNC@@PAUtagBLOCK@@H@Z"
   ]
  },
  "probes": {
@@ -336,7 +434,25 @@
   "5112a8ad": "@RegBuildGlobalConflict@4+lastuse_gr",
   "5112a5d7": "@RegBuildGlobalConflict@4+tmplast",
   "5112a650": "@RegBuildGlobalConflict@4+tmpconf",
-  "51129f65": "@RegBuildGlobalConflict@4+tmpdef"
+  "51129f65": "@RegBuildGlobalConflict@4+tmpdef",
+  "51063b42": "@SpillObvious@16+so",
+  "51067ab7": "@UpdateAffectedGlobregs@20+isp",
+  "51067c8a": "@UpdateAffectedGlobregs@20+nbr8",
+  "51067e92": "@UpdateAffectedGlobregs@20+nbr",
+  "5105fc9f": "@Color@4+poprec",
+  "51069ba2": "@Spill@8+needlives",
+  "511f9b2b": "@CmdUpdateCost@12+imm",
+  "511f9b5c": "@CmdUpdateCost@12+imm1",
+  "511f9b9a": "@CmdUpdateCost@12+two",
+  "511f9bd4": "@CmdUpdateCost@12+gen",
+  "511fa961": "@CmdProcessBytePressure@12+and",
+  "51066ce9": "@InsertSplitPoints@28+byte",
+  "51063f12": "@InsertInList@8+rec",
+  "51064d10": "@NewLiveRanges@4+piece",
+  "51065595": "@RewriteSplitGlobregs@12+usepiece",
+  "510657a2": "@RewriteSplitGlobregs@12+defpiece",
+  "510a7c30": "@GrgAirlockEnterloads@12+enter",
+  "5105f885": "@Color@4+entry"
  },
  "globals": {
   "_CurFunc": "51258400",
@@ -358,6 +474,21 @@
   "_BvConflicts": "51255be8"
  },
  "hooks": {
+  "symkeys": {
+   "init": "5113dd10",
+   "alloc": "5113ded0=eax,g51253cf0>0,a0,a1,a2,a3,a4,a5,a6,a7,a8/xeax>0x1c,eax",
+   "free": "5113e0e3=esi>0x1c,ebp>-4",
+   "uservar": "5113e520=eax>4$,eax,eax>0x28/xeax",
+   "equiv": "5113ea70=eax,eax>8,s3/xeax,eax>0x10,eax>0x20",
+   "splice": "510b3860=s5>0x28>0x18>4$,s5>0x14/xeax",
+   "read": "51118d60/xeax",
+   "opt": "510fc5f0=g51258400>0>0>4$",
+   "gc": "5113f200",
+   "pool": "5113dc40/xeax>4>0x1c",
+   "getinl": "510b2a20=s1>4>0x28>0x18>4$,s1>4>0x14/xeax",
+   "sort": "510e8a70=a0/xebx>4~5103eb78$,ebx>0x14,eax>8,eax>0x10,eax>0x18>0x1c,eax>0x28>8,eax>0x28>0x18>0x1c,eax>0>8,eax>0>0x10,eax>0>0x18>0x1c,eax>0>0x28>8,eax>0>0x28>0x18>0x1c",
+   "sortx": "511037e0/xeax>0x28>0x28>8,eax>0x28>0x28>0x18>0x1c,eax>0x28>0x28>0x2c>0x18>0x1c,eax>0x28>0x28>0x28,eax>0x28>0x28>0>8,eax>0x28>0x28>0>0x18>0x1c,eax>0x28>0>0x28>8,eax>0x28>0>0x28>0x18>0x1c,eax>0x28>0>0x28>0x2c>0x18>0x1c,eax>0x28>0>0x28>0x28,eax>0x28>0>0x28>0>8,eax>0x28>0>0x28>0>0x18>0x1c"
+  },
   "default": [
    "@Color@4=s1",
    "@Spillcosts@12=s1,s2,s3"
@@ -381,7 +512,7 @@
    "51067114=ebp>8,ebp>8>0x1c,ebp>8>0x20>0>0,ebp>8>0x20>0>4,ebp>8>0x20>0>8",
    "51067120=eax>4>0x1c,eax>8",
    "51067502=esi,esi>0x1c,esi>0x10",
-   "@InsertInList@8=eax,eax>0x1c,eax>0x20>0>0,eax>0x20>0>4,eax>0x20>0>8,eax>0x40,eax>0x38>4>0x1c,eax>0x38>8,eax>0x38>0>4>0x1c,eax>0x38>0>8,eax>0x38>0>0>4>0x1c,eax>0x38>0>0>8",
+   "@InsertInList@8=eax,eax>0x1c,eax>0x20>0>0,eax>0x20>0>4,eax>0x20>0>8,eax>0x40,eax>0x38>4>0x1c,eax>0x38>8,eax>0x38>0>4>0x1c,eax>0x38>0>8,eax>0x38>0>0>4>0x1c,eax>0x38>0>0>8/xeax,eax>4,eax>0x24,eax>0x28,eax>0x2c,eax>0x34,eax>0xc,eax>0x44,eax>0x3c>4,eax>0>0>4$,eax>0>0x1c,eax>0>4",
    "51063f0b=eax,eax>0x38>0>0>0>4>0x1c,eax>0x38>0>0>0>8,eax>0x38>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>8,eax>0x38>0>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>0>8,eax>0x38>0>0>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>0>0>8",
    "@InsertByBenefit@8",
    "51062dc6=edi,edi>0x1c,ebx>0x1c,esi,esi>4,esi>0x1c,edi>0x10",
@@ -442,7 +573,40 @@
    "5112a5d7=edi",
    "5112a650=eax",
    "51129f65=ebx>0x1c"
-  ]
+  ],
+  "regs_dec": [
+   "51063b42=eax,eax>0x1c,eax>0x24,eax>0x40,eax>0x3c>4,eax>4,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "@Spill@8=s2,s2>0x1c",
+   "@CmdSubstDef@12=s1/xa1",
+   "@ColRemoveGlobregFromHashTable@8=edi,edi>0x1c",
+   "@RestrictToReg@4=ebx/xeax",
+   "@ForceSingleBlockLives@4=s1",
+   "@ForceNoAirlocks@4=s1",
+   "@BetterToDefer@4=ebx,ecx/xeax",
+   "@FoldAwaySplitGlobreg@4=s1/xa1",
+   "51067ab7=esi",
+   "51067c8a=esi",
+   "51067e92=esi",
+   "51063f12=eax,eax>4,eax>0x24,eax>0x28,eax>0x2c,eax>0x34,eax>0xc,eax>0x44,eax>0x3c>4,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "5105fc9f=esi,esi>4,esi>0x24,esi>0x28,esi>0x2c,esi>0x34,esi>0x20>0,esi>0x3c>4,esi>0x3c>4~510389f8,esi>0x3c>0x2c>0x10,g51253d10>0",
+   "@TryToRecalc@4=s1",
+   "51069ba2=eax",
+   "511f9b2b=esi,eax",
+   "511f9b5c=esi",
+   "511f9b9a=esi",
+   "511f9bd4=esi>0x1c,eax",
+   "511fa961=edi,g51254350>0>0>0,g51254350>0>0>4,g51254350>0>0>8",
+   "51066ce9=ebp>0xc,g51254350>0>0>0,g51254350>0>0>4,g51254350>0>0>8",
+   "51064d10=eax,eax>0x1c,esi,esi>0x1c",
+   "51065595=eax,eax>0x1c,edi,edi>0x1c",
+   "510657a2=eax,eax>0x1c,ebx,ebx>0x1c",
+   "510a7c30=esi,esi>0x1c,eax",
+   "5105f885=g512582c4>0,g51253dd0>0>0x1c,g51253dd0>0>0x30>0x1c,g51253dd0>0>0x30>0x30>0x1c,g51253dd0>0>0x30>0x30>0x30>0x1c,g51253dd0>0>0x30>0x30>0x30>0x30>0x1c,g51253dd0>0>0x30>0x30>0x30>0x30>0x30>0x1c,g51253dd0>0>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g51253dd0>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g51253dd0>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g51253dd0>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c,g51253dd0>0>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x30>0x1c",
+   "@GrgNewGlobreg@4=eax/xeax,eax>0x1c"
+  ],
+  "regs_dec_exit": {
+   "18": 12
+  }
  },
  "opsched": [
   "510314e8",
@@ -452,5 +616,9 @@
   "2f",
   "33",
   "f"
- ]
+ ],
+ "regs_ops": {
+  "enterload": "2e0",
+  "last": "2be"
+ }
 }
