@@ -1,0 +1,456 @@
+{
+ "version": "15.00.30729.1",
+ "c2_sha256": "e3dd31ec4cb066fdf27cea24efc37944bb9d6a2720e6310213217e571f288404",
+ "image_base": "51030000",
+ "patch": {
+  "cave_rva": "2164c0",
+  "text_vsize": "2154bc",
+  "entry_rva": "210029",
+  "iat_loadlibrarya": "10b8",
+  "file_delta": "c00",
+  "nsec": 4
+ },
+ "setup": {
+  "from": "../spore-decomp/work/toolchain/vc9sp1/VC",
+  "sdk": "../spore-decomp/work/toolchain/vc9sp1/WinSDK",
+  "sal": ""
+ },
+ "dll": {
+  "regname": "51040080",
+  "opname": "5103eb78"
+ },
+ "functions": {
+  "@HandleCurrUncolorable@8": [
+   "30190",
+   371,
+   "pdb",
+   "?HandleCurrUncolorable@@YIPAUtagBV@@PAUtagSYM@@W4GLOBREGLASS_ENUM@@@Z"
+  ],
+  "@dop2_PreLowerGlobalOpts@4": [
+   "1257a0",
+   652,
+   "pdb",
+   "?dop2_PreLowerGlobalOpts@@YIHPAUtagFUNC@@@Z"
+  ],
+  "@dop2_Codegen@4": [
+   "125a40",
+   737,
+   "pdb",
+   "?dop2_Codegen@@YIHPAUtagFUNC@@@Z"
+  ],
+  "@dop2_CodegenUpdate@4": [
+   "125e80",
+   546,
+   "pdb",
+   "?dop2_CodegenUpdate@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@RegSimpleAssignBody@4": [
+   "f82f0",
+   641,
+   "pdb",
+   "?RegSimpleAssignBody@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@RegAssign@8": [
+   "f88b0",
+   1254,
+   "pdb",
+   "?RegAssign@@YIPAUtagSYM@@PAUtagTUPLE@@0@Z"
+  ],
+  "@dop2_CodegenFinish@4": [
+   "126110",
+   238,
+   "pdb",
+   "?dop2_CodegenFinish@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@CmdSetNextPos@8": [
+   "1c8ca0",
+   79,
+   "pdb",
+   "?CmdSetNextPos@@YIXGPAK@Z"
+  ],
+  "@dop2_GlobalRegAlloc@4": [
+   "125dd0",
+   170,
+   "pdb",
+   "?dop2_GlobalRegAlloc@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@Globregs@4": [
+   "748d0",
+   869,
+   "pdb",
+   "?Globregs@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@GrgIdentifyCandidates@4": [
+   "74700",
+   448,
+   "pdb",
+   "?GrgIdentifyCandidates@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_PostLowerPreRegAllocGlobalOpts@4": [
+   "125d30",
+   154,
+   "pdb",
+   "?dop2_PostLowerPreRegAllocGlobalOpts@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@FgEarlyTailDup@4": [
+   "482e0",
+   842,
+   "pdb",
+   "?FgEarlyTailDup@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@Color@4": [
+   "2f880",
+   1878,
+   "pdb",
+   "?Color@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@Spillcosts@12": [
+   "329e0",
+   4350,
+   "pdb",
+   "?Spillcosts@@YIXPAUtagFUNC@@W4GLOBREGLASS_ENUM@@PAUtagBV@@@Z"
+  ],
+  "@SpillObvious@16": [
+   "33af0",
+   515,
+   "pdb",
+   "?SpillObvious@@YIXPAUtagFUNC@@W4GLOBREGLASS_ENUM@@PAUtagBV@@2@Z"
+  ],
+  "@InsertInList@8": [
+   "33f00",
+   123,
+   "pdb",
+   "?InsertInList@@YIPAUtagSYM@@PAU1@0@Z"
+  ],
+  "@ChoosePhysReg@12": [
+   "36f30",
+   1790,
+   "pdb",
+   "?ChoosePhysReg@@YIXPAUtagSYM@@W4GLOBREGLASS_ENUM@@PAUtagBV@@@Z"
+  ],
+  "@InsertSplitPoints@28": [
+   "35a30",
+   5369,
+   "pdb",
+   "?InsertSplitPoints@@YIPAUtagBV@@PAUtagFUNC@@PAUtagSYM@@W4GLOBREGLASS_ENUM@@PAU1@33H@Z"
+  ],
+  "@OrderGlobregs@12": [
+   "33d00",
+   493,
+   "pdb",
+   "?OrderGlobregs@@YIPAUtagBV@@PAUtagFUNC@@W4GLOBREGLASS_ENUM@@PAU1@@Z"
+  ],
+  "@Schedule@8": [
+   "1a9d20",
+   315,
+   "pdb",
+   "?Schedule@@YIXPAUtagFUNC@@H@Z"
+  ],
+  "@SpillOrDefer@12": [
+   "2ffe0",
+   421,
+   "pdb",
+   "?SpillOrDefer@@YIPAUtagBV@@PAUtagSYM@@PAUtagFUNC@@W4GLOBREGLASS_ENUM@@@Z"
+  ],
+  "@InsertByBenefit@8": [
+   "33f80",
+   208,
+   "pdb",
+   "?InsertByBenefit@@YIPAUtagSYM@@PAU1@0@Z"
+  ],
+  "@InsertNewGlobregs@8": [
+   "359b0",
+   122,
+   "pdb",
+   "?InsertNewGlobregs@@YIPAUtagSYM@@PAUtagBV@@PAU1@@Z"
+  ],
+  "@FgCoalesceLabels@4": [
+   "43510",
+   293,
+   "pdb",
+   "?FgCoalesceLabels@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@EncEmitFunc@4": [
+   "3fcb0",
+   774,
+   "pdb",
+   "?EncEmitFunc@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@EncSetOffsets@12": [
+   "40a00",
+   1662,
+   "pdb",
+   "?EncSetOffsets@@YIXPAUtagFUNC@@EE@Z"
+  ],
+  "@Encode@4": [
+   "40600",
+   851,
+   "pdb",
+   "?Encode@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_EncodeAndRelated@4": [
+   "126440",
+   184,
+   "pdb",
+   "?dop2_EncodeAndRelated@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_PreEncode@4": [
+   "1262e0",
+   334,
+   "pdb",
+   "?dop2_PreEncode@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_FinalFlowOpts@4": [
+   "126210",
+   196,
+   "pdb",
+   "?dop2_FinalFlowOpts@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@FgCodeMotion@4": [
+   "4dd20",
+   1724,
+   "pdb",
+   "?FgCodeMotion@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@SchSelectInstrs@4": [
+   "1aa260",
+   469,
+   "pdb",
+   "?SchSelectInstrs@@YIHI@Z"
+  ],
+  "@SchSchedGraph@4": [
+   "1aa040",
+   529,
+   "pdb",
+   "?SchSchedGraph@@YIXPAUtagDAGGRAPH@@@Z"
+  ],
+  "@SchAddToReadyList@4": [
+   "1aa440",
+   135,
+   "pdb",
+   "?SchAddToReadyList@@YIXPAUtagDAGNODE@@@Z"
+  ],
+  "@SchComputeStaticPriority@4": [
+   "1a9e60",
+   462,
+   "pdb",
+   "?SchComputeStaticPriority@@YIXPAUtagDAGGRAPH@@@Z"
+  ],
+  "@MscClean@4": [
+   "ba710",
+   3060,
+   "pdb",
+   "?MscClean@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@MdmSuperHack@4": [
+   "1ffe50",
+   1668,
+   "pdb",
+   "?MdmSuperHack@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@RemoveSplitGlobregs@4": [
+   "34060",
+   68,
+   "pdb",
+   "?RemoveSplitGlobregs@@YIPAUtagSYM@@PAU1@@Z"
+  ],
+  "@dop2_PostCodegenFlowOpts@4": [
+   "1260b0",
+   88,
+   "pdb",
+   "?dop2_PostCodegenFlowOpts@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@LateGlobalOptimize@16": [
+   "1819c0",
+   322,
+   "pdb",
+   "?LateGlobalOptimize@@YIXPAUtagFUNC@@HHH@Z"
+  ],
+  "@FPColor@4": [
+   "1d9750",
+   647,
+   "pdb",
+   "?FPColor@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@FPSpillcosts@8": [
+   "1da2f0",
+   2439,
+   "pdb",
+   "?FPSpillcosts@@YIXPAUtagFUNC@@PAUtagBV@@@Z"
+  ],
+  "@FPRemoveSplitGlobregs@8": [
+   "1dea80",
+   352,
+   "pdb",
+   "?FPRemoveSplitGlobregs@@YIPAUtagSYM@@PAU1@PAUtagBV@@@Z"
+  ],
+  "@RegBuildGlobalConflict@4": [
+   "f9c30",
+   3575,
+   "pdb",
+   "?RegBuildGlobalConflict@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@RegResetRegMap@4": [
+   "faa30",
+   177,
+   "pdb",
+   "?RegResetRegMap@@YIXPAUtagTUPLE@@@Z"
+  ],
+  "@RegSpill@12": [
+   "f8e80",
+   1299,
+   "pdb",
+   "?RegSpill@@YIXKPAUtagTUPLE@@0@Z"
+  ],
+  "@RegFixConflict@8": [
+   "faaf0",
+   1187,
+   "pdb",
+   "?RegFixConflict@@YIXPAUtagTUPLE@@K@Z"
+  ]
+ },
+ "probes": {
+  "5105fc8c": "@Color@4+pop",
+  "510671a9": "@ChoosePhysReg@12+cand",
+  "51063a05": "@Spillcosts@12+blkend",
+  "51063a15": "@Spillcosts@12+died",
+  "51063a4e": "@Spillcosts@12+liveref",
+  "51063a5c": "@Spillcosts@12+livethru",
+  "51064079": "@RemoveSplitGlobregs@4+splitrm",
+  "51066f94": "@ChoosePhysReg@12+nbr",
+  "51066fb0": "@ChoosePhysReg@12+nbrpref",
+  "51067114": "@ChoosePhysReg@12+avail",
+  "51067120": "@ChoosePhysReg@12+pref",
+  "51067502": "@ChoosePhysReg@12+partner",
+  "51063f0b": "@InsertInList@8+prefs4",
+  "51062dc6": "@Spillcosts@12+pref21",
+  "51062e1b": "@Spillcosts@12+pref22",
+  "510632cb": "@Spillcosts@12+pref23",
+  "5106334f": "@Spillcosts@12+pref24",
+  "51063410": "@Spillcosts@12+pref25",
+  "510637ca": "@Spillcosts@12+pref26",
+  "511d9ea1": "@SchComputeStaticPriority@4+edge",
+  "5112a055": "@RegBuildGlobalConflict@4+physdef",
+  "5112a22a": "@RegBuildGlobalConflict@4+kill",
+  "5112a3e5": "@RegBuildGlobalConflict@4+lastuse",
+  "5112a8ad": "@RegBuildGlobalConflict@4+lastuse_gr",
+  "5112a5d7": "@RegBuildGlobalConflict@4+tmplast",
+  "5112a650": "@RegBuildGlobalConflict@4+tmpconf",
+  "51129f65": "@RegBuildGlobalConflict@4+tmpdef"
+ },
+ "globals": {
+  "_CurFunc": "51258400",
+  "_Function": "51253cf4",
+  "_RegName": "51040080",
+  "_TupOpcodeName": "5103eb78",
+  "weights": "5125b840",
+  "_NextIntPos": "512558a0",
+  "_IntPhysRegs": "512536a0",
+  "_RegSym": "51250640",
+  "_RegOrders": "5103a4fc",
+  "_SCHED_ccc": "51255b98",
+  "_issueArray": "51255bac",
+  "_OpSchedInfoP0": "510314e8",
+  "_OpSchedInfo": "512894c8",
+  "_RegMap": "51255d58",
+  "_regAvail": "51255a3c",
+  "_Speed": "51253d10",
+  "_BvConflicts": "51255be8"
+ },
+ "hooks": {
+  "default": [
+   "@Color@4=s1",
+   "@Spillcosts@12=s1,s2,s3"
+  ],
+  "regs": [
+   "@Color@4=g51258400>0>0>4$,g51258400>0>0x44,g51258400>0>8>0>0x1c%",
+   "@OrderGlobregs@12=s1",
+   "5105fc8c=esi,esi>0xc,esi>0x40,esi>0x24,esi>0x44,esi>0x1c,esi>0>0x1c,esi>0>4,esi>0>0>4$,ebp>-0xc",
+   "@ChoosePhysReg@12=s1/xa1,a1>0x10>0x1c~51040080$",
+   "510671a9=esi~51040080$,esi~5125b840",
+   "@SpillOrDefer@12=ecx",
+   "@HandleCurrUncolorable@8=ebx",
+   "@Spillcosts@12",
+   "51063a05=edi,ebp>-0x18,ebp>-0x10",
+   "51063a15=eax,eax>0x18,edx,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "51063a4e=eax,eax>0x18,edx,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "51063a5c=eax,edx,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "51064079=edx",
+   "51066f94=ecx,ecx>0x1c,ecx>0x20>0>0,ecx>0x20>0>4,ecx>0x20>0>8,ecx>0x40,ecx>0x10,ecx>0>0>4$,ecx>0>0x1c,ecx>0>4",
+   "51066fb0=edi,esi>4>0x1c,esi>8",
+   "51067114=ebp>8,ebp>8>0x1c,ebp>8>0x20>0>0,ebp>8>0x20>0>4,ebp>8>0x20>0>8",
+   "51067120=eax>4>0x1c,eax>8",
+   "51067502=esi,esi>0x1c,esi>0x10",
+   "@InsertInList@8=eax,eax>0x1c,eax>0x20>0>0,eax>0x20>0>4,eax>0x20>0>8,eax>0x40,eax>0x38>4>0x1c,eax>0x38>8,eax>0x38>0>4>0x1c,eax>0x38>0>8,eax>0x38>0>0>4>0x1c,eax>0x38>0>0>8",
+   "51063f0b=eax,eax>0x38>0>0>0>4>0x1c,eax>0x38>0>0>0>8,eax>0x38>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>8,eax>0x38>0>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>0>8,eax>0x38>0>0>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>0>0>8",
+   "@InsertByBenefit@8",
+   "51062dc6=edi,edi>0x1c,ebx>0x1c,esi,esi>4,esi>0x1c,edi>0x10",
+   "51062e1b=edi,edi>0x1c,esi>0x10>0x1c,esi,esi>4,esi>0x1c,edi>0x10",
+   "510632cb=edi,edi>0x1c,esi>0x1c,esi,esi>4,esi>0x1c,edi>0x10",
+   "5106334f=edi,edi>0x1c,ebx>0x1c,esi,esi>4,esi>0x1c,edi>0x10",
+   "51063410=ebx,ebx>0x1c,esi>0x10>0x1c,esi,esi>4,esi>0x1c,ebx>0x10",
+   "510637ca=ebx,ebx>0x1c,esi>0x1c,esi,esi>4,esi>0x1c,ebx>0x10"
+  ],
+  "il_spec": "=g51258400>0>0>4$,g51258400>0>8>0>0x1c%",
+  "il_default": [
+   "@dop2_PreLowerGlobalOpts@4",
+   "@dop2_Codegen@4",
+   "@dop2_PostLowerPreRegAllocGlobalOpts@4",
+   "@FgEarlyTailDup@4",
+   "@Globregs@4",
+   "@Color@4",
+   "@dop2_CodegenUpdate@4",
+   "@dop2_PostCodegenFlowOpts@4",
+   "@dop2_CodegenFinish@4",
+   "@LateGlobalOptimize@16",
+   "@dop2_FinalFlowOpts@4",
+   "@FgCodeMotion@4",
+   "@FgCoalesceLabels@4",
+   "@dop2_PreEncode@4",
+   "@MscClean@4",
+   "@MdmSuperHack@4",
+   "@dop2_EncodeAndRelated@4",
+   "@EncEmitFunc@4"
+  ],
+  "scratch": [
+   "@RegSimpleAssignBody@4=g51258400>0>0>4$",
+   "@RegAssign@8=s1>0x1c>0x1c,g512558a0>0>0~51040080$,s2,s2!/xeax>0x1c~51040080$,a1>0x1c>0x30>0x1c~51040080$",
+   "@CmdSetNextPos@8=eax",
+   "@Encode@4=g51258400>0>0>4$,g51258400>0>8>0>0x1c%"
+  ],
+  "sched": [
+   "@Schedule@8=g51258400>0>0>4$,g51258400>0>8>0>0x1c%",
+   "@SchSchedGraph@4=g51255b98>0",
+   "@SchAddToReadyList@4=ecx>0x1c,ecx>0x2c,ecx>0x38,ecx>0x24,ecx>0x40,ecx>0x34,g51255b98>0,ecx>0x3c,ecx>0x1c>4,ecx>0x1c>8,ecx>0x1c>0x28>8,ecx>0x1c>0x28>0>8",
+   "@SchSelectInstrs@4=g51255b98>0/xeax,g51255b98>0,g51255bac>0>0x1c,g51255bb0>0>0x1c,g51255bb4>0>0x1c",
+   "@MdmSuperHack@4=g51258400>0>0>4$,g51258400>0>8>0>0x1c%",
+   "511d9ea1=esi>0x1c,eax>0xc>0x1c,eax>0x14,eax>0x10,esi>0x3c"
+  ],
+  "scratch_x": [
+   "@RegSimpleAssignBody@4=g51258400>0>0>4$,g51253d10>0",
+   "@RegAssign@8=s1>0x1c>0x1c,g512558a0>0>0~51040080$,s2,s2!,s1>0x1c,s1>8,s1>0x1c>4,s1>0x1c>0x30>0x1c,g51255d58#9,g51255a3c#9,g512558a0>0>0/xeax>0x1c~51040080$,a1>0x1c>0x30>0x1c~51040080$,eax>0x1c,g512558a0>0>0,a1>0x1c>0x30>0x1c",
+   "@CmdSetNextPos@8=eax,ecx",
+   "@Encode@4=g51258400>0>0>4$,g51258400>0>8>0>0x1c%",
+   "@RegResetRegMap@4=eax>0x20",
+   "@RegSpill@12",
+   "@RegFixConflict@8=s2",
+   "@RegBuildGlobalConflict@4",
+   "5112a055=esi",
+   "5112a22a=edi",
+   "5112a3e5=edi",
+   "5112a8ad=esi",
+   "5112a5d7=edi",
+   "5112a650=eax",
+   "51129f65=ebx>0x1c"
+  ]
+ },
+ "opsched": [
+  "510314e8",
+  "2be"
+ ],
+ "sched_delay_cmp": [
+  "2f",
+  "33",
+  "f"
+ ]
+}

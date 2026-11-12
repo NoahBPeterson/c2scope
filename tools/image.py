@@ -26,7 +26,9 @@ def find_binary(name):
 class Image:
     def __init__(self, name):
         import pefile
-        self.path = find_binary(name)
+        import c2build
+        tbl = c2build.table() if name.lower() in ("c2", "c2.dll") else None      # another c2 build (port-1310.md)
+        self.path = c2build.orig_c2() if tbl else find_binary(name)
         self.name = os.path.basename(self.path).lower()
         self.pe = pefile.PE(self.path, fast_load=True)
         self.base = self.pe.OPTIONAL_HEADER.ImageBase
@@ -34,7 +36,12 @@ class Image:
         self.data = self.pe.get_memory_mapped_image()
         self.rows, self.by_va, self.by_sym = [], {}, {}
         idx = os.path.join(ROOT, "work", "index", self.name + ".csv")
-        if os.path.exists(idx):
+        if tbl:
+            for r in c2build.index_rows():
+                self.rows.append(r)
+                self.by_va.setdefault(r["va"], r)
+                self.by_sym.setdefault(r["symbol"], r)
+        elif os.path.exists(idx):
             for r in csv.DictReader(open(idx)):
                 r["va"] = int(r["va"], 16)
                 r["size"] = int(r["size"])
@@ -82,7 +89,14 @@ class Image:
     def func(self, key):
         if isinstance(key, int):
             return self.by_va.get(key)
-        return self.by_sym.get(key)
+        r = self.by_sym.get(key)
+        if r is None and key[:1] in "@_" and any(k.startswith("?") for k in self.by_sym):
+            # a build whose PDB has C++ names (cl 15.00: ?Color@@YIXPAUtagFUNC@@@Z): accept the 14.00 spelling
+            # (@Color@4, _Name) when exactly one function has that base name
+            base = key[1:].split("@")[0]
+            hit = [v for k, v in self.by_sym.items() if k.startswith("?%s@@Y" % base)]
+            r = hit[0] if len(hit) == 1 else None
+        return r
 
     def in_image(self, v):
         return self.base <= v < self.base + self.size

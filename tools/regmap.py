@@ -14,6 +14,11 @@ original's votes, and a verdict:
   WANTS r   the votes say r (majority)
   mixed     votes for several registers: a split range, or the alignment is off there
 
+Every register class the final IL names is covered: integer rows first (the format `rasim want` reads), then XMM
+(Color class 6), MMX, and x87. For x87 the "register" is the stack position ST(i) the value has at each aligned
+instruction (the final IL writes `ST(2)=var`), so a row says whether the original's stack has the value at the same
+depth there; it is a layout check, not a colour to ask rasim for. Each non-integer class starts with a `#` line.
+
 Then it lists swaps (A has what B wants and B has what A wants), which in rasim terms are usually ordering
 constraints: of two interfering values with the same candidates, the one coloured first gets the first free
 register (regalloc.md section 5). The names are the IL's (`_this`, `s386` = regs' `local386`, `t591`), and the
@@ -23,14 +28,48 @@ import argparse, collections, difflib, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c2trace, c2scratch, tsweep
 
-REG = tsweep.REG
-OPREG = re.compile(r"\b(e[abcd]x|e[sd]i|ebp|[abcd][lhx]|[sd]i|bp)=([^\s:\]]+):")
+# Every register class the final IL names: int, XMM (15.00 also writes the scalar views xmm0s/xmm0d/xmm0l), MMX and
+# the x87 stack positions ST(i). tsweep.REG (regdiff's key) is left as it is; this is regmap's own superset.
+# (tsweep.REG's `st\(\d\)` alternative never matches: a `\b` cannot follow the closing parenthesis.)
+REG = re.compile(r"\b(?:e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp|e?sp|xmm[0-7]|mm[0-7])\b|\bst\(\d\)")
+OPREG = re.compile(r"\b(e[abcd]x|e[sd]i|ebp|[abcd][lhx]|[sd]i|bp|xmm[0-7][sdl]?|mm[0-7]|ST\(\d\))=([^\s:\]]+):")
 WIDE = {"al": "eax", "ah": "eax", "ax": "eax", "bl": "ebx", "bh": "ebx", "bx": "ebx", "cl": "ecx", "ch": "ecx",
         "cx": "ecx", "dl": "edx", "dh": "edx", "dx": "edx", "si": "esi", "di": "edi", "bp": "ebp"}
+CLASSES = ["int", "xmm", "mmx", "x87"]
+CLASS_NOTE = {
+    "xmm": ("XMM values (Color class 6)", ""),
+    "mmx": ("MMX values (Color class 5)", ""),
+    "x87": ("x87 values, by stack position",
+            "#   the columns are the positions ST(i) a value has at each aligned instruction, not colours; a difference "
+            "means the\n#   original's stack holds other values, or another order, at that point (x87.md rules 5, 8, "
+            "11; `regs --all-classes`)\n"),
+}
 
 
 def wide(r):
+    r = r.lower()
+    if r.startswith("xmm"):
+        return r[:4]
     return WIDE.get(r, r)
+
+
+def rclass(r):
+    return "xmm" if r.startswith("xmm") else "mmx" if r.startswith("mm") else "x87" if r.startswith("st(") else "int"
+
+
+X87_TWO = re.compile(r"^\s*(st\(\d\))\s*,\s*(st\(\d\))\s*$")
+
+
+def norm(ins):
+    """(mnemonic, operands) in lower case. An x87 instruction with two stack operands keeps only the one that is not
+    ST(0): MASM writes `faddp ST(1), ST(0)` / `fmul ST(0), ST(2)`, capstone `faddp st(1)` / `fmul st(2)`."""
+    mn, ops = ins[0].lower(), ins[1].lower()
+    if mn.startswith("f"):
+        m = X87_TWO.match(ops)
+        if m:
+            a, b = m.groups()
+            ops = b if a == "st(0)" else a
+    return (mn, ops)
 
 
 def regs_name(il_name):
@@ -49,7 +88,7 @@ def final_ops(final):
         f = l.split()
         pairs = []
         for r, v in OPREG.findall(l.split("|", 1)[1] if "|" in l else ""):
-            if (wide(r), v) not in pairs:
+            if (wide(r), v) not in pairs and not re.fullmatch(r"ST\(\d\)", v):     # 13.10 writes `ST(1)=ST(0)`
                 pairs.append((wide(r), v))
         if pairs:
             out.setdefault(off, []).extend(p for p in pairs if p not in out.get(off, []))
@@ -59,8 +98,11 @@ def final_ops(final):
 
 def shape(ins):
     """Operand shape: registers -> R, memory operands -> M, everything else -> I ('mov M,R')."""
-    ops = re.sub(r"\b(dword|word|byte|qword|short)\s+ptr\b|\bshort\b|\boffset\b", "", ins[1].lower())
+    ops = re.sub(r"\b(xmmword|mmword|tbyte|dword|qword|word|byte|short)\s+ptr\b|\bshort\b|\boffset\b", "", ins[1].lower())
     ops = re.sub(r"[^,]*\[[^\]]*\][^,]*", "M", ops)
+    # A global without brackets in our listing (`DWORD PTR _g`, `__real@3f80..`) stays "I" although capstone writes
+    # the original's as [0x..] = "M": calling it M aligned fewer instructions on the one large function tried
+    # (Spore 0x00f7d9d0: 1800 against 2068 of 8379), so it is left as it was.
     parts = []
     for o in ops.split(","):
         o = o.strip()
@@ -83,10 +125,15 @@ def align(ours, orig):
 
 
 def analyse(final, asm, asm_func, orig):
+    """Votes per (variable, register class): a name can be an int value in one place and an XMM value in another
+    (inlined locals), and the classes never compete for a register."""
     ops = final_ops(final)
     lst = tsweep.listing_offsets(asm, asm_func)            # {offset: 'mnemonic operands'}
     offs = sorted(lst)
-    ours = [(lst[o].split()[0], lst[o].split(None, 1)[1] if " " in lst[o] else "") for o in offs]
+    shown = [lst[o] for o in offs]
+    ours = [norm((lst[o].split()[0], lst[o].split(None, 1)[1] if " " in lst[o] else "")) for o in offs]
+    orig_shown = [" ".join(x) for x in orig]
+    orig = [norm(x) for x in orig]
     votes = collections.defaultdict(collections.Counter)
     have = collections.defaultdict(collections.Counter)
     where = collections.defaultdict(list)
@@ -95,58 +142,81 @@ def analyse(final, asm, asm_func, orig):
         o = offs[i]
         if o not in ops:
             continue
-        ra = [wide(r) for r in REG.findall(ours[i][1].lower())]
-        rb = [wide(r) for r in REG.findall(orig[j][1].lower())]
+        ra = [wide(r) for r in REG.findall(ours[i][1])]
+        rb = [wide(r) for r in REG.findall(orig[j][1])]
         if len(ra) != len(rb):
             continue
         for reg, var in ops[o]:
-            have[var][reg] += 1
+            key = (var, rclass(reg))
+            hit = False
             for k, r in enumerate(ra):
-                if r == reg:
-                    votes[var][rb[k]] += 1
+                if r == reg and rclass(rb[k]) == key[1]:
+                    hit = True
+                    votes[key][rb[k]] += 1
                     if rb[k] != reg:
-                        where[var].append((o, " ".join(ours[i]), " ".join(orig[j]), reg, rb[k]))
+                        where[key].append((o, shown[i], orig_shown[j], reg, rb[k]))
                     else:
-                        agree[var] += 1
+                        agree[key] += 1
+            if hit or key[1] != "x87":      # an x87 operand the listing leaves implicit (ST(0)) is not a sighting
+                have[key][reg] += 1
     return have, votes, where, agree
 
 
 def report(have, votes, where, agree, show_all):
     """A vote disagrees when the original's register differs from ours at that same instruction (so a name
-    shared by several inlined locals, or a split range, is judged instruction by instruction)."""
+    shared by several inlined locals, or a split range, is judged instruction by instruction). Integer rows come
+    first, in the format `rasim want` reads; the other classes follow, each under a `#` header line."""
     rows = []
-    for var in sorted(have, key=lambda v: -sum(have[v].values())):
-        mine = have[var].most_common()
-        vt = votes[var].most_common()
+    for key in sorted(have, key=lambda v: (CLASSES.index(v[1]), -sum(have[v].values()))):
+        var, cls = key
+        mine = have[key].most_common()
+        vt = votes[key].most_common()
         if not vt:
             continue
-        bad = collections.Counter((w[3], w[4]) for w in where[var])
+        bad = collections.Counter((w[3], w[4]) for w in where[key])
         nbad = sum(bad.values())
         if not nbad:
             verdict = "ok"
-        elif len(bad) == 1 and nbad >= agree[var]:
+        elif len(bad) == 1 and nbad >= agree[key]:
             (fr, to), = bad
             verdict = "WANTS %s" % to if len(mine) == 1 else "WANTS %s for %s" % (to, fr)
         else:
-            verdict = "mixed (%d of %d votes differ: %s)" % (nbad, nbad + agree[var],
+            verdict = "mixed (%d of %d votes differ: %s)" % (nbad, nbad + agree[key],
                                                             " ".join("%s->%s:%d" % (a, b, c) for (a, b), c in bad.most_common(3)))
-        rows.append((var, mine, vt, verdict))
+        rows.append((var, mine, vt, verdict, cls))
     print("%-12s %-14s %-24s %-28s %s" % ("var (IL)", "regs name", "ours", "original's votes", "verdict"))
-    for var, mine, vt, verdict in rows:
+    cur = "int"
+    for var, mine, vt, verdict, cls in rows:
+        if cls != cur:
+            cur = cls
+            n = [r for r in rows if r[4] == cls]
+            sys.stdout.write("# %s: %d checked, %d agree everywhere\n%s" % (
+                CLASS_NOTE[cls][0], len(n), sum(1 for r in n if r[3] == "ok"), CLASS_NOTE[cls][1]))
         if verdict == "ok" and not show_all:
             continue
         print("%-12s %-14s %-24s %-28s %s" % (var, regs_name(var), " ".join("%s:%d" % x for x in mine),
                                               " ".join("%s:%d" % x for x in vt), verdict))
-        for o, a, b, _, _ in where[var][:3] if verdict != "ok" else []:
+        for o, a, b, _, _ in where[(var, cls)][:3] if verdict != "ok" else []:
             print("      %05x  ours %-36s orig %s" % (o, a[:36], b))
     nok = sum(1 for r in rows if r[3] == "ok")
     print("# %d variables checked, %d agree with the original everywhere" % (len(rows), nok))
-    wants = {r[0]: (r[1][0][0], r[3].split()[1]) for r in rows if r[3].startswith("WANTS") and len(r[1]) == 1}
-    swaps = [(a, b) for a in wants for b in wants if a < b and wants[a][0] == wants[b][1] and wants[b][0] == wants[a][1]]
+    per = ["%s %d of %d" % (c, sum(1 for r in rows if r[4] == c and r[3] == "ok"), sum(1 for r in rows if r[4] == c))
+           for c in CLASSES if any(r[4] == c for r in rows)]
+    if len(per) > 1 or (per and not per[0].startswith("int")):
+        print("# by class: " + ", ".join(per))
+    wants = {(r[0], r[4]): (r[1][0][0], r[3].split()[1]) for r in rows
+             if r[3].startswith("WANTS") and len(r[1]) == 1 and r[4] != "x87"}
+    swaps = [(a, b) for a in wants for b in wants if a < b and a[1] == b[1] and wants[a][0] == wants[b][1]
+             and wants[b][0] == wants[a][1]]
+    for cls in CLASSES[1:]:                 # a large SSE function has thousands of XMM pairs: list the first few
+        n = [p for p in swaps if p[0][1] == cls]
+        if len(n) > 12:
+            print("# %s: %d swap pairs, the first 12 listed" % (cls, len(n)))
+            swaps = [p for p in swaps if p[0][1] != cls] + n[:12]
     for a, b in swaps:
         print("swap: %s (%s, wants %s) <-> %s (%s, wants %s): try rasim need ... '%s>%s' or '%s>%s'" % (
-            a, wants[a][0], wants[a][1], b, wants[b][0], wants[b][1], regs_name(a), regs_name(b), regs_name(b),
-            regs_name(a)))
+            a[0], wants[a][0], wants[a][1], b[0], wants[b][0], wants[b][1], regs_name(a[0]), regs_name(b[0]),
+            regs_name(b[0]), regs_name(a[0])))
     return rows
 
 

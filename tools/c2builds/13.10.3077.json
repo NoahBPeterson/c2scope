@@ -1,0 +1,594 @@
+{
+ "version": "13.10.3077",
+ "c2_sha256": "bcd28f39b1798b07989c30a1df471cf87fc20e3802d130901a08f83800e6b81e",
+ "image_base": "10700000",
+ "patch": {
+  "cave_rva": "165d50",
+  "text_vsize": "164d47",
+  "entry_rva": "b240",
+  "iat_loadlibrarya": "166144"
+ },
+ "dll": {
+  "regname": "10867e20",
+  "opname": "108743a8",
+  "opcount": "24a",
+  "blk": "18",
+  "len": "16",
+  "mem": "2c"
+ },
+ "functions": {
+  "@FPSpillWorthless@12": [
+   "10b32",
+   590,
+   "high",
+   "sig 1.00 from 6030 rva 10c46"
+  ],
+  "@FPSpillcosts@8": [
+   "1128c",
+   176,
+   "high",
+   "calls 1.00 from 6030 rva 113a0"
+  ],
+  "@FPColor@4": [
+   "1133c",
+   454,
+   "high",
+   "sig 1.00 from 6030 rva 11450"
+  ],
+  "@FPAddToPriorityList@8": [
+   "118e8",
+   248,
+   "high",
+   "calls 1.00 from 6030 rva 119fc"
+  ],
+  "@FPCheckColorability@12": [
+   "12541",
+   1032,
+   "high",
+   "calls 1.00 from 6030 rva 12652"
+  ],
+  "@HandleCurrUncolorable@8": [
+   "22cbb",
+   261,
+   "high",
+   "calls 0.95 from 6030 rva 101b42"
+  ],
+  "@RegSpill@12": [
+   "24766",
+   630,
+   "high",
+   "sig 1.00 from 6030 rva 24966"
+  ],
+  "@RegFixConflict@8": [
+   "24a09",
+   96,
+   "high",
+   "sig 1.00 from 6030 rva 24c09"
+  ],
+  "@dop2_PreLowerGlobalOpts@4": [
+   "5f923",
+   414,
+   "high",
+   "calls 0.99 from 6030 rva a2881"
+  ],
+  "@dop2_Codegen@4": [
+   "70532",
+   305,
+   "high",
+   "calls 0.96 from 6030 rva 995af"
+  ],
+  "@dop2_CodegenUpdate@4": [
+   "74f92",
+   432,
+   "high",
+   "calls 0.99 from 6030 rva 9ba53"
+  ],
+  "@RegSimpleAssign@4": [
+   "75782",
+   229,
+   "medium",
+   "calls 0.51 from 6030 rva 9bd18"
+  ],
+  "@RegAssign@8": [
+   "75acc",
+   313,
+   "high",
+   "calls 1.00 from 6030 rva 9c134"
+  ],
+  "@dop2_CodegenFinish@4": [
+   "75efd",
+   83,
+   "high",
+   "sig 1.00 from 6030 rva 9ce0e"
+  ],
+  "@CmdSetNextPos@8": [
+   "7687e",
+   27,
+   "high",
+   "sig 1.00 from 6030 rva 9c388"
+  ],
+  "@dop2_GlobalRegAlloc@4": [
+   "7c08e",
+   129,
+   "high",
+   "sig 1.00 from 6030 rva a5471"
+  ],
+  "@Globregs@4": [
+   "7c367",
+   470,
+   "high",
+   "calls 0.99 from 6030 rva a54f2"
+  ],
+  "@GrgIdentifyCandidates@4": [
+   "7c5ac",
+   214,
+   "high",
+   "sig 1.00 from 6030 rva a3185"
+  ],
+  "@dop2_PostLowerPreRegAllocGlobalOpts@4": [
+   "7c937",
+   122,
+   "high",
+   "sig 1.00 from 6030 rva a56c8"
+  ],
+  "@FgEarlyTailDup@4": [
+   "7dfd0",
+   241,
+   "high",
+   "sig 1.00 from 6030 rva a61d6"
+  ],
+  "@Color@4": [
+   "821a7",
+   388,
+   "high",
+   "calls 1.00 from 6030 rva a8969"
+  ],
+  "@Spillcosts@12": [
+   "82473",
+   1285,
+   "high",
+   "calls 1.00 from 6030 rva a926d"
+  ],
+  "@SpillObvious@16": [
+   "82978",
+   42,
+   "high",
+   "calls 0.99 from 6030 rva a9d71"
+  ],
+  "@InsertInList@8": [
+   "82b26",
+   56,
+   "high",
+   "sig 1.00 from 6030 rva a9e17"
+  ],
+  "@ChoosePhysReg@12": [
+   "833f2",
+   668,
+   "medium",
+   "calls 0.88 from 6030 rva aab62"
+  ],
+  "@InsertSplitPoints@28": [
+   "8368e",
+   193,
+   "high",
+   "calls 1.00 from 6030 rva aa78f"
+  ],
+  "@OrderGlobregs@12": [
+   "8482f",
+   94,
+   "high",
+   "sig 1.00 from 6030 rva ac06a"
+  ],
+  "@RegBuildGlobalConflict@4": [
+   "859fc",
+   117,
+   "high",
+   "sig 1.00 from 6030 rva ac819"
+  ],
+  "@RegResetRegMap@4": [
+   "85a71",
+   56,
+   "high",
+   "sig 1.00 from 6030 rva ac8d1"
+  ],
+  "@Schedule@8": [
+   "8734c",
+   132,
+   "high",
+   "calls 0.98 from 6030 rva b1009"
+  ],
+  "@SpillOrDefer@12": [
+   "896c5",
+   80,
+   "high",
+   "sig 1.00 from 6030 rva b3eda"
+  ],
+  "@InsertByBenefit@8": [
+   "8a35c",
+   61,
+   "high",
+   "sig 1.00 from 6030 rva 6017e"
+  ],
+  "@InsertNewGlobregs@8": [
+   "8ba60",
+   87,
+   "high",
+   "calls 1.00 from 6030 rva 63e49"
+  ],
+  "@FgCoalesceLabels@4": [
+   "afe57",
+   50,
+   "high",
+   "sig 1.00 from 6030 rva 978a4"
+  ],
+  "@EncEmitFunc@4": [
+   "b0bf4",
+   607,
+   "medium",
+   "calls 0.88 from 6030 rva 9e17c"
+  ],
+  "@EncSetOffsets@12": [
+   "b11b0",
+   155,
+   "high",
+   "calls 0.94 from 6030 rva 9ec90"
+  ],
+  "@Encode@4": [
+   "b1556",
+   193,
+   "medium",
+   "calls 0.84 from 6030 rva 9f730"
+  ],
+  "@dop2_EncodeAndRelated@4": [
+   "b17d3",
+   142,
+   "medium",
+   "calls 0.63 from 6030 rva 9e3dd"
+  ],
+  "@dop2_PreEncode@4": [
+   "b2969",
+   233,
+   "high",
+   "calls 0.97 from 6030 rva 9dd1f"
+  ],
+  "@dop2_FinalFlowOpts@4": [
+   "b48c0",
+   154,
+   "high",
+   "sig 1.00 from 6030 rva aea6e"
+  ],
+  "@FgCodeMotion@4": [
+   "b4b22",
+   355,
+   "high",
+   "sig 1.00 from 6030 rva b016b"
+  ],
+  "@SchSelectInstrs@4": [
+   "b4f08",
+   112,
+   "high",
+   "sig 1.00 from 6030 rva b050d"
+  ],
+  "@SchAddToReadyList@4": [
+   "b5309",
+   47,
+   "high",
+   "sig 1.00 from 6030 rva b049a"
+  ],
+  "@SchSchedGraph@4": [
+   "b5338",
+   433,
+   "high",
+   "sig 1.00 from 6030 rva b0b9b"
+  ],
+  "@SchComputeStaticPriority@4": [
+   "b550a",
+   122,
+   "high",
+   "sig 1.00 from 6030 rva b0da6"
+  ],
+  "@MscClean@4": [
+   "b5aa6",
+   258,
+   "high",
+   "sig 1.00 from 6030 rva b03a0"
+  ],
+  "@MdmSuperHack@4": [
+   "b5dbb",
+   460,
+   "high",
+   "sig 1.00 from 6030 rva b19b3"
+  ]
+ },
+ "probes": {
+  "10782a5e": "@Color@4+pop",
+  "10783491": "@ChoosePhysReg@12+cand",
+  "107828eb": "@Spillcosts@12+blkend",
+  "10782919": "@Spillcosts@12+died",
+  "10783a45": "@Spillcosts@12+liveref",
+  "10783a6f": "@Spillcosts@12+livethru",
+  "1078b023": "@Color@4+splitrm",
+  "10784b8f": "@ChoosePhysReg@12+nbr",
+  "107aa2bd": "@ChoosePhysReg@12+nbrpref",
+  "1078341f": "@ChoosePhysReg@12+avail",
+  "1078c062": "@ChoosePhysReg@12+pref",
+  "107881e4": "@ChoosePhysReg@12+partner",
+  "10782b2c": "@InsertInList@8+6",
+  "107a855a": "@Spillcosts@12+pref21",
+  "1078a296": "@Spillcosts@12+pref22",
+  "1078c812": "@Spillcosts@12+pref23",
+  "1073f31e": "@Spillcosts@12+pref24",
+  "107a8c74": "@Spillcosts@12+pref25",
+  "107827b1": "@Spillcosts@12+pref26",
+  "107113d9": "@FPColor@4+pop",
+  "107113ed": "@FPColor@4+kept",
+  "107eb9c5": "@FPColor@4+split",
+  "10710bbc": "@FPSpillWorthless@12+drop",
+  "107b5546": "@SchComputeStaticPriority@4+edge",
+  "107965d3": "@RegBuildGlobalConflict@4+ev8",
+  "10789ec0": "@RegBuildGlobalConflict@4+ev9",
+  "10785931": "@RegBuildGlobalConflict@4+ev10",
+  "10786774": "@RegBuildGlobalConflict@4+ev11",
+  "10786651": "@RegBuildGlobalConflict@4+ev12",
+  "107874f8": "@RegBuildGlobalConflict@4+ev13",
+  "1078656d": "@RegBuildGlobalConflict@4+ev14"
+ },
+ "globals": {
+  "_CurFunc": "10881d74",
+  "_RegName": "10867e20",
+  "weights": "10880680",
+  "_NextIntPos": "108a7d0c",
+  "_IntPhysRegs": "108a9738",
+  "_RegSym": "108a97a4",
+  "_SCHED_ccc": "108a8018",
+  "_issueArray": "108a802c",
+  "_OpSchedInfo": "108a7db8",
+  "_Speed": "108a9208",
+  "_RegMap": "108a74f0",
+  "_regAvail1": "108a7b1c"
+ },
+ "hooks": {
+  "default": [
+   "@Color@4=s1",
+   "@Spillcosts@12=s1,s2,s3"
+  ],
+  "regs": [
+   "@Color@4=g10881d74>0>0>4$,g10881d74>0>0x38,g10881d74>0>8>0>0x1c%",
+   "@OrderGlobregs@12=s1",
+   "10782a5e=ebp,ebp>0xc,ebp>0x40,ebp>0x24,ebp>0x44,ebp>0x1c,ebp>0>0x1c,ebp>0>4,ebp>0>0>4$,ebx",
+   "@ChoosePhysReg@12=s1/xa1,a1>0x10>0x1c~10867e20$",
+   "10783491=esi~10867e20$,esi~10880680",
+   "@SpillOrDefer@12=ecx",
+   "@HandleCurrUncolorable@8=ecx",
+   "@Spillcosts@12",
+   "107828eb=eax,ebp,s8",
+   "10782919=eax,eax>0x18,edx,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "10783a45=eax,eax>0x18,edx,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "10783a6f=eax,edx,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "1078b023=ecx",
+   "10784b8f=edi,edi>0x1c,edi>0x20>0>0,edi>0x20>0>8,edi>0x20>0>4>8,edi>0x40,edi>0x10,edi>0>0>4$,edi>0>0x1c,edi>0>4",
+   "107aa2bd=edi,esi>4>0x1c,esi>8",
+   "1078341f=s8,s8>0x1c,s8>0x20>0>0,s8>0x20>0>8,s8>0x20>0>4>8",
+   "1078c062=eax>4>0x1c,eax>8",
+   "107881e4=esi,esi>0x1c,esi>0x10",
+   "@InsertInList@8=eax,eax>0x1c,eax>0x20>0>0,eax>0x20>0>8,eax>0x20>0>4>8,eax>0x40,eax>0x38>4>0x1c,eax>0x38>8,eax>0x38>0>4>0x1c,eax>0x38>0>8,eax>0x38>0>0>4>0x1c,eax>0x38>0>0>8",
+   "10782b2c=eax,eax>0x38>0>0>0>4>0x1c,eax>0x38>0>0>0>8,eax>0x38>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>8,eax>0x38>0>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>0>8,eax>0x38>0>0>0>0>0>0>4>0x1c,eax>0x38>0>0>0>0>0>0>8",
+   "@InsertByBenefit@8",
+   "107a855a=edi,edi>0x1c,esi>0x10>0x1c,esi,esi>4,esi>0x1c,edi>0x10",
+   "1078a296=edi,edi>0x1c,esi>0x10>0x1c,esi,esi>4,esi>0x1c,edi>0x10",
+   "1078c812=edi,edi>0x1c,esi>0x1c,esi,esi>4,esi>0x1c,edi>0x10",
+   "1073f31e=esi,esi>0x1c,ebp>0x10>0x1c,ebp,ebp>4,ebp>0x1c,esi>0x10",
+   "107a8c74=ebx,ebx>0x1c,ebp>0x10>0x1c,ebp,ebp>4,ebp>0x1c,ebx>0x10",
+   "107827b1=ebx,ebx>0x1c,ebp>0x1c,ebp,ebp>4,ebp>0x1c,ebx>0x10",
+   "107113d9=edi,edi>0xc,edi>0x40,edi>0x24,edi>0x44,edi>0x1c,edi>0>0x1c,edi>0>4,edi>0>0>4$",
+   "107113ed=edi",
+   "107eb9c5=edi",
+   "10710bbc=esi,esi>0xc,esi>0x40,esi>0x24,esi>0x44,esi>0x1c,esi>0>0x1c,esi>0>4,esi>0>0>4$"
+  ],
+  "il_spec": "=g10881d74>0>0>4$,g10881d74>0>8>0>0x1c%",
+  "il_default": [
+   "@dop2_PreLowerGlobalOpts@4",
+   "@dop2_Codegen@4",
+   "@dop2_PostLowerPreRegAllocGlobalOpts@4",
+   "@FgEarlyTailDup@4",
+   "@Globregs@4",
+   "@Color@4",
+   "@dop2_CodegenUpdate@4",
+   "@dop2_CodegenFinish@4",
+   "@dop2_FinalFlowOpts@4",
+   "@FgCodeMotion@4",
+   "@FgCoalesceLabels@4",
+   "@dop2_PreEncode@4",
+   "@MscClean@4",
+   "@MdmSuperHack@4",
+   "@dop2_EncodeAndRelated@4",
+   "@EncEmitFunc@4"
+  ],
+  "sched": [
+   "@Schedule@8=g10881d74>0>0>4$,g10881d74>0>8>0>0x1c%",
+   "@SchSchedGraph@4=g108a8018>0",
+   "@SchAddToReadyList@4=ecx>0x1c,ecx>0x28,ecx>0x34,ecx>0x20,ecx>0x3c,ecx>0x30,g108a8018>0,ecx>0x38,ecx>0x1c>4",
+   "@SchSelectInstrs@4=g108a8018>0/xeax,g108a8018>0,g108a802c>0>0x1c,g108a8030>0>0x1c,g108a8034>0>0x1c",
+   "@MdmSuperHack@4=g10881d74>0>0>4$,g10881d74>0>8>0>0x1c%",
+   "107b5546=esi>0x1c,eax>0xc>0x1c,eax>0x14,eax>0x10,esi>0x38"
+  ],
+  "scratch": [
+   "@RegSimpleAssign@4=g10881d74>0>0>4$",
+   "@RegAssign@8=s1>0x1c>0x1c,g108a7d0c>0>0~10867e20$,s2,s2!/xeax>0x1c~10867e20$,a1>0x1c>0x30>0x1c~10867e20$",
+   "@CmdSetNextPos@8=eax",
+   "@Encode@4=g10881d74>0>0>4$,g10881d74>0>8>0>0x1c%"
+  ],
+  "scratch_x": [
+   "@RegSimpleAssign@4=g10881d74>0>0>4$,g108a9208>0",
+   "@RegAssign@8=s1>0x1c>0x1c,g108a7d0c>0>0~10867e20$,s2,s2!,s1>0x1c,s1>8,s1>0x1c>4,s1>0x1c>0x30>0x1c,g108a74f0#9,g108a7b18#9,g108a7d0c>0>0/xeax>0x1c~10867e20$,a1>0x1c>0x30>0x1c~10867e20$,eax>0x1c,g108a7d0c>0>0,a1>0x1c>0x30>0x1c",
+   "@CmdSetNextPos@8=eax,ecx",
+   "@Encode@4=g10881d74>0>0>4$,g10881d74>0>8>0>0x1c%",
+   "@RegResetRegMap@4=eax>0x18",
+   "@RegSpill@12",
+   "@RegFixConflict@8=s2",
+   "@RegBuildGlobalConflict@4",
+   "107965d3=esi",
+   "10789ec0=esi",
+   "10785931=ebx",
+   "10786774=edi",
+   "10786651=edi",
+   "107874f8=eax",
+   "1078656d=ebx>0x1c"
+  ]
+ },
+ "opnames": {
+  "24a": "OPILLEGAL",
+  "24b": "OPICONST",
+  "24d": "OPFCONST",
+  "24f": "OPREG",
+  "250": "OPLOCAL",
+  "252": "OPBASED",
+  "253": "OPINDEXED",
+  "254": "OPLOCALSCALED",
+  "255": "OPSCALED",
+  "256": "OPSYMOFF",
+  "258": "OPSEGOFF",
+  "259": "OPEXTERNAL",
+  "25a": "OPINTERNAL",
+  "25b": "OPLABOFF",
+  "25d": "OPFRAMESIZE",
+  "25e": "OPREGSET",
+  "25f": "OPSYMSET",
+  "263": "OPASSIGN",
+  "264": "OPLOAD",
+  "266": "OPCONVERT",
+  "269": "OPPAREN",
+  "26a": "OPENTERLOAD",
+  "26b": "OPEXITSAVE",
+  "26d": "OPHARDINTRIN",
+  "26e": "OPLEA",
+  "271": "OPMBARG",
+  "272": "OPMBASSIGN",
+  "274": "OPRET",
+  "275": "OPPHI",
+  "277": "OPINLINEARGS",
+  "278": "OPADD",
+  "279": "OPSUB",
+  "27a": "OPMUL",
+  "27c": "OPSHL",
+  "27d": "OPAND",
+  "27e": "OPOR",
+  "27f": "OPXOR",
+  "283": "OPSHR",
+  "288": "OPCMP",
+  "28f": "OPSPADJUST",
+  "290": "OPCALL",
+  "291": "OPBRANCH",
+  "292": "OPGOTO",
+  "293": "OPCATCHRET",
+  "294": "OPFINALLYCALL",
+  "296": "OPSCOPEGOTO",
+  "298": "OPONERROR",
+  "299": "OPEXITGOTO",
+  "29b": "OPSWITCH",
+  "29c": "OPSCOPEEXIT",
+  "29d": "OPQUESTION",
+  "29e": "OPINTRINSIC",
+  "29f": "OPTUPLIST",
+  "2a0": "OPASM",
+  "2a1": "OPTRY",
+  "2a4": "OPFINALLYEND",
+  "2ab": "OPSIDEEFFECT",
+  "2ac": "OPSCOPEINDEX",
+  "2ad": "OPPUSHSTATE",
+  "2ae": "OPPOPSTATE",
+  "2af": "OPDTORACTION",
+  "2b1": "OPEHTRY",
+  "2b2": "OPCATCH",
+  "2b3": "OPEHENDTRY",
+  "2b4": "OPEHRET",
+  "2b5": "OPNEWSTATE",
+  "2b7": "OPARGPLACE",
+  "2b9": "OPCORRETHROW",
+  "2bc": "OPCOMOBJECT",
+  "2bf": "OPASSUME",
+  "2c0": "OPASSUMEEXPR",
+  "2c1": "OPPROBE",
+  "2c3": "OPLABEL",
+  "2c4": "OPBLOCK",
+  "2c5": "OPENTRY",
+  "2c6": "OPEXIT",
+  "2c7": "OPSPLITPOINT",
+  "2c8": "OPPROLOGEND",
+  "2c9": "OPEPILOGSTART",
+  "2cb": "OPBLKEND",
+  "2d0": "OPUSERLABEL",
+  "2d1": "OPSEGMENT",
+  "2d3": "OPUSERSTATEMENT",
+  "2d4": "OPDEADCATCHRET",
+  "24c": "OPSCONST",
+  "24e": "OPTEXT",
+  "251": "OPGLOBAL",
+  "257": "OPSYMSEG",
+  "25c": "OPPCREL",
+  "260": "OPARG",
+  "261": "OPOUTARG",
+  "262": "OPMGDCONVERT",
+  "265": "OPSTORE",
+  "267": "OPNOT",
+  "268": "OPNEG",
+  "26c": "OPHASH",
+  "276": "OPRHO",
+  "27b": "OPMULHI",
+  "280": "OPDIV",
+  "281": "OPREM",
+  "282": "OPDIVREM",
+  "289": "OPEQ",
+  "28a": "OPNE",
+  "28b": "OPLT",
+  "28c": "OPGT",
+  "28d": "OPLE",
+  "28e": "OPGE",
+  "295": "OPFINALLYRET",
+  "297": "OPSCOPEEXITGOTO",
+  "29a": "OPLEAVE",
+  "2a2": "OPTRYEND",
+  "2a3": "OPFINALLY",
+  "2a5": "OPEXCEPT",
+  "2a6": "OPEXCEPTEND",
+  "2a7": "OPFILTERSTART",
+  "2a8": "OPFILTER",
+  "2a9": "OPFILTEREND",
+  "2aa": "OPKILLREGS",
+  "2b0": "OPDTOREND",
+  "2b6": "OPSETSTATE",
+  "2b8": "OPCORTHROW",
+  "2ba": "OPEHFINALLY",
+  "2bb": "OPEHFINALLYEND",
+  "2ca": "OPBLKSTART",
+  "2cc": "OPINLINE",
+  "2cd": "OPINTERLOCK",
+  "2ce": "OPALIGNCODE",
+  "2cf": "OPEMPTYBLOCK",
+  "2d2": "OPSTATEMENT"
+ },
+ "opsched": [
+  "108692e0",
+  "249"
+ ],
+ "regs_events": {
+  "27": [
+   "pop",
+   1,
+   null
+  ],
+  "28": [
+   "out",
+   "x87 stack"
+  ],
+  "29": [
+   "out",
+   "split"
+  ],
+  "30": [
+   "pop",
+   1,
+   "spill (worthless)"
+  ]
+ }
+}

@@ -37,6 +37,7 @@ HOOKS = [
     "@MdmSuperHack@4=%s,%s" % (NAME, IL),                                                 # 4 post-schedule IL
     "@SchComputeStaticPriority@4+0x40=esi>0x1c,eax>0xc>0x1c,eax>0x14,eax>0x10,esi>0x3c",  # 5 one DAG edge
 ]
+HOOKS = c2trace.c2build.hooks("sched", HOOKS)    # another c2 build: its own table entry (port-1310.md)
 
 
 def parse(log, funcpat):
@@ -56,7 +57,7 @@ def parse(log, funcpat):
         il_target = None
         if hk == 0 and ev == "E":
             name = v[0].strip('"')
-            cur = (name, [], [], []) if funcpat in name else None
+            cur = (name, [], [], []) if c2trace.func_match(funcpat, name) else None
             if cur:
                 funcs.append(cur)
                 il_target = cur[1]
@@ -79,6 +80,8 @@ def parse(log, funcpat):
             t, prio, hl, pn, fl, est, cyc, lu, op = [int(x, 16) if x != "?" else 0 for x in v[:9]]
             region["nodes"][t] = dict(prio=prio, ht=hl & 0xffff, lex=hl >> 16, ns=pn >> 16, np=pn & 0xffff,
                                       fl=fl & 0xff, est=est, rdy=cyc, lat=lu & 0xff, unit=lu >> 16, op=op)
+            if len(v) >= 12:      # optional (15.00 table): tuple kind/type word, kind words of the first two sources
+                region["nodes"][t]["x"] = [int(x, 16) if x != "?" else 0 for x in v[9:12]]
             region["ready"].append(t)
             region["events"].append(("add", t))
         elif hk == 3 and ev == "E" and region is not None:
@@ -192,8 +195,9 @@ def op_cost(op):
         import struct
         from image import Image
         im = Image("c2")
-        _COST = [struct.unpack("<iii", im.read(0x10cdd328 + 12 * k, 12)) for k in range(0x273)]
-    return _COST[op] if op < 0x273 else (0, 0, 0x300)
+        tbl, rows = (int(x, 16) for x in c2trace.c2build.get("opsched", ["10cdd328", "273"]))   # per build
+        _COST = [struct.unpack("<iii", im.read(tbl + 12 * k, 12)) for k in range(rows)]
+    return _COST[op] if op < len(_COST) else (0, 0, 0x300)
 
 
 def simulate_check(funcs, verbose=False):
@@ -204,6 +208,28 @@ def simulate_check(funcs, verbose=False):
     for name, pre, post, regions in funcs:
         for k, r in enumerate(regions):
             N = r["nodes"]
+            # cl 15.00 only (table key sched_delay_cmp = [cmp, test, jcc opcodes]): SchmdShouldDelayCmp keeps a
+            # cmp/test whose single successor is a jcc out of the pick while that jcc has another unissued
+            # predecessor, so the pair stays adjacent (port-1500.md)
+            dly = [int(x, 16) for x in c2trace.c2build.get("sched_delay_cmp", [])]
+            succs, preds = {}, {}
+            for ea, eb_ in ((e_[0], e_[1]) for e_ in r["edges"]) if dly else ():
+                succs.setdefault(ea, set()).add(eb_)
+                preds.setdefault(eb_, []).append(ea)       # one entry per edge: DAGNODE +0x24 counts edges
+
+            def delayed(x):
+                if not dly or N[x]["op"] not in dly[:2] or len(succs.get(x, ())) != 1:
+                    return False
+                j = next(iter(succs[x]))
+                if j not in N or N[j]["op"] != dly[2]:
+                    return False
+                xx, jx = N[x].get("x"), N[j].get("x")
+                if xx and jx and not (xx[1] >> 0 & 0xff == 1 or xx[2] & 0xff == 1):
+                    return False                           # neither of the first two sources is a register
+                if xx and jx and N[x]["op"] == dly[0] and (jx[0] >> 16 & 0x1f) not in (1, 2, 7, 8, 9, 10):
+                    return False                           # cmp: only for these jcc type codes
+                return len([p for p in preds.get(j, ()) if p in N and p and p not in issued]) != 1
+
             busy = [0, 0, 0, 0]
             ready, issued, cyc, last = [], set(), None, None
             for e in r["events"]:
@@ -226,7 +252,7 @@ def simulate_check(funcs, verbose=False):
                             return u if u not in used and busy[u] < 3 else None
 
                         cand = [x for x in pool if x and unit_ok(x) is not None and
-                                N[x]["est"] <= cyc + max(busy[unit_ok(x)], 0)]
+                                N[x]["est"] <= cyc + max(busy[unit_ok(x)], 0) and not delayed(x)]
                         n += 1
                         best = min(cand, key=lambda x: (-N[x]["prio"], N[x]["lex"])) if cand else None
                         if best != t:

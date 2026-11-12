@@ -18,7 +18,8 @@ after GlobalOptimize, just before candidate selection; `@Color@4` is allocation.
   (0x00a89680: the Y compare at lines 27 and 32). **[C]**
 - **`__forceinline` members are calls in c1xx's IL** (`OPARG this; OPCALL`). Inlining is c2's `Inline` pass,
   so everything about inlined code (its temporaries, its `this` copy) is decided in c2. **[C]** (p1 f03, f04, f08)
-- **A ternary is one `OPQUESTION` tuple**, not branches (p1 f09); `&&` is branches. **[C]** So `?:` versus `if`
+- **A ternary with two integer-constant arms is one `OPQUESTION` tuple** (p1 f09); with other arms it is
+  branches and a two-definition temporary (frontend_il.md rule 1.6); `&&` is branches. **[C]** So `?:` versus `if`
   changes the block structure the allocator later sees, and with it P and live-through terms. In 0x00a89680 the
   nested-ternary spelling lowered `center` from 74 to 62 but changed the code (127 lines), so it is no fix there.
 
@@ -95,6 +96,9 @@ The cut-over is between 24 and 28 bytes (6 → 7 dwords) for all three. A tail t
 copied with a word then a byte (3 bytes: `mov dx,[eax]` + `mov al,[eax+2]`; 6 bytes: dword + word; 9 bytes:
 2 dwords + byte). `rep movsd` makes esi and edi busy for the copy, so a struct of 28 bytes or more copied in a
 function costs two callee-saved registers (push/pop) unless they are already in use. **[C]**
+
+Correction (isel.md §10): the cut is not a byte size. At /O2 a copy is unrolled iff it needs at most 6 moves
+(dwords + one word + one byte), so 22 and 24 bytes unroll while 23 and 25 use `rep movsd`. **[C]**
 
 ## Float and int conversions (probe p9, /O2, default /arch, /fp:precise)
 
@@ -204,14 +208,102 @@ can allocate their callers differently. When a function is stuck on a register o
 right, vary the helper bodies' local bindings (reference vs direct expression) before anything else, and expect
 the original helpers to bind references to sub-objects (`T& h = *p; f(&h.x)`), as `RetainString` here did.
 
-## Applied to 0x00a89680
+## Applied to 0x00a89680 (matched)
 
-`this` has exactly 2 references in c1xx's IL (the two member calls' `OPARG`), and no c2 pass adds one before
-allocation (`il --count _this:` at every early pass). The original never reads a field of `this` (it is only
-ever copied to ecx for the two calls), so the address-temporary mechanism above cannot be what gave the
-original's `this` its extra priority. Remaining candidates: a change in how `center` reaches the two calls
-(rasim: dropping `center`'s reference in the in-loop or post-loop call block closes the gap), or declarations
-that differ from the pack's.
+The draft differed from the original only by `this` and `center` swapping esi and ebp. The function's own body
+was right. What was wrong was the **declaration of the second callee**: the pack declared it
+`__declspec(noalias)` with no body, while in the real translation unit its body was present (0x00a8a2c0 follows
+the function), and it only reads `*p0`.
+
+**Rule: a same-TU callee's body is an input to the caller's register allocation, per pointer parameter. [C]**
+c2 compiles callees first and records which pointer parameters each one writes through (the call tuple then
+carries separate def and use points-at sets, `pas47`/`pas48`, instead of one). `__declspec(noalias)` on a
+declaration means "may write through every pointer argument". A parameter the real callee only reads keeps the
+caller's address-taken local in one web across the call: here `p0` has an `OPEXITSAVE` in the entry block and no
+`OPENTERLOAD` after the second call. The instructions are the same either way (`sub ecx, [p0]` reads memory).
+
+**Which pass records the summary: `ItfSummarizeFuncInterf` 10b7f5d0 (interf.obj), in the callee's own compile.
+[C code + trace]** The full description is docs/c2/callee.md (fields, boundaries, when a summary exists, the
+stub tool `tools/calleesum.py`); it was checked here independently with `work/scratch/openq/callee*.cpp` and
+agrees:
+- It is called from `ItfBuildInterference` 10b73430, right after `ComputePointsAtSets` and
+  `ItfFlagParamsGoingGlobal`, in `dop2_InitialOptsAndSetup` (before GlobalOptimize, on the callee's IL as
+  inlining left it), when `_BottomOpt` is set and the function is not too big for reaching definitions.
+- It stores on the callee's call-graph node (function symbol `+0x88`): `+0x3c` = bit set of parameters written
+  through, `+0x40` = read through, `+0x64` = pointer not kept (bit i = i-th parameter, `this` = 0; a null
+  pointer = empty set). Trace: `-H '@ItfSummarizeFuncInterf@12=/xg10d123ac>0>0>4$,g10d123ac>0>0>0x88>0x3c>0#3,
+  g10d123ac>0>0>0x88>0x40>0#3,g10d123ac>0>0>0x88>0x64>0#3'` (the middle dword of each triple is the mask):
+  `int rd(const V*p, V*q) { return p->x + q->y; }` → written none, read 3; `void wr(V*p, const V*q) { p->x =
+  q->y; }` → 1, 2; `void w3(V*p, V*q, V*r) { r->x = p->x; }` → 4, 1; `void chain(V*p, V*q) { wr(q, p); }` → 2, 1
+  (transitive); `void M::set(V*p, const V*q) { p->x = q->y + k; }` → 2, 5 (`this` is bit 0). `const` in the
+  signature plays no part.
+- The caller's `ItfBuildCallInterf` 10b83030 (from `ComputeReachesAndAliases` 10b754a0) turns the sets into the
+  call tuple's def and use points-at sets. `il --at @GrgIdentifyCandidates@4 --grep OPCALL` on callee2.cpp:
+  `rd(&u,&v)` is `t <- .. pas22` (no def set), `wr(&u,&v)` is `pas16 <- .. pas17`, `w3(&u,&v,&w)` is `pas18 <- ..
+  pas16`; a declaration without a body, with or without `__declspec(noalias)`, is `pas9 <- .. pas9` (callee3.cpp).
+- One detail not in callee.md: for a parameter the callee only keeps (`void e4(int*p) { gp = p; }`) the node has
+  the bit set in **both** `+0x3c` and `+0x40` and clear in `+0x64`, yet the caller's call tuple neither defines
+  nor uses the local (`pas15 <-` with no use set; `int x = 5; e4(&x); return x;` is `call; mov eax, 5` with the
+  store deleted, callee5.cpp), as callee.md's "Escape" row says. So for a kept pointer the caller goes by
+  `+0x64`, not by the two bits. **[C trace; why the bits are set is I]**
+
+Why that moves the registers: priorities barely change (`this` 54, `center` 74). The longer `p0` web is still
+uncoloured when `center` is, it interferes with `center`, and esi is the last register it has left. `ChoosePhysReg`
+therefore adds 100 x benefit(p0) = 200 to esi for `center` (10b14ca7, regalloc.md §4), `center` takes ebp, and
+`this` takes esi. So the fix was the neighbour penalty, not the priority order that every earlier attempt chased.
+
+| variant (work/scratch/f3/surv) | second callee | regdiff |
+|---|---|---|
+| draft | declared `noalias`, no body | 16 |
+| `def_w` | body, writes all six pointees | 16 |
+| `w_nop0` / `match_min` | body, `*p0` read only | 0 |
+| `w_nop5` | body, `*p5` read only | 16 |
+| `def_virt` | body, `*p0`, `*mid`, `*p5` read only | 48 |
+| `decl_const`, `decl_restrict` | declaration only (`T* const*`, `__restrict`), `noalias` kept | 16 |
+
+No declaration-only spelling reproduces it; the callee needs a body in the unit, and a stub is enough if it
+writes and does not write the same pointees as the real one. `match_min.cpp` is byte-exact against the
+executable except for the three call displacements (435 bytes).
+
+How to use this: when a draft differs by registers only and calls functions that take addresses of its locals,
+read each real callee's disassembly for which pointer parameters it stores through, and give the unit a body
+with that pattern, before trying anything on the caller.
+
+What did not work, for the record (rwsweep and hand probes, about 1300 variants):
+- No expression-level rewrite moves anything: identity helpers, aliases, statement swaps, re-reads, loop
+  spellings and dead uses of `this`/`center` all compile to the draft. About 45 further constructs referencing
+  `this` either vanish before Color or leave code (surv/REPORT.md has the table). **[C]**
+- `cur = (p0 != 0) ? p0 : p0;` is not needed: reading `in->m_elements` again for `cur`, `mid` and `end` gives
+  the same code (one merged temporary, `cur` a copy of it). `cur = p0` does not. **[C]**
+- Fallout3.exe's Rich header has only plain compiler objects (ids 109/110, build 50727): no LTCG, no PGO. **[C]**
+- A store of `this` after the second call also gives the right registers (it makes `this` outrank `center`),
+  which is why the search went after priorities; it was a second way to the same assignment, not the cause.
+
+## Parentheses on float expressions (probe work/scratch/paren)
+
+A redundant pair of parentheses around a `float` or `double` expression is one `OPPAREN` tuple in c1xx's IL, and
+it survives to register allocation: `float r = (a * k + b);` has one more tuple at `Color` than the same line
+without the parentheses. Integer expressions leave nothing. Seen on 14.00, 13.10 and 15.00 (2 more tuples at
+Color on 14.00 and 15.00, 1 on 13.10 for the probe's `fb` against `fa`). **[C]**
+
+The code is usually the same (the probe's three pairs compile identically on all three compilers), but the extra
+tuple is one more node in the expression's chain for the scheduler, and it can move a neighbouring instruction:
+Mount & Blade `MissionBlocker::update_camera` (0x4f8c80, cl 13.10, 6918 bytes) became byte-exact from one pair
+around the right-hand side of a float blend, which moved a load from between two stores of an `__int64` pair to
+after them. **[C on 13.10 by the M&B project; the code effect has not been reproduced on 14.00]** So when a draft
+differs only in where a load or store sits next to float arithmetic, try the parentheses: `rwsweep --families
+paren` enumerates every site.
+
+## Delete-and-reset: guarded or not (probe work/scratch/guard)
+
+`delete[] p; p = 0;` and `if (p) { delete[] p; p = 0; }` differ in which block holds the reset store. A delete
+that runs a destructor already has the compiler's own null test, so both forms test `p` once; unguarded, the
+store sits after the join, guarded it sits inside the test (the original's `je` then jumps past the store). In
+the probe the two forms differ by 2 to 4 aligned instructions on 14.00 and 13.10. **[C]** Beyond the store's
+place, the block it is in changes which candidates count there: in Mount & Blade `Game::load_game_data`
+(0x5236f0, cl 13.10, 3172 bytes) guarding the four resets lowered one address value's priority from 47 to 43,
+below a competitor at 44, and the function became byte-exact. **[C on 13.10 by the M&B project]**
+`rwsweep --families guard` tries both directions at every site.
 
 ## Next probes
 

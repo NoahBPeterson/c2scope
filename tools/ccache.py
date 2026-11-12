@@ -15,7 +15,7 @@ from image import ROOT
 
 DIR = os.path.join(ROOT, "work", "cache")
 INC = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
-OUTPUT_OPTS = ("/fo", "/fa", "/fe", "/fd", "/fp", "/fr")
+OUTPUT_OPTS = ("/Fo", "/Fa", "/Fe", "/Fd", "/Fp", "/FR", "/Fr")      # case-sensitive: /fp:strict is codegen
 _file_hash = {}
 
 
@@ -63,7 +63,7 @@ def key(src, args, extra=()):
         rel = "<src>" if p == srcabs else p
         h.update(("%s\0%s\0" % (rel, file_sha(p))).encode())
     for a in args:
-        if a.lower().startswith(OUTPUT_OPTS) or os.path.abspath(a) == srcabs:
+        if a.replace("-", "/", 1).startswith(OUTPUT_OPTS) or os.path.abspath(a) == srcabs:
             a = a[:3].lower()
         h.update((a + "\0").encode())
     for x in extra:

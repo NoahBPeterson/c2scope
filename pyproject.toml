@@ -1,7 +1,7 @@
 [project]
-name = "c2-glassbox"
+name = "c2scope"
 version = "0.1.0"
-description = "Tracer, register-allocation model and search tools for VS2005 SP1 c2.dll"
+description = "Tracer, register-allocation model and search tools for MSVC c2.dll (13.10, 14.00, 15.00)"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time setup for the c2 glass-box tools (VS2005 SP1 c2.dll 14.00.50727.762).
+"""One-time setup for c2scope (VS2005 SP1 c2.dll 14.00.50727.762; other builds: tools/c2build.py setup --c2 BUILD).
 
 usage: uv run python setup.py --vs2005 /path/to/vs2005 [--pdb /path/to/c2.pdb] [--no-download] [--skip-tests]
 

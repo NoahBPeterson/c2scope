@@ -19,8 +19,9 @@ Read docs/c2/il.md first. It covers BLOCK, TUPLE and the pipeline. Register allo
    `RegSimpleAssignBody` (10bda210, regasg.obj) gives the short-lived expression temporaries (*tmpregs*) the
    registers that are still free. **[C]**
 2. **Globregs are coloured one at a time, in descending priority.** Equal priorities are ordered by *def
-   ordinal* (section 3.4). Within one block that means the value defined first goes first. Across blocks, the value
-   whose def is in the later block goes first. **[C]**
+   ordinal*, larger first (section 3.4). Within one block that means the value defined first goes first. Across
+   blocks, the value whose def is in the later block goes first. The rule is the same for the int, x87 and XMM
+   classes and on c2 13.10, 14.00 and 15.00 (probe `tests/data/tieorder.c`). **[C]**
 3. **Priority** (`GLOBREG.prio`, +0x0c) is computed per block (section 3.2):
    `prio = Σ_B [ cost_B(v) · P_B · w_B ]  −  Σ_{B: v live through B, not referenced} P_B · w_B`.
    - `cost_B(v)` is 2 per reference at /O2: every def and every use.
@@ -32,12 +33,20 @@ Read docs/c2/il.md first. It covers BLOCK, TUPLE and the pipeline. Register allo
    value's still-available registers, trying them in the order **eax, ecx, edx, esi, edi, ebx, ebp**
    (`_IntRegOrder` 10ce59a0). The comparison is strict, so a tie goes to the earlier register. All weights start at
    0. They are lowered by the value's own copy-preferences and raised by its uncoloured neighbours' needs
-   (section 4). **[C]**
+   (section 4). Replayed from traces, this rule gives the register of every integer colouring checked (1,500+,
+   section 4). **[C]**
 5. **A call removes eax, ecx and edx** from the available set of every globreg live across it, so call-crossing
    webs get **esi, edi, ebx, ebp, in priority order**. This is the empirical M&B rule, and it is the code. It breaks
    down only when preferences or neighbour penalties are nonzero, or when the range is split or spilled. **[C]**
 6. **Scratch temporaries at /O2 rotate eax → ecx → edx → eax**, using one cursor for the whole function in IL
    order (`_NextIntPos`). At /O1 every temporary takes the first free register, which is usually eax. **[C]**
+7. **A value is cut in two when a neighbour takes its last register**, at that neighbour's colouring, not when its
+   own turn comes (3.6.4). **A value whose register would save nothing** (benefit <= 0: one use behind a reload, most
+   constants) is moved behind everything else; when its turn comes again it is spilled if it lives in one block
+   or has no load/store at its range ends, and otherwise cut into block-sized pieces together with the other
+   such values (3.6.2). A value with fewer than two references never gets a register (3.6.7). `rasim check
+   --predict` makes each of these decisions as c2 does on every traced function so far (3.6.8); what the pieces
+   of a cut look like is still taken from the trace. **[C]**
 
 ---
 
@@ -209,6 +218,7 @@ Spillcosts walks blocks in block-list order (FUNC+8). In each block it walks ins
 - **Pressure** P_B = the number of distinct globregs of this class referenced in B. This counts the ones that died
   in B, the live-out ones referenced in B, and immediate-candidate globregs (traced: an extra globreg of sym kind
   0xd, the constant of `cmp gx,0`, was counted) (10b113cf..10b11484).
+  Which constants are candidates and which blocks reference them: docs/c2/immcand.md.
 - **At the end of B** (10b11484..10b114e8):
   - Every globreg referenced in B gets `prio += blkcost·(P_B·w)`, then `blkcost = 0`.
   - Every globreg live through B but not referenced in it gets `prio -= P_B·w`. Under PGO it gets `prio -= w`.
@@ -229,6 +239,13 @@ and what the trace shows; in every case the two agree.
 | t6.c: `if (gx) { 6 × g(a) }`, then `g(b)×2, g(c), g(d)` | (4,1) (1,1) (3,1) | a = 8+12 = 20, b = 8−1+12 = 19, c = d = 8−1+6 = 13 |
 | t1.c: `do { g(a); g(a); } while (gx);` | (4,1) (1,1) (2,2) (0,1) (3,1) | a = 8−1+16 = 23, b = 8−1−4+18 = 21, c = d = 9 |
 | t1.c at /O1 | w = 1 everywhere | a's benefit = 6 (no loop weight) |
+
+**A web that is split is re-costed at the pressure of the later pass; one that is not keeps its first
+priority.** The pieces of a split are new globregs, so they raise P in their blocks, and each piece's priority is
+its cost times that larger P. A value that crosses a call in a class whose registers the call kills (x87: all of
+GF0..GF7) is split before the first pop, so each of its pieces outranks a never-split value of the same cost in
+the same block. Traced: `work/scratch/x87life/mini.c` `m2` (10 → 12 and 8 as P goes 1 → 2); Spore RotateSH (P 671 →
+1108). x87.md §10 has the consequences for float code. **[C]**
 
 ### 3.3 Interference and available sets **[C for the set operations; I for some event names]**
 
@@ -252,7 +269,11 @@ while the globreg itself is being coloured.
      is a copy (`mov`, `movss`/`movsd`/`movaps`/`movapd`/`movdqa`/`movq`, opcodes 1, 0x125, 0x189, 0x11f, 0x17f,
      0x181, 0x1fd) from the current globreg. This is the Chaitin copy exception.
    - After the choice, `UpdateAffectedGlobregs` 10b15470 clears the chosen register from the `avail` of every
-     member of `nbrs` (10b155xx loop). **[C]**
+     member of `nbrs` (10b155xx loop). **[C code and trace, section 4]** This is the only thing that changes an
+     avail set between two Spillcosts passes, apart from RestrictToReg (4.4).
+   - The neighbour list is recorded per colouring by `regs --export` (`pops[].choice.nbrs`). A split piece made
+     in a later pass starts with an avail set that already lacks the registers of its coloured neighbours
+     (item 3: Spillcosts subtracts the registers live at its defs). **[C trace]**
    - A neighbour whose avail becomes empty is folded away (`FoldAwaySplitGlobreg` 10b19ed0), recalculated
      (`TryToRecalc` 10b1a180), or split (`InsertAdditionalSplits` 10b15d50). **[C calls]**
 5. **Copy coalescing before colouring.** `SubsumeGlobregs` 10b0fdb0 merges `mov x, y` pairs where a side has a
@@ -276,6 +297,30 @@ while the globreg itself is being coloured.
   `rasim check` with these rules: 29/29, 69/69 and 69/69 pops on the three Fallout 3 snapshots, 2546/2548 on the
   26k-instruction synthetic (work/scratch/big/b250.c). **[C]**
 
+**One rule for every register class and every build. [C]** There is one list and one insert routine per Color
+run; the class only selects which globregs are in it. The compare is the same instruction sequence in all three
+c2 builds: `cmp new.prio, cur.prio; jg` (signed), then on equal prio `cmp new.defOrd, cur.defOrd; jae` (unsigned):
+14.00 `InsertInList` 10b11986..10b11992, 15.00 51063f16..51063f22, 13.10.3077 10782b41..10782b54 (`jb` to the
+walk, the same test). 13.10 colours x87 values through FPColor, whose list is built by `FPAddToPriorityList`
+107118e8; its compare is the same pair (1071196b..10711981: `jg`, then `jae` on +0x44). So **among equal
+priorities the larger defOrd is popped first**, for int, x87 (GFx) and XMM values alike. What "larger defOrd"
+means in source terms is below. Outside this order: webs with benefit ≤ 0, which are deferred and re-queued by
+`InsertByBenefit` (3.5).
+
+Probe `tests/data/tieorder.c` (`uv run tools/c2trace.py regs tests/data/tieorder.c --all-classes [--c2 13.10|15.00]
+[-- /arch:SSE2]`), pops in order as `name prio/def`; identical on 14.00, 15.00 and 13.10 except where noted:
+
+| Function | Class | Pops (prio/def) | Shows |
+|---|---|---|---|
+| `ti_blk` | int | a 18/32, b 18/28, c 18/24 → esi, edi, ebx | one block: earlier def = larger defOrd = first |
+| `ti_xblk` | int | b 12/34, a 12/13, c 12/9 | across blocks: the def in the later block first |
+| `tf_blk` | x87 | a 18/16, b 18/13, c 18/10 → GF0, GF1, GF2 (13.10, FPColor: a 6/16, b 6/13) | the same within a block |
+| `tf_xblk` | x87 | b 12/23, a 12/11, c 12/8 (13.10: no tie, FPColor's priorities are 6, 5, 5: a 5/11 before c 5/8) | the same across blocks |
+| `tf_blk` with `/arch:SSE2` | XMM | the two tied values: 30/16 then 30/13 → xmm1, xmm2 | the same for class 6 |
+
+The XMM class has no cross-block tie in this probe (its copies give the values different reference counts); the
+rule there rests on the shared code and the in-block tie. **[C code; I for an XMM cross-block trace]**
+
 **defOrd** (+0x44) is written by `RewriteAsGlobregs` 10b5ae50:
 
 - A counter starts at 0 per function and is incremented once per instruction (10b5b04c).
@@ -297,7 +342,7 @@ Consequences, each tested with the tracer and the listing **[C]**:
 ### 3.5 Deferral, spilling, splitting **[C structure]**
 
 - **benefit ≤ 0** → `SpillOrDefer` 10b0d690.
-  - If the globreg is not restricted to a register (`RestrictToReg` 10b1b430), the first time it gets fl5 |= 0x40
+  - If the globreg is not restricted to a register (`RestrictToReg` 10b1b430, section 4.4), the first time it gets fl5 |= 0x40
     and `InsertByBenefit` 10b119f0 moves it behind the regular entries. Those deferred entries are kept in
     ascending spill-cost (+0x40) order (a newcomer goes before the first deferred entry whose cost is ≥ its own),
     with immediates (sym kind 0xd) appended at the very end. **InsertByBenefit copies the priority (+0x0c) of the
@@ -318,7 +363,268 @@ Consequences, each tested with the tracer and the listing **[C]**:
   (`InsertAdditionalSplitsOne`), or with fl5 & 0x80 (byte register) runs `CmdSpillImmedBytes`. Then it tries
   recalculation (`CanRecalc`/`TryToRecalc`).
 - Split points and the register-pressure counts behind them (`InitialSplitPoints` 10b0ded0, `InsertSplitPoints`,
-  `CmdReduceSplits` 10c24aa0) are not specified here. See section 9.
+  `CmdReduceSplits` 10c24aa0): 3.6.5 gives the structure; the exact member rule is open (section 9).
+- The decision rules, test by test, and what a model of them predicts: 3.6.
+
+### 3.6 Spill, defer or split: the decision rules **[C code; traces where stated]**
+
+This section is the rule set behind `rasim check --predict` (tools/rasim/src/predict.rs, tracer.md). 3.5 is the
+overview; here every test is the code's, with its address. "Web" means one GLOBREG record.
+
+#### 3.6.1 One pop (`Color` 10b0d33b..10b0d48b) **[C]**
+
+The head `g` of `_SortedGlobregs` is unlinked, then, in this order:
+
+| Test (first that holds) | Action |
+|---|---|
+| `g.benefit < 0`, or `g.benefit == 0` and not (`firstBlk == lastBlk` and not an immediate and `nrefs > 2` and `_Speed`) (10b0d350..10b0d376) | `SpillOrDefer(g)` (3.6.2) |
+| `g.fl5 & 4` clear and `BetterToDefer(g)` returns nonzero (10b0d388..10b0d397) | `g` is re-queued with `InsertInList` at the priority BetterToDefer wrote (3.6.3) |
+| `g.avail` is empty (10b0d3bb) | `HandleCurrUncolorable(g)`: `fl5 \|= 2`, more split points (`InsertAdditionalSplitsOne`, 3.6.5), the split set is {g} |
+| otherwise | `InsertSplitPoints` (neighbours, register pressure), `ChoosePhysReg` (section 4), `UpdateAffectedGlobregs` (3.6.4) |
+
+Each action returns a set of web numbers or null (eax, kept in esi at 10b0d489). **A non-null set starts a split
+round before the next pop** (3.6.6), provided the list is not empty (10b0d264).
+
+#### 3.6.2 `SpillOrDefer` 10b0d690 **[C]**
+
+1. **Pin** (10b0d696..10b0d6c5). If `fl6 & 1` is clear and `RestrictToReg(g)` succeeds (4.4: load cost + benefit
+   > 0 and a PREF for a register still in avail), `g` goes back to the **head** of the list with
+   `avail = {that register}` and `benefit = 1`, so the next pop colours it.
+2. **Defer** (10b0d6c6..10b0d6f8). Else, if `fl5 & 0x40` is clear and the list is not empty: `fl5 |= 0x40` and
+   `InsertByBenefit(g)`.
+3. **Spill** (10b0d6f9..10b0d723). Else, if `fl6 & 1` is clear and (`firstBlk == lastBlk` or `nEnter == 0`):
+   `Spill(g)`. The record is retired.
+4. **Cut** (10b0d724..10b0d823). Else `ForceNoAirlocks(g)` when `fl6 & 1`, `ForceSingleBlockLives(g)` otherwise;
+   `g` goes back to the head with `fl5 |= 2`. Then **every later list entry** `p` with `p.benefit <= 0`, `fl5 & 0x40`
+   set, the same immediate-ness as `g`, and (`p.fl6 & 1`, or `p` spans several blocks with `nEnter > 0`) is cut the
+   same way and gets `fl5 |= 2`. The returned set is `g` plus those entries.
+
+So a web with benefit <= 0 is looked at twice. The first time it is only moved back; the second time it is
+spilled if it lives in one block or has no enterload/exitsave, and cut into block-sized pieces otherwise.
+
+**`InsertByBenefit` 10b119f0**, node for node. `D` is the first list node with `fl5 & 0x40`:
+
+- an immediate (`sym kind 0xd`) goes to the very end;
+- no deferred node yet: the end;
+- `D` is the list head and (`g.benefit <= D.benefit` or `D` is an immediate): `g` becomes the head;
+- otherwise walk on from `D` while the node's benefit is smaller than `g`'s, stopping at an immediate or at the last
+  node; `g` goes after that node if it is not an immediate and its benefit is still smaller, else before it.
+
+In every case `g.prio` is overwritten with the priority of the node it is linked next to (10b11a24, 10b11a63):
+the deferred tail has no priorities of its own. The tail is therefore ordered by ascending benefit, immediates
+last. **[C: the model's list has the traced head at every pop of the validation set, 3.6.8; the copied priority
+is compared at every re-pop]**
+
+#### 3.6.3 `BetterToDefer` 10b19de0 and folding a queued def **[C code; traces: 9 re-queues]**
+
+Only for a web whose every reference can be folded (`fl5 & 4` clear). `CmdGetComponents` (10c24590) gives the
+globregs its def is computed from; if there are none, or `ComputeFoldLegalityAndWorth` (10b191e0) says no, or a
+component has `benefit < 1`, the web is coloured normally. Otherwise, for class 0, `prio = min(component prios) - 1`
+and the web is re-queued (10b19e60); for other classes the def is folded at once.
+
+The fold itself happens later, **while a component is being coloured**: `InsertSplitPoints` collects the defs
+`d = f(g)` in the range of the web `g` it is colouring whose dst is an uncoloured web with `fl5 & 4` clear and
+whose source `g` is not used again (`UsedAgain`, 10b14071..10b140a3), and `ProcessFoldableDefs` (10b19030, called at 10b14a52) folds each one that
+`ComputeFoldLegalityAndWorth` accepts and retires its record. Such a web disappears from the list without being
+popped. **[C: bitvect.c `SbvFreeNode`: t144 is re-queued at 13 = prio(k) - 1 and retired when k is coloured]**
+
+#### 3.6.4 After a colouring: `UpdateAffectedGlobregs` 10b15470 **[C]**
+
+`nbrs` is InsertSplitPoints' neighbour set, `S` its own split set (3.6.5, register pressure), `r` the chosen
+register.
+
+1. For every `n` in `nbrs`: `n.avail -= r`. If `n.avail` is now empty: when `n.fl5 & 4` is clear,
+   `FoldAwaySplitGlobreg(n)` (10b19ed0) may fold its def into the uses instead (then `n` leaves `S` and is
+   retired); otherwise `n` joins a set `E`.
+2. For every `m` in `S`: `fl5 |= 2`; when `m.fl5 & 4` is clear, `FoldAwaySplitGlobreg(m)`; else, if `fl5 & 8` is
+   clear and `CanRecalc`, `TryToRecalc(m)` (10b1a180).
+3. `InsertAdditionalSplits(E)` puts split points into the webs of `E` (byte-register webs separately); each gets
+   `fl5 |= 2`, a recalculation attempt, and joins `S`.
+4. `S` is returned (null if empty).
+
+**So a web is split when the colouring of a neighbour takes its last register**, at that moment, not when it is
+popped. In the traces this is the usual cause: of the split rounds of the validation set, all but two start
+this way or with a cut (3.6.8), and `HandleCurrUncolorable` (a web popped with an empty avail set) never ran.
+**[C trace; that it never runs in general is not claimed]**
+
+Other things that change a **queued** web, each seen in a trace:
+
+- **Byte-register pressure.** Where the live values that need a byte register (`fl5 & 0x80`) use up the byte
+  registers, InsertSplitPoints restricts the web it is colouring (10b147ac..10b148f3), and
+  `CmdProcessBytePressure` (10c24fe0) every other uncoloured web live there, to `_UnByteAbleRegs` (10d0dd54:
+  ebp, esi, edi) if it can use one of them; a web that cannot is cut there. **[C code and trace: stress f1, `i`
+  goes from eax edx esi edi ebx ebp to esi edi ebp before it is coloured; 128 restrictions in the sweep of 3.6.8]**
+- **A spill changes other webs' benefit.** `Spill` calls `CmdUpdateCost` (10c242d0) for each instruction that
+  loses its register operand: the other globreg in that instruction gets `benefit += w_B` when it is an immediate
+  (/O2), `+= (CmdLoadCost - CmdSubCost)·w_B` otherwise. So spilling `x` makes the constant of `cmp x, K` more
+  worth a register. **[C code and trace: at /O2 the amount was 0 for every non-immediate (534 calls) and 1, 2, 4
+  or 8, the block weight, for an immediate (32 calls); at /O1 it was 1 or 2. In src/cl/compile.cpp 7 webs were
+  popped with another benefit than they were queued with until these calls were replayed. Which instructions
+  qualify (operand flag +0x15 & 0x80, tested at 10b175c1) is read only in outline: I]**
+- **A spill can delete a def.** If the spilled web has one reference left and that is a def, the instruction is
+  deleted; the uncoloured webs it used get `fl5 |= 2` and go into `_NeedNewLives` (10d0d690)
+  (10b1784e..10b1788f). The set is looked at only at the end of a split round (10b0d327): if it is not empty,
+  another round starts at once. **[C code; trace: bitvect.c /O1 `SbvFirstBitCommon`]**
+- **Spillcosts of a later round** adds PREFs to queued webs (use-side copies are counted in every pass, 4.1).
+  It does not re-cost them.
+- `fl5 & 4` can become set while a web is queued **[C trace, one case: bitvect.c `SbvAnd` t172; cause not read]**.
+
+#### 3.6.5 Where split points go **[C structure; details I unless marked]**
+
+A split point is a pseudo-instruction (`ColMakeSplitPoint` 10b185d0, opcode 0x2f6) carrying a set of web numbers;
+`ColMakeSplitPointOne` (10b18700) adds one web to the split point at a place, creating it if needed. Six places
+make them:
+
+1. **Register pressure, in `InsertSplitPoints` 10b13460** while web `g` is coloured. It walks each block of `g`'s
+   range backwards with a count of the values that need a register at each instruction (coloured values live
+   there, plus the operands of the instruction). Where the count would pass `_MaxPhysRegs[class]`, `SpillPseudo`
+   takes values out (10b14395), and where it reaches the limit a split point is made after the
+   instruction for the uncoloured webs live across it (`ColMakeSplitPoint` at 10b146bf). Those webs are InsertSplitPoints'
+   return set `S`. `CmdReduceSplits` (10c24aa0, called at 10b14b33) then prunes the list for class 0. **[C that this is where S comes
+   from; the exact member rule is I]** In the traces `S` is mostly a subset of the neighbours that lose
+   their last register anyway. Exceptions: b250.c round 1, where 61 webs that still had a register were cut,
+   one web in v_match, and the stress file of 3.6.8.
+2. **Byte-register pressure**, same walk (3.6.4).
+3. **A web with no register**: `InsertAdditionalSplitsOne` 10b16720 (from OrderGlobregs when a web starts with an
+   empty avail set, 10b118bb; from HandleCurrUncolorable, 10b0d8f8) and `InsertAdditionalSplits` 10b15d50 (several webs at once, from
+   UpdateAffectedGlobregs). The blocks of the range where the web is present are grown into regions. For each
+   block `BlockSplitsOne` (10b16bd0) walks the instructions with the set of registers still free for the web:
+   registers of coloured webs and physical registers defined or live there are removed, a call's kill set too. A
+   reference of the web reached with an empty set gets a split point in front of it and the set starts again. A
+   successor or predecessor where the web is live joins the region while a register is still common; where none
+   is, or where two regions meet, a split point goes on the boundary. **The pieces are therefore the maximal
+   stretches over which one register is free all the way.**
+4. **`ForceSingleBlockLives` 10b1b3b0**: a split point at the top of every block of the range where the web is
+   live in (after the label). **[C]**
+5. **`ForceNoAirlocks` 10b1b280**: every enterload (0x295) of the web whose operand has bit 0x80 (an airlock
+   load) is deleted and a split point is put at the top of each neighbouring block (BLOCK+0xc list) where the
+   web is live in. **[C code; which side the list is, I]**
+6. `InitialSplitPoints` 10b0ded0, before the first Spillcosts. Not read. **[I: loop boundaries]**
+
+#### 3.6.6 The split round (`Color` 10b0d270..10b0d330) **[C]**
+
+1. `RemoveSplitGlobregs` (10b11ad0) unlinks every list node with `fl5 & 2`.
+2. `ColProcessSplitGlobregs` (10b11b20), 32 webs at a time: over the blocks that hold one of the webs it rebuilds
+   gen/kill and liveness with the split points as boundaries (`CreateGenAndKill` 10b11f30, `ComputeNewLiveness`),
+   `NewLiveRanges` (10b12480) makes one new GLOBREG per connected piece, and `RewriteSplitGlobregs` (10b12d20)
+   renames the operands and puts an OPEXITSAVE / OPENTERLOAD pair where a value crosses a split point. A piece
+   copies its parent's `defOrd`. The old records are retired.
+3. `Spillcosts` costs the pieces only, with the formulas of 3.2: a piece's enterload costs it `CmdLoadCost·w`,
+   an exitsave 2·w, so a piece that is one use behind an enterload has benefit 0. Its avail set starts full and
+   loses the registers of the coloured values live at its defs (3.3). Blocks not touched by the split are not
+   walked (a round can cost nothing: b250.c rounds 5 to 30).
+4. `SpillObvious` (3.6.7) on the pieces.
+5. `InsertNewGlobregs` (10b133e0): `fl5 |= 0x20`, `CmdSetConstraints`, `InsertInList`, in ascending web number.
+   Unlike OrderGlobregs it does not look for an empty avail set; such a piece is found when it is popped.
+6. If `_NeedNewLives` is not empty and the list is not empty, the next round starts at once.
+
+Webs that were queued and not split keep their priority and benefit (they are not re-costed).
+
+#### 3.6.7 `SpillObvious` 10b11560 **[C]**
+
+For every new web, in ascending web number:
+
+- `nrefs < 2` and (`benefit <= 0`, or `lastDef` exists and is not an OPENTERLOAD): `Spill`.
+  **[C: the test gives c2's answer for all 4,378 new webs of the validation set and 5,085 of the sweep, 3.6.8]**
+- `nrefs == 2`: `CmdSubstDef` (10c25df0). It folds the def into the use only when the def is `mov web, mem`
+  (a symbol or an indirection), the next instruction is the use, `CmdCanDirectSubstitute` accepts it and, at
+  /O2, that instruction is not opcode 0xd. Then the record is retired. In the sweep of 3.6.8 this succeeded
+  twice in 1,489 attempts.
+- anything else stays.
+
+Benefit <= 0 is **not** a reason here: a piece with two references and benefit 0 goes into the list and is
+handled by SpillOrDefer when its turn comes.
+
+#### 3.6.8 Validation: `rasim check --predict` **[C]**
+
+The model runs the loop above from each round's inputs and is compared with the trace at every decision. After
+a miss it is put back on the trace, so each decision is scored against a correct history.
+
+Validation set (`rasim check SNAP --predict`; "a/b" = a of b decisions as c2 made them):
+
+| Function | rounds | list head | branch | spill/defer kind | register | no-register sets | cut sets | split rounds | SpillObvious | state differences |
+|---|---|---|---|---|---|---|---|---|---|---|
+| eh_helpers.cpp eA | 1 | 6/6 | 6/6 | - | 6/6 | - | - | - | 6/6 | 0 |
+| eh_helpers.cpp eB | 1 | 7/7 | 7/7 | - | 7/7 | - | - | - | 7/7 | 0 |
+| e2.cpp FUN_00e0a0b0 | 4 | 29/29 | 29/29 | 3/3 | 26/26 | 3/3 | - | 3/3 | 38/38 | 0 |
+| v_match.cpp FUN_00c7e9a0 | 12 | 98/98 | 98/98 | 21/21 | 77/77 | 8/8 | 2/2 | 11/11 | 124/124 | 0 |
+| b250.c | 34 | 3933/3933 | 3933/3933 | 2573/2573 | 1360/1360 | 28/28 | 4/4 | 33/33 | 4203/4203 | 0 |
+
+Columns: *list head* = the web c2 pops is the head of the model's list; *branch* = SpillOrDefer / no register /
+colour (3.6.1); *spill/defer kind* = pin / defer / spill / cut (3.6.2); *no-register sets* = for each colouring
+after which a neighbour is left without a register, the set of those neighbours; *cut sets* = the deferred webs cut
+together; *split rounds* = traced rounds the model also starts (it starts none that c2 does not).
+
+Per round (the trace calls Spillcosts once per round; v_match was "10 rounds" by the count of passes that cost a
+block, two of its 12 cost nothing):
+
+| | round | new webs | list head | branch | spill/defer kind | register | no-reg sets | cut sets | split round starts | SpillObvious |
+|---|---|---|---|---|---|---|---|---|---|---|
+| e2 | 1 | 31 | 17/17 | 17/17 | - | 17/17 | 1/1 | - | 1/1 | 34/34 |
+| | 2 | 2 | 7/7 | 7/7 | 1/1 | 6/6 | 1/1 | - | 1/1 | 2/2 |
+| | 3 | 1 | 1/1 | 1/1 | - | 1/1 | 1/1 | - | 1/1 | 1/1 |
+| | 4 | 0 | 4/4 | 4/4 | 2/2 | 2/2 | - | - | - | 1/1 |
+| v_match | 1 | 89 | 1/1 | 1/1 | - | 1/1 | 1/1 | - | 1/1 | 89/89 |
+| | 2 | 7 | 16/16 | 16/16 | - | 16/16 | 1/1 | - | 1/1 | 7/7 |
+| | 3 | 10 | 3/3 | 3/3 | - | 3/3 | 1/1 | - | 1/1 | 10/10 |
+| | 4 | 1 | 12/12 | 12/12 | - | 12/12 | 1/1 | - | 1/1 | 1/1 |
+| | 5 | 7 | 1/1 | 1/1 | - | 1/1 | 1/1 | - | 1/1 | 7/7 |
+| | 6 | 0 | 7/7 | 7/7 | - | 7/7 | - | - | 1/1 | - |
+| | 7 | 1 | 4/4 | 4/4 | - | 4/4 | 1/1 | - | 1/1 | 2/2 |
+| | 8 | 2 | 15/15 | 15/15 | - | 15/15 | 1/1 | - | 1/1 | 2/2 |
+| | 9 | 1 | 7/7 | 7/7 | - | 7/7 | 1/1 | - | 1/1 | 1/1 |
+| | 10 | 0 | 22/22 | 22/22 | 11/11 | 11/11 | - | 1/1 | 1/1 | - |
+| | 11 | 0 | 1/1 | 1/1 | 1/1 | - | - | 1/1 | 1/1 | 2/2 |
+| | 12 | 2 | 9/9 | 9/9 | 9/9 | - | - | - | - | 3/3 |
+| b250 | 1 | 1070 | 1018/1018 | 1018/1018 | 17/17 | 1001/1001 | - | - | 1/1 | 1070/1070 |
+| | 2 | 61 | 10/10 | 10/10 | 9/9 | 1/1 | 1/1 | - | 1/1 | 61/61 |
+| | 3 | 1429 | 12/12 | 12/12 | 11/11 | 1/1 | 1/1 | - | 1/1 | 1964/1964 |
+| | 4 | 1 | 6/6 | 6/6 | 4/4 | 2/2 | 1/1 | - | 1/1 | 1/1 |
+| | 5-8 | 0 | 4/4 | 4/4 | - | 4/4 | 4/4 | - | 4/4 | - |
+| | 9 | 0 | 11/11 | 11/11 | 10/10 | 1/1 | 1/1 | - | 1/1 | - |
+| | 10-24 | 0 | 15/15 | 15/15 | - | 15/15 | 15/15 | - | 15/15 | - |
+| | 25 | 0 | 372/372 | 372/372 | 217/217 | 155/155 | 1/1 | - | 1/1 | - |
+| | 26 | 0 | 26/26 | 26/26 | 25/25 | 1/1 | 1/1 | - | 1/1 | - |
+| | 27 | 0 | 27/27 | 27/27 | 26/26 | 1/1 | 1/1 | - | 1/1 | - |
+| | 28 | 0 | 20/20 | 20/20 | 19/19 | 1/1 | 1/1 | - | 1/1 | - |
+| | 29 | 0 | 11/11 | 11/11 | 10/10 | 1/1 | 1/1 | - | 1/1 | - |
+| | 30 | 0 | 899/899 | 899/899 | 899/899 | - | - | 1/1 | 1/1 | - |
+| | 31 | 354 | 923/923 | 923/923 | 748/748 | 175/175 | - | 1/1 | 1/1 | 535/535 |
+| | 32 | 0 | 118/118 | 118/118 | 118/118 | - | - | 1/1 | 1/1 | 2/2 |
+| | 33 | 39 | 40/40 | 40/40 | 40/40 | - | - | 1/1 | 1/1 | 360/360 |
+| | 34 | 210 | 421/421 | 421/421 | 420/420 | 1/1 | - | - | - | 210/210 |
+
+How much of this is the model's own work: of the 47 split rounds above, 45 are started by a decision the model
+makes alone (a neighbour without a register: 39; a cut: 6). The other two (v_match round 6 to 7, b250 round 1 to
+2) start only because InsertSplitPoints' replayed set `S` holds webs that still had a register (1 and 61 webs).
+
+Wider sweep, every function of 15 traced compiles (257 functions; the Fallout 3 TUs e2.cpp and v_match.cpp,
+src/cl/util.cpp, compile.cpp and dos.cpp, src/c2/bitvect.c, tuple.c and misc.c, tests/data, b100.c, a
+byte-register / shift / division stress file; bitvect.c and the stress file also at /O1, the stress file also with
+/Oy-): list head 4401/4401, branch 4392/4392 (9 BetterToDefer re-queues are replayed), spill/defer kind 2054/2054
+(14 pins; ForceNoAirlocks ran 520 times, ForceSingleBlockLives 6 times), register 2338/2338, no-register sets 141/141,
+cut sets 100/100, split rounds 270/270 and none extra, SpillObvious 5085/5085. Two state differences, both the
+`fl5 & 4` case of 3.6.4. Misses found while building the model, each now a rule or a replayed input above: the
+fold of a queued def, `CmdUpdateCost`, `_NeedNewLives`, byte-register pressure, and a split round that leaves no
+piece (the web is dissolved; the round still runs).
+
+
+What the model does **not** predict, and takes from the trace (each needs the instructions, which the snapshot
+does not hold):
+
+- **the pieces of a split round**: how many, their blocks, costs, benefit, avail set, PREFs, flags (3.6.5 and
+  3.6.6 say how c2 makes them; the model does not compute them);
+- the neighbour set and copy-partner set of each colouring (3.3 item 4, 4.3);
+- InsertSplitPoints' own split set `S` (3.6.5 item 1) and the byte-pressure restrictions;
+- whether `CmdSubstDef`, `FoldAwaySplitGlobreg`, `BetterToDefer` and the fold of a queued def succeed, and
+  the priority BetterToDefer gives;
+- `CmdUpdateCost` benefit changes and `_NeedNewLives`.
+
+So the model answers "given these webs, which are spilled, deferred, pinned, cut or split, in which order, and
+when does the next round start"; it does not yet answer "what do the pieces look like after this edit".
+
+Not exercised by any trace so far: `HandleCurrUncolorable` (no web was popped with an empty avail set), a
+successful `FoldAwaySplitGlobreg` at /O2, `RestrictToReg`'s `nrefs == 3` exception, classes other than int.
 
 ---
 
@@ -329,10 +635,10 @@ Arguments: eax = `nbrs` (an SBV of uncoloured interfering globreg ids from Inser
 
 ```text
 weights[*] = 0                                                  10b14b85
-for each n in nbrs with n.benefit > 0:                          10b14bd2
+for each n in nbrs with n.benefit > 0:                          10b14bd2 (jle 10b14bd6 skips benefit <= 0)
     for each PREF p in n.prefs: if p.reg in n.avail: weights[p.reg] += p.count     10b14c2c
     if |n.avail| == 1 (the only register r):       weights[r] += n.benefit * 100   10b14ca7
-for each PREF p in gr.prefs:                       weights[p.reg] -= p.count        10b14d59
+for each PREF p in gr.prefs:                       weights[p.reg] -= p.count        10b14d59 (no avail test)
 best = none
 for r in _RegOrders[class] (eax, ecx, edx, esi, edi, ebx, ebp):                    10b14d6a
     if r in gr.avail and (best == none or weights[r] < weights[best]): best = r    10b14df1 (jge)
@@ -341,15 +647,57 @@ for blocks firstBlk..lastBlk: record best in BLOCK +0x54/+0x40/+0x44 where gr is
 for each m in _UpdatePrefsBv with m.color == 0: m.prefs[best].count += 1            (10b15152..)
 ```
 
-### 4.1 Where preferences come from (`Spillcosts`, `InsertSplitPoints`) **[C]**
+Then `UpdateAffectedGlobregs` 10b15470 clears `best` from the avail set of **every** member of `nbrs`, whatever
+its benefit. **[C trace: the avail set of every neighbour, at every later sighting, is its initial set minus the
+registers of the neighbours coloured in between; 0 exceptions in 1,500+ colourings, see the table below]**
 
-- A copy (opcodes 1, 0x11f, 0x1fd, 0x17f, 0x181, 0x125, 0x189) between an uncoloured globreg and a physical
-  register or coloured globreg adds 1 to the globreg's PREF for that register. Typical sources: `mov gr, eax` after
-  a call, `mov eax, gr` before `ret`, and arguments arriving in ecx/edx under fastcall or thiscall.
-- `lea gr, [base]` (0x12) with a base that is a register adds a preference for that register.
-- A copy between the current globreg and another *uncoloured* globreg puts the partner into `_UpdatePrefsBv`. Once
-  the current globreg is coloured, the partner gets a preference for the same register, which is coalescing by
-  preference.
+**The avail bit vector.** `GLOBREG.avail` (+0x20) points to an SBV: a list of chunks `{base, lo, hi, next}`, and
+bit *n* of the chunk with `base == n & ~0x3f` is register number *n* (2.1). The set and clear masks are the
+64-bit tables at 10cf65e8 (`1 << n`) and 10cf67e8 (read from the binary). For the integer class that is one chunk
+with base 0: 0x2 eax, 0x4 ecx, 0x8 edx, 0x10 ebx, 0x40 ebp, 0x80 esi, 0x100 edi. **[C]**
+
+**This is the whole rule. [C]** `rasim check` (tracer.md) replays it from a traced snapshot: each globreg starts
+with the avail set and preferences it has when `InsertInList` first queues it; the neighbour list and the partner
+list of each colouring are taken from the trace; everything else (every later avail set, every preference count,
+every weight, every register) is computed and compared with what ChoosePhysReg read.
+
+| Function | int colourings | register predicted | state divergences |
+|---|---|---|---|
+| tests/data/eh_helpers.cpp eA, eB, nA, nB | 6, 7, 4, 4 | all | 0 |
+| Fallout 3 0x00e0a0b0 (work/scratch/f3/rw/e2.cpp) and 16 source variants of it | 26 or 27 each | all | 0 |
+| 0x00e0a950, 0x00e0a550, 0x00e0a850 (same file) | 32, 22, 2 | all | 0 |
+| Fallout 3 0x00c7e9a0 (work/scratch/f3/pk/v_match.cpp), an EH function with 10 Spillcosts passes | 77 | 77 | 0 |
+| 26k-instruction synthetic (work/scratch/big/b250.c), 34 Spillcosts passes | 1360 | 1360 | 0 |
+
+### 4.1 Where preferences come from: `Spillcosts` **[C code and trace]**
+
+Only two places write PREF nodes: Spillcosts (six sites) and ChoosePhysReg's partner loop (4.3). Summing the
+Spillcosts events and the partner increments reproduces every PREF list seen, both when a globreg is queued and
+when it is coloured (same runs as the table above).
+
+Spillcosts walks every instruction in every pass. A copy is opcode 1, 0x11f, 0x1fd, 0x17f, 0x181, 0x125 or
+0x189; G is an **uncoloured** globreg; S is a physical register or a globreg that already has a colour (then the
+preference is for that colour).
+
+| Site | Instruction | Counted |
+|---|---|---|
+| 10b1082d | `mov G, S`, S a coloured globreg (use side) | in every pass |
+| 10b10890 | `lea G, [S]` (opcode 0x12), S a coloured globreg | in every pass |
+| 10b10c31 | `mov G, S`, S a physical register (use side) | in every pass |
+| 10b10d9c | `lea S, [G + ..]`, S a coloured globreg (def side, base of the address) | in every pass |
+| 10b10e68 | `mov S, G`, S a coloured globreg (def side) | only while G is new (`fl5 & 1`, 10b10e25) |
+| 10b11238 | `mov S, G`, S a physical register (def side) | only while G is new (10b11208), and one of: the operand has `+0x15 & 0x10` (last use **[I]**), its symbol is its own base (`sym+8 == sym`), or `NoOverlappingEnregisterableSyms` 10b1bb90 returns nonzero |
+
+Typical sources: `mov gr, eax` after a call, `mov eax, gr` before `ret`, arguments arriving in or leaving through
+ecx/edx (thiscall, fastcall).
+
+**Use-side copies are counted again in every Spillcosts pass. [C]** `fl5 & 1` is cleared by InsertInList, so the
+def-side sites fire once per globreg, but the use-side sites have no such test: each split round (a new
+Spillcosts pass, 3.1) adds 1 more for every `mov G, reg` of every globreg that is still uncoloured. Traced in
+0x00e0a0b0: `this` has ecx:3 after pass 1 (`mov this, ecx` at entry plus two `mov ecx, this` before calls) and
+ecx:4 after the split round that follows pop 17. A later pass is also where a copy with a globreg coloured in the
+meantime becomes a preference even if 4.3 did not make it one (in that same pass `t353` got ecx:1 from
+`lea t353, [t231 + ..]`, t231 having been coloured ecx at pop 12).
 
 ### 4.2 The resulting rules
 
@@ -360,8 +708,46 @@ for each m in _UpdatePrefsBv with m.color == 0: m.prefs[best].count += 1        
 - **A copy with a register moves the choice.** t3.c `__fastcall f(x, y)`: y arrives in edx and is reassigned
   `y = g(y)` (eax). Its weights are eax −1 and edx −1 (ecx is not available). eax wins the tie by order. The listing
   has `mov eax, edx` at entry. **[C trace]**
-- A value avoids a register that an uncoloured neighbour prefers: +count per preference. It strongly avoids a
-  neighbour's last remaining register: +100·benefit. **[C code; not separately probed]**
+- A value avoids a register that an uncoloured neighbour prefers: +count per preference. **[C trace]** 0x00e0a850:
+  `c` is coloured with ecx:+1 because its neighbour `this` holds ecx:1; `c` takes eax anyway (0), and `this` then
+  gets ecx at −1.
+- A value strongly avoids a neighbour's last remaining register: +100·benefit. **[C trace]** 0x00e0a0b0: `t332`
+  sees ebp:800 because two neighbours have only ebp left (`mid`, benefit 2, and `p4`, benefit 6); `dst` sees
+  ebp:600 for `p4` alone.
+- Consequence for swaps between two callee-saved registers: the value coloured first takes the earlier register
+  unless something raises that register's weight for it. A neighbour that prefers it (+1) or has nothing else left
+  (+100·benefit) is enough, because all other weights are usually 0.
+
+### 4.3 Copy partners: `_UpdatePrefsBv` **[C code; the symmetry question is I]**
+
+`InsertSplitPoints` 10b13460 fills `_UpdatePrefsBv` while it walks the range of the globreg X being coloured:
+
+- **Use side** (10b14032..10b14047): X is the source of a copy `mov Y, X` and Y is a globreg. Y is added
+  unconditionally, coloured or not (a coloured Y gets nothing: 10b15152 tests `color == 0`).
+- **Def side** (10b13939..10b139bb): X is defined by a copy `mov X, Y`. If Y is coloured it goes on a new-def list
+  instead (`ColGetNewDefList`, used by `FlagAsNotReallyLastUse*`). If Y is uncoloured it is added only when it is
+  not in the set at `[esp+0x9c]` (the set that is ORed into `nbrs` right after, so the globregs live there **[I]**),
+  or the operand has `+0x15 & 0x10` (last use **[I]**). A copy with `TUPLE+0xa & 0xfff == 1` is skipped when either
+  operand's symbol has `+0x24 & 1` (10b1394f..10b13971; meaning not identified).
+
+So for one copy the relation depends on which side is coloured first: the destination always becomes a partner of
+the source; the source becomes a partner of the destination only if it dies at the copy **[I for "dies"]**. Traces agree: of 13
+globregs listed as an uncoloured partner and coloured later, 1 listed the first one back; in 0x00c7e9a0 `local31`
+lists the already coloured `values`, while `values` (coloured first) had not listed `local31`. **[C]**
+
+A partner that is skipped here still gets the preference from the next Spillcosts pass if one runs before it is
+coloured (4.1, sites 10b1082d and 10b10e68).
+
+### 4.4 `RestrictToReg` 10b1b430: a deferred web is pinned to its preferred register **[C code, one trace]**
+
+`SpillOrDefer` 10b0d690 first calls RestrictToReg (unless `fl6 & 1`). If `CmdLoadCost(sym) + benefit > 0` and the
+web has a PREF whose register is still in its avail set, the avail set becomes that one register (the highest
+count; the list is scanned from its head and replaced only by a strictly higher count), benefit becomes 1, and
+SpillOrDefer puts the web back at the **head** of `_SortedGlobregs` (10b0d6a9), so it is popped again at once and
+coloured. One exception is not decoded: `nrefs == 3` with a `lastDef` whose opcode has bit 0x40 in table 10ce1e60
+and whose dst operand has `+0x10 == 0` (10b1b4d3..10b1b4ff) **[I]**. `regs` shows this as a `spill/defer` pop followed by a pop of the same globreg
+with a single candidate. Seen once: b250.c pop 3513/3514, an immediate with esi:1 and avail eax ecx edx esi edi
+ebx, coloured esi.
 
 ---
 
@@ -393,24 +779,140 @@ of a, b, c, d moves into, in order):
 
 ## 6. Scratch temporaries: `RegSimpleAssignBody` 10bda210 / `RegAssign` 10bda7c0 **[C]**
 
-This pass runs after Color. It walks the function's tuples in order. On each block tuple (kind 0x1a) it clears
-`_RegMap` (`RegResetRegMap` 10bdc830). For each instruction it runs `RegAssignSrcs` 10bda4a0, then
-`RegAssignDsts` 10bda5c0. The conflict sets `_BvConflicts[reg]` come from `RegBuildGlobalConflict` 10bdba20.
+This pass runs after Color and gives every tmpreg a register. There is no later renaming pass: the registers in
+the listing are these picks; the scheduler only reorders the instructions afterwards (sched.md). The whole rule
+below is replayed by `rasim scratch` (tracer.md), which predicts every integer pick of the validation set (6.5).
 
-`RegAssign` picks a register for a tmpreg in this order:
+### 6.1 The walk (`RegSimpleAssignBody`) **[C code]**
 
-1. **Preferred register** (`tmp+0x30`). It is set when the def is a copy from a register of a compatible type, or a
-   `lea` from a base register. The preferred register is taken if it is free in RegMap, available in regAvail, and
-   not conflicting (10bda7c0..10bda8a0).
-2. **/O2 (`_Speed`): round robin over eax, ecx, edx.** The scan starts at `CmdGetNextPos()` (`_NextIntPos`) and wraps
-   when the entry is 0 or greater than 3 (the scratch registers). It takes the first register that is free and not
-   in `_BvConflicts`. Then it sets `_NextIntPos` to the following entry (`CmdSetNextPos` 10c23520). The cursor is
-   reset only at function start (10bda2f0: `_NextIntPos = &_IntPhysRegs`) and at EnC 0x303 tuples.
-3. Otherwise, including always at /O1: **first fit** over `_IntPhysRegs`: eax, ecx, edx, esi, edi, [ebx], [ebp].
-4. Then first fit ignoring `_BvConflicts` but checking `TupFindDstRegInterf`. Last, spill (`RegSpill` 10bdad70) the
-   register whose next use is farthest (`RegFindPhysRegUse` 10bdacc0).
+One run per function body and one per EH unwind funclet, each starting with `_RegMap` (10d0fd10, one slot per
+register: 0 = free, else the symbol that holds it) cleared and the cursor `_NextIntPos` (10d0f854) pointing at the
+first entry of `_IntPhysRegs` (10d0cfd0, dwords 1 2 3 7 8 4 6 0 = eax ecx edx esi edi ebx ebp; ebx and ebp are
+cut off when `regAvail` 10d0f9f0 says they are taken). So **the cursor starts at eax in every run and is never
+reset inside a run** (the only other write is at EnC tuples, opcode 0x303, under `_EnC` 10d0d31c). **[C]**
+At /O2 the conflict sets are built first for the whole run by `RegBuildGlobalConflict` 10bdba20 (6.2); the EH
+funclet runs of 0x00c7e9a0 did not go through it (they take the `RegBuildConflict` 10bdb270 branch at 10bda2f0..
+10bda339; which of the three flags tested there differs for a funclet was not determined **[I]**).
 
-Tested with t4.c, `x1 = s[0]; ... x5 = s[4];`: /O2 gives eax, ecx, edx, eax, ecx. /O1 gives eax five times. **[C]**
+Then the tuples are walked in IL order:
+- a block tuple (kind 0x1a): `RegResetRegMap` 10bdc830 clears `_RegMap` and marks every register in the block's
+  live-in set (`BLOCK+0x40`) as held by itself. So nothing a temp holds survives a block boundary, and a
+  coloured variable live into the block makes its register busy from the top of the block. **[C]**
+- an instruction: `RegAssignSrcs` 10bda4a0, then `RegAssignDsts` 10bda5c0.
+  - **Sources first.** A tmpreg operand is replaced by the register `_RegMap` shows for it; if the operand carries
+    the last-use flag (operand `+0x15` bit 0x10, set by the conflict builder) the slot is freed. A coloured
+    variable's register is freed the same way at its last use (10bda510). **A register freed by a source is
+    therefore free for the destination of the same instruction**: `mov t2, [t1+8]` with t1 dying can put t2 in
+    t1's register, if the cursor points there or the other candidates are blocked. **[C code; trace: eA pick 2]**
+  - **Destinations.** A coloured variable (or a temp Color already placed) being defined marks its register busy
+    (10bda650); if a live tmpreg sits there, `RegFixConflict` 10bdc8e0 moves it. A bare physreg operand (eax
+    after a call, ecx for a shift count) is *not* entered in `_RegMap`: it is kept clear of temps by the conflict
+    sets only. A kill set (operand kind 0xb: the registers a call clobbers) calls `RegFixConflict` for every
+    register in it that a non-physreg symbol holds. A tmpreg destination not yet in `_RegMap` is one **pick**:
+    a `RegAssign` call. A tmpreg defined twice while still live is one pick. **[C code]**
+
+### 6.2 The conflict sets (`RegBuildGlobalConflict`) **[C code; the sets [C] against memory, 6.5]**
+
+`_BvConflicts[r]` (10d0fba0) is the set of tmpreg ids that must not get register r. It is built before the first
+pick, so **it does not depend on any scratch pick**, only on Color's result and the IL. Each block is walked
+backwards with P = the physregs live at this point (initially `BLOCK+0x44`, the live-out set) and T = the tmpregs
+live at this point:
+
+| event in the backward walk | effect |
+|---|---|
+| last use of temp t (first time it is met) | T += t; t joins `_BvConflicts[r]` for every r in P (10bdc440); the operand gets the last-use flag |
+| def of temp t (not also a source of the instruction) | T -= t |
+| last use of a coloured variable in r, or of a temp Color placed in r | `_BvConflicts[r]` \|= T; P += r; last-use flag (10bdc69d, 10bdc1c3) |
+| def of a coloured variable in r | P -= r (no conflict is added here) |
+| use of a bare physreg r | P += r only |
+| def of a bare physreg r | `_BvConflicts[r]` \|= T; P -= r (10bdbe42) |
+| kill set (call) containing r | `_BvConflicts[r]` \|= T; P -= r (10bdbffd) |
+| a byte-sized temp (type size 1) | joins the sets of esi, edi and ebp, and gets flag `+5` bit 0x80 |
+
+In words: a temp conflicts with r when r is live at the temp's last use, when a value in r has its last use
+while the temp is live, or when r is defined bare or clobbered by a call while the temp is live. **A temp that
+is live across a call conflicts with eax, ecx and edx**, so it can only be placed by first fit in esi/edi/ebx/ebp
+(or spilled); temps that the rotation serves are exactly those that live between two calls. Not covered by the
+table: a temp defined after a bare physreg's def and still live after that physreg's last use gets no conflict
+with it **[I, from the code; no case seen]**.
+
+The same walk sets the temp's **preferred register** (`tmp+0x30`), a register symbol or 0:
+- at the temp's def: the instruction is a copy (opcodes 1, 0x11f, 0x1fd, 0x17f, 0x181, 0x125, 0x189) from a
+  register operand of a compatible type → that register;
+- at each use, overwriting (so the *first* use in program order wins, unless the def rule fired, which runs
+  last): a copy of the temp *into* a register → that register (also one `lea` form, 10bdc593 on); otherwise 0. **[C code, no trace case]**
+
+### 6.3 One pick (`RegAssign`) **[C code, C trace]**
+
+1. **Preference.** If `tmp+0x30` is still 0, RegAssign derives it from the defining instruction, whose sources
+   have already been turned into registers: a copy from a register (same opcode list, compatible type, not esp)
+   → that register; a `lea` (opcode 0x12) whose address is base register only or base + displacement (no symbol,
+   and no index unless scale and displacement are 0) → the base register. This is how a preference follows an
+   earlier pick: `t2 = t1`, or `lea t2, [t1+8]`, prefers whatever register t1 was given. The preferred
+   register is taken when its `_RegMap` slot is free, `regAvail` is set, it is below 6 for a byte temp, and the
+   temp is not in its conflict set. **The cursor does not move.** The preferred register may be any register
+   (esi, edi: `lea t, [esi+32]` with esi's variable dying takes esi).
+2. **Rotation** (only when `_Speed` 10d0d71c, i.e. /O2). Scan from the cursor: eax → ecx → edx → eax, at most
+   three entries (the scan wraps when the next entry is 0 or ≥ 4 and stops when it is back at its start). Take the
+   first register whose `_RegMap` slot is free and whose conflict set does not hold the temp. `regAvail` is not
+   tested here. Then **the cursor is set to the entry after the register taken** (`CmdSetNextPos`; after edx:
+   eax), not to the entry after the old cursor. A skipped register is therefore not retried by the next pick.
+3. **First fit** (rotation found nothing, or /O1): eax, ecx, edx, esi, edi, [ebx, [ebp]] with the same two tests.
+   The cursor does not move.
+4. First fit ignoring `_BvConflicts` but requiring `TupFindDstRegInterf` = 0, then `RegSpill` 10bdad70 of the
+   register whose next use is farthest (`RegFindPhysRegUse` 10bdacc0). Not seen in the validation set; not
+   modelled.
+
+Float temps (type class 5) use the list at 10d0cff0 (GF0..) and the cursors 10d0f850/10d0f84c; they never move
+the integer cursor (`CmdGetNextPos`/`CmdSetNextPos` 10c234c0/10c23520 switch on the type's top nibble: 1, 2 and 6
+are the integer class). **[C code; trace: e2 picks 3-8, 22-28]**
+
+### 6.4 What this means for a decompiler
+
+A pick is a **rotation pick** when the temp has no usable preference; it gets the cursor's register unless
+that one is *forced away*, and the trace (`scratch --why`) names the reason:
+- *busy, coloured variable*: Color put a variable, or a call result, in that register and it is live here;
+- *busy, temp tN*: an earlier temp of the same block has not had its last use yet (the usual case is the
+  second and third argument of a call being computed while the first waits);
+- *conflict*: the register is free now but something will be put in it before the temp dies.
+
+Consequences, each seen in the traces **[C]**:
+- A pick with a preference taken is cursor-neutral (eA pick 3: removing it changes nothing later).
+- One more or one fewer rotation pick shifts every later rotation pick by one register **until a forced pick**:
+  a pick with only one candidate lands on it from any cursor and sets the cursor after it, so the rotation is
+  back in step. In straight-line code with all three registers free the shift runs to the end of the function
+  (the straight-line test of 6.5: 9 of 9 later picks move). In eA, removing pick 1 changes only pick 2. In 0x00c7e9a0,
+  inserting a pick before pick 7 changes nothing after it (pick 7 has the single candidate edx).
+- So to move the register at one listing offset, look for the nearest earlier pick whose candidate set has more
+  than one entry and change the number of rotation picks between the last forced pick and it; `rasim scratch
+  SNAP ins:N` / `drop:N` gives the picks that move.
+- The picks are in IL order, per block; the listing order differs (sched.md), so use the `off` column.
+
+`/O1`: `_Speed` is 0, step 2 is skipped, every pick is first fit. Tested with t4.c,
+`x1 = s[0]; ... x5 = s[4];`: /O2 gives eax, ecx, edx, eax, ecx; /O1 gives eax five times. **[C]**
+
+### 6.5 Validation **[C]**
+
+`c2trace.py scratch --export` records, per pick, `_RegMap`, `regAvail`, the cursor before and after, the
+preference before and after, and the conflict sets (rebuilt from the builder's events of 6.2). `rasim scratch`
+replays 6.3 with its own cursor and its own temp → register map:
+
+| function | runs with picks | integer picks predicted (register, kind, cursor) | float picks (not modelled) |
+|---|---|---|---|
+| tests/data/eh_helpers.cpp eA | 1 | 7 / 7 | 0 |
+| tests/data/eh_helpers.cpp eB | 1 | 6 / 6 | 0 |
+| Fallout 3 0x00e0a0b0 (work/scratch/f3/rw/e2.cpp) | 1 | 23 / 23 | 13 |
+| Fallout 3 0x00c7e9a0 (work/scratch/f3/pk/v_match.cpp) | 5 (4 funclets, body) | 63 / 63 (body 59 / 59) | 16 |
+
+No misses, so there is no miss to explain. The reconstructed conflict sets were also compared with the bits
+read from `_BvConflicts[eax/ecx/edx]` in memory at every pick: 21/21 (eA), 104/104 (e2; 4 more out of reach of the
+tracer's pointer depth), 225/225 (0x00c7e9a0). What-if answers were checked against real compiles of a
+straight-line function (three calls with three loaded arguments each, two stores between): `drop:2` predicted
+the 9 later registers of the variant with that load replaced by a constant (9/9), `ins:5` the 8 registers from
+the inserted load on in the variant with one more store (8/8). Limits: the four funclet runs have no conflict
+sets in the snapshot (one pick each); a what-if assumes the edit leaves Color's result and the other temps'
+lifetimes alone, which a real source edit often does not (replacing an argument in eA also changed which
+values Color handles).
 
 
 ## 7. Which values reach Color: the candidate rule (`GrgIdentifyCandidates`, `EnumerateSymbols`) **[C]**
@@ -429,7 +931,11 @@ and 4) and never touch the scratch cursor. **Tmpregs** are given registers after
    - its type is enregisterable (byte table 10ceb338 indexed by `TyGetIndex`) and not x87 (`type & 0xf000 !=
      0x5000`; x87 values go to FPColor);
    - its kind is not 0xa (function);
-   - globals 10d0ddac == 0, 10d0d708 != 0 and 10d07a24 == 0 (meanings not identified **[I]**).
+   - `_Wvm_flag` (10d0ddac) == 0, `_Globopt_flag` (10d0d708) != 0 and `_FWvmSafe` (10d07a24) == 0: native code
+     (not the managed/MSIL back end), global optimisation on (/Og, so /O1, /O2, /Ox; il_pipeline.md), not
+     verifiable managed code. **[C: `CgCanForceDoubleAlign` 10b06130 tests the same three addresses in this
+     order (`cmp [10d0ddac],0; jne` / `cmp [10d0d708],0; je` / `cmp [10d07a24],0; jne`) and its decompile, which
+     has the PDB names, reads `_Wvm_flag != 0 || _Globopt_flag == 0 || _FWvmSafe != 0`]**
    A call's target operand is skipped (kind 0xf with the leaf at src[0]), as is opcode 0x2d9 with +0x30 & 2.
 2. `EnumerateSymbols` 10b568f0 then gives each base symbol a candidate bit (10b56956 switch on the kind byte):
    - kind 3 (temporary): **only if `+0x14 == 0`** (no single def); otherwise it is counted as excluded;
@@ -515,11 +1021,14 @@ Agreement there is evidence that the algorithm family is the same, and a disagre
 
 1. The exact split-point rule (`InitialSplitPoints` 10b0ded0, `InsertSplitPoints` 10b13460, `CmdReduceSplits`
    10c24aa0) and when `NeedNewLives` (10d0d690) forces a recompute. Only these decide functions with more than
-   about 4 call-crossing webs.
+   about 4 call-crossing webs. 3.6.5 has the structure and 3.6.4 the `NeedNewLives` rule; what is still
+   open is the exact set InsertSplitPoints cuts under register pressure and how the pieces come out
+   (`BlockSplitsOne`), which is why `rasim check --predict` replays the pieces.
 2. Which operand set `SbvMinus` subtracts at each def (10b11093). It is presumed to be the physical registers live
    at that point.
 3. `Globregs` candidate selection: which variables become globregs, and which stay in memory or as tmpregs
    (`GrgIdentifyCandidates`, `GrgSpillCheapSyms` 10b5c160, `Enterloads`).
 4. `SubsumeGlobregs`'s exact conditions, and how coalescing changes refs and P.
-5. FPColor (x87), and the byte-register path (fl5 & 0x80, `CmdProcessBytePressure` 10c24fe0).
+5. FPColor (x87). The byte-register path (fl5 & 0x80, `CmdProcessBytePressure` 10c24fe0) is described in 3.6.4;
+   its trigger count (how many byte values are live against how many byte registers) is read only in outline.
 6. Whether cl 13.10 (M&B) has the same formula without loop weighting. This c2 cannot test that.

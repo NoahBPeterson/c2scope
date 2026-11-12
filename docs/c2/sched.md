@@ -206,9 +206,45 @@ v_gg.cpp), plain "highest (prio, -lex) with est <= cycle" 13,658 of 13,729.
 
 ## Unknown / not covered
 
-- The exact PAS interference rules behind memory disambiguation (`ItfPartialInterf`, `ItfTotalInterf`) are only
-  described by their outcomes in rule 4; arrays indexed by registers, `this`-relative members through two
-  different registers, and `volatile` were not probed.
+- **The aliasing rule behind rule 4 (when a load may cross a store), read in the code. [C code; probes where
+  named]** `DagChkMemrefRefs` 10b1d0f0 / `DagChkMemrefDefs` 10b1d2d0 add a memory edge (type 0x40) between two
+  memory operands of a region exactly when `ItfPartialInterf` 10b71f80 returns non-zero. A load never crosses a
+  call: calls are control points (rule 3), whatever they touch. `ItfPartialInterf(A, B)`:
+  - **named variable against named variable** (operand kind SYM, or a register operand that stands for one):
+    interfere iff same base symbol and overlapping byte ranges (`offset`, `offset + size` at sym+0x24/+0x20).
+    Two different globals, or two fields of one struct variable, never interfere.
+  - **dereference against named variable**: `ItfIsMemberOfPas` 10b72660 (after stack packing
+    `ItfStackLocIsMemberOfPas` 10b72930): is the variable a member of the dereference's points-at set? A
+    local or parameter whose address was never taken is in no set, so it is independent of every pointer
+    access.
+  - **dereference against dereference** (INDIR leaves; the alias class is the PAS index at leaf+0x1c, assigned
+    by `ComputePointsAtSets` before GlobalOptimize): `ItfPasInterf` 10b72990.
+    1. Either index is 2: no interference. Either index is 1, or the two are equal: interference.
+    2. Both indices are ≥ `_NextPasIndex` (these are entries of `_PASMap`, 16 bytes each: parent PAS, pointer
+       value number, size, offset; made when `_PtrValueSensitivity` is on) **and have the same pointer value
+       number**: interfere iff the byte ranges `[offset, offset+size)` overlap. This is "same base register,
+       disjoint offsets are independent" (probes n1, n3).
+    3. Otherwise each index is replaced by its parent and the two points-at sets are intersected
+       (`FbvAnyCommon` on `_PointsAtSetBvs`). No common member: no interference (after stack packing, locals
+       that share a stack slot are checked as well, `StkGetOverlayedSyms`). Two pointer parameters both
+       point at "unknown memory", so they intersect: dependent (n2, m2), with no regard to `int*` against
+       `short*` (m8).
+    4. **One exception by type:** if the sets intersect but one class is dereferenced only as floating point
+       (`ItfIndirPasIsFP` 10b7c970, table `_PasFPIndirTable`) and the other only as a pointer
+       (`ItfIndirPasIsPtr`, `_PasPtrIndirTable`; both built by `BuildPasTypeTables` 10b7c9a0), they do
+       **not** interfere. Probe `work/scratch/openq/alias.c`, where the same function serves GlobalOptimize:
+       `float x = a[0]; *b = v; return x + a[0];` with `int **b` reads `a[0]` once, after the store (`mov [ecx],
+       eax; .. fld [eax]; fadd [eax]`), and `int *x = a[0]; *b = v;` with `float *b` likewise (`fstp [eax]; mov
+       eax,[ecx]; add eax,eax`); with `int *b` and a float `a`, or `int **b` and an int `a`, the value is
+       kept and `a[0]` is reloaded after the store. **[C code + compile]**
+  - Operands flagged volatile (leaf+0x15 & 8) always get the edge, except against an INDIR of PAS 3; a
+    definition through an INDIR of PAS 2 gets no memory edges at all. What classes 2 and 3 stand for was not
+    traced (2 behaves as "aliases nothing"). **[C code, I meaning]**
+  - `ItfTotalInterf` 10b721a0 is the stronger test "B lies entirely inside A" (same symbol and range
+    containment, or two INDIRs of the same value-numbered class); `DagChkMemrefDefs` uses it for a store to a
+    named variable to stop the search at the store that fully overwrites it.
+  - Not probed: arrays indexed by registers and `this`-relative members through two different registers
+    (by the code they follow 2 and 3: same pointer value number → range test, otherwise set intersection).
 - When exactly a dependency is breakable (`SchmdDepIsBreakable`'s cases for lea/shl and the `_Speed`
   differences), and how `SchmdBreakDep` chooses which uses to rewrite.
 - The 3 selection misses: x87 regions where the first pick differs from the model (unit 2 busy or

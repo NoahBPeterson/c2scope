@@ -83,10 +83,27 @@ There are two kinds of switch at phase 2, and they take different paths. **[C]**
 
 ### 3.2 Sparse switches
 
-For widely spread values (s4: 1, 20, 77, 300, 500, 9000) c1xx emits a value split itself: `cmp 300` with a
-branch to the upper part, a second `cmp 300` for the equal case, an `OPSWITCH` for the lower values, and
-single compares for 500 and 9000. Each leaf group follows §3.1. **[I]** (the split point and the group sizes
-were not mapped).
+For widely spread values (s4: 1, 20, 77, 300, 500, 9000) the IL at `@MscRVO@4` already holds a value split:
+`cmp 300` with a branch to the upper part, a second `cmp 300` for the equal case, an `OPSWITCH` for the lower
+values, and single compares for 500 and 9000. **The split is not c1xx's: c2's reader makes it** (`SwGenSwitch`
+10bed250, called from `RdrGetTuples`, before any pass that can be dumped), and the rule is isel.md §9.2 to §9.4
+**[C there]**:
+- a switch is split when it has 4 or more compared values and its range R is ≥ 255 and > 4 × that count (/O2);
+- the pivot is sorted node `N/2` unless there is a dense cluster of 4 or more values (isel.md §9.4), and the
+  code is `cmp x, pivot; jg RIGHT; je pivot_case`;
+- each side goes through the method choice again, so a leaf is a compare chain of at most 3 values (a
+  compare-chain `OPSWITCH` or bare compares) or a table.
+
+Applied to s4: N = 6, R = 8999, no cluster → pivot = node 3 = 300, left leaf {1, 20, 77}, right leaf {500, 9000},
+which is the IL above. `work/scratch/openq/sw.cpp` **[C]**: e5 (10, 200, 3000, 40000, 500000) → pivot 3000; s8
+(the s4 values plus 20000, 50000) → pivot 500, and the left side {1, 20, 77, 300} is split again at 77; d2
+(1..4, 100..103: R = 102) is one table.
+
+Block order after the phase 2 reorder (`order.py`, same probes) **[C for these three, I as a general rule]**:
+left subtree, pivot's case, then (once, after the outermost pivot's case) `default`, then the right subtree;
+a leaf chain lists its cases in descending value. s4: 77, 20, 1 | 300 | default | 9000, 500. s8: 20, 1 | 77 | 300 |
+500 | default | 50000, 20000, 9000. e5: 200, 10 | 3000 | default | 500000, 40000. In the listing all compares
+of a subtree come first (`jg je je je jne` for s4), then its bodies in that order.
 
 ## 4. Loop exits are moved out of the loop (LgRemoveBreakBlocks)
 
@@ -179,9 +196,25 @@ that fits in a byte, a register source instead of an immediate).
 
 ## 7. Open
 
-- The sparse-switch split in c1xx (§3.2): where it splits and how big the leaf groups are.
+- The sparse-switch split: settled in §3.2 (it is c2's reader; isel.md §9.4 has the pivot rule).
 - §5.1 header split: not probed. A probe needs a loop entered by a branch to its head (a `goto` into a
   `while`, or a loop right after a `switch` case label).
-- When credit (+0x1c) is non-zero in practice. It needs three or more jumps to one label where an earlier pair
-  merged. Not probed.
+- **Credit (+0x1c): settled; it exists but left no trace in the final code of any probe.** Trace of
+  `size + credit` at 10b30b74 (`ebp`; limit in `ebx`) on `work/scratch/openq/tmc.c`, three arms jumping to one
+  join, two of them sharing 10 + 7 + jmp = 22 bytes and the third only the 7-byte store (12 with the jump)
+  **[C]**:
+  - Credit is per `FgTryCommonTailMerge` call: it is cleared for every jump at the start of the call
+    (il_fg.md §7.2), and the pairs are tried from the **lexically last** jump backwards (the label's
+    reference list is newest first). So credit only reaches a jump that lies *before* the pair that merged.
+    c1 and c6 (short arm written last): the pairs come out 12, 12, 22; the two short pairs are refused before
+    the long pair merges, and later calls start from 0 again. c3 and c5 (short arm written first): 22
+    (merged), then 12 + 20 = 32 > 20, so the short arm **is** merged into the shared store. c4 (short arm in
+    the middle): 12, 22, no credit use.
+  - The merge that credit buys is undone. Its shared piece is by construction at most 15 bytes (otherwise it
+    would pass without credit), and `FgCodeMotion` copies a join block of ≤ 20 bytes back into the jumps that
+    reach it (il_fg.md §8). c3 and c5 end with two copies of `mov BYTE PTR _b1, 21` exactly like c1 and c6,
+    with a tail-call join (c3) and with a 40-byte join (c5).
+  - For matching: ignore credit. The order of the arms decides which pairs are tried first, but in these
+    shapes the bytes do not depend on it. Not tried: /O1 (limit 2, where the size test rarely fails anyway)
+    and a join that `FgCodeMotion` refuses to copy for another reason.
 - The exact DFO condition that ends a moved run in LgRemoveBreakBlocks1. All probed runs were one block.

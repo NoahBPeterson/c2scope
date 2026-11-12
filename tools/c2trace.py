@@ -3,6 +3,7 @@
 
 usage: c2trace.py install                      build c2trace.dll and patch the traced toolchain copy's c2.dll
        c2trace.py il <src> --func S [--at P,P] [--grep RE | --count RE] [-- <cl args>]   IL dump at passes (c2il.py)
+       c2trace.py il <src> --func S --diff PASS_A,PASS_B [-- <cl args>]   what the passes between A and B changed
        c2trace.py scratch <src> --func S [-- <cl args>]   scratch-register picks -> listing offsets (c2scratch.py)
        c2trace.py regs <src> [--func S] [--why a,b] [-- <cl args>]   register-allocation report (tools/c2regs.py)
        c2trace.py regmap <src> --func S --asm-vs ORIG.s --asm-func DEC [-- <cl args>]   which register each variable
@@ -30,9 +31,10 @@ patched (entry point -> 45-byte cave that LoadLibraryA's c2trace.dll) and VC/Bin
 DLL reads %C2TRACE_CFG% and writes 5-byte JMP detours into c2's .text in memory; without C2TRACE_CFG it is inert,
 so the traced copy compiles exactly like the original.
 """
-import argparse, os, shutil, struct, subprocess, sys, tempfile
+import argparse, os, re, shutil, struct, subprocess, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capstone
+import c2build                # takes --c2 BUILD out of sys.argv; C2_BUILD selects a non-default c2 (port-1310.md)
 from image import Image, ROOT
 import ccache, msvc
 
@@ -43,7 +45,17 @@ CAVE_RVA = 0x1D7BB0          # .text slack: VirtualSize ends at RVA 0x1d7bab, ra
 TEXT_HDR_VSIZE = 0x1D6BAB
 ENTRY_RVA = 0x1D706D         # __DllMainCRTStartup@12
 IAT_LOADLIBRARYA = 0x1D8028  # KERNEL32!LoadLibraryA IAT slot (RVA)
+FILE_DELTA, NSEC = 0, 5     # .text RVA - file offset; number of sections (build tables may override: patch)
 DEFAULT_HOOKS = ["@Color@4=s1,s2", "@Spillcosts@12=s1,s2,s3"]
+if c2build.table():           # another c2 build: its own toolchain copies and cave addresses (tools/c2builds/*.json)
+    TRACE = c2build.toolchain(True)
+    TBIN = os.path.join(TRACE, "VC", "Bin")
+    ORIG_C2 = c2build.orig_c2()
+    CAVE_RVA, TEXT_HDR_VSIZE, ENTRY_RVA, IAT_LOADLIBRARYA = (int(c2build.get("patch")[k], 16) for k in (
+        "cave_rva", "text_vsize", "entry_rva", "iat_loadlibrarya"))
+    # optional: .text RVA minus file offset (0 when the file is section-aligned like 14.00), section count
+    FILE_DELTA, NSEC = int(c2build.get("patch").get("file_delta", "0"), 16), int(c2build.get("patch").get("nsec", 5))
+    DEFAULT_HOOKS = c2build.hooks("default", DEFAULT_HOOKS)
 
 DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (VS2005 SP1).
  * Loaded by a cave at the patched c2.dll's entry point. Reads a hook list from %C2TRACE_CFG%,
@@ -57,6 +69,10 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
  *                 1 jcc (cc = condition nibble), 2 jmp, 3 call: re-encoded rel32 to target
  *   max <n>       stop logging after n events
  *   ilmax <n>     cap on tuples per '%' IL dump (default 2000000; env C2TRACE_ILMAX on the Python side)
+ *   set <name> <hex>  another c2 build (tools/c2build.py): base = preferred image base, regname / opname = the
+ *                 _RegName / _TupOpcodeName tables, opcount = entries in the latter, blk / len / mem = tuple layout
+ *                 (extended dump only: ext / labtup / brcc / ehop / ulabop, see dumpilx)
+ *   op <hex> <name>   name of an opcode the build's own table lacks (after `set opcount`)
  * spec := base { '>' off } [ '#' n ]
  *   base: eax ecx edx ebx esp ebp esi edi | sN (stack word N at entry: s0 = return address, s1 = first stack arg)
  *         | aN (entry stack word N, saved, usable at exit) | gHEX (c2 VA, e.g. a global; rebased if c2 moved)
@@ -65,6 +81,7 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
  *   '#n'   logs n dwords starting at address v instead of v itself;  '$' logs the C string at v
  *   '%'    v is a tuple: dump the tuple stream from it as "T ..." lines after the event (IL dump)
  *   '!'    the same for the one tuple v.  T I lines: T I <tuple> <opcode> <line offset> <+0x1c byte> | dst <- src
+ *   '%+' '!+'  the extended dump (dumpilx below): the same lines plus notes after " ;" and the P/C/A line kinds
  * Log lines:  E <seq> <depth> <id> eax ecx edx ebx ebp esi edi esp | specs...
  *             X <seq> <depth> <id> eax edx | specs...
  */
@@ -80,8 +97,15 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
 
 typedef struct { DWORD edi, esi, ebp, esp, ebx, edx, ecx, eax, eflags, slot; } Regs;  /* pushfd;pushad image */
 
-typedef struct { int base; DWORD idx; int nder; int der[6]; char tbl[6]; int n; } Spec; /* base: 0..7 reg, 8 s, 9 a, 10 g */
-static DWORD delta;            /* actual c2 base - 0x10b00000 */
+#define MAXDER 12             /* '>' / '~' steps per spec (was 6: longer PREF-chain specs were cut short) */
+typedef struct { int base; DWORD idx; int nder; int der[MAXDER]; char tbl[MAXDER]; int n; } Spec; /* base: 0..7 reg, 8 s, 9 a, 10 g */
+static DWORD delta;            /* actual c2 base - imgbase */
+static DWORD imgbase = 0x10b00000, REGNAME = 0x10cec7b8, OPNAME = 0x10ceb3d8;   /* 14.00.50727.762; `set` changes them */
+static DWORD OPCOUNT = 0xffffffff;   /* entries in the opcode-name table (13.10: machine opcodes only) */
+/* tuple layout, `set blk|len|mem`: BLOCK tuple's BB*, an instruction's encoded-length byte, a memory operand's
+ * {sym, disp, base leaf, index leaf} (13.10: 0x18, 0x16, 0x2c) */
+static int LBLK = 0x20, LLEN = 0x1c, LMEM = 0x24;
+static char opx[256][20];      /* `op <hex> <name>`: names of opcodes >= OPCOUNT */
 typedef struct {
     int id; DWORD rva; int steal; int exitp; int ne, nx;
     int ni; int ilen[8], kind[8], cc[8]; DWORD tgt[8];   /* displaced instrs: kind 0 copy, 1 jcc, 2 jmp, 3 call */
@@ -121,6 +145,7 @@ static int readd(DWORD a, DWORD *v) {
 static const char *regn[8] = { "edi", "esi", "ebp", "esp", "ebx", "edx", "ecx", "eax" };
 
 static DWORD pend_il; static int pend_max; static int ilmax = 2000000;
+static int pend_x;            /* '%+' / '!+': extended dump (dumpilx) */
 static void emit(Spec *s, int ns, Regs *r, DWORD *stk, Frame *f) {
     int i, j, k;
     for (i = 0; i < ns; i++) {
@@ -132,7 +157,7 @@ static void emit(Spec *s, int ns, Regs *r, DWORD *stk, Frame *f) {
         for (j = 0; ok && j < s[i].nder; j++)
             ok = s[i].tbl[j] ? readd((DWORD)s[i].der[j] + delta + 4 * v, &v) : readd(v + s[i].der[j], &v);
         if (!ok) { out(" ?"); continue; }
-        if (s[i].n == -2 || s[i].n == -3) { out(" IL"); pend_il = v; pend_max = s[i].n == -2 ? ilmax : 1; continue; }
+        if (s[i].n <= -2 && s[i].n >= -5) { out(" IL"); pend_il = v; pend_x = s[i].n < -3; pend_max = s[i].n & 1 ? 1 : ilmax; continue; }
         if (s[i].n < 0) {           /* '$': C string at v */
             char c[80]; int m = 0; DWORD w = 0;
             while (m < 79 && readd(v + m, &w) && (c[m] = (char)w) != 0) { if (c[m] <= ' ' || c[m] > '~' || strchr("[]|\"", c[m])) c[m] = '.'; m++; }
@@ -153,8 +178,6 @@ static int rstr(DWORD a, char *c, int max) {
 }
 static BYTE rb(DWORD a) { DWORD w = 0; readd(a, &w); return (BYTE)w; }
 static DWORD rd(DWORD a) { DWORD w = 0; readd(a, &w); return w; }
-#define REGNAME 0x10cec7b8
-#define OPNAME 0x10ceb3d8
 static void symname(DWORD x) {
     char c[64]; BYTE k;
     if (!x) { out("0"); return; }
@@ -176,10 +199,10 @@ static void leaf(DWORD l) {
     case 9: out("fconst"); break;
     case 5: case 6:
         out("[");
-        if (rd(l + 0x24)) { symname(rd(l + 0x24)); out("+"); }
-        if (rd(l + 0x2c)) { leaf(rd(l + 0x2c)); out("+"); }
-        if (rd(l + 0x30)) { leaf(rd(l + 0x30)); out("*%d+", 1 << (rb(l + 0x14) & 15)); }
-        out("%d]", (int)rd(l + 0x28)); break;
+        if (rd(l + LMEM)) { symname(rd(l + LMEM)); out("+"); }
+        if (rd(l + LMEM + 8)) { leaf(rd(l + LMEM + 8)); out("+"); }
+        if (rd(l + LMEM + 12)) { leaf(rd(l + LMEM + 12)); out("*%d+", 1 << (rb(l + 0x14) & 15)); }
+        out("%d]", (int)rd(l + LMEM + 4)); break;
     case 11: out("regset"); break;
     case 12: out("pas%d", rd(l + 0x18)); break;
     default: out("k%d", k);
@@ -195,13 +218,122 @@ static void dumpil(DWORD t, int max) {
     while (t && n++ < max) {
         BYTE k = rb(t + 8), f = rb(t + 9);
         DWORD op = rd(t + 4);
-        if (k == 26) out("T B %x\n", rd(t + 0x20));
+        if (k == 26) out("T B %x\n", rd(t + LBLK));
         else if (k == 27) out("T L %x\n", t);
         else if (f & 1) {
-            if (!rstr(rd(OPNAME + delta + 4 * op), c, sizeof c)) sprintf(c, "op%x", op);
-            out("T I %x %s %d %d |", t, c, rd(t + 0x14) & 0xffff, rb(t + 0x1c));
+            if (op >= OPCOUNT && op - OPCOUNT < 256 && opx[op - OPCOUNT][0]) strcpy(c, opx[op - OPCOUNT]);
+            else if (op >= OPCOUNT || !rstr(rd(OPNAME + delta + 4 * op), c, sizeof c)) sprintf(c, "op%x", op);
+            out("T I %x %s %d %d |", t, c, rd(t + 0x14) & 0xffff, rb(t + LLEN));
             oplist(rd(t + 0x2c)); out(" <-"); oplist(rd(t + 0x28));
             if (k == 18 && rb(rd(t + 0x28) + 8) == 4) { out(" ->"); }
+            out("\n");
+        }
+        if (blen > (int)sizeof buf - 1024) flush();
+        t = rd(t);
+    }
+}
+
+/* ---- extended IL dump ('%+' / '!+' specs): what the plain dump leaves out (docs/c2/tracer.md, `il`).
+ * Adds to T I lines, after " ;": cc=<x86 cc> (BRANCH, QUESTION), sN=/dN= notes on the Nth src/dst operand
+ * (& address leaf, <name> code address, L<label tuple>, float constant value), intrin=, default=/cases= (SWITCH),
+ * eh{..} (EH record). New lines: T L <tuple> [name], T P <tuple> <opcode> <+0x20 word> [name] (non-instruction
+ * tuples), T C <switch> <low> <high> L<label> (case list), T A <line> (unwind action of the preceding OPPUSHSTATE).
+ * Layout (`set`): ext = per-kind word after the operand lists (QUESTION cc, SWITCH default, EH record; cases at
+ * ext+4), labtup = label SSR -> its LABEL tuple, brcc = BRANCH condition-code nibble, ehop / ulabop = the
+ * opcode numbers of OPPUSHSTATE and OPUSERLABEL. */
+static int LEXT = 0x30, LLABT = 0x33, LBRCC = 0x0a;
+static DWORD OPEH = 0x2db, OPULAB = 0x300;   /* opcode numbers: OPPUSHSTATE (.. OPSETSTATE = +9), OPUSERLABEL */
+static int xdepth;
+static const char *ccname[17] = { "0", "e", "ne", "l", "g", "le", "ge", "b", "a", "be", "ae", "s", "ns", "p", "np", "o", "no" };
+static void xopname(DWORD op, char *c, int max) {
+    if (op >= OPCOUNT && op - OPCOUNT < 256 && opx[op - OPCOUNT][0]) strcpy(c, opx[op - OPCOUNT]);
+    else if (op >= OPCOUNT || !rstr(rd(OPNAME + delta + 4 * op), c, max)) sprintf(c, "op%x", op);
+}
+static int ssrname(DWORD s, const char *pre) {   /* front-end symbol (CODEADDR leaves, labels): name pointer at +4 */
+    char c[80]; DWORD p = s ? rd(s + 4) : 0;
+    if (p && rstr(p, c, sizeof c)) { out("%s%s", pre, c); return 1; }
+    return 0;
+}
+static DWORD labtup(DWORD s) { DWORD l = s ? rd(s + LLABT) : 0; return l && rb(l + 8) == 27 ? l : 0; }
+static void xfconst(DWORD l) {         /* FCONST leaf: 80-bit x87 value at +0x18 */
+    DWORD w[3]; double d;
+    if (!readd(l + 0x18, &w[0]) || !readd(l + 0x1c, &w[1]) || !readd(l + 0x20, &w[2])) { out("?"); return; }
+    __asm fld tbyte ptr w
+    __asm fstp qword ptr d
+    out((rd(l + 8) >> 16 & 0xfff) == 4 ? "%.9g" : "%.17g", d);
+}
+static int xehinfo(DWORD e) {          /* 1 if e looks like an ehinfo (kind byte 1..15, small state) */
+    DWORD k = e ? rd(e + 0x10) & 0xff : 0;
+    return k && k < 16 && (rd(e + 0x14) < 0x10000 || rd(e + 0x14) == 0xffffffff);
+}
+static void xnotes(DWORD t, BYTE k, DWORD op) {
+    int side, i, any = 0; DWORD l, s, r, e;
+#define NOTE (any++ ? out(" ") : out(" ; "))
+    if (k == 18 && (rb(t + LBRCC) & 0xf)) { NOTE; out("cc=%s", ccname[rb(t + LBRCC) & 0xf]); }
+    if (k == 17 && rb(t + LEXT) <= 16) { NOTE; out("cc=%s", ccname[rb(t + LEXT)]); }
+    if (k == 19) { NOTE; out("intrin=%d", rd(t + LEXT) & 0xffff); }
+    for (side = 0; side < 2; side++)
+        for (i = 0, l = rd(t + (side ? 0x2c : 0x28)); l && i < 16; i++, l = rd(l)) {
+            BYTE lk = rb(l + 8);
+            if (lk != 3 && lk != 4 && lk != 5 && lk != 9) continue;
+            NOTE; out("%c%d=", side ? 'd' : 's', i);
+            if (lk == 9) xfconst(l);
+            else if (lk != 4) out("&");
+            else if ((s = labtup(rd(l + 0x18))) != 0) out("L%x", s);
+            else if (!ssrname(rd(l + 0x18), "")) out("?");
+        }
+    if (k == 20) {
+        for (i = 0, l = rd(t + LEXT + 4); l && i < 100000; i++) l = rd(l);
+        NOTE; out("default=L%x cases=%d", rd(t + LEXT), i);
+    }
+    if (k == 21 && (op >= OPEH && op <= OPEH + 9) && (r = rd(t + LEXT)) != 0) {
+        NOTE; e = rd(r + 4);
+        if (op == OPEH + 1 || op == OPEH + 2) out("eh{n=%d fl=%x", rd(r), rd(r + 8));
+        else if (op == OPEH) out("eh{fl=%x", rd(r + 8));
+        else if (op == OPEH + 8) out("eh{flag=%x", rd(r));
+        else if (op == OPEH + 5 && !xehinfo(e)) {       /* reader form: catch object, type descriptor, flags */
+            out("eh{obj="); if (!ssrname(rd(r), "")) out("%x", rd(r));
+            out(" type="); if (!ssrname(e, "")) out("%x", e);
+            out(" fl=%x", rd(r + 8));
+        } else out("eh{w=%x,%x,%x", rd(r), e, rd(r + 8));
+        if (xehinfo(e)) {
+            out(" state=%d to=%d kind=%d", rd(e + 0x14), rd(e + 0x18), rd(e + 0x10) & 0xff);
+            if (op == OPEH + 8 && xehinfo(rd(r + 0xc))) out(" next=%d", rd(rd(r + 0xc) + 0x14));
+        }
+        if (op != OPEH + 8 && op > OPEH + 2 && rd(r + 0xc)) out(" try=%x", rd(r + 0xc));
+        out("}");
+    }
+#undef NOTE
+}
+static void dumpilx(DWORD t, int max, const char *pf) {
+    int n = 0, i; char c[48]; DWORD l, r, e;
+    while (t && n++ < max) {
+        BYTE k = rb(t + 8), f = rb(t + 9);
+        DWORD op = rd(t + 4);
+        if (k == 26) out("%sB %x\n", pf, rd(t + LBLK));
+        else if (k == 27) { out("%sL %x", pf, t); ssrname(rd(t + 0x24), " "); out("\n"); }
+        else if (f & 1) {
+            xopname(op, c, sizeof c);
+            out("%sI %x %s %d %d |", pf, t, c, rd(t + 0x14) & 0xffff, rb(t + LLEN));
+            oplist(rd(t + 0x2c)); out(" <-"); oplist(rd(t + 0x28));
+            if (k == 18 && rb(rd(t + 0x28) + 8) == 4) { out(" ->"); }
+            xnotes(t, k, op);
+            out("\n");
+            if (k == 20)
+                for (i = 0, l = rd(t + LEXT + 4); l && i < 4096; i++, l = rd(l)) {
+                    out("%sC %x %d %d L%x\n", pf, t, rd(l + 0xc), rd(l + 0x10), rd(l + 0x14));
+                    if (blen > (int)sizeof buf - 1024) flush();
+                }
+            if (k == 21 && op == OPEH && !xdepth && (r = rd(t + LEXT)) != 0) {
+                e = rd(r + 4);            /* unwind action: reader form record+0, later the ehinfo's funclet body */
+                l = rd(r);
+                if (!l && xehinfo(e) && rd(e + 0x34)) l = rd(rd(rd(rd(e + 0x34) + 8)) + 0x1c);
+                if (l) { xdepth++; dumpilx(l, 64, "T A "); xdepth--; }
+            }
+        } else if (k >= 13) {
+            xopname(op, c, sizeof c);
+            out("%sP %x %s %x", pf, t, c, rd(t + LBLK));
+            if (op == OPULAB) ssrname(rd(t + LBLK), " ");
             out("\n");
         }
         if (blen > (int)sizeof buf - 1024) flush();
@@ -229,7 +361,7 @@ static void __cdecl on_entry(int i, Regs *r) {
             r->eax, r->ecx, r->edx, r->ebx, r->ebp, r->esi, r->edi, esp0);
         emit(h->e, h->ne, r, stk, f);
         out("\n");
-        if (pend_il) { dumpil(pend_il, pend_max); pend_il = 0; }
+        if (pend_il) { if (pend_x) dumpilx(pend_il, pend_max, "T "); else dumpil(pend_il, pend_max); pend_il = 0; }
         if (eachflush) flush();
     }
     seq++;
@@ -262,16 +394,31 @@ static int parsespec(const char *t, Spec *s) {
         if (*t == 's') s->base = 8; else if (*t == 'a') s->base = 9; else if (*t == 'g') s->base = 10; else return 0;
         s->idx = strtoul(t + 1, &e, s->base == 10 ? 16 : 0); t = e;
     }
-    while ((*t == '>' || *t == '~') && s->nder < 6) {
+    while ((*t == '>' || *t == '~') && s->nder < MAXDER) {
         s->tbl[s->nder] = *t == '~';
         s->der[s->nder] = *t == '~' ? (int)strtoul(t + 1, &e, 16) : strtol(t + 1, &e, 0);
         s->nder++; t = e;
     }
     if (*t == '#') s->n = strtol(t + 1, &e, 0);
     else if (*t == '$') s->n = -1;
-    else if (*t == '%') s->n = -2;
-    else if (*t == '!') s->n = -3;
+    else if (*t == '%') s->n = t[1] == '+' ? -4 : -2;
+    else if (*t == '!') s->n = t[1] == '+' ? -5 : -3;
     return 1;
+}
+
+static void setvar(const char *nm, DWORD v) {
+    if (!strcmp(nm, "base")) imgbase = v;
+    else if (!strcmp(nm, "regname")) REGNAME = v;
+    else if (!strcmp(nm, "opname")) OPNAME = v;
+    else if (!strcmp(nm, "opcount")) OPCOUNT = v;
+    else if (!strcmp(nm, "blk")) LBLK = (int)v;
+    else if (!strcmp(nm, "len")) LLEN = (int)v;
+    else if (!strcmp(nm, "mem")) LMEM = (int)v;
+    else if (!strcmp(nm, "ext")) LEXT = (int)v;
+    else if (!strcmp(nm, "labtup")) LLABT = (int)v;
+    else if (!strcmp(nm, "brcc")) LBRCC = (int)v;
+    else if (!strcmp(nm, "ehop")) OPEH = v;
+    else if (!strcmp(nm, "ulabop")) OPULAB = v;
 }
 
 static void install(BYTE *base) {
@@ -301,12 +448,18 @@ static void install(BYTE *base) {
             sscanf(line, "max %lu", &maxev);
         } else if (!strcmp(a, "ilmax")) {
             sscanf(line, "ilmax %d", &ilmax);
+        } else if (!strcmp(a, "set")) {
+            char nm[32]; unsigned long v;
+            if (sscanf(line, "set %31s %lx", nm, &v) == 2) setvar(nm, v);
+        } else if (!strcmp(a, "op")) {
+            char nm[20]; unsigned long v;
+            if (sscanf(line, "op %lx %19s", &v, nm) == 2 && v >= OPCOUNT && v - OPCOUNT < 256) strcpy(opx[v - OPCOUNT], nm);
         } else if (!strcmp(a, "flush")) eachflush = 1;
     }
     fclose(fp);
     if (GetEnvironmentVariableA("C2TRACE_LOG", path, sizeof path))
         logf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
-    delta = (DWORD)base - 0x10b00000;
+    delta = (DWORD)base - imgbase;
     out("# c2trace base %x hooks %d\n", (DWORD)base, nhooks);
 
     code = (BYTE *)VirtualAlloc(NULL, 64 * MAXHOOK + 10 * MAXDEPTH + 64, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
@@ -387,12 +540,14 @@ def patch_c2(data):
     opt = lfanew + 24
     nsec = struct.unpack_from("<H", data, lfanew + 6)[0]
     shdr = opt + struct.unpack_from("<H", data, lfanew + 20)[0]
-    assert data[shdr:shdr + 5] == b".text" and nsec == 5
-    assert struct.unpack_from("<I", data, opt + 16)[0] == ENTRY_RVA, "c2.dll is not the pristine 50727.762 build"
+    assert data[shdr:shdr + 5] == b".text" and nsec == NSEC
+    assert struct.unpack_from("<I", data, opt + 16)[0] == ENTRY_RVA, "c2.dll is not the pristine %s build" % (
+        c2build.get("version", "50727.762"))
     assert struct.unpack_from("<I", data, shdr + 8)[0] == TEXT_HDR_VSIZE
-    assert data[CAVE_RVA:CAVE_RVA + 0x40] == bytes(0x40)                   # .text: file offset == RVA
+    co = CAVE_RVA - FILE_DELTA                                             # 14.00 .text: file offset == RVA
+    assert data[co:co + 0x40] == bytes(0x40)
     cv = cave()
-    data[CAVE_RVA:CAVE_RVA + len(cv)] = cv
+    data[co:co + len(cv)] = cv
     struct.pack_into("<I", data, opt + 16, CAVE_RVA)                       # AddressOfEntryPoint
     struct.pack_into("<I", data, shdr + 8, CAVE_RVA + 0x40 - 0x1000)       # .text VirtualSize covers the cave
     import pefile
@@ -405,6 +560,8 @@ def install():
     if not os.path.isdir(TRACE):
         sys.exit("missing %s: cp -RL work/toolchain/vs2005 work/toolchain/vs2005-trace" % TRACE)
     orig = open(ORIG_C2, "rb").read()
+    if c2build.table() and c2build.sha256(ORIG_C2) != c2build.get("c2_sha256"):
+        sys.exit("%s is not c2.dll %s" % (ORIG_C2, c2build.get("version")))
     open(os.path.join(TBIN, "c2.dll"), "wb").write(patch_c2(orig))
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "c2trace.c")
@@ -470,6 +627,10 @@ def containing(img, va):
     import bisect
     k = bisect.bisect_right(img.starts, va) - 1
     r = img.by_va[img.starts[k]] if k >= 0 else None
+    if c2build.table() and not (r and va < r["va"] + r["size"]) and img.base + 0x1000 <= va < img.base + TEXT_HDR_VSIZE + 0x1000:
+        # a build without a PDB (functions scattered by BBT, sizes unknown): any .text address can be hooked;
+        # the caller is responsible for it being an instruction that nothing branches into the middle of
+        return dict(va=va, size=16, symbol="%08x" % va, flags="address")
     return r if r and va < r["va"] + r["size"] else None
 
 
@@ -492,9 +653,12 @@ def parse_hook(img, text):
         sys.exit("%08x is not inside a known c2 function" % va)
     entry = fn["va"] == va
     sym = fn["symbol"] + ("" if entry else "+0x%x" % (va - fn["va"]))
+    loose = fn.get("flags") in ("probe", "address")     # another c2 build: a listed probe, or a bare address
+    if loose:        # never given exit logging by --exit; a bare address counts as an entry only with /x specs
+        entry = fn["flags"] == "address" and bool(xspecs)
     if xspecs and not entry:
         sys.exit("%s: exit specs need a function-entry hook" % sym)
-    if not entry:  # a probe must sit on an instruction boundary (linear sweep of the function)
+    if not entry and not loose:  # a probe must sit on an instruction boundary (linear sweep of the function)
         md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
         if va not in {i.address for i in md.disasm(img.read(fn["va"], fn["size"]), fn["va"])}:
             sys.exit("%s (%08x) is not an instruction boundary" % (sym, va))
@@ -544,6 +708,67 @@ def _split(s):
     return out
 
 
+def write_cfg(cfg, img, hooks, maxn=None, exit_all=False):
+    """The trace config c2trace.dll reads (%C2TRACE_CFG%) for these parsed hooks."""
+    with open(cfg, "w") as f:
+        if maxn is not None:
+            f.write("max %d\n" % maxn)
+        if os.environ.get("C2TRACE_ILMAX"):
+            f.write("ilmax %d\n" % int(os.environ["C2TRACE_ILMAX"]))
+        if c2build.table():
+            f.write("set base %s\n" % c2build.get("image_base"))
+            f.writelines("set %s %s\n" % kv for kv in sorted(c2build.get("dll", {}).items()))
+            f.writelines("op %s %s\n" % kv for kv in sorted(c2build.get("opnames", {}).items()))
+        for k, h in enumerate(hooks):
+            n, ins = steal_len(img, h["va"])
+            f.write("# %s\nhook %d %x %d %d\n" % (h["name"], k, h["va"] - img.base, n, int(h["entry"] and (exit_all or bool(h["x"])))))
+            if any(kind for _, kind, _, _ in ins):
+                f.writelines("i %d %d %d %x\n" % t for t in ins)
+            f.writelines("e %s\n" % s for s in h["e"])
+            f.writelines("x %s\n" % s for s in h["x"])
+
+
+def func_pat(pat):
+    """The text a --func value is looked up as in decorated names (shared by every subcommand and the sweeps).
+    `Class::method` -> `?method@Class@@` (nested: `N::C::m` -> `?m@C@N@@`; `C::C` / `C::~C` -> `??0C@@` / `??1C@@`);
+    `::name` -> a global function (`?name@@` in C++ names; for C names use the plain form);
+    anything else (a plain name, `method@Class`, a full decorated name) is returned unchanged: a substring."""
+    if not pat or "::" not in pat:
+        return pat
+    parts = [x for x in pat.split("::") if x]
+    if not parts:
+        return pat
+    name, scope = parts[-1], parts[:-1]
+    if scope and name == scope[-1]:
+        name = "?0"
+    elif scope and name == "~" + scope[-1]:
+        name = "?1"
+    return "?" + "@".join([name] + scope[::-1]) + "@@"
+
+
+def func_decl(pat):
+    """A --func value as the start of a decorated member name where one is needed to find the definition in the
+    source (rwsweep, helpersweep): `Class::method` and `method@Class` -> `?method@Class@@`; others unchanged."""
+    pat = func_pat(pat)
+    m = re.fullmatch(r"(\w+)@(\w+)", pat or "")
+    return "?%s@%s@@" % m.groups() if m else pat
+
+
+def func_match(pat, name):
+    """True when the decorated `name` is selected by the --func value `pat` (None or '' selects everything)."""
+    return not pat or func_pat(pat) in name
+
+
+def listing_proc(text, func):
+    """(start, end) of the PROC..ENDP text of the function selected by `func` (any --func form) in a /FAsc listing;
+    the first match wins.  KeyError when there is none."""
+    pat = func_pat(func) or ""
+    for m in re.finditer(r"^(\S+)[ \t]+PROC\b", text, re.M):
+        if pat in m.group(1):
+            return m.start(), text.index("ENDP", m.end())
+    raise KeyError("%s PROC not in the listing" % func)
+
+
 def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=False):
     """Compile src with the traced c2; returns (img, hooks, rc, cl output, raw log text)."""
     if open(os.path.join(TBIN, "c2.dll"), "rb").read() == open(ORIG_C2, "rb").read() or \
@@ -554,23 +779,14 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
     d = keep or tempfile.mkdtemp(prefix="c2trace_")
     os.makedirs(d, exist_ok=True)
     cfg, log = os.path.join(d, "c2trace.cfg"), os.path.join(d, "c2trace.log")
-    with open(cfg, "w") as f:
-        if maxn is not None:
-            f.write("max %d\n" % maxn)
-        if os.environ.get("C2TRACE_ILMAX"):
-            f.write("ilmax %d\n" % int(os.environ["C2TRACE_ILMAX"]))
-        for k, h in enumerate(hooks):
-            n, ins = steal_len(img, h["va"])
-            f.write("# %s\nhook %d %x %d %d\n" % (h["name"], k, h["va"] - img.base, n, int(h["entry"] and (exit_all or bool(h["x"])))))
-            if any(kind for _, kind, _, _ in ins):
-                f.writelines("i %d %d %d %x\n" % t for t in ins)
-            f.writelines("e %s\n" % s for s in h["e"])
-            f.writelines("x %s\n" % s for s in h["x"])
+    write_cfg(cfg, img, hooks, maxn, exit_all)
     if os.path.exists(log):
         os.remove(log)
     stem = os.path.splitext(os.path.basename(src))[0]
     asm, obj = os.path.join(d, stem + ".asm"), os.path.join(d, stem + ".obj")
-    args = ["/nologo", "/c", "/O2"] + cl + ["/FAsc", "/Fa" + asm, "/Fo" + obj, os.path.abspath(src)]
+    pdb = [] if any(a[:3] in ("/Fd", "-Fd") for a in cl) else ["/Fd" + os.path.join(d, stem + ".pdb")]
+    # ^ with /Zi every compile would otherwise share vcNN.pdb in the cwd: parallel sweeps then fail with C1033
+    args = ["/nologo", "/c", "/O2"] + cl + pdb + ["/FAsc", "/Fa" + asm, "/Fo" + obj, os.path.abspath(src)]
     k = ccache.key(src, args, [open(cfg).read(), ccache.file_sha(os.path.join(TBIN, "c2.dll")),
                                ccache.file_sha(os.path.join(TBIN, "c2trace.dll")), "trace"])
     hit = ccache.get(k)
@@ -612,7 +828,7 @@ def main():
     if sys.argv[1:2] == ["regs"]:
         import c2regs
         return c2regs.main(sys.argv[2:])
-    ap = argparse.ArgumentParser(usage=__doc__)
+    ap = argparse.ArgumentParser(usage=__doc__.replace("%", "%%"))   # argparse %-formats the usage text
     ap.add_argument("-H", "--hook", action="append", default=[])
     ap.add_argument("--exit", action="store_true")
     ap.add_argument("--max", type=int)

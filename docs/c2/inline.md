@@ -119,6 +119,58 @@ is decided here), regalloc.md §7 (which variables are candidates), il_pipeline.
 8. **At most one inlining is attempted per call site.** Candidates are tried in IL order (`GetInlineCandidates`
    10b6d2f0 collects them in stream order). **[C: code, traces]**
 
+8a. **Two vetoes after the cost model accepts: `InlBadCandidate` 10b6a690** (84 bytes; called at the end of ICGD,
+   10b6a46d, so `__forceinline` never reaches it). It returns 1 = do not inline in exactly two cases; there are no
+   thresholds. Inputs: the call tuple (eax), the callee's call-graph node (esi; flag byte at node+0xb3), and bit 2
+   of the candidate's `+0x1c` (stack argument: 1 when the call site is inside a loop of the caller, 0 otherwise
+   **[C trace: 1 for every call in a `for` body, 0 for straight-line code and for an `if` arm]**).
+   - **(a) A loop-invariant call to a side-effect-free callee that is not straight-line stays a call.** All of:
+     the call site is in a loop; the callee has a branch, a switch or a side-effecting call (node+0xb3 bit 0x80
+     clear; this is the same bit that gives the −10 of rule 3, set by `InlCollectInfo` 10b70b50 when the callee
+     was compiled); `TupQueryCallSideEffect` 10bf5940 says the call writes nothing (the callee's summary: no
+     store to a global or through a pointer; it may read globals and read through pointer arguments); and
+     `InlInvariantArgs` 10b6a860 accepts every argument. The call is then left for loop-invariant code motion.
+     It is hoisted to the loop preheader when nothing in the loop can change what it reads; **if it cannot be
+     hoisted it still stays an out-of-line call inside the loop**.
+     - `InlInvariantArgs`: each argument must be a constant, a variable with no definition inside the loop, or
+       the result of another such call; a value loaded from memory (`a[i]`, `p->m`) or computed in the loop is
+       not invariant. **At most 4 variable arguments** (`this` counts); a call with 5 is "not invariant" and is
+       inlined. **[C code for the count; the per-kind tests read only in outline: I]**
+     - Probes (`work/scratch/openq/inlbad2.cpp`, `inlbad3.cpp`; callee `if (x > 5) return x*3; return x+1;`, 17
+       bytes, far below the rule 3 limit) **[C trace of the return value + listing]**:
+
+       | call in a `for` loop | InlBadCandidate | listing |
+       |---|---|---|
+       | `br_pure(k)`, k a parameter | 1 | `call` hoisted in front of the loop |
+       | `br_pure(9)` | 1 | call hoisted |
+       | `br_rd(k)` (callee reads a global), loop has no store | 1 | call hoisted |
+       | `br_rd(k)`, loop stores `a[i]` | 1 | **call stays in the loop**, not inlined |
+       | `br_ptr(k)` (callee reads `*k`) | 1 | call stays in the loop, not inlined |
+       | `o->m(k)` (const member with a branch), `inline` and `static` versions | 1 | call |
+       | `br_pure(a[i])`, `br_pure(m)` with `m = k + 1` in the loop | 0 (args not invariant) | inlined |
+       | `br_wr(k)` (callee stores a global) | 0 (side effect) | inlined |
+       | `pure1(k)` (straight-line callee `x*3+1`) | 0 (bit 0x80 set) | inlined |
+       | `a5(k, n, k, n, k)` (5 variable arguments) | 0 | inlined |
+       | `__forceinline` version | not called | inlined |
+       | the same call outside a loop, or in an `if` arm | 0 | inlined |
+
+       For matching: a small `const` getter with an `if` in it, called in a loop with loop-invariant arguments,
+       is a `call` in the original even though the same getter is inlined everywhere else. To get it inlined
+       there, the original source must have had a side effect in it, an argument computed in the loop, or
+       `__forceinline`.
+   - **(b) An unused result of a side-effect-free callee that contains a loop.** All of: the call tuple has no
+     destination (`tuple+0x2c` == 0); the callee has a loop (node+0xb3 bit 0x40 = `FUNC+0x0c` loop list non-empty
+     when the callee was compiled) or node+0xc is non-zero; and `TupQueryCallSideEffect` = 0. The call is not
+     inlined, and it is then deleted as dead: `void U(int k) { lp_pure(k); }` compiles to `ret`. With the result
+     used (`return lp_pure(k);`) or a loop-free callee (`br_pure(k);`) the veto does not fire. No effect on code.
+     **[C: code; trace inlbad2.cpp U_lp_pure, U_lp_rd = 1, V_lp_pure, U_br_pure = 0]** What node+0xc holds is
+     not known (0 in every probe). **[I]**
+   - Node flag byte +0xb3, as seen: bit 0 = the callee stores nothing visible (set by `ItfFuncInterf2`
+     10b80fb0), bit 1 = it reads no global or pointed-to memory, bits 0x10/0x20 = recursion state
+     (`CgIdentifyNodeRecursion`), 0x40 = has a loop, 0x80 = straight-line. Values: `x*3+1` 0x93, reads a global
+     0x91, stores a global 0x90 (straight-line) / 0x12 (with a branch), branch only 0x13, loop 0x53. **[C trace
+     for the values; the meaning of bits 0 and 1 is I from them]**
+
 9. **Reading a decision.** `uv run tools/c2trace.py "${H[@]}" t.cpp -- <flags>` with `work/scratch/inline/hooks.sh`.
    - `ConsiderCandidate` exit eax=1 means the call was inlined.
    - The ICGD probe at +0x88 shows the size; +0xe7 the B array; +0x359 c; +0x40f d and d'; +0x489 the weight;
@@ -204,8 +256,9 @@ Dump points: `@Inline@4` is c1xx's IL; `@WrnEmitWarnings@4` comes right after In
 
 ## Unknown / not covered
 
-- **`InlBadCandidate`** 10b6a690 (run on every accept): it seems to reject a call whose result is unused when the
-  callee has no side effects. Not probed. **[I]**
+- **`InlBadCandidate`** is settled: rule 8a. Left open there: the exact per-operand tests of `InlInvariantArgs`
+  (address arguments, nested calls), what call-graph node+0xc is, and the PGO caller of the veto
+  (`PogoPrepAnalyzeCallSites`).
 - **Why `_alloca` callees are rejected.** The test after ICGD was not traced.
 - **The flag that adds `2*vol`** to the rule 7 budget (`_Function+0xac & 0x140000` and `& 8`), and the caller's
   call-graph list bit that halves the frame limit.

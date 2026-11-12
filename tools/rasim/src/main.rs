@@ -15,22 +15,55 @@
 //! Commands:
 //!   rasim check SNAP                       verify the model against the trace (every term, every total, the order
 //!                                          of every pass up to its first deviation, and the re-pops)
+//!   rasim check SNAP --predict [-v]        run Color's loop as a model (predict.rs): predict every spill, deferral,
+//!                                          split-round and register decision from the model's own state and
+//!                                          report, per round, where prediction and trace diverge
 //!   rasim order SNAP [--pass N] [--top K] [EDIT...]
 //!                                          priority order of pass N, after the edits; changes are marked
 //!   rasim need SNAP [--pass N] [EDIT...] A>B [A>B...] [--edits K]   (EDITs are applied first, as givens)
 //!                                          for each constraint "A must be coloured before B": the current gap; then the
 //!                                          single edits and pairs of edits that satisfy all constraints, cheapest first
 //!   rasim blocks SNAP [--pass N] VAR...    each block's w, P and the variables' terms side by side
+//!   rasim regs SNAP [CHANGE|EDIT...]       the register of every colouring per the ChoosePhysReg model (choose.rs),
+//!                                          after the changes; an EDIT moves priorities, order, benefit and overlaps
+//!                                          together (combo.rs)
+//!   rasim need SNAP reg:VAR=REG... [CHANGE|EDIT...] [--top K] [--pool N] [--depth 1|2|3]
+//!                                          the single changes that give every VAR its REG: a source-level edit, a
+//!                                          colouring-order change, an added/removed interference or preference, a
+//!                                          copy; if no single change works, pairs (then triples) of the N most
+//!                                          promising ones; each answer lists the other registers it moves
+//!   rasim want SNAP REGMAP.txt [CHANGE|EDIT...]
+//!                                          the same, with the targets read from `c2trace.py regmap` output
+//!                                          (WANTS rows; with regmap --all the ok rows are pinned) or VAR=REG lines
+//!
+//!   rasim scratch SSNAP [--run K] [-v] [drop:N ins:N[:LIFE] nopref:N pref:N:REG ...]
+//!                                          scratch-register picks (scratch.rs): predict them from a
+//!                                          `c2trace.py scratch --export` snapshot; with edits, which picks change
+//!
+//! CHANGE (register choice; VAR is a name, or name@pN for the piece coloured as pop N):
+//!   before:A:B  after:A:B   A is coloured just before / just after B
+//!   interf:A:B  nointerf:A:B   A and B interfere / do not interfere
+//!   pref:A:REG[:N]          A has N (default 1) more preferences for REG (a copy with that register); N < 0 removes
+//!   copy:A:B                A and B are copy partners (the one coloured second prefers the first one's register)
+//!   nocopy:A:B              they no longer are
+//!   noreg:A:REG  canreg:A:REG   A cannot / can have REG (it lives, or no longer lives, across a call, a shift count
+//!                           in ecx, a division, an argument loaded into a register)
 //!
 //! EDIT (what a source change does to the IL, see docs/c2/regalloc.md section 7):
 //!   ref:VAR:B[:COST]    VAR gets a reference of COST (default 2) in block B (P_B += 1 if it was not referenced)
 //!   unref:VAR:B         VAR loses its references in B but stays live through it (P_B -= 1)
 //!   drop:VAR:B          VAR is no longer referenced in or live through B (P_B -= 1 if it was referenced)
+//!   extend:VAR:B        VAR's range grows to reach B: a reference there, the blocks in between are lived through
 //!   var:NAME:B[:C],B..  a new globreg (e.g. a named local) referenced in those blocks (P += 1 in each)
 //!   w:B:N  P:B:N        override a block's weight or pressure
 //! VAR is a name (`this`), `name#grptr` when a name has several pieces, or `name@k` for its k-th piece.
 
 use serde::Deserialize;
+
+mod choose;
+mod combo;
+mod predict;
+mod scratch;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::exit;
 
@@ -39,6 +72,54 @@ struct Snap {
     func: String,
     passes: Vec<SPass>,
     pops: Vec<SPop>,
+    // register choice (absent in snapshots made before c2regs.py exported it): see choose.rs
+    #[serde(default)]
+    inserts: Option<Vec<SInsert>>,
+    #[serde(default)]
+    pref_events: Option<Vec<SPrefEv>>,
+}
+/// One InsertInList call: the globreg's avail set and PREF list as it enters the priority list.
+#[derive(Deserialize)]
+struct SInsert {
+    npass: u32,
+    after_pop: usize,
+    gr: Option<String>,
+    num: Option<serde_json::Value>,
+    avail: Option<Vec<u32>>,
+    ben: Option<i64>,
+    prefs: Option<Vec<(u32, i64)>>,
+}
+/// One preference added by Spillcosts; src = the coloured globreg on the other side of the copy, if any.
+#[derive(Deserialize)]
+struct SPrefEv {
+    npass: u32,
+    after_pop: usize,
+    gr: String,
+    num: Option<serde_json::Value>,
+    reg: u32,
+    site: String,
+    src: Option<String>,
+}
+/// What ChoosePhysReg saw when it coloured a globreg.
+#[derive(Deserialize)]
+struct SChoice {
+    avail: Option<Vec<u32>>,
+    prefs: Vec<(u32, i64)>,
+    nbrs: Vec<SNbr>,
+    partners: Vec<SPartner>,
+}
+#[derive(Deserialize)]
+struct SNbr {
+    gr: String,
+    avail: Vec<u32>,
+    ben: i64,
+    name: String,
+    prefs: Vec<(u32, i64)>,
+}
+#[derive(Deserialize)]
+struct SPartner {
+    gr: String,
+    coloured: Option<bool>,
 }
 #[derive(Deserialize)]
 struct SPass {
@@ -85,6 +166,8 @@ struct SPop {
     kind: Option<String>,
     #[serde(default)]
     num: Option<u32>, // GLOBREG.num (+0x1c): web number; its low 10 bits are the _GlobregHash bucket
+    #[serde(default)]
+    choice: Option<SChoice>,
 }
 
 #[derive(Clone)]
@@ -306,6 +389,27 @@ impl State {
                     num: None,
                 });
             }
+            Edit::Extend(v, b) => {
+                // the range grows to reach block b: a reference there, the blocks in between are lived through
+                let i = self.find(v)?;
+                let (lo, hi) = {
+                    let x = &self.vars[i];
+                    let mut k = x.cost.keys().chain(x.live.iter()).copied();
+                    let f = k.next().ok_or(format!("{} has no blocks", v))?;
+                    k.fold((f, f), |(lo, hi), b| (lo.min(b), hi.max(b)))
+                };
+                if (lo..=hi).contains(b) {
+                    return Err(format!("{} already reaches block {} (its range is {}..{}); use ref:", v, b, lo, hi));
+                }
+                let between: Vec<u32> = if *b < lo { (*b + 1..lo).collect() } else { (hi + 1..*b).collect() };
+                for k in between {
+                    if self.blocks.contains_key(&k) || self.vars[i].own.as_ref().map_or(false, |t| t.contains_key(&k)) {
+                        self.vars[i].live.insert(k);
+                    }
+                }
+                self.vars[i].cost.insert(*b, 2);
+                self.bump(*b, 1);
+            }
             Edit::W(b, n) => {
                 self.blocks.entry(*b).or_insert((1, 0)).0 = *n;
             }
@@ -322,6 +426,7 @@ enum Edit {
     Ref(String, u32, i64),
     Unref(String, u32, bool),
     NewVar(String, Vec<(u32, i64)>),
+    Extend(String, u32),
     W(u32, i64),
     P(u32, i64),
 }
@@ -338,6 +443,7 @@ impl std::fmt::Display for Edit {
                 n,
                 r.iter().map(|(b, c)| format!("{}:{}", b, c)).collect::<Vec<_>>().join(",")
             ),
+            Edit::Extend(v, b) => write!(f, "extend:{}:{}", v, b),
             Edit::W(b, n) => write!(f, "w:{}:{}", b, n),
             Edit::P(b, n) => write!(f, "P:{}:{}", b, n),
         }
@@ -355,6 +461,7 @@ fn parse_edit(s: &str) -> Result<Edit, String> {
         }
         (Some("unref"), 3) => Ok(Edit::Unref(p[1].into(), blk(p[2])?, true)),
         (Some("drop"), 3) => Ok(Edit::Unref(p[1].into(), blk(p[2])?, false)),
+        (Some("extend"), 3) => Ok(Edit::Extend(p[1].into(), blk(p[2])?)),
         (Some("var"), 3) => {
             let mut refs = vec![];
             for t in p[2].split(',') {
@@ -365,7 +472,7 @@ fn parse_edit(s: &str) -> Result<Edit, String> {
         }
         (Some("w"), 3) => Ok(Edit::W(blk(p[1])?, num(p[2])?)),
         (Some("P"), 3) => Ok(Edit::P(blk(p[1])?, num(p[2])?)),
-        _ => Err(format!("bad edit {:?} (ref:VAR:B[:C] unref:VAR:B drop:VAR:B var:N:B[:C],.. w:B:N P:B:N)", s)),
+        _ => Err(format!("bad edit {:?} (ref:VAR:B[:C] unref:VAR:B drop:VAR:B extend:VAR:B var:N:B[:C],.. w:B:N P:B:N)", s)),
     }
 }
 
@@ -483,6 +590,131 @@ fn pass<'a>(s: &'a Snap, n: Option<u32>) -> &'a SPass {
         Some(n) => s.passes.iter().find(|p| p.n == n).unwrap_or_else(|| die(&format!("no pass {}", n))),
         None => s.passes.iter().find(|p| p.cls == Some(0)).unwrap_or_else(|| &s.passes[0]),
     }
+}
+
+fn cls_name(c: i64) -> &'static str {
+    match c {
+        0 => "int",
+        1 => "x87",
+        5 => "MMX",
+        6 => "XMM",
+        _ => "other",
+    }
+}
+
+/// The pass to answer in when --pass is not given and the command names variables (need 'A>B', blocks): the
+/// register class those variables are costed in, and in it the pass whose priority list first decides between
+/// them (the pass in which the first of them is popped, if all of them are in its list; otherwise the first pass
+/// that has them all). Variables of different classes are never compared by c2 (each class has its own registers
+/// and its own list), so that is an error here, not an answer from some pass. Returns None when the choice is the
+/// old default (the first int pass), so nothing changes for integer questions.
+fn default_pass(s: &Snap, sels: &[String]) -> Option<u32> {
+    let mut names: Vec<String> = vec![];
+    for sel in sels {
+        let b = sel.split(|c| c == '#' || c == '@').next().unwrap_or(sel).to_string();
+        if !b.is_empty() && !names.contains(&b) {
+            names.push(b);
+        }
+    }
+    if names.is_empty() || s.passes.is_empty() {
+        return None;
+    }
+    let cls_of = |p: &SPass| p.cls.unwrap_or(0);
+    let costed: Vec<BTreeMap<i64, Vec<u32>>> = names
+        .iter()
+        .map(|nm| {
+            let mut m: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
+            for p in &s.passes {
+                if p.grs.values().any(|g| &g.name == nm) {
+                    m.entry(cls_of(p)).or_default().push(p.n);
+                }
+            }
+            for v in m.values_mut() {
+                v.sort();
+            }
+            m
+        })
+        .collect();
+    let describe = |i: usize| -> String {
+        if costed[i].is_empty() {
+            return format!("  {}: not costed in any Spillcosts pass", names[i]);
+        }
+        let parts: Vec<String> = costed[i]
+            .iter()
+            .map(|(c, ps)| {
+                let shown: Vec<String> = ps.iter().take(8).map(|n| n.to_string()).collect();
+                format!(
+                    "{} class, costed in pass{} {}{}",
+                    cls_name(*c),
+                    if ps.len() > 1 { "es" } else { "" },
+                    shown.join(", "),
+                    if ps.len() > 8 { ", ..." } else { "" }
+                )
+            })
+            .collect();
+        format!("  {}: {}", names[i], parts.join("; "))
+    };
+    let all: Vec<String> = (0..names.len()).map(|i| describe(i)).collect();
+    if let Some(i) = costed.iter().position(|m| m.is_empty()) {
+        die(&format!(
+            "no globreg named {} in any Spillcosts pass of this snapshot (not a Color candidate: a scratch temporary, \
+             or a name the trace does not have)\n{}",
+            names[i],
+            all.join("\n")
+        ));
+    }
+    let mut common: BTreeSet<i64> = costed[0].keys().copied().collect();
+    for m in &costed[1..] {
+        let k: BTreeSet<i64> = m.keys().copied().collect();
+        common = common.intersection(&k).copied().collect();
+    }
+    if common.is_empty() {
+        die(&format!(
+            "these variables are in different register classes, so c2 never compares them (each class has its own \
+             registers and its own priority list):\n{}\nask about variables of one class; --pass N looks at one pass \
+             regardless",
+            all.join("\n")
+        ));
+    }
+    let d = defs(s);
+    let mut best: Option<(u32, i64, &'static str)> = None;
+    for &c in &common {
+        let mut cand: Vec<(u32, &'static str)> = vec![];
+        if let Some(k) = s.pops.iter().filter(|q| q.cls.unwrap_or(0) == c && names.contains(&q.name)).map(|q| q.npass).min() {
+            cand.push((k, "the first of them is popped in it"));
+        }
+        let mut ks: Vec<u32> = costed.iter().flat_map(|m| m.get(&c).cloned().unwrap_or_default()).collect();
+        ks.sort();
+        ks.dedup();
+        cand.extend(ks.into_iter().map(|k| (k, "the first pass with all of them in its list")));
+        for (k, why) in cand {
+            if !s.passes.iter().any(|p| p.n == k && cls_of(p) == c) {
+                continue;
+            }
+            let st = State::at_pass(s, k, &d);
+            if names.iter().all(|nm| st.vars.iter().any(|v| &v.name == nm)) {
+                if best.map_or(true, |b| k < b.0) {
+                    best = Some((k, c, why));
+                }
+                break;
+            }
+        }
+    }
+    let Some((k, c, why)) = best else {
+        die(&format!(
+            "these variables are never in the same priority list (one is coloured, split or removed before the other \
+             is costed):\n{}\ngive --pass N to look at one pass",
+            all.join("\n")
+        ))
+    };
+    if k == pass(s, None).n {
+        return None;
+    }
+    println!("pass {} ({} class) chosen from the variables named: {}; --pass N overrides", k, cls_name(c), why);
+    for l in &all {
+        println!("{}", l);
+    }
+    Some(k)
 }
 
 fn cmd_check(s: &Snap) {
@@ -1007,20 +1239,62 @@ fn main() {
         eprintln!("{}", include_str!("main.rs").lines().take_while(|l| l.starts_with("//!")).map(|l| l.trim_start_matches("//!").trim_start_matches(' ')).collect::<Vec<_>>().join("\n"));
         exit(2);
     }
+    if args[0] == "scratch" {
+        return scratch::main(&args[1..]);
+    }
     let s = load(&args[1]);
     let mut n = None;
     let mut top = 30usize;
+    let mut pool = 160usize;
+    let mut depth = 3usize;
     let mut rest = vec![];
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--pass" => n = it.next().and_then(|x| x.parse().ok()),
             "--top" | "--edits" => top = it.next().and_then(|x| x.parse().ok()).unwrap_or(top),
+            "--pool" => pool = it.next().and_then(|x| x.parse().ok()).unwrap_or(pool),
+            "--depth" => depth = it.next().and_then(|x| x.parse().ok()).unwrap_or(depth),
             _ => rest.push(a.clone()),
         }
     }
+    if n.is_none() {
+        // no --pass: follow the variables the command names (their class, the pass that decides between them)
+        let named: Vec<String> = match args[0].as_str() {
+            "need" if !rest.iter().any(|c| c.starts_with("reg:")) => {
+                rest.iter().filter(|c| c.contains('>')).flat_map(|c| c.split('>').map(|x| x.to_string()).collect::<Vec<_>>()).collect()
+            }
+            "blocks" => rest.clone(),
+            _ => vec![],
+        };
+        n = default_pass(&s, &named);
+    }
     match args[0].as_str() {
-        "check" => cmd_check(&s),
+        "check" if rest.iter().any(|a| a == "--predict") => predict::main(&args[1], rest.iter().any(|a| a == "-v"), false),
+        "check" => {
+            cmd_check(&s);
+            choose::cmd_check(&s);
+            combo::cmd_check(&s);
+            predict::main(&args[1], false, true);
+        }
+        "regs" => combo::cmd_regs(&s, &rest),
+        "need" if rest.iter().any(|c| c.starts_with("reg:")) => {
+            let mut tg = vec![];
+            let mut given = vec![];
+            for c in &rest {
+                if let Some(t) = c.strip_prefix("reg:") {
+                    let (v, r) = t.split_once('=').unwrap_or_else(|| die(&format!("target {:?} is not reg:VAR=REG", c)));
+                    tg.push((v.to_string(), r.to_string()));
+                } else {
+                    given.push(c.clone());
+                }
+            }
+            combo::cmd_need(&s, &tg, &given, &combo::Opts { top, pool, depth })
+        }
+        "want" => {
+            let Some(file) = rest.first() else { die("want: give the regmap output file") };
+            combo::cmd_want(&s, file, &rest[1..], &combo::Opts { top, pool, depth })
+        }
         "order" => {
             let edits: Vec<Edit> = rest.iter().map(|e| parse_edit(e).unwrap_or_else(|m| die(&m))).collect();
             cmd_order(&s, n, top, &edits)

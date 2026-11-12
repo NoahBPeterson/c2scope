@@ -1,17 +1,26 @@
-# c2 glass box: tools for matching code compiled by VS2005 SP1
+# c2scope: see inside the MSVC back end while it compiles
 
-Tools that look inside the Visual C++ 2005 SP1 back end (`c2.dll` 14.00.50727.762, the compiler Fallout 3 was built
-with) while it compiles your source, so that matching a decompiled function becomes prediction instead of guessing.
+Tools that look inside Microsoft's C++ back end (`c2.dll`) while it compiles your source, so that matching a
+decompiled function becomes prediction instead of guessing. Three compilers are supported:
+
+| compiler | used by | option |
+|---|---|---|
+| VS2005 SP1, 14.00.50727.762 | Fallout 3 | default |
+| VS .NET 2003, 13.10.3077 and 13.10.3052 | Mount & Blade | `--c2 13.10`, `--c2 13.10.3052` |
+| VS2008 SP1, 15.00.30729.1 | Spore | `--c2 15.00` |
+
 They trace c2's own decisions (which values get registers and in what order, which register each temporary gets,
-the IL at every pass), model the register allocator well enough to answer "what would make A get a register
-before B?" in milliseconds, and search for source rewrites that fix an allocation without changing any code.
+the IL at every pass, the scheduler's choices), model the register allocator well enough to answer "what source
+edit gives these variables these registers?" in milliseconds, and search for source rewrites that fix an
+allocation without changing any code.
 
-The specs in `docs/c2/` describe what the compiler does (register allocation, scheduler, inliner, block layout, x87,
-stack frame, IL) with each rule marked confirmed or inferred and backed by probe compiles.
+The specs in `docs/c2/` describe what the compiler does (front end, optimiser, instruction selection, register
+allocation, scheduler, inliner, block layout, x87, stack frame, IL) with each rule marked confirmed or inferred
+and backed by probe compiles. `docs/c2/port-1310.md` and `port-1500.md` cover the other two compilers.
 
-No Microsoft code or binaries are included. You need your own copy of the VS2005 SP1 toolchain. Setup patches a
-private copy of `c2.dll` in this directory (an entry-point hook that loads the tracer DLL); your toolchain is
-never modified.
+No Microsoft code or binaries are included. You need your own copy of each toolchain. Setup patches a private
+copy of `c2.dll` in this directory (an entry-point hook that loads the tracer DLL); your toolchain is never
+modified.
 
 ## Setup (once)
 
@@ -29,6 +38,9 @@ Setup checks every requirement, verifies that `c2.dll` is the exact build, fetch
 Microsoft symbol server (or pass `--pdb c2.pdb`), builds the function index, creates a wine prefix, builds the
 traced toolchain and rasim, and finishes with a regression test (9 checks). If a step fails it says why and how
 to fix it; run the same command again and it continues where it stopped.
+
+For the other compilers, after the setup above: `uv run tools/c2build.py setup --c2 13.10` (or `--c2 15.00`),
+then add the same `--c2` option to any tool command. `tools/c2build.py` explains where it looks for each toolchain.
 
 ## Quick start
 
@@ -69,6 +81,7 @@ Pass compiler flags literally after `--`; in zsh a `$FLAGS` variable holding sev
 | `tools/rasim` | Rust model of c2's priority formula and colouring order: `check`, `order`, `blocks`, `need` | tracer.md |
 | `tools/tsweep.py` | variant sweep scored by trace numbers and aligned register diff | tracer.md |
 | `tools/helpersweep.py` | finds inline-helper rewrites that fix a colouring order without code change | tracer.md, frontend.md |
+| `tools/rwsweep.py` | general search over mechanical source rewrites (identity helpers, aliases, dead uses, swaps): which ones move registers without changing code | tracer.md |
 | `tools/c2sched.py` | the instruction scheduler's decisions and a model check | docs/c2/sched.md |
 | `tools/ccache.py` | content cache behind every traced compile (`stats`, `clear`; `CCACHE=0` bypasses it) | tracer.md |
 

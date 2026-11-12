@@ -43,11 +43,9 @@ REG = re.compile(r"\b(e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp|e?sp|st\(\d\))\b")
 def listing_offsets(path, func):
     """{offset: 'mnemonic operands'} for our listing of func."""
     text = open(path, errors="replace").read()
-    i = text.find(func + " PROC")
-    if i < 0:
-        raise KeyError("%s PROC not in the listing (give the full decorated name)" % func)
+    i, j = c2trace.listing_proc(text, func)      # any --func form; `NAME<tab>PROC` (C names, cl 13.10) too
     out, pend = {}, None
-    for ln in text[i:text.index("ENDP", i)].splitlines():
+    for ln in text[i:j].splitlines():
         m = re.match(r"\s+([0-9a-f]{5})\t[0-9a-f ]+(?:\t+ (\w+)\s*(.*))?$", ln)
         c = re.match(r"\t[0-9a-f ]+\t+ (\w+)\s*(.*)", ln)       # continuation line of a long instruction
         if m:
@@ -64,10 +62,8 @@ def listing_offsets(path, func):
 
 def listing_instrs(path, func):
     text = open(path, errors="replace").read()
-    i = text.find(func + " PROC")
-    if i < 0:
-        raise KeyError("%s PROC not in the listing (give the full decorated name)" % func)
-    body = text[i:text.index("ENDP", i)]
+    i, j = c2trace.listing_proc(text, func)
+    body = text[i:j]
     out = []
     for ln in body.splitlines():
         m = re.match(r"(?:\s+[0-9a-f]{5})?\t[0-9a-f ]+\t+ (\w+)\s*(.*)", ln)
@@ -229,6 +225,8 @@ def main():
     if len(combos) > a.max:
         sys.exit("%d combinations (> --max %d): split the grid" % (len(combos), a.max))
     out = os.path.join(ROOT, "work", "tsweep", os.path.basename(a.template).rsplit(".", 1)[0])
+    if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory
+        out += "@" + c2trace.c2build.name()
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
     hdr_dir = os.path.dirname(os.path.abspath(a.template))
@@ -236,7 +234,8 @@ def main():
     for k, combo in enumerate(combos):
         it = iter(combo)
         body = ALT.sub(lambda m: m.group(1).split("<|>")[next(it)], text)
-        body = re.sub(r'#include "([^"]+)"', lambda m: '#include "%s"' % os.path.join(hdr_dir, m.group(1)), body)
+        body = re.sub(r'#include "([^"]+)"', lambda m: '#include "%s"' % os.path.join(hdr_dir, m.group(1))
+                  if os.path.exists(os.path.join(hdr_dir, m.group(1))) else m.group(0), body)
         d = os.path.join(out, "v%03d" % k)
         os.makedirs(d)
         p = os.path.join(d, "v%03d.cpp" % k)

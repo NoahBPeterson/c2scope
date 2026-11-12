@@ -256,7 +256,9 @@ def main():
     A, B = a.want.split(">")
     text = open(a.tu).read()
     hdr_dir = os.path.dirname(os.path.abspath(a.tu))
-    text = re.sub(r'#include "([^"/][^"]*)"', lambda m: '#include "%s"' % os.path.join(hdr_dir, m.group(1)), text)
+    text = re.sub(r'#include "([^"/][^"]*)"', lambda m: '#include "%s"' % os.path.join(hdr_dir, m.group(1))
+                  if os.path.exists(os.path.join(hdr_dir, m.group(1))) else m.group(0), text)
+    a.func = c2trace.func_decl(a.func)         # Class::method or method@Class -> ?method@Class@@
     fns = functions(text)
     target = body_of(text, a.func)
     helpers = used_helpers(text, target, fns)
@@ -267,6 +269,8 @@ def main():
     sites = sorted(set(sites), key=lambda x: x[1])
     print("%d helpers used by the target, %d rewrite sites" % (len(helpers), len(sites)), flush=True)
     out = os.path.join(ROOT, "work", "helpersweep", os.path.splitext(os.path.basename(a.tu))[0])
+    if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory
+        out += "@" + c2trace.c2build.name()
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the VS2005 SP1 tools (cl 14.00.50727.762) under this project's own Wine prefix.
 
-usage: msvc.py [--tool cl|link|lib|dumpbin|undname|ml] <MSVC arguments>
+usage: msvc.py [--tool cl|link|lib|dumpbin|undname|ml] <MSVC arguments>     (or: msvc.py cl|link|... <arguments>)
 Absolute Unix paths (bare, or after /I /Fo /Fa /Fe /OUT: /LIBPATH: /PDB: /MAP: /DEF: /IMPLIB:) become Z:\\ paths.
 
 Toolchain: work/toolchain/vs2005 (VC/{Bin,INCLUDE,LIB} + SDK/{Include,Lib}); currently a symlink to fn3-test's
@@ -16,8 +16,11 @@ import os, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TC = Path(os.environ.get("VS8_ROOT") or ROOT / "work" / "toolchain" / "vs2005")
+sys.path.insert(0, str(ROOT / "tools"))
+import c2build                # C2_BUILD / --c2 selects another compiler build's toolchain copy (docs/c2/port-1310.md)
+TC = Path(os.environ.get("VS8_ROOT") or (c2build.toolchain() if c2build.table() else ROOT / "work" / "toolchain" / "vs2005"))
 PREFIX = Path(os.environ.get("VS8_PREFIX") or ROOT / "work" / "toolchain" / "wineprefix")
+TOOLS = ("cl", "link", "lib", "dumpbin", "undname", "ml")
 OPTS = ["/LIBPATH:", "/OUT:", "/DEF:", "/IMPLIB:", "/PDB:", "/MAP:", "/Fo", "/Fa", "/Fe", "/Fd", "/I"]
 
 
@@ -97,4 +100,6 @@ if __name__ == "__main__":
     tool = "cl"
     if a[:1] == ["--tool"]:
         tool, a = a[1], a[2:]
+    elif a[:1] and a[0].lower() in TOOLS:        # `msvc.py cl /c x.c`, `msvc.py link ...`: a leading tool name
+        tool, a = a[0].lower(), a[1:]
     sys.exit(run(tool, a))

@@ -2,6 +2,7 @@
 """Build a function index for one binary from its public PDB.
 
 usage: pdbindex.py <Bin/name.dll|exe> [--pdb work/pdb/x.pdb]   -> work/index/<file name>.csv (e.g. cl.exe.csv)
+       pdbindex.py <dir/c2.dll> --pdb P --out work/index/<build>/c2.dll.csv   another c2 build (tools/c2build.py)
 
 The public PDBs (Microsoft symbol server) carry S_PUB32 records (mangled names, section:offset, a "function"
 flag), the module list (original .obj paths) and section contributions (each COMDAT's start, size, module), but
@@ -33,6 +34,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
     ap.add_argument("--pdb")
+    ap.add_argument("--out", help="index file to write (default: work/index/<file name>.csv)")
     a = ap.parse_args()
     import pefile
     pe = pefile.PE(a.binary, fast_load=True)
@@ -108,7 +110,7 @@ def main():
         modname, objname = mods.get(mod, ("", ""))
         rows.append((base + secs[s - 1][0] + o, size, "contrib", modname, objname, "static", ""))
     rows.sort()
-    out = os.path.join(ROOT, "work", "index", os.path.basename(a.binary).lower() + ".csv")
+    out = os.path.abspath(a.out) if a.out else os.path.join(ROOT, "work", "index", os.path.basename(a.binary).lower() + ".csv")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
