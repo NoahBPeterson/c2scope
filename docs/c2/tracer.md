@@ -1616,14 +1616,72 @@ while a chosen function is being compiled:
   build table's `globals._CurFunc`; 14.00: 10d123ac). Hooks still run and exit frames are still tracked, so only
   the log changes. The DLL writes `# func <n>` into the log when it filters.
 - `run_trace(..., func=PAT)` writes the lines for a `--func` value (func_pat; split around anonymous-namespace
-  hashes, which depend on the compile's path). Without it the environment variable `C2TRACE_FUNC=PAT` does the
-  same for any tool (`C2TRACE_FUNC='?eA@@' uv run tools/c2trace.py regs ...`).
-- `c2trace.py il` and `icount.py` pass their `--func` by default (their reports are by function anyway; output
-  unchanged). The other subcommands do not, because some of their events fire outside the function's own
-  compile (helpers inlined into it are compiled first under their own names); use `C2TRACE_FUNC` with them when the
-  trace is too big and the events you need are the function's own.
+  hashes, which depend on the compile's path). With `func` left out, the filter is the environment variable
+  `C2TRACE_FUNC` if it is set, else the tool's own `--func` (read from its command line when c2trace is imported).
+  So every tool that takes `--func` logs only that function's compile: regs, scratch, slots, merges, il, regmap,
+  loadcse, c2sched, schedwant, c2x87, icount, and the sweeps (tsweep, rwsweep, helpersweep, realize, effectmine),
+  with the same results (the suite on all four builds, and filtered/unfiltered runs compared). Mount & Blade
+  `agent_logic.cpp` (463 KB, 13.10, `regs --func ?move_dir@Agent@@...`, local wine): 193 MB of log and 76 s
+  unfiltered, 4 KB and 11 s filtered, the same report. `C2TRACE_FUNC=`
+  (set, empty) turns the filter off; `func=False` does the same for one call.
+- Exception: `symkeys.py` traces unfiltered (`func=False`), and so do the tools that use it (sulever, effectmine's
+  key feature). Symbol keys are assigned before `_CurFunc` names the function, and those events are dropped by the
+  filter.
 - A compile server whose c2trace.dll predates the directive ignores it (no `# func` line) and logs everything;
   the Python side filters by name as before, so results are the same, only bigger. Builds: all four.
+
+## Composed units (`--unit SPEC`, `--f3pack DIR`; `tools/unitcompose.py`)
+
+A candidate function is usually checked inside a bigger translation unit than its own file: a header hoisted first,
+the project's unit headers, a pragma, then the candidate with some of its lines removed. Tracing the candidate file
+alone gives another compile. Every tool built on c2trace.py (`regs`, `scratch`, `slots`, `il`, `regmap`,
+`merges`, `symkeys`, `tsweep`, `rwsweep`, `realize`, `icount`, `schedwant`, `effectmine`, `loadcse`, `sulever`,
+`framefields`, ...) takes `--unit SPEC`: the options are taken out of the command line when c2trace is imported
+(like `--c2`), SRC is the candidate, and the tool runs on the composed unit instead.
+
+    uv run tools/c2trace.py slots cand.cpp --unit unit.json --orig orig.s
+    uv run tools/icount.py cand.cpp --f3pack ../packs/clm_x --asm-vs orig.s          # an adapter, below
+    uv run tools/unitcompose.py compose unit.json cand.cpp -o tu.cpp                 # just write the unit
+
+The spec (JSON, paths relative to it; full format in `unitcompose.py --help`):
+
+    {"parts": [{"text": "#include <windows.h>"},              literal lines
+               {"hoisted": true},                              where hoisted candidate lines go
+               {"include": "inc/h_types.h"},                   an #include "/absolute/path" line
+               {"inline": "inc/h_more.h", "drop": ["RE"]},     the file's text, minus lines a regex finds
+               {"text": "#pragma optimize(\"\", on)"},
+               {"candidate": true, "hoist": ["RE"], "drop": ["RE"]}],
+     "flags": ["/MT", "/O2", "/GS", "/EHsc", "/Gy"], "func": "FUN_00401000"}
+
+- **Where it goes:** `--unit-out PATH`, else the `--keep` directory, else next to `--export`, else
+  `work/units/<hash>/<stem>.unit.cpp`; with it `<stem>.unit.json`, the line map. A sweep's kept variant of the
+  unit gives back its candidate part with `unitcompose.py extract UNIT VARIANT`.
+- **Flags and function:** the spec's flags go after `--` before yours (a later flag of yours wins); `--func` is
+  added from `func` when you give none, and C2TRACE_FUNC (the function filter above) is set to it unless it is
+  already in the environment or you gave `--func`. `C2TRACE_FUNC=` (empty) keeps every event: some reports need
+  events of helpers compiled before the function (see the function filter above).
+- **Line numbers:** reports that print absolute source lines print the candidate's: `slots` (`L<n>`),
+  `scratch --phase` (a case's first line), `icount` (`line <n>`, assertion lines). A line outside the candidate
+  prints as `tu:N` (or `name.h:L` inside an inlined file). `regs --why` (`src`), `realize`, `rwsweep` and
+  `symkeys` print offsets from the function's first line, which composition does not move. `unitcompose.py line
+  UNIT N` maps one line; `unitcompose.cand_line` / `unit_line` / `label` do it in Python. The listing itself keeps
+  the unit's numbering (it must equal the checker's compile), and a listing line from an inline function in an
+  `#include`d header carries that header's number, which the tools cannot tell apart (inline such headers).
+- **Remote compiles:** the composed unit is an ordinary source file; headers named by `include` parts are absolute
+  `#include "..."` lines, which the compile server's client ships and rewrites like any project header, and
+  `inline` parts need nothing.
+
+### Adapter: f3decomp packs (`--f3pack DIR` = `--unit f3pack:DIR`)
+
+Builds the spec from a pack directory's `pack.json` (`headers`, `flags`, `symbol`, `source`), as the checker
+composes it: `#include <windows.h>`; the candidate's other `#include <...>` and `#pragma intrinsic|function`
+lines (hoisted); `#include "DIR/<header>"` for each header in pack.json's order; the unit source's own text
+when it has more than those header includes (inlined, without them); `#pragma optimize("", on)`; the candidate
+without its `#include <windows.h>` and without any other preprocessor line. On F3 0x00608e00
+(clm_7bf5256f4270481bbc0b) the unit equals the hand-built `mk.sh` one byte for byte for all 12 candidates there, and a
+traced compile of c1.cpp gives the same listing as mk.sh's unit (pack flags, and with `-- /O2`) and the same
+`slots` report, its lines mapped back by 3. Other
+checkers are other adapters: a function in unitcompose.py that returns a spec.
 
 ## Compile cache (`tools/ccache.py`)
 
@@ -1680,10 +1738,10 @@ different). Fixed **[C, unit test in tests/run_tests.py]**:
 - **One thread assumed** (c2 compiles serially in-process). The shadow stack and the log buffer are not
   thread-safe.
 - **No reads of floating point or SSE state**, and no logging of memory *writes* (use a probe after the store).
-  Specs print hex dwords or strings; interpreting structs is up to you (use `src/c2/tuple.h` etc.).
-- **LTCG (`/GL` + `link /LTCG`)**: link.exe loads c2.dll from the same `VC/Bin`, so the cave should fire there too.
-  Untested (INFERRED). Run it via `VS8_ROOT=... uv run tools/msvc.py --tool link ...` with C2TRACE_CFG/LOG set by
-  hand. Copy a cfg from `--keep`.
+  Specs print hex dwords, strings or one of the DLL's built-in dumps (`%` / `%+` IL, `&` x87 view); any other
+  struct is yours to interpret (`src/c2/tuple.h` etc.).
+- **LTCG (`/GL` + `link /LTCG`)**: link.exe loads c2.dll from the same `VC/Bin` and the cave fires there too;
+  `tools/c2ltcg.py` runs the traced link (section "LTCG builds").
 - **Cost**: each event costs a sprintf. 10k events add no measurable time. A hook on a very hot function
   (`@SbvNext@4` gets ~5k calls in bitvect.c) produces large logs, so use `--max`.
 

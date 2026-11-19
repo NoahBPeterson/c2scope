@@ -47,6 +47,7 @@ Examples:
 import argparse, collections, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c2trace, c2il, tsweep, loadcse, c2merges, c2scratch  # noqa: E402
+import unitcompose  # noqa: E402  (a composed unit, --unit: reports print the candidate's lines)
 from c2trace import c2build  # noqa: E402
 
 # The per-function pipeline (il_pipeline.md §5.3, opt.md §1) as hook points, in order. Each is a base name looked
@@ -1172,10 +1173,10 @@ class Analysis:
                     if deref:
                         self._why = ("decided by the assertion `%s != 0` that GdfInsertAssertions put after the "
                                      "dereference of %s at line %s (c2 takes a dereferenced pointer to be non-null)" % (
-                                         v, v, self.src_line(deref[-1]["line"])))
+                                         v, v, unitcompose.label(self.src_line(deref[-1]["line"]))))
                         return "folded:nonnull"
                     self._why = "decided by the assertion `%s %s %s` (GdfInsertAssertions, line %s)" % (
-                        v, {"OPNE": "!=", "OPEQ": "=="}.get(x["op"], x["op"]), c, self.src_line(x["line"]))
+                        v, {"OPNE": "!=", "OPEQ": "=="}.get(x["op"], x["op"]), c, unitcompose.label(self.src_line(x["line"])))
                 prior = [x for x in s.ins[:i["pos"]] if x["op"] in ("OPCMP", "cmp") and x["srcs"] and
                          loadcse.leaf_name(x["srcs"][0]) == v]
                 if prior:
@@ -1344,7 +1345,8 @@ def show(rep):
         where = ("ours @%x" % r["off"]) if r["kind"] == "extra" and r.get("off") is not None else \
             ("orig %08x" % r["va"]) if r.get("va") is not None else ""
         print("\n%s %d  %s  line %s%s  -> %s" % ("EXTRA" if r["kind"] == "extra" else "MISSING", n, where,
-                                                 r.get("line"), "  `%s`" % r["src"][:70] if r.get("src") else "",
+                                                 unitcompose.label(r.get("line")) if r.get("line") is not None else None,
+                                                 "  `%s`" % r["src"][:70] if r.get("src") else "",
                                                  r["verdict"]))
         if r["kind"] == "missing":
             print("   between ours `%s` and `%s`" % tuple(r["between"]))
@@ -1359,7 +1361,7 @@ def show(rep):
             else:
                 if it.get("tuple"):
                     print("           our tuple %s `%s` (line %s) %s after %s" % (
-                        it["tuple"], it["il"][:80], it["line"], "removed" if it["how"] == "removed" else
+                        it["tuple"], it["il"][:80], unitcompose.label(it["line"]), "removed" if it["how"] == "removed" else
                         "lost its memory operand", it["removed_after"]))
                     print("           by %s" % it["by"])
                     if it.get("now"):

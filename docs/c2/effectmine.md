@@ -263,10 +263,10 @@ unchanged instructions, frame-key adders with fixed counts) and the 13.10 declar
 
 - **Cost per variant is the trace, not the compile, for large units.** A regs trace logs every function of the unit:
   Mount & Blade `agent_logic.cpp` (463 KB) writes a 177 MB log per compile, which the compile server sends back;
-  with the 26 s compile that is about one variant per minute per slot (Fallout 3 and Spore units: 1 to 10 s). A
-  function filter in c2trace.dll (log only between the target's `@Color@4` and the next function's) would make
-  large units about as cheap as small ones; it is a tracer change and a redeploy, not done here. Until then use
-  `--features regs,scratch` (or the one model the answer is in) on large units.
+  with the 26 s compile that is about one variant per minute per slot (Fallout 3 and Spore units: 1 to 10 s). The
+  tracer's function filter (tracer.md, "Function filter") now applies by default: every trace logs only F's
+  compile, so a large unit costs its compile time and F's events. The key feature (symkeys) still traces the
+  whole unit, so on large units leave it out (`--features` without `keys`) unless the answer is a key.
 - **Lazy secondary traces** miss a model input that changes while the IL at Color and the bytes stay the same (a
   slot use count that moves no offset, a key renumbering that flips no sort). `--eager` / `--eager-feats` measure
   them; the table counts S L K Q M over the variants where they were traced.

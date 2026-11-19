@@ -656,7 +656,8 @@ def ename(s, i):
 
 def eline(s, i):
     L = s["listing"].get(i)
-    return ("L%d" % L["line"]) if L and L.get("line") else ""
+    import unitcompose                # a composed unit (--unit): the candidate's line
+    return ("L%s" % unitcompose.label(L["line"])) if L and L.get("line") else ""
 
 
 # ---------------------------------------------------------------- report
@@ -1278,5 +1279,5 @@ def offline(argv):
 
 
 if __name__ == "__main__":
-    import c2build  # noqa: F401  (takes --c2 out of argv)
+    import c2trace  # noqa: F401  (takes --c2 and --unit / --f3pack out of argv)
     sys.exit(main(sys.argv[1:]))

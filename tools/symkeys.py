@@ -1569,7 +1569,8 @@ def trace(src, cl):
     roles = list(HOOKS)
     ROLE.clear()
     ROLE.update(enumerate(roles))
-    img, hooks, rc, out, text = c2trace.run_trace(src, [HOOKS[r] for r in roles], cl, maxn=None)
+    img, hooks, rc, out, text = c2trace.run_trace(src, [HOOKS[r] for r in roles], cl, maxn=None,
+                                                  func=False)   # unfiltered: keys are assigned outside F's compile
     if rc:
         sys.stdout.write(out)
     return parse(text, hooks, img)

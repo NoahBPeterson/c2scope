@@ -51,6 +51,7 @@ in one phase, and (unless --no-scan) every single inserted / removed pick ranked
 import argparse, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c2trace
+import unitcompose
 
 REGNAME = "10cec7b8"
 NEXTINTPOS = "10d0f854"      # _NextIntPos (.data 0003:38996)
@@ -831,7 +832,8 @@ def phase(a, picks, pos, asm, snap, body):
         for off, nm in starts:
             k = bisect.bisect_left(so, off)
             if k < len(so) and (k + 1 >= len(so) or True):
-                first[nm] = srcl[so[k]][:60]
+                num, _, txt = srcl[so[k]].partition(":")      # "NN: text"; a composed unit: the candidate's line
+                first[nm] = ("%s:%s" % (unitcompose.label(num), txt))[:60]
     print("# %s: %d picks; %d of our %d instructions aligned to %d of the original's; groups: %s (%d)" % (
         a.func, len(picks), npair, nours, norig, "switch cases (jump-table targets, layout order)" if by == "case"
         else "IL blocks", len(names)))

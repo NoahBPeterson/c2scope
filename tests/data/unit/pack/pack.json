@@ -1,0 +1,18 @@
+{
+ "address": "0x00401000",
+ "size": 64,
+ "source": "unit_test.cpp",
+ "symbol": "Unit_Sum",
+ "flags": [
+  "/MT",
+  "/O2",
+  "/GS",
+  "/EHsc",
+  "/Gy"
+ ],
+ "canary": false,
+ "headers": [
+  "h_types.h",
+  "h_ext.h"
+ ]
+}

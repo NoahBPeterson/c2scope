@@ -1,0 +1,11 @@
+{
+ "parts": [
+  {"text": "#include <windows.h>"},
+  {"inline": "pack/h_types.h"},
+  {"include": "pack/h_ext.h"},
+  {"text": "int g_unit_total;"},
+  {"candidate": true, "drop": ["^#"]}
+ ],
+ "flags": ["/MT", "/O2", "/GS", "/EHsc", "/Gy"],
+ "func": "Unit_Sum"
+}

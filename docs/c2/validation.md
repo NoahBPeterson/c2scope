@@ -267,9 +267,10 @@ Verdict: **holds** (CONFIRMED).
 
 ## Not tested, or open
 
-- ChoosePhysReg's `+100·benefit` term for a neighbour's last free register, SpillOrDefer and deferral order,
-  `BetterToDefer` re-queueing, the parameter-home undo at T ≥ 112, and the EBP adjustment were not exercised by
-  any of these probes. They remain as the authors left them.
+- Not exercised by these probes, but tested since: the parameter-home undo (slots.md section 5; test "slots: T >
+  128 ... (undo)") and SpillOrDefer / `BetterToDefer` re-queueing (regalloc.md 3.6, `rasim check --predict`).
+  Still not targeted by any probe: ChoosePhysReg's `+100·benefit` term for a neighbour's last free register
+  (implemented in choose.rs) and the EBP adjustment.
 - The P_B accounting for immediates: whether a constant must be used two or more times in the function to become
   a web was not isolated, only seen in R4a and R1b (INFERRED).
 - The PAS mechanism behind section 8 (INFERRED; trace 0x10bea457 to confirm).

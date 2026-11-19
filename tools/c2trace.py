@@ -22,6 +22,9 @@ usage: c2trace.py install                      build c2trace.dll and patch the t
   --max N                            stop logging after N events
   --raw                              print the raw log, not the decoded one
   --keep DIR                         keep cfg/log/obj/asm in DIR (default: a temp dir)
+  --func S                           log only while function S is compiled (default: $C2TRACE_FUNC, else all)
+  --unit SPEC | --f3pack DIR         (every tool) SRC is a candidate: compile the unit SPEC composes around it
+                                     (tools/unitcompose.py; tracer.md "Composed units")
   default hooks (no -H): @Color@4 and @Spillcosts@12 with a few stack words
 SPEC := base {'>' off | '~' table} ['#' n | '$']   base = eax..edi | sN (entry stack word N; s0 = return address, s1 =
         first stack arg) | aN (same word, saved at entry: usable in exit specs) | gHEX (a c2 VA, e.g. a global);
@@ -41,6 +44,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import time
 import capstone
 import c2build                # takes --c2 BUILD out of sys.argv; C2_BUILD selects a non-default c2 (port-1310.md)
+import unitcompose            # --unit SPEC / --f3pack DIR: SRC is a candidate, composed into its unit (tracer.md)
+unitcompose.take_argv()
+
+
+def _argv_func(argv):
+    """The tool's own --func value (before any `--`), or None: the default of the tracer's function filter."""
+    end = argv.index("--") if "--" in argv else len(argv)
+    for k in range(1, end):
+        if argv[k] == "--func" and k + 1 < end:
+            return argv[k + 1]
+        if argv[k].startswith("--func="):
+            return argv[k][len("--func="):]
+    return None
+
+
+ARGV_FUNC = _argv_func(sys.argv)   # every tool that imports c2trace logs only its --func's compile by default
 from image import Image, ROOT
 import ccache, msvc
 
@@ -1094,9 +1113,10 @@ def curfunc_va():
 
 def write_cfg(cfg, img, hooks, maxn=None, exit_all=False, func=None):
     """The trace config c2trace.dll reads (%C2TRACE_CFG%) for these parsed hooks. `func` (or the environment
-    variable C2TRACE_FUNC when func is None): log only while that function is compiled (DLL directive `func`)."""
-    if func is None:
-        func = os.environ.get("C2TRACE_FUNC") or None
+    variable C2TRACE_FUNC when func is None, else the tool's own --func; C2TRACE_FUNC= empty turns it off): log only
+    while that function is compiled (DLL directive `func`)."""
+    if func is None:   # C2TRACE_FUNC (set and empty: no filter), else the tool's --func
+        func = (os.environ["C2TRACE_FUNC"] if "C2TRACE_FUNC" in os.environ else ARGV_FUNC) or None
     with open(cfg, "w") as f:
         if maxn is not None:
             f.write("max %d\n" % maxn)
@@ -1210,7 +1230,7 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
     """Compile src with the traced c2; returns (img, hooks, rc, cl output, raw log text).
     Relative `src` and `keep` paths are taken against the caller's cwd (resolved here, before anything runs elsewhere).
     func: a --func value; events are then logged only while that function is compiled (write_cfg; default: the
-    environment variable C2TRACE_FUNC, unset = everything)."""
+    environment variable C2TRACE_FUNC if set, else the tool's own --func; False or C2TRACE_FUNC= empty: everything)."""
     src = os.path.abspath(src)
     if not os.path.isfile(src):
         # before anything is written: a script that passed a relative source from the wrong cwd used to leave one
@@ -1345,11 +1365,13 @@ def main():
     ap.add_argument("--max", type=int)
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--keep")
+    ap.add_argument("--func")            # log only while this function is compiled (default: C2TRACE_FUNC)
     ap.add_argument("src")
     ap.add_argument("cl", nargs="*")     # cl arguments without `--` (c2ltcg.py raw passes them so)
     argv, cl = split_cl(sys.argv[1:])    # options anywhere before `--`; everything after it goes to cl unchanged
     a = ap.parse_args(argv)
-    img, hooks, rc, out, text = run_trace(a.src, a.hook or DEFAULT_HOOKS, a.cl + cl, a.max, a.keep, a.exit)
+    img, hooks, rc, out, text = run_trace(a.src, a.hook or DEFAULT_HOOKS, a.cl + cl, a.max, a.keep, a.exit,
+                                          func=a.func)
     sys.stdout.write(out)
     sys.stdout.write(decode(text, hooks, a.raw))
     return rc

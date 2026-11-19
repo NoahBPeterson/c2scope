@@ -1902,5 +1902,49 @@ def tool_portability_tests():
 
 tool_portability_tests()
 
+
+def unit_tests():
+    """T14: composed units (tools/unitcompose.py, tracer.md "Composed units") on a tiny fake f3decomp pack
+    (tests/data/unit/pack) and a JSON spec: the composed text, the argv rewrite, the line map, one traced compile."""
+    import unitcompose
+    U = os.path.join(HERE, "tests", "data", "unit")
+    cand, pack = os.path.join(U, "cand.cpp"), os.path.join(U, "pack")
+    text, m = unitcompose.compose(unitcompose.load_spec("f3pack:" + pack), cand)
+    ls = text.splitlines()
+    want = ["#include <windows.h>", "#include <string.h>", '#include "%s"' % os.path.join(pack, "h_types.h"),
+            '#include "%s"' % os.path.join(pack, "h_ext.h"), "", "int g_unit_total;", '#pragma optimize("", on)']
+    check("f3pack: windows.h, hoisted <string.h>, pack headers in order, unit source, pragma, candidate",
+          (ls[:7], ls[7].startswith("// candidate"), "#define UNIT_UNUSED" in text), (want, True, False))
+    check("f3pack: candidate line 8 (Ext(&a)) is unit line 12; 12 maps back; a dropped line has none",
+          (unitcompose.unit_line(8, m), unitcompose.cand_line(12, m), unitcompose.unit_line(3, m),
+           unitcompose.label(12, m), unitcompose.label(3, m)), (12, 8, None, "8", "tu:3"))
+    text2, m2 = unitcompose.compose(unitcompose.load_spec(os.path.join(U, "spec.json")), cand)
+    check("spec: an inlined header maps to its own lines (h_types.h:4), the candidate after it",
+          (unitcompose.label(5, m2), text2.count("#include"), unitcompose.offsets(m2)["delta"]),
+          ("h_types.h:4", 2, 5))
+    d = tempfile.mkdtemp()
+    argv = ["tool.py", "slots", cand, "--f3pack", pack, "--unit-out", os.path.join(d, "u.cpp"), "--", "/W3"]
+    env, act = os.environ.pop("C2TRACE_FUNC", None), unitcompose.ACTIVE
+    try:
+        unitcompose.take_argv(argv, quiet=True)
+        got = (argv, os.environ.get("C2TRACE_FUNC"), os.path.isfile(os.path.join(d, "u.json")))
+    finally:
+        os.environ.pop("C2TRACE_FUNC", None)
+        if env is not None:
+            os.environ["C2TRACE_FUNC"] = env
+        unitcompose.ACTIVE = act
+    check("--f3pack: SRC -> the unit, --func and C2TRACE_FUNC from the symbol, pack flags before the user's",
+          got, (["tool.py", "slots", os.path.join(d, "u.cpp"), "--func", "Unit_Sum", "--", "/MT", "/O2", "/GS",
+                 "/EHsc", "/Gy", "/W3"], "Unit_Sum", True))
+    # traced: slots prints the candidate's lines (a: first referenced on candidate line 8, q on 11), the composed
+    # unit is kept next to the outputs
+    out = tool("slots", cand, "--f3pack", pack, "--keep", os.path.join(d, "k"))
+    got = sorted(re.findall(r"^\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(_[aq]\$) (L\d+)", out, re.M))
+    check("slots --f3pack: candidate lines (_a$ L8, _q$ L11), unit kept with --keep", (got, os.path.isfile(
+        os.path.join(d, "k", "cand.unit.cpp"))), ([("_a$", "L8"), ("_q$", "L11")], True))
+
+
+unit_tests()
+
 print("%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

@@ -16,6 +16,11 @@ first; read `docs/c2/tracer.md` for every tool's details. Every tool prints its 
   `~/.config/c2trace-remote` (see the comment above `REMOTE_CLIENTS` in tools/c2trace.py) and says so once per run.
   `C2TRACE_REMOTE=0` keeps them local, for example when a brief says local only or the source must not leave the
   machine. Without a configured client everything compiles locally.
+- A candidate checked inside a bigger unit (hoisted headers, unit headers, a pragma): pass `--unit SPEC.json` (or
+  `--f3pack PACKDIR` for an f3decomp pack) to any tool; SRC is the candidate, the tool traces the composed unit and
+  reports candidate line numbers. docs/c2/tracer.md "Composed units".
+- A traced compile logs only the compile of the tool's `--func` (symkeys excepted), so a large unit traces about as
+  fast as a small one. `C2TRACE_FUNC=PAT` picks another function; `C2TRACE_FUNC=` (empty) logs every function.
 - Compiles are cached by content (source, includes, flags, compiler build). `CCACHE=0` bypasses the cache.
 - The original's disassembly (`orig.s`) is one instruction per line: `VA mnemonic operands`, capstone style.
 - Trust order: a byte comparison against the original, then a traced compile, then a model answer, then a doc
@@ -25,6 +30,7 @@ first; read `docs/c2/tracer.md` for every tool's details. Every tool prints its 
 
 | Your draft differs from the original by | Start with | Then |
 |---|---|---|
+| A different instruction count (extra or missing loads, compares, moves, a loop unrolled or not) | `icount.py SRC --func F --asm-vs orig.s` (each extra/missing instruction: its IL tuple, the pass that made, kept or removed it, a verdict class) | the lever printed for its verdict class (docs/c2/icount.md table); `--vs-func G` compares against another function of the same compile |
 | Registers only (same instructions) | `c2trace.py regmap` (which variable wants which register) | `rasim want SNAP regmap.txt` for the source edits that fix them |
 | Two values in swapped callee-saved registers | `c2trace.py regs --why A,B` (priority per block) | `rasim need SNAP 'A>B'` or `reg:A=esi` |
 | eax/ecx/edx choices (scratch temporaries) | `c2trace.py scratch --why` | `rasim scratch SSNAP drop:N` / `ins:N`; several `want:` at once: the joint edit set is printed first |
@@ -42,7 +48,7 @@ first; read `docs/c2/tracer.md` for every tool's details. Every tool prints its 
 | Code inside an EH frame (C++ destructors, try) | `helpersweep.py` (reference bindings in inline helpers) | |
 | A tail shared in one and duplicated in the other (switch cases, if/else arms) | `c2trace.py merges` (each jump pair: merged, or the first difference: call target, register, size) | il_fg.md §7.5: twins called by two symbols, scratch rotation, which copy survives |
 | Stack offsets differ (`_x$`/`$T`/`tv` slots in other places, same code) | `c2trace.py slots SRC --func F --orig orig.s` (colours, visiting order, every colour refused and why; ours against the original's slots) | `--search` (single edits: uses, visiting position, a conflict) and `c2slots.py what SNAP uses:X=N` to try one; rules: docs/c2/slots.md |
-| /GL + /LTCG code | `c2ltcg.py` (traces at link time) | docs/c2/ltcg.md when present |
+| /GL + /LTCG code | `c2ltcg.py` (links an LTCG probe and gives the other tools its listing: `c2ltcg.py regmap`, `c2ltcg.py tsweep`) | `ltcgstub.py callees EXE VA` (each callee's kill set, read from the original), `ltcgstub.py stubs` (/GL stubs that reproduce them), `ltcgstub.py cmp` (the target linked with the stubs, against the original); tracer.md "LTCG builds" |
 | A model answer (`ref:V:B`, `extend:V:B`, `P:B:+1`, `add:frame@V:n`) you cannot spell in C++ | `realize.py edit SRC --func F EDIT` (each catalogued construct applied at the block's source lines, compiled, checked) | `realize.py --from-rasim auto SRC --func F --asm-vs orig.s` runs regmap, `rasim want` and the rewrites until one matches; catalogue: docs/c2/realize.md |
 | A model answer realize has no construct for (`drop:N`, `uses:X=N`, `conf-:A,B`, `pref:V:REG`, `before:A:B`, `sched:A>B`, a key count) | `effectmine.py mine SRC --func F --want EFFECT --asm-vs orig.s` (generic mutations of the function and its unit, each compiled traced, every model's effect recorded in a database) | `effectmine.py table`: per mutation class, how often it produced each effect elsewhere; docs/c2/effectmine.md |
 
@@ -100,4 +106,5 @@ From `docs/c2/frontend.md`, `immcand.md`, `symkeys.md` and `x87.md`; each is an 
     (docs/c2/x87.md section 12: `rasim check --predict`, `need stack:V`): which calls kill the stack, fxch,
     pops, fldz and airlocks.
   - Split points made between rounds are still read from the trace.
-  - Reference costs of split pieces were checked on 14.00 only.
+  - Reference costs of split pieces are checked on all four builds; on 13.10 one tied-destination cost rule still
+    misses (regalloc.md 3.6.11).
