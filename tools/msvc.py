@@ -24,6 +24,11 @@ TOOLS = ("cl", "link", "lib", "dumpbin", "undname", "ml")
 OPTS = ["/LIBPATH:", "/OUT:", "/DEF:", "/IMPLIB:", "/PDB:", "/MAP:", "/Fo", "/Fa", "/Fe", "/Fd", "/I"]
 
 
+def tc(rel):
+    """A path in the toolchain, matched case-insensitively (c2build.tcpath: a lower-case `vc/bin` unpack on Linux)."""
+    return Path(c2build.tcpath(TC, rel))
+
+
 def winpath(p):
     return "Z:" + str(Path(p).resolve()).replace("/", "\\")
 
@@ -42,9 +47,9 @@ def convert(args):
 
 def env():
     e = os.environ.copy()
-    e.update(WINEPREFIX=str(PREFIX), WINEDEBUG="-all", WINEPATH=winpath(TC / "VC/Bin"),
-             INCLUDE=";".join(winpath(p) for p in [ROOT / "src" / "include", TC / "VC/INCLUDE", TC / "SDK/Include"]),
-             LIB=";".join(winpath(p) for p in [TC / "VC/LIB", TC / "SDK/Lib"]))
+    e.update(WINEPREFIX=str(PREFIX), WINEDEBUG="-all", WINEPATH=winpath(tc("VC/Bin")),
+             INCLUDE=";".join(winpath(p) for p in [ROOT / "src" / "include", tc("VC/INCLUDE"), tc("SDK/Include")]),
+             LIB=";".join(winpath(p) for p in [tc("VC/LIB"), tc("SDK/Lib")]))
     return e
 
 
@@ -85,7 +90,7 @@ def run(tool, args, capture=False):
     e = env()
     ensure_wine(e)
     with tempfile.TemporaryFile() as out:
-        rc = subprocess.run(["wine", str(TC / "VC/Bin" / (tool + ".exe"))] + convert(args), env=e,
+        rc = subprocess.run(["wine", str(tc("VC/Bin/" + tool + ".exe"))] + convert(args), env=e,
                             stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT).returncode
         out.seek(0)
         text = out.read().decode("latin-1")

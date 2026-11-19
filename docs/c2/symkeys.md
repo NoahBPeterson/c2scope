@@ -82,10 +82,17 @@ equal SU and count (two loads, two field views, two `(double)` conversions of lo
 | named variable or field view, key k | `((k & 0x7ff) << 5) ^ (k >> 11)` |
 | temporary with several definitions | `(k << 6) & 0xffff` |
 | temporary with one definition | its definition's weight |
-| `[base + d]` | `d + 0x31 + (hash(base) << 8)` (memory ops in a float conversion add the conversion's opcode) |
+| `[base + d]` (a memory leaf, OPBASED 0x27c) | `d + (0x27c - 0x274) + (hash(base) << 8)` = `d + 8 + (hash(base) << 8)` (`[p+0]` with p key 2: 0x4008) |
+| member at `d != 0` before AddrModes: `[t+0]` with `t = p + d` (one definition) | the weight of `OPADD(p, d)`: `h(p) + 2·d + (0x2a5 - 0x274 = 0x31)` (13.10: `+ 0x2e`), SU 1, count 2 |
 | conversion / negation of x | `hash(x) + opcode - 0x274` |
 
 `symkeys.py sites --line L --pass 2` prints each sort with both operands, their keys and weights.
+
+The `+ 0x31` once given here for `[base + d]` was the OPADD constant of the address temporary, not the leaf's: the code
+(`OptHashNode` case 2, 0x10bb6798) adds the leaf's own opcode minus 0x274, which is 8 for OPBASED, and the R200 /
+R450 notes of f3decomp quote the two forms (rules_xref.md). Traced on all four builds with
+tests/data/rules/R200_memhash.cpp: `p->a * q->a` sorts h4008 / h2008, `p->c * q->b` h0081 / h0059 (13.10: h007e /
+h0056). **[C]**
 
 **Sorts of more than two operands.** The optimiser flattens associative chains, so `a + b + c + d` and an address
 such as `&scene[vs].visitors[p0].troop` (`base + vs*size + p0*8 + d`) reach OptLeftWeightTree as one OPADD with a
@@ -97,6 +104,17 @@ tests/data/symkeys_nary.cpp: `kn4` sorts `_a _b _c _d` (keys 4..1); in `kcall3` 
 (`int c = f3();` before a and b) turns `c b a` into `b a c`, predicted by `swap:_c,_a` (`compare`: 1 of 1, all
 four builds). In Mount & Blade's Operation::execute the `scene(vs)->visitors[p0]` adds are four-operand sorts
 (`[$o58791 key 24043+0]`, `(?g_visitor_scene key 4135 ..)`, `$o53502`, a constant; lines 1260-1269). **[C]**
+
+**When SU or count decides** (`tools/sulever.py --site LINE:A>B`): no key edit moves the order, and the operand
+has to change shape without changing code. Known constructs **[C]**:
+- a zero-extended narrow variable in memory (a byte or short parameter) is SU0; `(*(unsigned*)&x & 0xff)` (a 32-bit
+  view of it, masked) is SU1 and instruction selection turns `and m32, 0xff` back into `movzx r32, byte ptr [m]`:
+  Spore 0x0068c6d0, `(hi << 8) | lo | (g & 0xffff0000)` with lo before the mask term, byte match.
+  `(unsigned)x & 0xff` is folded before pass 1; a wider mask (`& 0xffff`) gives SU1 but keeps the `and`.
+- a single-use local or a `v |= ..` chain is substituted before the sort (no effect); an inner pair under another
+  opcode (`+`, `^`) is one operand of the outer sort but changes the instruction.
+- an offset-0 member is SU0 n1 (or n2 through a float conversion); there is no known code-neutral way to raise it
+  (Fallout 3 0x00a72450: 12 spellings, `rot.Column(n).x` CSEs into a hash temp, still SU0).
 
 ## 4. Constructs: what takes a key (probes `c1.cpp` .. `c4.cpp`, 14.00, the same on 15.00)
 
@@ -119,6 +137,13 @@ four builds). In Mount & Blade's Operation::execute the `scene(vs)->visitors[p0]
 | `switch` | 0 frame | temps only | c3 sw1 [C] |
 | local array, elements touched | 1 + 1 per element offset touched | - | c3 arr1 [C] |
 | function earlier in the unit | nothing | - | tu_a/tu_b [C] |
+| struct copied element by element through an inlined `operator=` (f3decomp R310) | 14.00/15.00: the `+0` field view is made inside the first `operator=` expansion (its `this` is the local's own address), so element 0 gets a low key; `+12`, `+24` views are made later by the optimiser. 13.10: every element gets a reader-time view first (no asymmetry) | - | rules/R310_copy_elem0.cpp: `_m+0.f4` key 6 (`V::operator=#1`), `_m+12.f4` 13, `_m+24.f4` 14; 13.10: 4, 5, 6 [C] |
+| `if ((x & 0x80000000) == 0)` instead of `if (x >= 0)` (R480) | +1 symbol before OptFuncExpr, +7 keys in all (the AND and compare temps); code `test; js` against `test; jl`, all builds | temps | rules/R480_js_jl.cpp: 10 / 42 against 11 / 49 [C] |
+
+**Counts, not keys (R470).** `double s = x*x; s += y*y; s += z*z;` gives the first OPADD of pass 2 the accumulator
+(the converted `x*x`) with count 4 against 3 for `y*y` (13.10: 5 against 4), so `x*x` is evaluated first whatever
+the keys; a plain float sum `x*x + y*y + z*z` has equal counts and the keys decide. All four builds. **[C: `sites`
+on rules/R470_double_acc.cpp]**
 
 ## 5. The tool, and how accurate it is
 

@@ -273,6 +273,13 @@ At /O1 a constant divisor is loaded with `push imm8; pop ecx` (F4) or `mov ecx, 
 - `(a << 5) | (a >> 27)` on unsigned is `rol eax, 5`, with a variable count `rol eax, cl`, at both levels;
   `_rotl`/`_rotr` are inline only with `/Oi` (/O2) and calls at /O1 (div.c rot, rotv; idi.c i6, i7). Which pass
   recognises the pattern: `OptRotatePeep` (§13). **[C probes]**
+- **Byte swaps and rotates per build (f3decomp R1150, probe tests/data/rules/R1150_bswap_rot.cpp).** No shift/mask
+  spelling becomes `bswap` on any build (14 instructions, `shl/and/or/shr`); only `_byteswap_ulong` is `bswap`.
+  `_byteswap_ushort(*p)` is `mov cx, [eax]; mov ah, cl; mov al, ch` (registers as allocated; f3decomp saw
+  `mov ch, al; mov cl, ah; mov ax, cx`). `(unsigned short)((x >> 8) | (x << 8))` is `movzx; shr; shl; or`. A byte
+  swap through `unsigned char*` stays byte moves. `_rotl(x, 8)` is `rol` everywhere; **the shift spellings
+  `(x << 8) | (x >> 24)` / `(x >> 8) | (x << 24)` are `rol` / `ror` on 14.00 and 15.00 but `shr; shl; or` on
+  13.10.3077 and 3052** (13.10's OptRotatePeep does not fire on them at /O2 /TP). **[C probe, all four builds]**
 
 ## 4. Zero and sign extension, 8- and 16-bit operations
 
@@ -586,6 +593,30 @@ At /O2 the loads and pushes of several memory arguments interleave under the sch
 rotation (q1: `mov ecx,[eax+28]; mov edx,[eax+24]; push ecx; mov ecx,[eax+20]; push edx; ...`; sched.md).
 The `mov`-then-`push` choice is made at Lower (§7.3).
 
+**8.1a Empty tag objects by value (f3decomp R1250). [C probe tests/data/rules/R1250_tag_temps.cpp, all four
+builds]** Each empty-struct temporary passed by value (the STL's `_Ptr_cat(...)`, `_Range_checked_iterator_tag()`)
+is a byte store of 0 to its own `$T` slot and a dword load of that slot for the push: two temporaries are two
+stores and two loads (`mov BYTE PTR $T2606, al; mov ecx, $T2606; mov BYTE PTR $T2600, al; mov eax, $T2600`), also
+when both have the same type. One named tag object passed twice is one load (14.00/15.00: `mov eax, _t$; push eax;
+mov ecx, eax; push ecx`; 13.10: the same register pushed twice). An inline function returning the first tag gives
+the same code as a plain temporary. f3decomp's original reloaded one shared slot (`mov edx,[ebp+8]` twice); in the
+probe the two temporaries keep separate slots, so a shared slot needs the packing of their function (frame.md §4).
+
+**8.1b C++ EH around inlined member constructors (f3decomp R1320, R1310). [C probes, all four builds]**
+- A local whose inlined constructor builds member subobjects whose own constructors contain a call, even one
+  folded away (`Arr(unsigned n = 0) : d(0) { if (n) Grow(n); }` with n = 0), gets one EH state per member: the
+  state after construction is 1 (`mov __$EHRec$.state, 1`) and an unwind funclet for the first member stays
+  (two funclets). Without a call (`ArrT() : d(0) {}`) the state is 0 (`mov __$EHRec$.state, eax`, eax = 0) and
+  there is one funclet. (tests/data/rules/R1320_eh_member_states.cpp f1, f2)
+- State stores between two states with the same upper bytes are byte stores: with two locals, -1 to 0 `mov
+  DWORD PTR state, ebx` (ebx = 0), 0 to 1 `mov BYTE PTR state, 1`, 1 to 0 `mov BYTE PTR state, bl`, back to -1
+  `mov DWORD PTR state, -1` (f3).
+- A `catch` block is emitted right after the parent's `ret`, inside the same function's COMDAT
+  (`__catch$?f@@...$0:` on 14.00/15.00, `$Lnnn:` on 13.10): `call Tidy; push 0; push 0; call __CxxThrowException@8`
+  for a rethrow, or `mov eax, $LN7@g; ret` (the continuation address) when the handler returns.
+  A function index that splits the handler off cuts the parent at its `ret`.
+  (tests/data/rules/R1310_catch_after_ret.cpp)
+
 **8.2 Conventions. [C]** cdecl: caller cleans (8.3). stdcall and thiscall callee: no cleanup, `ret N` in the
 callee. fastcall: stack arguments pushed first, then `mov edx, ..; mov ecx, ..` (k8-k10). Member call: `this` in
 ecx, vtable in eax; the target is loaded at /O2 (`mov edx, [eax]; push 1; call edx`) and called through memory
@@ -887,8 +918,17 @@ At /O2 a 32-bit constant is always `mov r, imm32` except 0 and −1. **[C]**
 | F10 | `lea r, [a+b]` → `add r, other` | dst is a or b, scale 1, no displacement | 10c28cb3 | a1, m18 |
 | F11 | `lea r, [r*4]` / `[r*8]` → `shl r, 2/3` (then F13) | no base, index = dst. Index ≠ dst: /O2 keeps the lea (`lea eax, [ecx*8]`, m7), /O1 gives `mov r, i; shl r, n` | 10c28dc8 | fl_a l_4 |
 | F12 | `[r*2]` → `[r+r]` | scale 2, no symbol (LoRewriteOpscale 10c2af30) | | a6: `lea eax, [eax+eax+7]` |
+| F12a | `[ebp+r*1+d]` → `[r+ebp+d]`: base and index exchanged | an indexed operand (OPINDEXED 0x27d) whose base is the physical register ebp (`&RegSym[6]`, 0x10d0a1b0) and whose scale code (+0x14 & 0xf) is 0 (×1); any displacement, any operand (dst, both srcs). Called from LoFinalLower for the dst and both srcs of each instruction (LoRewriteEBPOpindexed 10c2afb0) | | tests/data/rules/R460_ebpindex.cpp: `[esi+ebp+12]`, `[esi+ebp]` (SIB base esi, index ebp); scale 4 keeps `[ebp+esi*4+12]`; all four builds |
 
 A lea with three components is never split here (a4: `lea eax, [ecx+eax*4+12]` at both levels). **[C]**
+
+Why F12a: with ebp in the SIB base field the encoding has no `mod = 00` form (base 101 with mod 00 means "disp32, no
+base"), so `[ebp+esi]` needs a zero disp8 and is a byte longer than `[esi+ebp]`; ebp as the index has no such
+restriction. The code does not test the displacement, so the exchange also happens when it saves nothing (`+12`). The
+segment (ebp as base selects SS) plays no part: the test is only base == ebp and scale 1. For a decompiler: a final
+`[r+ebp]` / `[r+ebp+d]` says nothing about which register was the IL base; an IL `[x+ebp*1]` stays as it is, an IL
+`[ebp+x*1]` is turned into it (`c2trace.py il --at @LoFinalLower@4,@FgDoLateFlowOpts@8` shows the change). **[C code
+and trace; M on 13.10.3077, 13.10.3052, 14.00, 15.00]**
 
 *Shifts, inc/dec, add/sub*
 

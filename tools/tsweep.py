@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Sweep a source template's alternatives and rank the variants by a number read from a c2 trace.
 
-usage: tsweep.py <template.cpp> --func SUBSTR --metric EXPR [--show EXPR]... [--jobs 8] [--max 256] [--top 10]
-                 [--asm-vs ORIG.s --asm-func DECORATED] [-- <cl args>]
+usage: tsweep.py <template.cpp> --func SUBSTR [--metric EXPR] [--show EXPR]... [--jobs 8] [--max 256] [--top 10]
+                 [--asm-vs ORIG.s [--asm-func DECORATED]] [-- <cl args>]
 
 The template uses sweep.py's syntax: alternatives written `{{first<|>second<|>third}}`. Every combination is
-compiled with the traced c2 (tools/c2trace.py) and scored by EXPR, a Python expression; lower is better. Use it
+compiled with the traced c2 (tools/c2trace.py) and scored by EXPR, a Python expression; lower is better (default
+`bdiff`, which needs --asm-vs; --asm-func defaults to --func). Use it
 when the byte diff is a poor guide, i.e. when the fix is "make X outrank Y" or "get the cursor to eax at pick 7"
 and every intermediate step looks like no progress in bytes. Names available in EXPR (and --show):
 
@@ -21,8 +22,13 @@ and every intermediate step looks like no progress in bytes. Names available in 
                      the value became a Color variable: use dst(offset) to score the register in the code)
   ins(offset)        our instruction at a listing offset ('mov eax, DWORD PTR [esi+672]'), dst(offset) its first
                      register (both need --asm-func)
-  regdiff            instructions (mnemonic + registers) left unmatched by an alignment with --asm-vs, both sides
-                     counted (a substitution 2, an insertion 1); posdiff: the positional count over the common length
+  bdiff              the byte-faithful score against --asm-vs: whole instructions (mnemonic, registers,
+                     displacements, immediates, operand order and size) left unmatched by an alignment, both sides
+                     counted (a substitution 2, an insertion 1; only a displacement/immediate or a jump's target
+                     wrong: 1); relocated addresses, call targets and alignment padding are masked
+                     (docs/c2/tracer.md, `bdiff`)
+  regdiff            the same alignment over mnemonic + registers only (blind to displacements and immediates);
+                     posdiff: the positional count over the common length
   hinge(x, t)        max(0, x - t): 0 once x <= t (e.g. hinge(prio('this',2), 79))
 
 A variant whose metric raises (e.g. a name not found) scores as +inf and its error is shown.
@@ -30,11 +36,25 @@ Example (Fallout 3 0x008e7d40):
   tsweep.py t.cpp --func FUN_00c7e9a0@SceneOwner \\
       --metric "hinge(prio('this',2), 79) + 10*(sat(0xa8)!='eax')" --show "prio('scene',2)" -- /TP /MT /GS /EHsc /Gy
 """
-import argparse, difflib, itertools, math, os, re, shutil, sys
+import argparse, hashlib, difflib, itertools, math, os, re, shutil, sys
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image import ROOT
 import c2trace, c2regs, c2scratch
+
+
+def out_name(path):
+    """The per-source variant directory name of tsweep, rwsweep, helpersweep and realize: `<stem>-<hash6>`, the hash
+    of the source's directory, so that two agents' v3.cpp in different directories do not share (and rmtree) one
+    directory. A stem with capitals also enters the hash: on a case-insensitive file system (macOS) `r2_D.cpp` and
+    `r2_d.cpp` of one directory would otherwise be one directory. All-lowercase stems keep their old names."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    key = os.path.dirname(os.path.abspath(path))
+    if stem != stem.lower():
+        key += "\0" + stem
+    return stem + "-" + hashlib.md5(key.encode()).hexdigest()[:6]
+
+
 ALT = re.compile(r"\{\{(.*?\}*)\}\}(?!\})", re.S)   # a code `}` just before the closing `}}` stays in the alternative
 
 REG = re.compile(r"\b(e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp|e?sp|st\(\d\))\b")
@@ -60,16 +80,170 @@ def listing_offsets(path, func):
     return out
 
 
+class Instrs(list):
+    """listing_instrs' result: [(mnemonic, operands)] as the listing prints them, plus `decoded`: per instruction the
+    capstone text of the listing's code bytes and which fields hold a relocation (bdiff's input; None when the
+    listing has no code bytes)."""
+    decoded = None
+    addrs = None
+    va0 = None
+    listing = False         # True: our /FAsc listing (MASM operand order), not capstone text of the original
+
+
 def listing_instrs(path, func):
     text = open(path, errors="replace").read()
     i, j = c2trace.listing_proc(text, func)
     body = text[i:j]
-    out = []
+    out, dec, buf, off = Instrs(), [], [], 0
     for ln in body.splitlines():
-        m = re.match(r"(?:\s+[0-9a-f]{5})?\t[0-9a-f ]+\t+ (\w+)\s*(.*)", ln)
-        if m:
-            out.append((m.group(1), re.sub(r"\s*;.*", "", m.group(2))))
+        m = re.match(r"(?:\s+([0-9a-f]{5}))?\t([0-9a-f]{2}(?: [0-9a-f]{2})*) *(?:\t+ (\w+)\s*(.*))?$", ln)
+        if not m:
+            continue
+        if m.group(1):
+            buf, off = [], int(m.group(1), 16)
+        buf += m.group(2).split()
+        if m.group(3):
+            ops = re.sub(r"\s*;.*", "", m.group(4))
+            out.append((m.group(3), ops))
+            dec.append((off, bytes.fromhex("".join(buf)), m.group(3), ops))
+            buf = []
+    if out and all(d[1] for d in dec):
+        rel = _obj_relocs(path, re.match(r"(\S+)", text[i:]).group(1))
+        main = next((k for k in range(1, len(dec)) if dec[k][0] < dec[k - 1][0]), len(dec))   # EH funclets after
+        out.decoded = [_decode(*d, rel=rel if k < main else None) for k, d in enumerate(dec)]
+        out.addrs = [d[0] for d in dec]
+    out.listing = True
     return out
+
+
+# The listing (MASM) and capstone write some instructions' operands in another order for the same bytes: `test` and
+# `xchg` are `test reg, r/m` in the listing and `test r/m, reg` in capstone (85 c2 is the listing's `test eax, edx`,
+# capstone's `test edx, eax`). Comparing the listing's text position by position with the original's capstone text
+# then pairs eax with edx: false WANTS in regmap (Mount & Blade 0x46bc70: 4 of 5), false scratch phases. Checked on
+# 14.00 and 13.10 listings: imul (2 and 3 operand), cmpxchg, xadd, shld/shrd, bt/bsf and the x87 two-stack forms
+# (regmap.norm) keep the order; fcomip/fucomip are capstone's fcompi/fucompi (CS_MNEMONIC).
+_SWAPPED = ("test", "xchg")
+_REGOP = re.compile(r"(?:e?[abcd]x|[abcd][lh]|e?[sd]i|e?[sb]p)", re.I)
+
+
+def canon_listing(mn, ops):
+    """(mnemonic, operands) of one listing instruction in capstone's operand order and mnemonic (text only: for a
+    listing without code bytes, or where the operands' symbol names are needed). Prefer cs_text: the bytes."""
+    if mn.lower() in _SWAPPED:
+        o = [x.strip() for x in _split_ops(ops)]
+        if len(o) == 2 and _REGOP.fullmatch(o[0]) and (_REGOP.fullmatch(o[1]) or re.search(r"\[|\bPTR\b", o[1], re.I)):
+            return (mn, "%s, %s" % (o[1], o[0]))
+    return ({v: k for k, v in CS_MNEMONIC.items()}.get(mn.lower(), mn), ops)
+
+
+def cs_text(lst):
+    """[(mnemonic, operands)] of a listing_instrs result as capstone writes the listing's code bytes (the form of the
+    original's orig.s), split like orig_instrs splits a line (`rep movsd ...` is ("rep", "movsd ...")). Alignment
+    pads and data (a jump table) keep the listing's text; a listing without code bytes is canonicalised from its text
+    (canon_listing). Any other list (capstone text already) is returned as it is."""
+    if not getattr(lst, "listing", False):
+        return list(lst)
+    dec = lst.decoded
+    out = []
+    for k, x in enumerate(lst):
+        d = dec[k] if dec else None
+        if d is None or d[0] in ("npad", "db"):
+            out.append(tuple(x) if d is not None else canon_listing(*x))
+        else:
+            t = (d[0] + " " + d[1]).split(None, 1)
+            out.append((t[0], t[1].strip() if len(t) > 1 else ""))
+    return out
+
+
+def listing_cs_offsets(path, func):
+    """{offset: 'mnemonic operands'} like listing_offsets, but the text is capstone's of the listing's code bytes
+    (cs_text): what regmap, scratch --phase and every other position-by-position register comparison with the
+    original's orig.s reads. Without code bytes (a /FAs listing), the listing's text in capstone's operand order."""
+    lst = listing_instrs(path, func)
+    if lst and lst.addrs:
+        return {a: (mn + " " + ops).strip() for a, (mn, ops) in zip(lst.addrs, cs_text(lst))}
+    out = {}
+    for o, t in listing_offsets(path, func).items():
+        p = t.split(None, 1)
+        mn, ops = canon_listing(p[0], p[1] if len(p) > 1 else "")
+        out[o] = (mn + " " + ops).strip()
+    return out
+
+
+def _obj_relocs(asm, name):
+    """Function-relative byte offsets covered by a relocation in the object next to the listing (same stem), or
+    None without one: a relocated field reads 0 (or its addend) whatever the listing text shows."""
+    obj = os.path.splitext(asm)[0] + ".obj"
+    if not os.path.exists(obj):
+        return None
+    try:
+        import coff
+        secs, syms, _ = coff.parse_coff(obj)
+        if name not in syms:
+            return None
+        si, val = syms[name]
+        return {o + k - val for o, _s, typ in secs[si]["relocs"] for k in range(coff.REL_SIZES.get(typ, 4))}
+    except Exception:
+        return None
+
+
+_CS = None
+
+
+def _decode(off, code, mn, ops, rel=None):
+    """(capstone mnemonic, capstone operands, imm_sym, mem_sym) of one listing instruction's bytes: the listing's
+    text says which fields hold a relocation (`OFFSET sym` an immediate; a symbol that is not a frame variable a
+    displacement), since a relocated field is 0 (or the addend) in an object."""
+    global _CS
+    if mn == "npad":
+        return ("npad", "", False, False)
+    if _CS is None:
+        import capstone
+        _CS = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        _CS.detail = True
+    ins = list(_CS.disasm(code, off))
+    if len(ins) != 1 or ins[0].size != len(code):
+        return ("db", code.hex(), False, False)         # data in the procedure (a jump table) or a decode failure
+    imm_sym = bool(re.search(r"\bOFFSET\b", ops))
+    mem_sym = False
+    if rel:                                             # the object's relocations, where there is one
+        x = ins[0]
+        imm_sym |= bool(x.imm_size and off + x.imm_offset in rel)
+        mem_sym |= bool(x.disp_size and off + x.disp_offset in rel)
+    for o in _split_ops(ops):
+        mem = bool(re.search(r"\bPTR\b|\[|^\s*[cdefgs]s:", o))
+        o = re.sub(r"^(?:BYTE|WORD|DWORD|QWORD|TBYTE|FWORD|XMMWORD|MMWORD|OWORD)\s+PTR\s+", "", o.strip())
+        o = re.sub(r"^FLAT:", "", re.sub(r"^[cdefgs]s:", "", o))
+        m = re.match(r"([\w?@$.]+)\s*(\[[^\]]*\])?", o)
+        if not m or "OFFSET" in o or re.fullmatch(r"(?:e?[a-d]x|[a-d][lh]|e?[sd]i|e?[sb]p|st|st\(\d\)|xmm\d|mm\d|"
+                                                    r"-?[0-9][0-9a-f]*h?)", m.group(1).lower()):
+            continue
+        if m.group(2) and re.match(r"\[\s*e[sb]p\b", m.group(2)):
+            continue                                    # a frame variable: _x$[esp+8], the bytes have its offset
+        if mem:
+            mem_sym = True                              # a global, constant, import or jump table
+        else:
+            imm_sym = True                              # a bare symbol as an immediate (`push __ehhandler$f`)
+    return (ins[0].mnemonic, ins[0].op_str, imm_sym, mem_sym)
+
+
+def _split_ops(ops):
+    out, depth, cur = [], 0, ""
+    for ch in ops:
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+            continue
+        depth += ch == "["
+        depth -= ch == "]"
+        cur += ch
+    return out + [cur] if cur.strip() else out
+
+
+# capstone's names for instructions the listing (MASM) spells otherwise: DF F0+i is `fcomip` in the listing and
+# `fcompi` in capstone (the same for fucomip, DF E8+i). For regdiff's keys of a plain list of listing text (regdiff
+# itself reads our side through cs_text: capstone of the listing's bytes); bdiff decodes both sides with capstone.
+CS_MNEMONIC = {"fcompi": "fcomip", "fucompi": "fucomip"}
 
 
 def orig_instrs(path):
@@ -80,21 +254,53 @@ def orig_instrs(path):
         if len(p) >= 2:
             out.append((p[1], p[2].strip() if len(p) > 2 else ""))
             va.append(p[0].lower())
-    # a long alignment pad is `jmp` over the padding (the listing's npad 5..): `jmp X; lea r, [r]; X:` is one npad
+    # a long alignment pad is `jmp` over the padding (the listing's npad 5..): `jmp X; lea r, [r]; X:` is one npad,
+    # also in several parts (npad 14: `jmp X; lea esp, [esp]; jmp X; lea ecx, [ecx]; X:`): a jmp followed by pad
+    # instructions and further jmps, each jmp landing at or before the end X of the run, X the first jmp's target
+    def _va(t):
+        t = t.lower().strip()
+        return int(t, 16) if re.fullmatch(r"(?:0x)?[0-9a-f]+", t) else None
+    vn = [_va(v) for v in va]
     for i in range(len(out) - 2):
         if out[i][0] != "jmp" or _key(out[i + 1]) != ("npad", ()):
             continue
+        x = _va(out[i][1])
         k = i + 1
-        while k < len(out) and _key(out[k]) == ("npad", ()):
+        while k < len(out) and vn[k] != x and (_key(out[k]) == ("npad", ()) or (
+                out[k][0] == "jmp" and _va(out[k][1]) is not None and vn[k] is not None and x is not None and
+                vn[k] < _va(out[k][1]) <= x)):
             k += 1
-        if k < len(out) and out[i][1].lower().replace("0x", "").lstrip("0") == va[k].replace("0x", "").lstrip("0"):
-            out[i] = ("npad", "")
+        if x is not None and k < len(out) and vn[k] == x:
+            for q in range(i, k):
+                if out[q][0] == "jmp":
+                    out[q] = ("npad", "")
+    out = Instrs(out)
+    out.decoded = [x + (False, False) for x in out]
+    try:
+        vas = [int(v, 16) for v in va]
+    except ValueError:
+        return out
+    out.va0 = vas[0] if vas else None
+    out.addrs = vas
+    # a jump table (or byte index table) after the code decodes as garbage: bdiff stops at the first table the code
+    # indexes inside the function's range (our listing's table entries are data, not instructions)
+    tabs = []
+    for mn, ops in out:
+        m = re.search(r"\[\w+\*4 \+ (0x[0-9a-f]+)\]$", ops) if mn == "jmp" else \
+            re.search(r"^\w+, byte ptr \[\w+ \+ (0x[0-9a-f]+)\]$", ops) if mn == "movzx" else None
+        if m and vas[0] < int(m.group(1), 16) <= vas[-1]:
+            tabs.append(int(m.group(1), 16))
+    if tabs:
+        cut = next((k for k, v in enumerate(vas) if v >= min(tabs)), len(vas))
+        out.decoded, out.addrs = out.decoded[:cut], vas[:cut]
     return out
 
 
 def _key(ins):
     if ins[0] in ("rep", "repe", "repne"):          # capstone spells out the implicit operands of rep movsd/stosd
         return (ins[0], ins[1].split()[0].lower() if ins[1] else "")
+    if re.fullmatch(r"(movs|stos|lods|scas|cmps)[bwd]", ins[0]) and "xmm" not in ins[1].lower():
+        return (ins[0], ())                         # ... and of a bare movsb/movsw (the listing writes none)
     regs = tuple(REG.findall(re.sub(r"[\w?@$]*[?@$][\w?@$]*", " ", ins[1]).lower()))   # not inside symbol names
     if ins[0] == "imul" and len(regs) == 2 and regs[0] == regs[1] and ins[1].count(",") == 2:
         regs = regs[:1]                             # capstone `imul r, r, imm` is the listing's `imul r, imm`
@@ -104,7 +310,7 @@ def _key(ins):
         return ("npad", ())                         # alignment padding: the listing's npad, decoded as lea r, [r]
     if ins[0] == "nop" or ins[0] == "mov" and regs == ("edi", "edi"):
         return ("npad", ())                         # npad 2
-    return (ins[0], regs)
+    return (CS_MNEMONIC.get(ins[0], ins[0]), regs)
 
 
 def regdiff(ours, orig):
@@ -118,7 +324,7 @@ def regdiff(ours, orig):
             if not (k == ("npad", ()) and out and out[-1] == k):
                 out.append(k)
         return out
-    a, b = keys(ours), keys(orig)
+    a, b = keys(cs_text(ours)), keys(orig)       # our listing as capstone reads its bytes: operand order (test)
     sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
     blocks = [m for m in sm.get_matching_blocks() if m.size]
     if not blocks:
@@ -128,9 +334,167 @@ def regdiff(ours, orig):
     return (last.a + last.size - matched) + (len(b) - matched)
 
 
+# bdiff: the byte-faithful score. Both sides are capstone text (the original's orig.s; ours decoded from the
+# listing's code bytes), so displacements, immediates, operand order and operand sizes compare exactly; masked:
+# relocated fields (by the listing's symbols on our side, by image-address range on both), call and jump targets,
+# alignment padding.
+ADDR_LO, ADDR_HI = 0x00400000, 0x04000000       # image addresses for a function below 0x04000000; else see _addr_range
+
+
+def _addr_range(va0):
+    if va0 is None or va0 < ADDR_HI:
+        return ADDR_LO, ADDR_HI
+    return va0 & 0xff000000, (va0 & 0xff000000) + 0x04000000
+
+
+def _num(t):
+    t = t.strip().lower()
+    neg = t.startswith("-")
+    t = t.lstrip("+-").strip()
+    v = int(t, 16) if t.startswith("0x") else int(t[:-1], 16) if t.endswith("h") else int(t)
+    return (-v if neg else v) & 0xffffffff
+
+
+def _bop(o, mn, imm_sym, mem_sym, rng):
+    o = o.strip()
+    m = re.match(r"((?:\w+ ptr )?(?:[cdefgs]s:)?)\[(.*)\]$", o)
+    if m:
+        regs, disp = [], 0
+        for sign, t in re.findall(r"([+-]?)\s*([^+-]+)", m.group(2)):
+            t = t.strip()
+            if re.fullmatch(r"(?:0x[0-9a-f]+|\d+)", t):
+                disp = (disp + (-_num(t) if sign == "-" else _num(t))) & 0xffffffff
+            else:
+                regs.append(t.replace(" ", ""))
+        if mem_sym or not regs or rng[0] <= disp < rng[1]:
+            d = "+A" if regs else "A"
+        else:
+            d = "%+d" % (disp - (1 << 32) if disp & 0x80000000 else disp) if disp else ""
+        return "%s[%s%s]" % (m.group(1), "+".join(regs), d)
+    if re.fullmatch(r"-?(?:0x[0-9a-f]+|\d+)", o):
+        if mn == "call":
+            return "T"                                  # a call target (relocated in ours)
+        if mn.startswith(("j", "loop")):
+            return "L"                                  # a jump target: the instruction stream shows the layout
+        v = _num(o)
+        return "A" if imm_sym or rng[0] <= v < rng[1] else "%#x" % v
+    return o
+
+
+def _bkey(d, rng):
+    mn, ops, imm_sym, mem_sym = d[:4]
+    if mn in ("rep", "repe", "repne", "repz", "repnz", "lock") and ops:     # capstone prints a prefix either way
+        w, _, ops = ops.partition(" ")
+        mn += " " + w
+    if re.fullmatch(r"(?:rep\w* )?(?:movs|stos|lods|scas|cmps)[bwd]", mn):
+        return (mn,)                                    # implicit operands: printed by capstone, not the listing
+    k = _key((mn, ops))
+    if k == ("npad", ()) or (mn == "add" and re.fullmatch(r"eax,\s*0(?:x0+)?", ops)):
+        return ("npad",)
+    return (mn,) + tuple(_bop(o, mn, imm_sym, mem_sym, rng) for o in _split_ops(ops))
+
+
+def bkeys(lst, va0=None):
+    """bdiff's keys of one side: instructions as normalised capstone text with the masked fields replaced (`A` an
+    address, `T` a call target, `L` a jump target), a run of alignment pads as one ("npad",).  `lst` is a
+    listing_instrs or orig_instrs result; a plain [(mnemonic, operands)] list is read as capstone text."""
+    return _bside(lst, va0)[0]
+
+
+def _bside(lst, va0=None):
+    """(keys, {address: key index}, {key index: jump target address}) of one side."""
+    dec = getattr(lst, "decoded", None)
+    if dec is None:
+        dec = [tuple(x) + (False, False) for x in lst]
+    addrs = getattr(lst, "addrs", None) or [None] * len(dec)
+    rng = _addr_range(va0 if va0 is not None else getattr(lst, "va0", None))
+    out, at, tg = [], {}, {}
+    for d, va in zip(dec, addrs):
+        if d[0] == "db":
+            continue                                    # data in our procedure (a jump table)
+        k = _bkey(d, rng)
+        if not (k == ("npad",) and out and out[-1] == k):
+            out.append(k)
+        if va is not None:
+            at.setdefault(va, len(out) - 1)
+            if k[-1:] == ("L",):
+                try:
+                    tg[len(out) - 1] = _num(d[1])
+                except ValueError:
+                    pass
+    return out, at, tg
+
+
+def _lcs_count(a, b):
+    """Both sides' unmatched count of an LCS-style alignment; a's lines past its last match are ignored (our listing
+    may carry EH funclets the original's function range lacks)."""
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    blocks = [m for m in sm.get_matching_blocks() if m.size]
+    if not blocks:
+        return len(a) + len(b)
+    last = blocks[-1]
+    matched = sum(m.size for m in blocks)
+    return (last.a + last.size - matched) + (len(b) - matched)
+
+
+def _bshape(k):
+    return (k[0],) + tuple(tuple(REG.findall(o)) for o in k[1:])
+
+
+def bdiff(ours, orig):
+    """The default score: instructions as the bytes encode them (mnemonic, registers, displacements, immediates,
+    operand order and size), relocated addresses, call targets and padding masked. Aligned like regdiff, on the
+    instruction shapes (mnemonic + registers per operand, so a moved stack slot does not break the alignment);
+    unmatched instructions count 1 per side, an aligned pair that differs in a displacement or immediate 1, an
+    aligned jump to another (aligned) instruction than the original's 1, and each change of the byte offset between
+    consecutive aligned pairs 1 (where the code moves against the original's: a longer or shorter encoding, an
+    inserted or dropped instruction). 0 means the same instruction stream as the original up to those masks. Needs listing code bytes (/FAsc) on our side; without them it falls back to
+    regdiff."""
+    if getattr(ours, "decoded", None) is None and isinstance(ours, Instrs):
+        return regdiff(ours, orig)
+    return _bparts(ours, orig)["n"]
+
+
+def _bparts(ours, orig):
+    """bdiff and its parts: n (the score), fields (aligned pairs differing in a field), jumps (aligned jumps to
+    another target), shifts (changes of the byte offset between aligned pairs: where the code moves), moved
+    (aligned pairs at another byte offset than the original's). n = unmatched + fields + jumps + shifts; moved
+    is not part of n."""
+    va0 = getattr(orig, "va0", None)
+    a, at_a, tg_a = _bside(ours, va0)
+    b, at_b, tg_b = _bside(orig, va0)
+    sa, sb = [_bshape(x) for x in a], [_bshape(x) for x in b]
+    sm = difflib.SequenceMatcher(None, sa, sb, autojunk=False)
+    blocks = [m for m in sm.get_matching_blocks() if m.size]
+    if not blocks:
+        return dict(n=len(a) + len(b), fields=0, jumps=0, shifts=0, moved=0)
+    last = blocks[-1]
+    matched = sum(m.size for m in blocks)
+    n = (last.a + last.size - matched) + (len(b) - matched)   # our lines past the last match (EH funclets) do not count
+    amap = {m.a + k: m.b + k for m in blocks for k in range(m.size)}
+    fields = sum(1 for i, j in amap.items() if a[i] != b[j])
+    bmatched = set(amap.values())
+    jumps = 0
+    for i, j in amap.items():
+        if i in tg_a and j in tg_b:
+            ti, tj = at_a.get(tg_a[i]), at_b.get(tg_b[j])
+            if ti is not None and tj is not None and ti in amap and tj in bmatched and amap[ti] != tj:
+                jumps += 1
+    ka = {k: va for va, k in sorted(at_a.items(), reverse=True)}
+    kb = {k: va for va, k in sorted(at_b.items(), reverse=True)}
+    shifts, moved, prev = 0, 0, None
+    for i in sorted(amap):
+        if i in ka and amap[i] in kb:
+            dlt = ka[i] - (kb[amap[i]] - (va0 or 0))
+            shifts += prev is not None and dlt != prev
+            moved += dlt != 0
+            prev = dlt
+    return dict(n=n + fields + jumps + shifts, fields=fields, jumps=jumps, shifts=shifts, moved=moved)
+
+
 def posdiff(ours, orig):
     """Positional difference over the common length (the old regdiff)."""
-    return sum(1 for x, y in zip(ours, orig) if _key(x) != _key(y))
+    return sum(1 for x, y in zip(cs_text(ours), orig) if _key(x) != _key(y))
 
 
 class Ctx:
@@ -157,6 +521,7 @@ class Ctx:
             if orig:
                 ours = listing_instrs(asm, asm_func)
                 self.ns["regdiff"] = regdiff(ours, orig)
+                self.ns["bdiff"] = bdiff(ours, orig)
                 self.ns["posdiff"] = posdiff(ours, orig)
             self.lst = listing_offsets(asm, asm_func) if asm_func else {}
         self.ns.update(prio=self.prio, reg=self.reg, pops=self.pops, cur=self.cur, sreg=self.sreg, rot=self.rot,
@@ -228,29 +593,34 @@ def main():
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("template")
     ap.add_argument("--func", required=True)
-    ap.add_argument("--metric", required=True)
+    ap.add_argument("--metric", default="bdiff")
     ap.add_argument("--show", action="append", default=[])
     ap.add_argument("--asm-vs", help="the original function's disassembly ('VA mnemonic operands' lines)")
-    ap.add_argument("--asm-func", help="decorated name of the function in our listing (for regdiff)")
+    ap.add_argument("--asm-func", help="the function in our listing (for bdiff/regdiff/ins/dst; default --func)")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--max", type=int, default=256)
     ap.add_argument("--top", type=int, default=10)
     a = ap.parse_args(argv)
+    a.asm_func = a.asm_func or a.func
     exprs = [a.metric] + a.show
     need_regs = any(re.search(r"\b(prio|reg|pops)\(", e) for e in exprs)
     need_scratch = any(re.search(r"\b(cur|sreg|rot|off|gone|sat|ins|dst)\(", e) for e in exprs)
-    if any(re.search(r"\b(ins|dst)\(", e) for e in exprs) and not a.asm_func:
-        sys.exit("ins()/dst() need --asm-func (the function's decorated name in our listing)")
-    if re.search(r"\b(regdiff|posdiff)\b", " ".join(exprs)) and not (a.asm_vs and a.asm_func):
-        sys.exit("regdiff needs --asm-vs and --asm-func")
+    if re.search(r"\b(bdiff|regdiff|posdiff)\b", " ".join(exprs)) and not a.asm_vs:
+        sys.exit("bdiff/regdiff need --asm-vs (the original's disassembly); give --metric for a trace-only score")
     orig = orig_instrs(a.asm_vs) if a.asm_vs else None
 
     text = open(a.template).read()
-    spots = [m.group(1).split("<|>") for m in ALT.finditer(text)]
+    if any("{{" in m.group(1) and "<|>" in m.group(1) for m in ALT.finditer(text)):
+        sys.exit("nested {{..}} alternatives are not supported: flatten the grid (every variant would fail to compile)")
+    # a `{{..}}` without `<|>` is code, not a spot: a nested brace initialiser (`int f[2][2]={{0,1},{2,3}};`) in a
+    # pack unit used to be taken as a one-way spot and lost its outer braces in every variant
+    spots = [m.group(1).split("<|>") for m in ALT.finditer(text) if "<|>" in m.group(1)]
     combos = list(itertools.product(*[range(len(s)) for s in spots]))
     if len(combos) > a.max:
         sys.exit("%d combinations (> --max %d): split the grid" % (len(combos), a.max))
-    out = os.path.join(ROOT, "work", "tsweep", os.path.basename(a.template).rsplit(".", 1)[0])
+    # the template's directory enters the name: two templates called tmpl.cpp elsewhere (two agents) must not share,
+    # and rmtree, one variant directory
+    out = os.path.join(ROOT, "work", "tsweep", out_name(a.template))
     if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory
         out += "@" + c2trace.c2build.name()
     shutil.rmtree(out, ignore_errors=True)
@@ -259,7 +629,7 @@ def main():
     jobs = []
     for k, combo in enumerate(combos):
         it = iter(combo)
-        body = ALT.sub(lambda m: m.group(1).split("<|>")[next(it)], text)
+        body = ALT.sub(lambda m: m.group(1).split("<|>")[next(it)] if "<|>" in m.group(1) else m.group(0), text)
         body = re.sub(r'#include "([^"]+)"', lambda m: '#include "%s"' % os.path.join(hdr_dir, m.group(1))
                   if os.path.exists(os.path.join(hdr_dir, m.group(1))) else m.group(0), body)
         d = os.path.join(out, "v%03d" % k)

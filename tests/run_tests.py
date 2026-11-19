@@ -271,20 +271,50 @@ check("regs: equal priorities pop the larger def first in the int, x87 and XMM c
 
 kd = tempfile.mkdtemp()
 tool("regs", FP, "--keep", kd, "--", "/arch:SSE2")
-lst = open(os.path.join(kd, "fpclasses.asm"), errors="replace").read()
 got = {}
+
+
+def orig_from_listing(asm, func, path):
+    """Our own code as the "original": capstone of the listing's code bytes in orig.s's 'VA mnemonic operands' form
+    (what an image's disassembly gives; the listing's own text has MASM's operand order)."""
+    import tsweep
+    lst = tsweep.listing_instrs(asm, func)
+    open(path, "w").write("".join("%08x %s %s\n" % (o, d[0], d[1]) for o, d in zip(lst.addrs, lst.decoded)))
+    return path
+
+
 for fn_ in ("_f", "_h"):
-    m = re.search(r"^%s\s+PROC" % fn_, lst, re.M)
-    body = lst[m.start():lst.index("ENDP", m.start())] if m else ""
-    ins = re.findall(r"^\s+([0-9a-f]{5})\t[0-9a-f ]+\t+ (\w+)[ \t]*([^;\n]*)", body, re.M)
-    orig = os.path.join(kd, fn_ + ".s")           # our own listing as the "original": every row must agree
-    open(orig, "w").write("".join("%s %s %s\n" % (o, mn, ops.strip()) for o, mn, ops in ins))
+    orig = orig_from_listing(os.path.join(kd, "fpclasses.asm"), fn_, os.path.join(kd, fn_ + ".s"))   # every row agrees
     out = tool("regmap", FP, "--func", fn_, "--asm-vs", orig, "--asm-func", fn_, "--all", "--", "/arch:SSE2")
     m = re.search(r"^# by class: (.*)$", out, re.M)
     got[fn_] = dict((c, (int(a), int(b))) for c, a, b in re.findall(r"(\w+) (\d+) of (\d+)", m.group(1))) if m else {}
 xm, st = got["_f"].get("xmm", (0, -1)), got["_h"].get("x87", (0, -1))
 check("regmap: XMM rows (f) and x87 stack-position rows (h), all agreeing with the same code",
       (xm[0] == xm[1] and xm[1] >= 4, st[0] == st[1] and st[1] >= 4), (True, True))
+
+
+def testorder_tests():
+    """`test al, bl` in the listing is `test bl, al` in capstone (84 c3): regmap compares capstone of our bytes with
+    orig.s, so our own code as the original gives no WANTS and no swap (it gave a false WANTS pair and a swap)."""
+    import tsweep
+    src, d = os.path.join(HERE, "tests", "data", "testorder.c"), tempfile.mkdtemp()
+    tool("scratch", src, "--func", "both", "--keep", d)
+    asm = os.path.join(d, "testorder.asm")
+    orig = orig_from_listing(asm, "_both", os.path.join(d, "both.s"))
+    txt = list(tsweep.listing_instrs(asm, "_both"))
+    out = tool("regmap", src, "--func", "both", "--asm-vs", orig, "--asm-func", "_both")
+    check("regmap: listing `test r8, r8` vs capstone order: no false WANTS / swap (testorder.c)",
+          (("test", "al, bl") in txt, "WANTS" in out, "swap:" in out,
+           bool(re.search(r"^# (\d+) variables checked, \1 agree", out, re.M))),
+          (True, False, False, True))
+    check("tsweep regdiff / canon_listing: the listing's test and xchg operand order is capstone's",
+          (tsweep.regdiff(tsweep.listing_instrs(asm, "_both"), tsweep.orig_instrs(orig)),
+           tsweep.canon_listing("test", "al, bl"), tsweep.canon_listing("xchg", "ecx, DWORD PTR _g"),
+           tsweep.canon_listing("test", "eax, 5"), tsweep.canon_listing("fcomip", "ST(1)")),
+          (0, ("test", "bl, al"), ("xchg", "DWORD PTR _g, ecx"), ("test", "eax, 5"), ("fcompi", "ST(1)")))
+
+
+testorder_tests()
 
 fsnap = os.path.join(kd, "f.json")
 tool("regs", FP, "--func", "_f", "--export", fsnap, "--", "/arch:SSE2")
@@ -489,9 +519,46 @@ def fpcheck_tests():
            "c would be colourable; it needs +2 priority" in r.stdout), (True, True))
 
 
+def x87stack_tests():
+    """14.00 / 15.00: the x87 stack after Color, docs/c2/x87.md section 12: which calls keep x87 values
+    (LoAddCallScratchRegs + MscRecordInterProcRegInfo), the GFx -> ST(i) mapper (X87MapGFxToSTx), and `need stack:V`,
+    predicted by rasim x87stack.rs from the snapshot key x87 (tools/c2x87.py) and checked against the trace."""
+    XS = os.path.join(HERE, "tests", "data", "x87stack.cpp")
+    fd = tempfile.mkdtemp()
+    tool("regs", XS, "--export", os.path.join(fd, "%s.json"), *FLAGS)
+    tot, keep = [0] * 8, {}
+    for fn_ in sorted(os.listdir(fd)):
+        o = subprocess.run([rasim, "check", os.path.join(fd, fn_), "--predict", "-v"], capture_output=True, text=True).stdout
+        m = re.search(r"x87 stack .*?calls (\d+) of (\d+).*?blocks (\d+) of (\d+).*?\((\d+) of (\d+) x87.*?airlocks (\d+) of (\d+)", o)
+        if m:
+            tot = [a + int(b) for a, b in zip(tot, m.groups())]
+        for c in re.findall(r"^  call \?(\w+)@\S*: (x87 values stay|kills GF0..GF7)", o, re.M):
+            keep[c[0]] = c[1] == "x87 values stay"
+    check("x87 stack: every call's kill set, block and airlock of x87stack.cpp predicted (model = trace)",
+          (tot[0] == tot[1] > 0, tot[2] == tot[3] > 0, tot[4] == tot[5] > 100, tot[6] == tot[7] > 0), (True,) * 4)
+    check("x87 kept across a call: x87-free same-unit bodies (no push; one push returning float) only",
+          [keep.get(k) for k in ("ext", "geti", "getf", "getf2", "voidfp", "gin")], [False, True, True, False, False, False])
+    o = subprocess.run([rasim, "check", os.path.join(fd, "_f_join@@YAMPBMHH@Z.json"), "--predict", "-v"],
+                       capture_output=True, text=True).stdout
+    check("x87 stack: f_join's uninitialised-on-one-path s gets fldz on that edge (airlock), predicted",
+          "fldz" in o and "airlocks 2 of 2" in o, True)
+    js = json.load(open(os.path.join(fd, "_r_float@@YAMMMM@Z.json")))["x87"]["gf"]
+    jd = json.load(open(os.path.join(fd, "_r_double@@YAMMMM@Z.json")))["x87"]["gf"]
+    check("rounding: a float variable is written to its home and reloaded (_s <- GF; GF <- _s), a double is not",
+          (any(re.search(r"_fmov \d+ \d+ \| _s:5004 <- GF", x) for x in js), any(re.search(r"<- _s:5004", x) for x in js),
+           any(" _s:" in x for x in jd)), (True, True, False))
+    r = subprocess.run([rasim, "need", os.path.join(fd, "_z_tie@@YAXPAUV@@PBU1@ABUT@@H@Z.json"), "stack:__real@00000000"],
+                       capture_output=True, text=True)
+    check("rasim need stack:0.0 (z_tie): split when local19 took the last slot; one more reference closes the tie",
+          (bool(re.search(r"pass 1: split before its pop", r.stdout)), "blocker: local19" in r.stdout,
+           "ref:_real@00000000" in r.stdout), (True, True, True))
+
+
 if BUILD.startswith("13.10"):
     fpcolor_tests()
     fpcheck_tests()
+else:
+    x87stack_tests()
 
 if c2build.table() is None or "symkeys" in (c2build.get("hooks") or {}):
     symkeys_tests()
@@ -565,6 +632,113 @@ def realize_tests():
 realize_tests()
 
 
+def realize2_tests():
+    """The slot, scratch-pick and key constructs of realize.py (docs/c2/realize.md 2.5, 2.6, 2.8), with the build
+    differences recorded there: equal arms count twice for the packer and are merged after it; a statement at the
+    end of both arms hides one scratch pick; an earlier initialised declaration moves a frame key."""
+    RZ = os.path.join(HERE, "tests", "data", "realize2.cpp")
+    fl = ["--", "/TP", "/MT", "/EHsc", "/Gy", "/O2"]
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "pairs", RZ, "--slots", "--scratch",
+                        "--keys"] + fl, capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-4000:], r.stderr[-2000:])
+    rows, ctx, cur = {}, None, None
+    for ln in r.stdout.splitlines():
+        m = re.match(r"## (\w+):", ln)
+        if m:
+            ctx = m.group(1)
+            continue
+        m = re.match(r"  (\w+)\s+code (\d+) \(bag (\d+)", ln)
+        if m and ctx:
+            cur = rows[(ctx, m.group(1))] = dict(code=int(m.group(2)), more="")
+            continue
+        if cur is not None:
+            cur["more"] += ln.strip() + "\n"
+    row = lambda k: rows.get(k, dict(code=-1, more=""))
+    v13 = BUILD.startswith("13.10")
+    check("realize2: a test of the stack local a in equal arms is uses:_a 2>3 for the packer (code 0 on 14.00/15.00, "
+          "the memory test stays on 13.10)",
+          ("slots: uses:_a:2>3" in row(("sc", "eqa"))["more"], row(("sc", "eqa"))["code"] == 0), (True, not v13))
+    check("realize2: a statement reading a in equal arms on a register value: uses:_a 2>3 (code 0 on 13.10)",
+          ("slots: uses:_a:2>3" in row(("sp", "eqb"))["more"], row(("sp", "eqb"))["code"] == 0), (True, v13))
+    check("realize2: the statement after an if at the end of both arms: one hidden pick (ins:3), same instructions",
+          ("ins:3(gone)" in row(("pt", "dup"))["more"], row(("pt", "dup"))["code"]), (True, 0))
+    check("realize2: an initialised declaration two statements earlier moves 3 named keys, same code",
+          ("3 of 12 named keys moved" in row(("kd", "early"))["more"], row(("kd", "early"))["code"]), (True, 0))
+    check("realize2: an empty inline helper with 4 parameters is tmp+4 frame+4 keys, same code",
+          ("keys: tmp+4 frame+4" in row(("kp", "h4"))["more"], row(("kp", "h4"))["code"]), (True, 0))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "edit", RZ, "--func", "pt__base", "ins:3",
+                        "--keep", os.path.join(tempfile.mkdtemp(), "rz")] + fl, capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    check("realize2 edit ins:3: taildup realises it, every pick as rasim scratch predicts",
+          bool(re.search(r"^\s+exact\s+taildup\s+code 0 bag 0", r.stdout, re.M)) and "every pick as rasim predicts" in r.stdout, True)
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "edit", RZ, "--func", "sc__base", "uses:_a$=3",
+                        "--keep", os.path.join(tempfile.mkdtemp(), "rz")] + fl, capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    check("realize2 edit uses:_a$=3: an equal-arms construct gives the packer's count%s" % (" with code 0" if not v13 else ""),
+          bool(re.search(r"^\s+(exact|yes)\s+eqif\s+code 0 bag 0", r.stdout, re.M)) if not v13 else "uses:_a:2>3" in r.stdout, True)
+
+    # the load-reuse levers: loads / stores / read-modify-writes of [reg+92] in the variant realize generates
+    import tsweep
+    def lcount(asm, func):
+        l = s = w = 0
+        for mn, o in tsweep.listing_instrs(asm, func):
+            ins = "%s %s" % (mn, o)
+            if "+92]" not in ins:
+                continue
+            if re.match(r"^(add|sub|and|or|xor|shl|shr|sar|inc|dec)\s+(?:DWORD|WORD|BYTE) PTR \[", ins):
+                w += 1
+            elif re.match(r"^mov (?:DWORD|WORD|BYTE) PTR \[", ins):
+                s += 1
+            else:
+                l += 1
+        return (l, s, w)
+    got = []
+    for fn, ed in (("la__base", "alias2:p->m"), ("lp__base", "ptrlocal:p->q"), ("lw__base", "subobj:w->e")):
+        d = os.path.join(tempfile.mkdtemp(), "rz")
+        subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "edit", RZ, "--func", fn, ed, "--keep", d] + fl,
+                       capture_output=True, text=True, cwd=HERE)
+        try:
+            got.append((lcount(os.path.join(d, "base", "base.asm"), fn), lcount(os.path.join(d, "e0_000", "e0_000.asm"), fn)))
+        except Exception as e:
+            got.append(str(e)[:60])
+    check("realize2 load levers: alias2 1 -> 3 loads, ptrlocal 2 -> 1, subobj read+store -> one RMW (13.10: 2 loads)",
+          got, [((1, 0, 0), (3, 0, 0)), ((2, 1, 0), (1, 1, 0)), ((1, 1, 0), (2, 1, 0) if v13 else (1, 0, 1))])
+
+
+realize2_tests()
+
+
+def realize_ins_tests():
+    """realize.py's ins family (docs/c2/realize.md 2.5.1): a statement before an if whose then-arm returns, written at
+    the head of that arm and again after the if (headret), is head-merged after RegSimpleAssignBody on 14.00 / 15.00:
+    one hidden pick, the same instructions; 13.10 keeps both copies."""
+    RZ = os.path.join(HERE, "tests", "data", "realize_ins.cpp")
+    fl = ["--", "/TP", "/MT", "/EHsc", "/Gy", "/O2"]
+    v13 = BUILD.startswith("13.10")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "pairs", RZ, "--scratch"] + fl,
+                       capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    m = re.search(r"^## hr:.*\n\s+dup\s+code (\d+) .*\n\s+picks: (.*)$", r.stdout, re.M)
+    m3 = re.search(r"^## h3:.*\n\s+dup\s+code (\d+) ", r.stdout, re.M)
+    check("realize_ins: a log call at the head of a returning arm and after the if: one hidden pick (ins:4), same "
+          "instructions (13.10: not merged); with 3 picks in the arm the copies differ",
+          (bool(m) and "ins:4(gone)" in m.group(2), bool(m) and m.group(1) == "0", bool(m3) and m3.group(1) != "0"),
+          (not v13, not v13, True))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "edit", RZ, "--func", "hr__base", "ins:4",
+                        "--keep", os.path.join(tempfile.mkdtemp(), "rz")] + fl, capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    check("realize_ins edit ins:4: headret realises it exactly, every pick as rasim scratch predicts (13.10: no)",
+          bool(re.search(r"^\s+exact\s+headret\s+code 0 bag 0", r.stdout, re.M)), not v13)
+
+
+realize_ins_tests()
+
+
 def regdiff_norm_tests():
     """tsweep.regdiff: printing differences between the listing and capstone are not differences."""
     import tsweep
@@ -576,9 +750,112 @@ def regdiff_norm_tests():
     check("tsweep regdiff: symbol names, imul r, r, imm and alignment padding count as equal",
           (tsweep.regdiff(ours, tsweep.orig_instrs(path)), tsweep.regdiff(ours[:3] + [("cmp", "esi, 3")] + ours[4:], tsweep.orig_instrs(path))),
           (0, 2))
+    # capstone names DF F0+i `fcompi` (the listing: fcomip); Spore 009d3410
+    open(path, "w").write("00000000 fcompi st(1)\n00000002 fucompi st(2)\n")
+    check("tsweep regdiff: capstone's fcompi / fucompi are the listing's fcomip / fucomip",
+          tsweep.regdiff([("fcomip", "ST(1)"), ("fucomip", "ST(2)")], tsweep.orig_instrs(path)), 0)
 
 
 regdiff_norm_tests()
+
+
+def realize_member_type_tests():
+    """realize._member_type: a member declared after a member with a trailing comment (Spore 009d3410)."""
+    import types, realize, rwsweep
+    c = types.SimpleNamespace(text="struct L {\n    int mCount;              // +0x0c\n    Limb* mLimbsBegin;  // +0x10\n"
+                                   "    Limb* mLimbsEnd; /* +0x14 */\n    float f;\n};\n", rw=rwsweep)
+    check("realize member type: found behind // and /* */ comments",
+          (realize._member_type(c, "mLimbsBegin"), realize._member_type(c, "f")), ("Limb*", "float"))
+
+
+realize_member_type_tests()
+
+
+def operator_def_tests():
+    """helpersweep.functions / body_of: operator functions (`??4Vec@@` is Vec::operator=; Spore 00c94c30)."""
+    import helpersweep
+    src = ("struct V { int a; V& operator=(const V& o); bool operator == (V b) { return a == b.a; } int operator()(int x)"
+           " const { return x; } };\nV& V::operator=(const V& o) { a = o.a; return *this; }\n")
+    fn = helpersweep.body_of(src, "??4V@@QAEAAU0@ABU0@@Z")
+    check("helpersweep: operator definitions listed, ??4 found as Class::operator=",
+          ([f[0] for f in helpersweep.functions(src)], src[fn[4]:fn[2]].strip()),
+          (["operator==", "operator()", "operator="], "V::operator=(const V& o)"))
+
+
+operator_def_tests()
+
+
+def bdiff_tests():
+    """tsweep.bdiff: displacements and immediates count, relocations / call targets / padding do not (synthetic
+    listing); a compile's listing against the linked image of its own object scores 0 (every c2 build)."""
+    import tsweep, c2ltcg
+    d = tempfile.mkdtemp()
+    lst = os.path.join(d, "f.asm")
+    open(lst, "w").write(
+        "_a$ = 8\n_f\tPROC NEAR\n"
+        "  00000\t8b 44 24 04\t mov\t eax, DWORD PTR _a$[esp-4]\n"
+        "  00004\t8b 0d 00 00 00\n\t00\t\t mov\t ecx, DWORD PTR _g\n"
+        "  0000a\td9 40 08\t fld\t DWORD PTR [eax+8]\n"
+        "  0000d\te8 00 00 00 00\t call\t _ext\n"
+        "  00012\t68 00 00 00 00\t push\t OFFSET $SG1\n"
+        "  00017\t8d 49 00\t npad\t 3\n"
+        "  0001a\t68 00 00 00 00\t push\t __ehhandler$_f\n"
+        "  0001f\tc3\t\t ret\t 0\n_f\tENDP\n")
+    orig = ["00401000 mov eax, dword ptr [esp + 4]", "00401004 mov ecx, dword ptr [0x5e2930]",
+            "0040100a fld dword ptr [eax + 8]", "0040100d call 0x478f30", "00401012 push 0x5a0010",
+            "00401017 lea ecx, [ecx]", "0040101a push 0x5a1000", "0040101f ret"]
+
+    def score(lines):
+        p = os.path.join(d, "o.s")
+        open(p, "w").write("\n".join(lines) + "\n")
+        o = tsweep.orig_instrs(p)
+        ours = tsweep.listing_instrs(lst, "_f")
+        return tsweep.bdiff(ours, o), tsweep.regdiff(ours, o)
+    check("bdiff: relocations, call, OFFSET, bare symbol, frame var, npad",
+          score(orig), (0, 0))
+    check("bdiff: a displacement counts (regdiff blind to it)",
+          score(orig[:2] + ["0040100a fld dword ptr [eax + 0xc]"] + orig[3:]), (1, 0))
+    check("bdiff: another immediate counts", score(orig[:4] + ["00401012 push 5"] + orig[5:]), (1, 0))
+    jl = os.path.join(d, "j.asm")       # a jump to another (aligned) instruction than the original's
+    open(jl, "w").write("_j\tPROC NEAR\n  00000\t85 c0\t\t test\t eax, eax\n  00002\t74 03\t\t je\t SHORT $LN1@j\n"
+                        "  00004\t33 c0\t\t xor\t eax, eax\n  00006\t40\t\t inc\t eax\n$LN1@j:\n  00007\tc3\t\t ret\t 0\n_j\tENDP\n")
+    jo = os.path.join(d, "j.s")
+    got = []
+    for t in ("0x401007", "0x401006"):
+        open(jo, "w").write("00401000 test eax, eax\n00401002 je %s\n00401004 xor eax, eax\n00401006 inc eax\n"
+                            "00401007 ret\n" % t)
+        got.append(tsweep.bdiff(tsweep.listing_instrs(jl, "_j"), tsweep.orig_instrs(jo)))
+    check("bdiff: a jump's target counts (same target, another one)", got, [0, 1])
+    pl = os.path.join(d, "p.asm")       # npad 14 against the image's two-jump form of it
+    open(pl, "w").write("_p\tPROC NEAR\n  00000\t57\t\t push\t edi\n  00001\teb 0c 8d a4 24\n\t00 00 00 00 eb 03\n"
+                        "\t8d 49 00\t\t npad\t 14\n$LN2@p:\n  0000f\t5f\t\t pop\t edi\n  00010\tc3\t\t ret\t 0\n_p\tENDP\n")
+    po = os.path.join(d, "p.s")
+    open(po, "w").write("00401000 push edi\n00401001 jmp 0x40100f\n00401003 lea esp, [esp]\n0040100a jmp 0x40100f\n"
+                        "0040100c lea ecx, [ecx]\n0040100f pop edi\n00401010 ret\n")
+    check("bdiff: a pad in several jumps (npad 14) is one pad",
+          (tsweep.bdiff(tsweep.listing_instrs(pl, "_p"), tsweep.orig_instrs(po)),
+           tsweep.regdiff(tsweep.listing_instrs(pl, "_p"), tsweep.orig_instrs(po))), (0, 0))
+    # the real thing: cl's listing (relocations unresolved) against the image link makes of the same object
+    src = os.path.join(HERE, "tests", "data", "bdiff.c")
+    ms = [sys.executable, os.path.join(HERE, "tools", "msvc.py")]
+    subprocess.run(ms + ["cl", "/nologo", "/c", "/O2", "/Gy", "/FAsc", "/Fa" + os.path.join(d, "b.asm"),
+                         "/Fo" + os.path.join(d, "b.obj"), src], capture_output=True, text=True, cwd=HERE)
+    subprocess.run(ms + ["link", "/nologo", "/DLL", "/NOENTRY", "/NODEFAULTLIB", "/FORCE:UNRESOLVED", "/OPT:NOREF",
+                         "/OPT:NOICF", "/MAP:" + os.path.join(d, "b.map"), "/OUT:" + os.path.join(d, "b.dll"),
+                         os.path.join(d, "b.obj")], capture_output=True, text=True, cwd=HERE)
+    got = []
+    try:
+        c2ltcg.write_listing(os.path.join(d, "b.dll"), os.path.join(d, "b.map"), os.path.join(d, "img.asm"),
+                             os.path.join(d, "s"))
+        for f in ("_sw", "_fsum", "_big"):
+            got.append(tsweep.bdiff(tsweep.listing_instrs(os.path.join(d, "b.asm"), f),
+                                    tsweep.orig_instrs(os.path.join(d, "s", f + ".s"))))
+    except Exception as e:
+        got = "%s: %s" % (type(e).__name__, e)
+    check("bdiff: listing vs its linked image: 0 (3 functions)", got, [0, 0, 0])
+
+
+bdiff_tests()
 
 
 
@@ -750,6 +1027,880 @@ def slots_tests():
 
 
 slots_tests()
+
+def loadcse_tests():
+    """Load reuse and read-modify-write (docs/c2/loadcse.md): the rule loadcse.py names for each probe of
+    tests/data/loadcse.cpp, the PAS-index dump it needs (C2TRACE_ILPAS) and the rwsweep `unalias` family."""
+    src = os.path.join(HERE, "tests", "data", "loadcse.cpp")
+    d = tempfile.mkdtemp()
+
+    def rep(fn_):
+        js = os.path.join(d, re.sub(r"\W", "_", fn_) + ".json")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "loadcse.py"), src, "--func", fn_, "--json", js,
+                            "--", "/TP", "/MT", "/GS", "/EHsc", "/Gy", "/O2"], capture_output=True, text=True, cwd=HERE)
+        if VERBOSE:
+            print(r.stdout[-3000:], r.stderr[-2000:])
+        return json.load(open(js)) if os.path.exists(js) else {"locations": [], "rmw": []}
+
+    def statuses(j):
+        return [ld["status"] for loc in j["locations"] for ld in loc["loads"]]
+
+    old13 = BUILD.startswith("13.10")
+    j = rep("drain0")
+    check("loadcse: one end pointer for read and decrement: no RMW (M2 shared result)",
+          [("M2" in r["status"], r["status"].startswith("NOT FORMED")) for r in j["rmw"]], [(True, True)])
+    j = rep("drain1")
+    check("loadcse: through an inline accessor on the sub-object: RMW formed%s" % (", split again on 13.10" if old13 else ""),
+          [r["status"] for r in j["rmw"]], ["FORMED, SPLIT after allocation" if old13 else "FORMED"])
+    j = rep("::twolevel")
+    check("loadcse: store through p->q in the arm: its reads get another alias class (R2)",
+          any(s_.startswith("RELOADED R2") for s_ in statuses(j)), True)
+    j = rep("::twolevel_local")
+    check("loadcse: the same with Q* q = p->q: nothing reloaded", any(s_.startswith("RELOADED") for s_ in statuses(j)), False)
+    j = rep("::refmember")
+    check("loadcse: a reference to the member, used twice, is another base (R3 through _re)",
+          any(ld["status"].startswith("RELOADED R3") and "_re" in ld["why"] for loc in j["locations"] for ld in loc["loads"]),
+          True)
+    j = rep("::killcall")
+    check("loadcse: a call between: R5 kill", any(s_.startswith("RELOADED R5") for s_ in statuses(j)), True)
+    j = rep("::samechain")
+    check("loadcse: (m | a) | 2 is one operator chain: `or [m]`%s" % (", split again on 13.10" if old13 else ""),
+          [r["status"] for r in j["rmw"]], ["FORMED, SPLIT after allocation" if old13 else "FORMED"])
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "rwsweep.py"), src, "--func", "::refmember",
+                        "--families", "unalias", "--list", "--", "/TP", "/O2"], capture_output=True, text=True, cwd=HERE)
+    check("rwsweep unalias: the reference `re` is offered for removal (2 uses)",
+          "unalias ref &re = x.e removed" in r.stdout and "(2 uses)" in r.stdout, True)
+
+
+loadcse_tests()
+
+
+def sulever_tests():
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "sulever.py"),
+                        os.path.join(HERE, "tests", "data", "sulever.cpp"), "--func", "kind3", "--site", "*:_lo>+0]",
+                        "--spell", "(unsigned int)lo", "--jobs", "3", "--", "/TP", "/O2"],
+                       capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    check("sulever: 3-operand OR, lo after the mask term: decided by SU", "A>B is not satisfied; decided by SU" in r.stdout,
+          True)
+    m = re.search(r"^view-mask\s.*order: \S+ \S+ SU\d n\d h\w+ \| \((\S+)", r.stdout, re.M)
+    check("sulever: the view-mask spelling puts lo second", bool(m and m.group(1).startswith("_lo+0")), True)
+
+
+sulever_tests()
+
+
+def toolgap_tests():
+    """Tool gaps of the second benchmark round (work/bench/spore/RESULTS2.md "Tool bugs" 8-12, mb item 5, the stray
+    b/ directory): realize alias2 with two reads and --asm-func, rwsweep byval / wrap / touch / combinations, the
+    case-safe output names, the original's prologue in c2slots, c2trace's keep directory."""
+    import types, hashlib, rwsweep, tsweep, c2slots, c2trace, realize
+    TG = os.path.join(HERE, "tests", "data", "toolgaps.cpp")
+    fl = ["--", "/TP", "/MT", "/EHsc", "/Gy", "/O2"]
+    # realize alias2 on a pointer member read only twice: one later read through the reference, reloaded
+    d = os.path.join(tempfile.mkdtemp(), "rz")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "edit", TG, "--func", "lt__base",
+                        "alias2:p->m", "--asm-func", "lt__base", "--keep", d] + fl, capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+
+    def loads(asm, func):
+        try:
+            return sum("+92]" in o for _, o in tsweep.listing_instrs(asm, func))
+        except Exception as e:
+            return str(e)[:40]
+    v13 = c2trace.c2build.name().startswith("13.10")
+    check("realize alias2:p->m with two reads: a construct, 1 -> %d loads" % (1 if v13 else 2),
+          ("read 2 of 2 through it (one use)" in r.stdout, loads(os.path.join(d, "base", "base.asm"), "lt__base"),
+           loads(os.path.join(d, "e0_000", "e0_000.asm"), "lt__base")), (True, 1, 1 if v13 else 2))
+    # --asm-func: the score reads that function of our listing
+    asm = os.path.join(d, "base", "base.asm")
+    f = types.SimpleNamespace(instrs=[("nop", "")], asm_path=asm)
+    ctx = types.SimpleNamespace(a=types.SimpleNamespace(func="lt__base", asm_func="lt__other"))
+    got = realize.Ctx.scored(ctx, f) if os.path.exists(asm) else None
+    check("realize --asm-func: the scored instructions are that function's",
+          got == tsweep.listing_instrs(asm, "lt__other") if got is not None else None, True)
+
+    text = open(TG).read()
+    fn = rwsweep.body_of(text, "?get@BvUser@@QAEPAXH@Z")
+    B = rwsweep.Body(text, fn, "BvUser")
+    call = text.index("touch_ref(k, any)") - B.b
+    check("rwsweep wrap: an argument to a `bool&` parameter only through hs_bind (C2664 otherwise)",
+          sorted(v[1].split("(")[0] for v in rwsweep.gen_wrap(B) if "(any) @%d" % (call + 13) in v[1]), ["hs_bind"])
+    t2 = "struct S { int a; }; void f(const int c, S s) { int x = c; x++; (void)x; }"
+    forms = {tuple(v[1].split()[:2]) for v in rwsweep.gen_touch(rwsweep.Body(t2, rwsweep.body_of(t2, "f"), None))}
+    check("rwsweep touch: no `c = c` for a const c, no if/__assume on a struct",
+          (("self", "c") in forms, ("if", "s") in forms, ("assume", "s") in forms, ("self", "x") in forms,
+           ("if", "c") in forms), (False, False, False, True, True))
+    bv = list(rwsweep.gen_byval(B))
+    check("rwsweep byval: map.find(&k) through `typename M::It rz_bv_find1(M&, const A0&)` before the definition",
+          (len(bv), bv[0][2][1][2] if bv else None, bv[0][2][0][2].strip() if bv else None,
+           text[bv[0][2][0][0]:].startswith("void* BvUser::get") if bv else None),
+          (1, "rz_bv_find1(map, &k)", "template <class M, class A0> inline typename M::It rz_bv_find1(M& m, const A0& a0) "
+           "{ return m.find(a0); }", True))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "rwsweep.py"), TG, "--func", "?get@BvUser@@QAEPAXH@Z",
+                        "--families", "byval,wrap", "--vars", "any,map"] + fl, capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    m = re.search(r"(\d+) measured, (\d+) failed to compile", r.stdout)
+    check("rwsweep byval and wrap: every variant compiles", (int(m.group(2)), int(m.group(1)) > 2) if m else None, (0, True))
+    # combinations: with --asm-vs, code-changing singles that lower the bdiff are combined (Spore 0099f110)
+    rows = [dict(i=0, shape=0, bd=9, dgap=None), dict(i=1, shape=4, bd=8, dgap=None), dict(i=2, shape=2, bd=7, dgap=None),
+            dict(i=3, shape=3, bd=12, dgap=None)]
+    var = [("x", "", [(k * 10, k * 10 + 1, "")]) for k in range(4)]
+    good, better, combos = rwsweep.plan_combos(rows, var, 10, None, 2)
+    check("rwsweep combinations: improving code-changing singles are combined too, best gain first",
+          ([x["i"] for x in good], [x["i"] for x in better], [c[2] for c in combos]), ([0], [2, 1], [[2, 1], [0, 2], [0, 1]]))
+    check("rwsweep combinations: without --asm-vs only code-neutral ones (none here)",
+          rwsweep.plan_combos(rows, var, None, None, 2)[2], [])
+    # output names that differ only in case (macOS: one directory)
+    dd = tempfile.mkdtemp()
+    names = [tsweep.out_name(os.path.join(dd, n)) for n in ("r2_D.cpp", "r2_d.cpp", "R2_d.cpp")]
+    check("out_name: r2_D / r2_d / R2_d differ ignoring case; lowercase keeps <stem>-<dirhash>",
+          (len({n.lower() for n in names}), names[1] == "r2_d-" + hashlib.md5(os.path.abspath(dd).encode()).hexdigest()[:6]),
+          (3, True))
+    # c2slots: an instruction scheduled into the prologue (M&B 004362e0) does not end it
+    ins = [(0, "mov", "eax, dword ptr [esp + 0x18]"), (4, "sub", "esp, 8"), (7, "push", "ebx"),
+           (8, "mov", "ebx, dword ptr [esp + 0x20]"), (12, "push", "ebp"), (13, "push", "esi"), (14, "push", "edi"),
+           (15, "push", "ecx"), (16, "lea", "edx, [esp + 0x14]"), (20, "push", "edx"), (21, "mov", "ecx, esi"),
+           (23, "call", "0x432790"), (28, "mov", "ecx, dword ptr [esp + 0x20]"), (32, "ret", "0x18")]
+    keys = dict(c2slots.orig_slots(ins)[0])
+    check("c2slots orig_slots: prologue pushes after a scheduled load are not call arguments",
+          (keys.get(0), keys.get(3), keys.get(8), keys.get(12)), ([24], [20], [-8], [8]))
+    # c2trace keep directories: from the repository root a relative --keep outside work/ goes under work/keep/
+    cwd = os.getcwd()
+    try:
+        os.chdir(HERE)
+        got = (c2trace.keep_path("b/k_x"), c2trace.keep_path("work/scratch/k"), c2trace.keep_path("/tmp/k"))
+    finally:
+        os.chdir(cwd)
+    check("c2trace keep_path: root-relative b/k_x -> work/keep/b/k_x; work/.. and absolute unchanged", got,
+          (os.path.join(HERE, "work", "keep", "b", "k_x"), os.path.join(HERE, "work", "scratch", "k"), "/tmp/k"))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2trace.py"), "no_such_file.cpp", "--keep",
+                        os.path.join(dd, "k")], capture_output=True, text=True, cwd=dd)
+    check("c2trace: a missing source stops before the keep directory is made",
+          (r.returncode != 0, os.path.exists(os.path.join(dd, "k"))), (True, False))
+
+
+toolgap_tests()
+
+
+def schedwant_tests():
+    src = os.path.join(HERE, "tests", "data", "schedwant.cpp")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2sched.py"), src, "--func", "?kcopy@", "--all",
+                        "--", "/TP", "/O2"], capture_output=True, text=True, cwd=HERE).stdout
+    reg, lex, region, issued = None, {}, None, []
+    for ln in r.splitlines():
+        m = re.match(r"-- region (\d+)", ln)
+        if m:
+            reg = int(m.group(1))
+            lex, issued = {}, []
+            continue
+        m = re.match(r"\s+(\d+)\s+\d+\s+\d+\s+\S+\s+[0-9a-f]+\s+\d+\s+\d+\s+(.*)$", ln)
+        if m:
+            lex[int(m.group(1))] = m.group(2)
+        m = re.match(r"\s+cyc\s+\d+ .? lex\s+(\d+)", ln)
+        if m:
+            issued.append(int(m.group(1)))
+        sv = {k: int(m_.group(1)) for k, t in lex.items() for m_ in [re.search(r"^mov .*<- s(\d+):\d+\s*$", t)] if m_}
+        ld = sorted(sv, key=lambda k: -sv[k])[:1] if len(sv) >= 2 else []     # key.b: the field view made later
+        st = [k for k, t in lex.items() if "*8+0]" in t.split("<-")[0]]
+        if ld and st and issued and len(issued) == len(lex):
+            region, L, S, order = reg, ld[0], st[0], list(issued)
+    ok = region is not None and order.index(S) < order.index(L)
+    check("schedwant: key.b's load waits for the first element store", ok, True)
+    if not ok:
+        return
+    order.remove(L)
+    order.insert(order.index(S), L)
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "schedwant.py"), src, "--func", "?kcopy@",
+                        "--region", str(region), "--want-lex", ",".join(map(str, order)), "--", "/TP", "/O2"],
+                       capture_output=True, text=True, cwd=HERE).stdout
+    if VERBOSE:
+        print(r[-3000:])
+    check("schedwant: the replay reproduces the traced order", "(= traced)" in r, True)
+    check("schedwant: unalias of that load gives the wanted order",
+          bool(re.search(r"^\s+WANTED\s+unalias:%d\s*$" % L, r, re.M)), True)
+
+
+schedwant_tests()
+
+
+def framefields_tests():
+    d = os.path.join(HERE, "tests", "data", "framefields")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "framefields.py"), os.path.join(d, "a.cpp"),
+                        "--func", "ins16", "--orig-src", os.path.join(d, "b.cpp"), "--", "/TP", "/O2"],
+                       capture_output=True, text=True, cwd=HERE).stdout
+    if VERBOSE:
+        print(r[-3000:])
+    check("framefields: a 16-byte local whose original is larger (pair<key, value>)",
+          bool(re.search(r"_value\$: \d+ of its references touch another field .* the original's type is larger", r)), True)
+
+
+framefields_tests()
+
+
+# effectmine (docs/c2/effectmine.md, tools/effectmine.py), on every c2 build: mutations generated, compiled traced,
+# their effects read in each model's vocabulary and stored; a scratch database (EFFECTMINE_DIR), not work/effectmine
+def effectmine_tests():
+    EM = os.path.join(HERE, "tests", "data", "effectmine.cpp")
+    tool_ = os.path.join(HERE, "tools", "effectmine.py")
+    env = dict(os.environ, EFFECTMINE_DIR=tempfile.mkdtemp(prefix="emtest_"))
+    r = subprocess.run([sys.executable, tool_, "mine", EM, "--func", "em__base", "--list"] + FLAGS,
+                       capture_output=True, text=True, cwd=HERE, env=env)
+    classes = set(re.findall(r"^\s+\d+ (\S+)", r.stdout, re.M))
+    check("effectmine --list: rwsweep, realize and its own classes generated",
+          {"copy", "wrap.var.hs_id", "pad.init.top", "decl.extvar.before", "commute", "move.end"} <= classes, True)
+    r = subprocess.run([sys.executable, tool_, "mine", EM, "--func", "em__base", "--features", "regs,keys", "--eager-feats", "keys",
+                        "--classes", r"^(copy|pad\.init\.top|decl\.extvar\.before)$", "--max-compiles", "60",
+                        "--jobs", "8"] + FLAGS, capture_output=True, text=True, cwd=HERE, env=env)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    db = [json.loads(l) for l in open(os.path.join(env["EFFECTMINE_DIR"], "effects.jsonl"))] \
+        if os.path.exists(os.path.join(env["EFFECTMINE_DIR"], "effects.jsonl")) else []
+    cp = [x for x in db if x["cls"] == "copy" and x["ok"]]
+    check("effectmine: a copy of n is +2 on n and one more candidate in the copy's block, instructions unchanged",
+          any(any(re.match(r"ref:n:\d+:\+2$", e) for e in x["eff"]["R"]) and any(e.startswith("P:") for e in x["eff"]["R"])
+              and x["code"]["code"] == 0 for x in cp), True)
+    pad = [x for x in db if x["cls"] == "pad.init.top" and x["meta"].get("n") == 1 and x["ok"]]
+    check("effectmine: one unused initialised local is one frame key, code identical",
+          [("keys:frame:+1" in x["eff"].get("K", []), x["code"]["ident"]) for x in pad], [(True, 0)])
+    dec = [x for x in db if x["cls"] == "decl.extvar.before" and x["ok"]]
+    check("effectmine: dummy extern declarations before the function: compiled, effects recorded",
+          bool(dec) and all("types" in x for x in dec), True)
+    r = subprocess.run([sys.executable, tool_, "table", "--min-n", "1"], capture_output=True, text=True, cwd=HERE, env=env)
+    check("effectmine table: the copy class shows R.ref+ with the instructions unchanged",
+          bool(re.search(r"^copy\s+\d+\s+1\s.*\d+\(\s*\d+\)", r.stdout, re.M)) and "R.ref+" in r.stdout, True)
+
+
+effectmine_tests()
+
+
+def untraced_tests():
+    """Temps with no Color pop and no RegAssign pick (Mount & Blade 0x529c30 t437, 0x43c9c0 t385/t386, 0x524420 t814),
+    commutative two-address votes in regmap (0x524420 t728), and a closed stdout (rasim / c2trace | head)."""
+    import tsweep
+    d = tempfile.mkdtemp()
+    # 1. cl 13.10's Riscify: `add eax, [m]` split into a load to a new temp, given its register by GetReg (riscify.c)
+    rsnap = os.path.join(d, "r.json")
+    out = tool("scratch", os.path.join(HERE, "tests", "data", "riscify.c"), "--func", "pick2", "--export", rsnap)
+    rrows = re.findall(r"^\s+R\s+(\d+) blk \S+\s+\S+\s+(\S+)\s+(\S+)\s+busy \S+\s+made (t\d+)", out, re.M)
+    rs = subprocess.run([rasim, "scratch", rsnap], capture_output=True, text=True).stdout
+    m = re.search(r"riscify: (\d+) of (\d+) GetReg calls predicted \(register\); cursor right at (\d+) of", rs)
+    unm = re.findall(r"^\s+\?\s+(t\d+)\s+\S+\s+\S+\s+.*\[(.+)\]$", out, re.M)
+    if BUILD.startswith("13.10"):
+        check("scratch: Riscify's GetReg call makes the load temp (edx), offset known; rasim replays every call",
+              (len(rrows), rrows[0][1] if rrows else None, rrows[0][2] != "gone" if rrows else None,
+               m and m.group(1) == m.group(2) == m.group(3)), (1, "edx", True, True))
+        t = rrows[0][3] if rrows else "t0"
+        w = subprocess.run([rasim, "scratch", rsnap, "want:%s=eax" % t], capture_output=True, text=True).stdout
+        check("rasim scratch want: on a Riscify temp names the GetReg call and scans rdrop/rins", 
+              ("made by Riscify (GetReg call R%s" % rrows[0][0] if rrows else "?") in w, True)
+    else:
+        check("scratch: no Riscify on this build; the temps without a pick are named with their phase",
+              (len(rrows), m is None, bool(unm) and all(ph for _, ph in unm)), (0, True, True))
+    if unm:
+        w = subprocess.run([rasim, "scratch", rsnap, "want:%s=edi" % unm[0][0]], capture_output=True, text=True).stdout
+        check("rasim scratch want: on a temp no modelled phase assigned says which phase did", "rasim does not model that phase" in w, True)
+    # 2. a pick whose IL name at pick time is not its final-code name (0x524420 t814 was pick 25 as t728)
+    src = os.path.join(HERE, "tests", "data", "twoaddr.c")
+    k = os.path.join(d, "k")
+    out = tool("scratch", src, "--func", "addsum", "--keep", k)
+    check("scratch: a pick under another IL name shows the temp the final code calls it",
+          bool(re.search(r"^\s+\d+\s.*\[temp t\d+ in the final code\]$", out, re.M)), True)
+    # 3. regmap: `add eax, esi` against an original `add esi, eax` (the same operands, the sum in the other register)
+    asm = os.path.join(k, "twoaddr.asm")
+    lst = tsweep.listing_instrs(asm, "_addsum")
+    rows = [list(x) for x in zip(lst.addrs, (dd[0] for dd in lst.decoded), (dd[1] for dd in lst.decoded))]
+    for i, (o, mn, ops) in enumerate(rows):
+        mm = re.fullmatch(r"(e\w\w), (e\w\w)", ops)
+        if mn == "add" and mm and i and rows[i - 1][1] in ("call", "mov"):
+            a, b = mm.groups()
+            rows[i][2] = "%s, %s" % (b, a)
+            for r in rows[i + 1:]:
+                if r[1] == "mov" and r[2].endswith(", " + a) and "0x9c" in r[2]:
+                    r[2] = r[2][:-len(a)] + b
+                    break
+            break
+    orig = os.path.join(d, "addsum.s")
+    open(orig, "w").write("".join("%08x %s %s\n" % tuple(r) for r in rows))
+    out = tool("regmap", src, "--func", "addsum", "--asm-vs", orig, "--asm-func", "_addsum")
+    wants = re.findall(r"^(\S+)\s+\S+\s+\S+\s+\S+\s+(WANTS \S+|mixed.*)$", out, re.M)
+    check("regmap: commutative two-address op in the other order: only the sum WANTS, noted as operand order",
+          (len(wants), all(w[1].startswith("WANTS") for w in wants), "commutative two-address op" in out,
+           "      from: scratch pick" in out), (1, True, True, True))
+    # 4. a reader that goes away: no panic, no traceback (status 141 / SIGPIPE)
+    bad = []
+    for cmd in ([rasim, "scratch", rsnap, "-v"], [rasim, "need", snap, "reg:k=esi"],
+                [sys.executable, os.path.join(HERE, "tools", "c2trace.py"), "--help"],
+                [sys.executable, os.path.join(HERE, "tools", "regmap.py"), "--help"]):
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p.stdout.close()
+        err = p.stderr.read().decode(errors="replace")
+        rc = p.wait()
+        if "panicked" in err or "Traceback" in err or "BrokenPipeError" in err or rc not in (0, 2, 141, -13):
+            bad.append((os.path.basename(cmd[0]), cmd[1], rc, err[-200:]))
+    check("closed stdout: rasim and c2trace/regmap end quietly (EPIPE)", bad, [])
+
+
+untraced_tests()
+
+
+def mbrequest_tests():
+    """Mount & Blade session requests: several scratch wants answered jointly (0x4b1930: one ins for five picks), the
+    terms behind `need`'s weights (0x4ea290: ebx:400), the locals and parameters with no `regs` row and why
+    (0x4bd4d0: line), and why Riscify split an instruction or not (0x43c9c0: R14, R15)."""
+    d = tempfile.mkdtemp()
+    # 1. joint wants: the last three rotation picks of eA each want the next register: one ins:K before them
+    js = json.load(open(ssnap))
+    run = max(js["runs"], key=lambda r: len(r["picks"]))
+    rot = [p for p in run["picks"] if p["how"] == "ROT" and p["cls"] == "int"][-3:]
+    nxt = {"eax": "ecx", "ecx": "edx", "edx": "eax"}
+    r = subprocess.run([rasim, "scratch", ssnap] + ["want:%s=%s" % (p["tmp"], nxt[p["reg"]]) for p in rot],
+                       capture_output=True, text=True).stdout
+    m = re.search(r"best: (\d+) of (\d+) with (\d+) edit", r)
+    first = re.search(r"^  (\S+)\s+\d+ of \d+;", r, re.M)
+    check("rasim scratch: three wants, one joint edit (ins:K / drop:K), before the per-want answers",
+          (m.groups() if m else None, bool(first and first.group(1).startswith(("ins:", "drop:"))),
+           "per want:" in r and r.index("joint:") < r.index("per want:")), (("3", "3", "1"), True, True))
+    # 2. need: each nonzero weight with its terms (here the value's own preference)
+    r = subprocess.run([rasim, "need", snap, "pref:k:edi", "reg:k=esi"], capture_output=True, text=True).stdout
+    check("rasim need: a weight is explained term by term (own PREF -1)",
+          bool(re.search(r"^  k weights \(wanted esi\):\n    edi:-1 = -1 its own preference for edi", r, re.M)), True)
+    # 3. regs: the locals and parameters with no row, and the phase that dropped each
+    src = os.path.join(HERE, "tests", "data", "regmissing.c")
+    msnap = os.path.join(d, "m.json")
+    out = tool("regs", src, "--func", "f", "--export", msnap)
+    why = dict(re.findall(r"^    (\w+)\s+(?:local|param|\?)\s+(\S+)", out, re.M))
+    check("regs: volatile, address-taken and propagated-away locals listed with their reason",
+          (why.get("v"), why.get("x"), why.get("copy")), ("volatile", "address-taken:", "every"))
+    r = subprocess.run([rasim, "need", msnap, "reg:v=esi"], capture_output=True, text=True)
+    check("rasim need on a variable with no row prints its reason", "has no row in the regs table: volatile" in r.stdout + r.stderr, True)
+    # 4. Riscify (cl 13.10): split and kept (the scheduler separated load and store), split and undone, not split
+    if BUILD.startswith("13.10"):
+        src = os.path.join(HERE, "tests", "data", "riscify2.c")
+        res = []
+        for fn in ("rmw", "rmw0"):
+            out = tool("scratch", src, "--func", fn)
+            res.append(re.findall(r"^\s+R\s+\d+ .*\n\s+(split, kept|split, undone after Schedule|not split: no memory operand)", out, re.M))
+        check("scratch: Riscify split reasons (rmw kept, rmw0 undone after Schedule, register forms not split)",
+              (res[0][:1], "not split: no memory operand" in res[0], res[1][:1]),
+              (["split, kept"], True, ["split, undone after Schedule"]))
+
+
+mbrequest_tests()
+
+
+def icount_tests():
+    """tools/icount.py (docs/c2/icount.md): the verdict class of each probe pair of tests/data/icount.cpp (X_ours
+    against X_orig of the same compile), and the tracer's function filter (C2TRACE_FUNC / `func`)."""
+    src = os.path.join(HERE, "tests", "data", "icount.cpp")
+    d = tempfile.mkdtemp()
+
+    def classes(p):
+        js = os.path.join(d, p + ".json")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "icount.py"), src, "--func", "::%s_ours" % p,
+                            "--vs-func", "::%s_orig" % p, "--json", js, "--", "/TP", "/O2"],
+                           capture_output=True, text=True, cwd=HERE)
+        if VERBOSE:
+            print(r.stdout[-3000:], r.stderr[-2000:])
+        j = json.load(open(js)) if os.path.exists(js) else {}
+        return j.get("ours", 0) - j.get("orig", 0), sorted(j.get("classes", {}))
+
+    old13 = BUILD.startswith("13.10")
+    check("icount: one load where the original reloads: removed-by:GlobalOptimize/CSE", classes("cse"),
+          (-1, ["removed-by:GlobalOptimize/CSE"]))
+    dl, cl = classes("alias")
+    check("icount: a reference used twice keeps a reload: kept:alias%s" % (" (15.00, no branch targets: kept:*)"
+          if BUILD.startswith("15.00") else ""), (dl, len(cl) == 1 and cl[0].startswith("kept:alias" if not
+          BUILD.startswith("15.00") else "kept:")), (1, True))
+    dl, cl = classes("kill")
+    check("icount: a store through a loaded pointer between two reads: kept:kill", (dl, "kept:kill" in cl), (2, True))
+    dl, cl = classes("range")
+    check("icount: the struct copy's field tested twice: %s" % ("folded:range-check (13.10)" if old13 else
+          "folded in both variants (14.00, 15.00)"), (dl, "folded:range-check" in cl) if old13 else (dl, cl),
+          (-5, True) if old13 else (0, []))
+    check("icount: the first of two stores is dead: removed-by:GlobalOptimize/DeadStores", classes("dead"),
+          (-1, ["removed-by:GlobalOptimize/DeadStores"]))
+    dl, cl = classes("tail")
+    check("icount: equal tails merged (twins from the merge events): merged:FgDoLateFlowOpts",
+          (dl, "merged:FgDoLateFlowOpts" in cl), (-8, True))
+    check("icount: a statement the original has: structure", classes("stmt"), (-1, ["structure"]))
+    # the function filter: with C2TRACE_FUNC the DLL logs only while that function is compiled
+    env = dict(os.environ, C2TRACE_FUNC="?dead_ours@@")
+    kd = os.path.join(d, "ff")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2trace.py"), "--keep", kd, src, "--", "/TP"],
+                       capture_output=True, text=True, cwd=HERE, env=env)
+    log = open(os.path.join(kd, "c2trace.log"), errors="replace").read() if os.path.exists(os.path.join(kd, "c2trace.log")) else ""
+    ev = [l for l in log.splitlines() if l.startswith("E ")]
+    check("tracer func filter: `func` logged, only the named function's Color/Spillcosts events",
+          ("# func 1" in log, len(ev) > 0 and all("dead_ours" in l for l in ev if "@Color@" in l or '"' in l)),
+          (True, True))
+
+
+def ccache_ice_tests():
+    """tools/ccache.py never stores, nor replays, a compile that died with C1001: a traced c2's crash depends on
+    things outside the key (the compile server's tracer), and one cached crash failed icount `stmt` on 13.10."""
+    import ccache
+    old = ccache.DIR
+    ccache.DIR = tempfile.mkdtemp()
+    try:
+        ice = {"rc": 2, "out": "x.cpp\nfatal error C1001: INTERNAL COMPILER ERROR\n"}
+        stored = ccache.put("k_ice", {}, ice)
+        os.makedirs(os.path.join(ccache.DIR, "k_old"))
+        json.dump(ice, open(os.path.join(ccache.DIR, "k_old", "meta.json"), "w"))       # an entry from before
+        ok = ccache.put("k_ok", {}, {"rc": 0, "out": "x.cpp\n"})
+        check("ccache: a C1001 compile is not stored, an old C1001 entry is a miss, a good one is a hit",
+              (stored, ccache.get("k_ice"), ccache.get("k_old"), ccache.get("k_ok") == ok and ok is not None),
+              (None, None, None, ccache.mode() not in ("0", "refresh")))
+    finally:
+        ccache.DIR = old
+
+
+ccache_ice_tests()
+icount_tests()
+
+
+# External compiler rules (docs/c2/rules_xref.md, "how to add a rule probe"): each probe is
+# tests/data/rules/R<id>_<name>.cpp, compiled on the current C2_BUILD; expectations are dicts keyed by RKEY.
+RKEY = BUILD[:5] if BUILD.startswith(("14.00", "15.00")) else BUILD      # 14.00, 15.00, 13.10.3077, 13.10.3052
+RULES = os.path.join(HERE, "tests", "data", "rules")
+
+
+def rule_compile(name, *flags):
+    """Untraced /O2 /TP /Gy /FAsc compile of tests/data/rules/<name> (+ cl flags, e.g. /DVARIANT); the listing text."""
+    d = tempfile.mkdtemp()
+    subprocess.run([sys.executable, os.path.join(HERE, "tools", "msvc.py"), "cl", "/nologo", "/c", "/O2", "/TP", "/Gy",
+                    "/FAsc", "/Fa" + os.path.join(d, "x.asm"), "/Fo" + os.path.join(d, "x.obj")] + list(flags)
+                   + [os.path.join(RULES, name)], capture_output=True, text=True, cwd=HERE)
+    p = os.path.join(d, "x.asm")
+    return open(p, errors="replace").read() if os.path.exists(p) else ""
+
+
+def rule_proc(asm, prefix):
+    """The listing of the function whose decorated name starts with `prefix` ('' if absent)."""
+    m = re.search(r"^(%s\S*)\s+PROC\b(.*?)^\1\s+ENDP" % re.escape(prefix), asm, re.M | re.S)
+    return m.group(2) if m else ""
+
+
+def rule_trace(name, func, hook, *flags):
+    """Traced compile (compile server) of a rule probe, logging only while `func` is compiled: the logged events."""
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2trace.py"), "-H", hook, os.path.join(RULES, name),
+                        "--", "/TP"] + list(flags), capture_output=True, text=True, cwd=HERE,
+                       env=dict(os.environ, C2TRACE_FUNC=func))
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    return re.findall(r"^\s+\d+ > (.*)$", r.stdout, re.M)
+
+
+def rules_calls_tests():
+    """T02-T04: R850 (_FHasMustAlign), R860 (struct parameter), R865 (entry enter-loads), R1050 (null test after a copy)."""
+    regp = lambda proc: dict(re.findall(r"^; _(\w+)\$ = (\w+)$", proc, re.M))
+    # R850: does m (loaded into ebx at helper's entry) arrive in ebx?  14.00/15.00: module-wide _FHasMustAlign (any
+    # compiled function with an aligned local, or /arch:SSE2); 13.10: only callers with an aligned local (CGNODE 0x1000)
+    hp = "?helper@@YAHPAHHHH@Z"
+    got = tuple(regp(rule_proc(rule_compile("R850_mustalign.cpp", *f), hp)).get("m")
+                for f in ([], ["/DBEFORE"], ["/DAFTER"], ["/DCALLER"], ["/arch:SSE2"]))
+    want = {"14.00": ("ebx", None, None, None, None), "15.00": ("ebx", None, None, None, None),
+            "13.10.3077": ("ebx", "ebx", "ebx", None, "ebx"), "13.10.3052": ("ebx", "ebx", "ebx", None, "ebx")}
+    check("R850: ebx register parameter: declared / before / after / caller / SSE2", got, want[RKEY])
+    hook = {"14.00": "@MdmFlexParams@4=g10d08fe0>0", "15.00": "512306d0=g512470d8>0",        # _FHasMustAlign
+            "13.10.3077": "1074b268=eax>0x99>0x50", "13.10.3052": "1074c0c7=eax>0x99>0x50"}  # CGNODE+0x50
+    ev = [rule_trace("R850_mustalign.cpp", "?helper@@", hook[RKEY], f) for f in ("/DAFTER", "/DCALLER")]
+    val = [int(e[0].rsplit("=", 1)[1], 16) if e else None for e in ev]
+    if RKEY.startswith("13.10"):
+        got = [v & 0x1000 if v is not None else None for v in val]
+        check("R850 trace: CGNODE+0x50 bit 0x1000 (caller has must-align): after 0, caller set", got, [0, 0x1000])
+    else:
+        check("R850 trace: _FHasMustAlign at MdmFlexParams: after 1, caller 1", val, [1, 1])
+    # R860: a one-pointer struct parameter stays on the stack (all builds); the scalar arrives in ebx
+    got = tuple(regp(rule_proc(rule_compile("R860_structparam.cpp", *f), p)).get("n")
+                for f, p in (([], "?find@@YAHUNameArg@@H@Z"), (["/DSCALAR"], "?find@@YAHPBDH@Z"),
+                             (["/DENTRY"], "?find@@YAHUNameArg@@H@Z")))
+    check("R860: struct n on the stack (loop use, entry use), scalar n in ebx", got, (None, "ebx", None))
+    # R860/R865: ReachingOccurGenKill calls CmdInsertEnter (the entry enter-load) for each register-typed parameter
+    # of a may-be-flexible function (SSR+0xb4); probe on that call
+    site = {"14.00": "10b56fb0", "15.00": "510a55ae", "13.10.3077": "1077e8e7", "13.10.3052": "10782217"}[RKEY]
+    got = (len(rule_trace("R860_structparam.cpp", "?find@@", site)),
+           len(rule_trace("R860_structparam.cpp", "?find@@", site, "/DSCALAR")),
+           len(rule_trace("R865_enterload.cpp", "?late@@", site)),
+           len(rule_trace("R865_enterload.cpp", "?late@@", site, "/DSTATIC")))
+    check("R860/R865 trace: entry enter-loads: struct 1, scalar 2, extern 0, static 2", got, (1, 2, 0, 2))
+    # R865: info's load in the entry block (static, becomes a register parameter) or in the loop's preheader (extern)
+    ext = rule_proc(rule_compile("R865_enterload.cpp"), "?late@@")
+    st = rule_proc(rule_compile("R865_enterload.cpp", "/DSTATIC"), "?late@@")
+    early = re.findall(r"^\s+0000[0-9a-f]\s.*\smov\s+(\w+), DWORD PTR _info\$", st, re.M)   # in the first 16 bytes
+    got = (bool(re.search(r"mov\s+\w+, DWORD PTR _info\$", ext)), regp(st).get("info") or "load " + "".join(early))
+    want = {"14.00": (True, "ebx"), "13.10.3077": (True, "ebx"), "13.10.3052": (True, "ebx"),
+            "15.00": (True, "load ebp")}     # 15.00 unrolls the loop: ebp at the top, never a register parameter
+    check("R865: extern loads info at its use; static: ebx parameter (15.00: early ebp load)", got, want[RKEY])
+    # R1050: which copy forms delete `if (c)` (no test left in the function)
+    asm = rule_compile("R1050_nonnull_copy.cpp")
+    forms = ("assign", "memcpy", "copy", "copyk", "readf", "writer", "memcopy", "memcopyf", "memset", "memsetw",
+             "memcpy4", "memset4", "memcpyv")
+    got = " ".join(f for f in forms if re.search(r"\stest\s", rule_proc(asm, "?x_%s@@" % f)))
+    same = "memcopy memcopyf memset memsetw memset4 memcpyv"
+    want = {"14.00": same, "15.00": same, "13.10.3077": same, "13.10.3052": same}
+    check("R1050: null test kept after (inline size-parameter memcpy, memset, call)", got, want[RKEY])
+
+
+rules_calls_tests()
+
+
+def rules_question_tests():
+    """T10 (rules_xref.md, questionable items): R871 (both-arm expression), R1100 (unrolling), R900 (float locals),
+    R460 (ebp base -> index), R200/R450 (memory-leaf hash), on the current C2_BUILD. Listings come from a traced
+    compile on the compile server (`c2trace.py --keep`, logging only a function that does not exist)."""
+    def listing(name, *flags):
+        d = tempfile.mkdtemp()
+        subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2trace.py"), "--keep", d,
+                        os.path.join(RULES, name), "--", "/TP", "/O2"] + list(flags), capture_output=True, text=True,
+                       cwd=HERE, env=dict(os.environ, C2TRACE_FUNC="?no_such_function@@"))
+        p = os.path.join(d, os.path.splitext(name)[0] + ".asm")
+        return open(p, errors="replace").read() if os.path.exists(p) else ""
+
+    def looped(proc):
+        """True when the function's listing has a backward jump (a loop that stayed)."""
+        lab, cur, jumps = {}, None, []
+        for ln in proc.splitlines():
+            m = re.match(r"^(\$\w+(?:@\w+)?):", ln)
+            if m:
+                cur = m.group(1)
+                continue
+            m = re.match(r"\s+([0-9a-f]{5})\t", ln)
+            if m and cur:
+                lab.setdefault(cur, int(m.group(1), 16))
+            m = re.match(r"\s+([0-9a-f]{5})\t.*\sj\w+\s+(?:SHORT )?(\$\w+(?:@\w+)?)", ln)
+            if m:
+                jumps.append((int(m.group(1), 16), m.group(2)))
+        return any(t in lab and lab[t] <= o for o, t in jumps)
+
+    # R871: i's split head piece is coloured only when the row expression is written in both arms (two uses at Color)
+    kd = tempfile.mkdtemp()
+    out = tool("regs", os.path.join(RULES, "R871_branchrow.cpp"), "--func", "row_", "--keep", kd, "--", "/TP", "/O2")
+    parts = re.split(r"^(?=\?row_)", out, flags=re.M)
+    pieces = lambda f: [(int(p), r) for blk in parts if blk.startswith("?" + f)
+                        for p, r in re.findall(r"^\s+\d+\s+i\s+local\s+(-?\d+)\s+\S+\s+\S+\s+\S+\s+(\S+)", blk, re.M)]
+    pc = ([(40, "eax"), (15, "spill/defer")], [(40, "eax"), (25, "ecx")])
+    want = {"14.00": pc, "15.00": pc, "13.10.3077": pc, "13.10.3052": pc}
+    check("R871: i's pieces (prio, reg): shared 40 eax / 15 spill, arms 40 eax / 25 ecx",
+          (pieces("row_shared")[:2], pieces("row_arms")[:2]), want[RKEY])
+    asm = open(os.path.join(kd, "R871_branchrow.asm"), errors="replace").read() if \
+        os.path.exists(os.path.join(kd, "R871_branchrow.asm")) else ""
+    sh, ar = rule_proc(asm, "?row_shared@@"), rule_proc(asm, "?row_arms@@")
+    got = (bool(re.search(r"imul\s+eax, DWORD PTR _i\$", sh)), bool(re.search(r"xor\s+ecx, ecx", ar)),
+           len(re.findall(r"imul\s+eax, ecx", ar)))
+    want = {"14.00": (True, True, 1), "15.00": (True, True, 1),       # FgTryHeadMerge merges the arms after Color
+            "13.10.3077": (True, True, 2), "13.10.3052": (True, True, 2)}  # the scheduled arms differ at the imul
+    check("R871 listing: shared imul [i]; arms xor ecx,ecx, imul eax,ecx (13.10: in both arms)", got, want[RKEY])
+    out = tool("il", os.path.join(RULES, "R871_branchrow.cpp"), "--func", "row_arms", "--at", "@Color@4",
+               "--count", "imul", "--", "/TP", "/O2")
+    m = re.search(r"@Color@4\s+(\d+)", out)
+    want = {"14.00": 2, "15.00": 2, "13.10.3077": 2, "13.10.3052": 2}
+    check("R871 il: two imuls of i in row_arms at Color (no CSE across the arms)", int(m.group(1)) if m else None,
+          want[RKEY])
+    # R1100: completely unrolled unless a call, do-while, `!=` exit test or no integer counter (all builds)
+    asm = listing("R1100_unroll3.cpp")
+    fs = ("u_glob", "u_param", "scale@V3", "u_dbl", "u_call", "u_sink", "u_do", "u_ptr", "u_ne", "u_end", "u_copy")
+    got = " ".join(f for f in fs if looped(rule_proc(asm, "?" + f + "@")))
+    kept = "u_call u_sink u_do u_ne u_end"
+    want = {"14.00": kept, "15.00": kept, "13.10.3077": kept, "13.10.3052": kept}
+    check("R1100: loops kept: call, call use, do-while, `!=` test, pointer end test", got, want[RKEY])
+    # R900: a float local's home round trip (fstp/fld or a store across a call)
+    asm = listing("R900_floatlocal.cpp")
+    fs = ("fx_expr", "dx_expr", "fx_load", "dx_load", "fx_member", "fx_loadcall", "dx_loadcall", "fx_param")
+    got = " ".join(f for f in fs if re.search(r"(?:fstp|mov)\s+[DQ]WORD PTR _[ks]\$", rule_proc(asm, "?" + f + "@")))
+    new, old = "fx_expr fx_load fx_member fx_loadcall dx_loadcall", "fx_loadcall dx_loadcall"
+    want = {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old}
+    check("R900: locals stored to their home (float: expression or load; 13.10 and double: only across a call)",
+          got, want[RKEY])
+    # R460: an ebp base with scale 1 becomes the SIB index (LoRewriteEBPOpindexed); scale 4 keeps ebp as the base
+    asm = listing("R460_ebpindex.cpp")
+    got = tuple((re.findall(r"DWORD PTR (\[[^\]]*ebp[^\]]*\])", rule_proc(asm, "?" + f + "@")) or [None])[0]
+                for f in ("ebp_idx", "ebp_idx0", "ebp_idx4"))
+    sib = ("[esi+ebp+12]", "[esi+ebp]", "[ebp+esi*4+12]")
+    want = {"14.00": sib, "15.00": sib, "13.10.3077": sib, "13.10.3052": sib}
+    check("R460: [esi+ebp+12], [esi+ebp], [ebp+esi*4+12]", got, want[RKEY])
+    # R200/R450: memory leaf [p+0] hashes d + 8 + (h(p) << 8); a member at d != 0 is OPADD(p, d): h(p) + 2d + 0x31
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "sites",
+                        os.path.join(RULES, "R200_memhash.cpp"), "--func", "mh_", "--", "/TP", "/O2"],
+                       capture_output=True, text=True, cwd=HERE)
+    hs = re.findall(r"^pass 2 line\s+\d+ OPMUL\s+1st .*\bh([0-9a-f]{4})\n\s+2nd .*\bh([0-9a-f]{4})", r.stdout, re.M)
+    new, old = [("4008", "2008"), ("0081", "0059")], [("4008", "2008"), ("007e", "0056")]
+    want = {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old}
+    check("R200/R450: OPMUL sort hashes [p+0]/[q+0] 4008/2008; p->c, q->b 81/59 (13.10: 7e/56)", hs, want[RKEY])
+
+
+rules_question_tests()
+
+
+def rules_misc_tests():
+    """T05-T09 (rules_xref.md, layout / x87 narrowing / scheduling / flow): R1300 (loop-head npad, AlignmentWins), R420
+    (float compare narrowing, OptDoubleConstMakeSingle), R1270/R1275 (stores pinned by an unplaceable store; schedwant
+    alias:X), R1276/R1280 (guard copy propagation, jump threading; icount), R310, R470, R480, R1150, R1250, R1320,
+    R1310. Listings from the compile server (`c2trace.py --keep`, logging only a function that does not exist)."""
+    def listing(name, *flags):
+        d = tempfile.mkdtemp()
+        subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2trace.py"), "--keep", d,
+                        os.path.join(RULES, name), "--", "/TP", "/O2"] + list(flags), capture_output=True, text=True,
+                       cwd=HERE, env=dict(os.environ, C2TRACE_FUNC="?no_such_function@@"))
+        p = os.path.join(d, os.path.splitext(name)[0] + ".asm")
+        return open(p, errors="replace").read() if os.path.exists(p) else ""
+
+    def instrs(proc):
+        """[(offset, length, mnemonic, text)] and labels [(index, name)] of one function's listing."""
+        out, labels, lines = [], [], proc.splitlines()
+        for i, l in enumerate(lines):
+            m = re.match(r"^(\$\w+(?:@\w+)?):", l)
+            if m:
+                labels.append((len(out), m.group(1)))
+            m = re.match(r"^  ([0-9a-f]{5})\t((?:[0-9a-f]{2} ?)+)(?:\t\s*(.*))?$", l)
+            if m:
+                n, txt, k = len(m.group(2).split()), m.group(3) or "", i + 1
+                while k < len(lines) and re.match(r"^\t(?:[0-9a-f]{2} ?)+(\t.*)?$", lines[k]):
+                    mm = re.match(r"^\t((?:[0-9a-f]{2} ?)+)(\t\s*(.*))?$", lines[k])
+                    n += len(mm.group(1).split())
+                    txt = mm.group(3) or txt
+                    k += 1
+                txt = re.sub(r"\s+", " ", txt.split(";")[0]).strip()
+                out.append((int(m.group(1), 16), n, txt.split(" ")[0] if txt else "", txt))
+        return out, labels
+
+    def procs(asm):
+        return {m.group(1): m.group(2) for m in re.finditer(r"^(\S+)\s+PROC\b[^\n]*\n(.*?)^\1\s+ENDP", asm, re.M | re.S)}
+
+    # R1300: AlignmentWins (encode.obj; the same code in all four builds). A candidate loop head (14.00/15.00: the
+    # listing's $LL/$LC labels, i.e. label symbol flag +0x43 bit 2; 13.10: every backward-jump target) at offset o
+    # (mod 16) is padded iff o >= 9, or else fewer than 3 of its first instructions fit in the 16-o bytes left in the
+    # line and fewer than fit in 16 bytes from an aligned head (walk stops after a branch / call / ret)
+    def pad_wins(o16, lens):
+        if o16 > 8:
+            return True
+        cum = a = f = 0
+        for ln, mn in lens:
+            cum += ln
+            if cum > 16:
+                break
+            a += 1
+            f += o16 + cum <= 16
+            if mn.startswith("j") or mn in ("call", "ret") or cum >= 16:
+                break
+        return f < 3 and f < a
+    rows = []
+    for name, proc in procs(listing("R1300_loop_pad.cpp")).items():
+        ins, labels = instrs(proc)
+        for k, lab in labels:
+            back = any(t.startswith("j") and x.split()[-1] == lab for _, _, t, x in ins[k:])
+            cand = lab.startswith(("$LL", "$LC")) if not RKEY.startswith("13.10") else back
+            if not back or not cand or k == 0 or k >= len(ins):
+                continue
+            pad = int(ins[k - 1][3].split()[1]) if ins[k - 1][2] == "npad" else 0
+            o = ins[k][0] - pad
+            pred = bool(o & 15) and pad_wins(o & 15, [(x[1], x[2]) for x in ins[k:]])
+            rows.append((bool(pad), pred, (-o) & 15))
+    check("R1300: AlignmentWins model = every candidate loop head's npad (>= 150 heads)",
+          (len(rows) >= 150, sum(p != q for p, q, _ in rows)), (True, 0))
+    check("R1300: needs of 9 to 15 are padded too (not only <= 7 / 8)", len({n for p, _, n in rows if p and n >= 9}) >= 3,
+          True)
+
+    # R420: OPCMP narrowing (OptPeeps -> OptDoubleConstMakeSingle) reads the 80-bit constant's significand as a double
+    # in its +-FLT_MAX check: on 14.00/15.00 a float constant on the right narrows iff its significand < 1+0x47f/2048
+    import struct
+    asm = listing("R420_float_cmp_narrow.cpp")
+    vals = dict(re.findall(r"^int (c\d+)\(\) \{ return get\(\) > \S+; \} // (\S+)$",
+                           open(os.path.join(RULES, "R420_float_cmp_narrow.cpp")).read(), re.M))
+    bad = []
+    for fn, proc in procs(asm).items():
+        m = re.match(r"\?(c\d+)@@", fn)
+        w = re.search(r"fcomp\s+(DWORD|QWORD) PTR __real@", proc)
+        if not m or m.group(1) not in vals or not w:
+            continue
+        bits = struct.unpack("<I", struct.pack("<f", float(vals[m.group(1)])))[0]
+        narrow = RKEY.startswith("13.10") or (bits & 0x7fffff) >> 12 <= 0x47e
+        if (w.group(1) == "DWORD") != narrow:
+            bad.append(vals[m.group(1)])
+    check("R420: every right-hand constant's width follows the significand rule (13.10: all DWORD)",
+          (len(vals) >= 40, bad), (True, []))
+    p = procs(asm)
+    width = lambda f: (re.findall(r"(?:fld|fcomp|fmul)\s+(DWORD|QWORD) PTR __real@", p.get(f, "")) or ["-"])[0]
+    got = tuple(width(f) for f in ("?l99@@YAHXZ", "?m99@@YAHPAUP@@@Z", "?m100@@YAHPAUP@@@Z", "?mul6@@YAMPAUP@@@Z"))
+    want = {"14.00": ("QWORD", "DWORD", "QWORD", "QWORD"), "15.00": ("QWORD", "DWORD", "QWORD", "QWORD"),
+            "13.10.3077": ("DWORD",) * 4, "13.10.3052": ("DWORD",) * 4}
+    check("R420: constant on the left / member 99 / member 100 / multiply", got, want[RKEY])
+
+    # R1270: is the res store (+24) issued right before the call (sunk) or right after the size store (pinned)?
+    p = procs(listing("R1270_store_index.cpp"))
+    def pinned(f):
+        ins = [x[3] for x in instrs(next((v for k, v in p.items() if k.startswith("?%s@@" % f)), ""))[0]]
+        k = next((i for i, t in enumerate(ins) if "+24], 15" in t), None)
+        return k is not None and k > 0 and "+20]" in ins[k - 1]
+    fs = ("a_plain", "a_rev", "a_const", "a_eos", "b_inplace", "b_var", "b_reread", "b_ptr")
+    got = " ".join(f for f in fs if pinned(f))
+    new, old = "b_inplace b_var b_reread b_ptr", "b_var b_reread b_ptr"
+    check("R1270: res store pinned after the size store by a non-literal index / pointer copy",
+          got, {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old}[RKEY])
+    # R1275: the vtable store issues before the EH state store when a member has its own inlined constructor
+    p = procs(listing("R1275_member_ctor.cpp", "/EHsc"))
+    def early(cls):
+        ins = [x[3] for x in instrs(p.get("??0%s@@QAE@PAX@Z" % cls, ""))[0]]
+        v = next((i for i, t in enumerate(ins) if "OFFSET" in t and "??_7" in t), 99)
+        s = next((i for i, t in enumerate(ins) if "__$EHRec$" in t and t.startswith("mov DWORD PTR __$EHRec$")), -1)
+        return v < s
+    check("R1275: vtable store above the state store: WithH, WithH2 yes; Plain, WithZ (Zero(int&)), WithC (Clear()) no",
+          [early(c) for c in ("WithH", "WithH2", "Plain", "WithZ", "WithC")], [True, True, False, False, False])
+
+    # schedwant alias:X (sched.md rule 4a): the order of the pinned variant, asked of the plain one, is one alias edit
+    def sched_order(src, func, *flags):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2sched.py"), os.path.join(RULES, src), "--func",
+                            func, "--all", "--", "/TP", "/O2"] + list(flags), capture_output=True, text=True, cwd=HERE).stdout
+        regs = re.split(r"^-- region ", r, flags=re.M)[1:]
+        best = max(regs, key=len) if regs else ""
+        k = int(best.split()[0]) if best else -1
+        return k, [int(x) for x in re.findall(r"^\s+cyc\s+\d+ .? lex\s+(\d+)", best, re.M)]
+
+    def alias_wanted(src, plain, pinned_, *flags):
+        k, want = sched_order(src, pinned_, *flags)
+        k0, have = sched_order(src, plain, *flags)
+        if k < 0 or len(want) != len(have):
+            return "regions differ: %d/%d instrs" % (len(want), len(have))
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "schedwant.py"), os.path.join(RULES, src),
+                            "--func", plain, "--region", str(k0), "--want-lex", ",".join(map(str, want)), "--", "/TP",
+                            "/O2"] + list(flags), capture_output=True, text=True, cwd=HERE).stdout
+        if VERBOSE:
+            print(r[-3000:])
+        return bool(re.search(r"^\s+WANTED\s+alias:\d+\s*$", r, re.M)) if want != have else "same order"
+    got = (alias_wanted("R1270_store_index.cpp", "a_plain", "b_var"),
+           alias_wanted("R1275_member_ctor.cpp", "??0Plain@@", "??0WithH@@", "/EHsc"))
+    check("schedwant: alias:X alone gives the pinned order (R1270 b_var from a_plain, R1275 WithH from Plain)",
+          got, (True, True))
+
+    # R1276: the zero-trip guard tests the head's register (f_hlive: test edi; mov esi, edi), the lever swaps the copy
+    p = procs(listing("R1276_guard_copyprop.cpp"))
+    def guard(f):
+        ins = [x[3] for x in instrs(p.get("?%s@@YAXH@Z" % f, ""))[0]]
+        t = next((x for x in ins if x.startswith("test ")), "")
+        loopvar = next((x.split()[-1] for i, x in enumerate(ins) if i > 3 and x.startswith("push ")
+                        and x.split()[-1] in ("esi", "edi", "ebx")), None)     # the argument of use(p)
+        return t.split()[-1] == loopvar
+    check("R1276: the guard tests the loop variable: f_hlive no (head), l1_rev yes (lever)",
+          (guard("f_hlive"), guard("l1_rev")), (False, True))
+
+    # R1280: the copy keeps the join (one more instruction) on every build; icount names it structure, not flow
+    p = procs(listing("R1280_jump_thread.cpp"))
+    n = lambda f: len(instrs(p.get("?%s@@YAXPAUMap@@@Z" % f, ""))[0])
+    check("R1280: copy forms keep the `xor; test; je` join: +1 instruction against the direct forms",
+          (n("copy_ours") - n("direct_orig"), n("copy2_ours") - n("sep_orig"), n("one_orig") - n("direct_orig")), (1, 1, 0))
+    js = os.path.join(tempfile.mkdtemp(), "ic.json")
+    subprocess.run([sys.executable, os.path.join(HERE, "tools", "icount.py"), os.path.join(RULES, "R1280_jump_thread.cpp"),
+                    "--func", "::copy_ours", "--vs-func", "::direct_orig", "--json", js, "--", "/TP", "/O2"],
+                   capture_output=True, text=True, cwd=HERE)
+    j = json.load(open(js)) if os.path.exists(js) else {}
+    check("R1280 icount: +1, classes structure (+ structure:inline / regalloc:callee-saved)",
+          (j.get("ours", 0) - j.get("orig", 0), any(c.startswith("structure") for c in j.get("classes", {}))), (1, True))
+
+    # R310: the copy's +0 field view is made in the first operator= expansion; +12/+24 by the optimiser (13.10: all
+    # elements get reader-time views first)
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "keys", os.path.join(RULES, "R310_copy_elem0.cpp"),
+                        "--func", "?g@@", "--", "/TP", "/O2"], capture_output=True, text=True, cwd=HERE).stdout
+    first = {}
+    for m in re.finditer(r"^\s+(\d+) frame \d+\s+_m\+(0|12|24)(?:\.f4)?\s+(\S*)", r, re.M):
+        first.setdefault(m.group(2), (int(m.group(1)), m.group(3)))
+    got = (first.get("0", (0, ""))[1].startswith("V::operator=#1"), first.get("0", (99,))[0] < first.get("12", (0,))[0])
+    want = {"14.00": (True, True), "15.00": (True, True), "13.10.3077": (False, True), "13.10.3052": (False, True)}
+    check("R310: element 0's view made in operator=#1 with a lower key than element 1's", got, want[RKEY])
+    # R470: the double accumulator's first add sorts the accumulator first by count
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "sites", os.path.join(RULES, "R470_double_acc.cpp"),
+                        "--func", "?dacc@@", "--pass", "2", "--", "/TP", "/O2"], capture_output=True, text=True, cwd=HERE).stdout
+    m = re.search(r"OPADD\s+1st .*SU1 n(\d+) .*\n\s+2nd .*SU1 n(\d+)", r)
+    check("R470: dacc's first SU1 add: the accumulator's count is one more", (int(m.group(1)) - int(m.group(2))) if m else None, 1)
+    # R480: js / jl, and the bit test's extra keys
+    p = procs(listing("R480_js_jl.cpp"))
+    got = tuple(next((x[2] for x in instrs(p.get("?%s@@YAHH@Z" % f, ""))[0] if x[2].startswith("j")), None)
+                for f in ("sgn", "bit", "sgnl", "bitl"))
+    check("R480: x >= 0 jl, bit test js, x < 0 jge, bit set jns", got, ("jl", "js", "jge", "jns"))
+    keys = []
+    for f in ("sgn", "bit"):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "keys", os.path.join(RULES, "R480_js_jl.cpp"),
+                            "--func", "?%s@@" % f, "--all", "--", "/TP", "/O2"], capture_output=True, text=True, cwd=HERE).stdout
+        m = re.search(r"\((\d+) symbols allocated before OptFuncExpr, \d+ events; replay: (\d+)/", r)
+        keys.append(tuple(map(int, m.groups())) if m else None)
+    check("R480: the bit test: +1 symbol before OptFuncExpr, +7 keys", (keys[1][0] - keys[0][0], keys[1][1] - keys[0][1])
+          if None not in keys else keys, (1, 7))
+    # R1150: bswap / rol
+    p = procs(listing("R1150_bswap_rot.cpp"))
+    has = lambda f, mn: any(x[2] == mn for x in instrs(next((v for k, v in p.items() if k.startswith("?%s@@" % f)), ""))[0])
+    got = (has("shiftswap", "bswap"), has("maskswap", "bswap"), has("bsw", "bswap"), has("rotl8", "rol"),
+           has("rotsh", "rol"), has("rotr", "ror"))
+    new, old = (False, False, True, True, True, True), (False, False, True, True, False, False)
+    check("R1150: shift swaps no bswap; intrinsic bswap; _rotl rol; shift rotates rol/ror (13.10: no)", got,
+          {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old}[RKEY])
+    # R1250: two tag temporaries are two loads, one tag twice one load
+    p = procs(listing("R1250_tag_temps.cpp", "/EHsc"))
+    loads = lambda f: sum(1 for x in instrs(next((v for k, v in p.items() if k.startswith("?%s@@" % f)), ""))[0]
+                          if re.match(r"mov e\wx, DWORD PTR (\$T|_t\$)", x[3]))
+    check("R1250: tag loads: two 2, twotmp 2, twosame 2, once 1", tuple(loads(f) for f in ("two", "twotmp", "twosame", "once")),
+          (2, 2, 2, 1))
+    # R1320: EH state 1 after a member-calling inlined constructor, 0 (eax) without a call
+    asm = listing("R1320_eh_member_states.cpp", "/EHsc")
+    p = procs(asm)
+    st = lambda f: re.findall(r"mov\s+DWORD PTR __\$EHRec\$\[esp\+\d+\], (\w+)", p.get("?%s@@YAXXZ" % f, ""))[:1]
+    check("R1320: f1 (Arr with a folded Grow call) state 1, f2 (no call) eax (0)", (st("f1"), st("f2")), (["1"], ["eax"]))
+    check("R1320: byte state stores between states that share the upper bytes (f3)",
+          bool(re.search(r"mov\s+BYTE PTR __\$EHRec\$", p.get("?f3@@YAXXZ", ""))), True)
+    # R1310: the catch block follows the parent's ret inside the same function
+    p = procs(listing("R1310_catch_after_ret.cpp", "/EHsc"))
+    body = p.get("?f@@YAXPAUV@@H@Z", "")
+    k_ret, k_catch = body.find("ret\t 0"), body.find("Tidy@V@@")
+    check("R1310: f's catch block (Tidy, rethrow) after its ret, in the same function", 0 < k_ret < k_catch, True)
+
+
+rules_misc_tests()
+
+
+def tool_portability_tests():
+    """T11: --func expansion (`Class::method` matches any enclosing namespace) and the case-insensitive toolchain
+    lookup (c2build.tcpath) for a lower-case unpack on a case-sensitive filesystem. Pure Python, no compile."""
+    import c2trace, helpersweep
+    got = [c2trace.func_pat(p) for p in ("C::m", "N::C::m", "C::C", "C::~C", "::f", "m@C")]
+    check("func_pat: ?m@C@, ?m@C@N@, ??0C@, ??1C@, ?f@@, unchanged", got,
+          ["?m@C@", "?m@C@N@", "??0C@", "??1C@", "?f@@", "m@C"])
+    got = [c2trace.func_match("C::m", n) for n in ("?m@C@@QAEXXZ", "?m@C@N@@QAEXXZ", "?m@C@O@N@@QAEXXZ", "?m@CC@@QAEXXZ",
+                                                   "?m@D@C@@QAEXXZ")]
+    check("func_match C::m: C, N::C, N::O::C yes; CC, C::D no", got, [True, True, True, False, False])
+    src = "namespace N { struct C { int m(); }; }\nint N::C::m() { return 1; }\nint g() { return 2; }\n"
+    fn = helpersweep.body_of(src, c2trace.func_decl("C::m"))
+    check("helpersweep.body_of(func_decl('C::m')) finds N::C::m's definition", (fn[0], src[fn[2]:fn[3] + 1].strip()),
+          ("m", "{ return 1; }"))
+    d = tempfile.mkdtemp()
+    for p in ("vc/bin", "vc/include", "sdk/lib"):
+        os.makedirs(os.path.join(d, p))
+    open(os.path.join(d, "vc", "bin", "c2.dll"), "w").close()
+    real_exists = os.path.exists
+
+    def cs_exists(p):                 # a case-sensitive filesystem: every component must match exactly
+        p = os.path.abspath(p)
+        if not p.startswith(d):
+            return real_exists(p)
+        cur = d
+        for part in os.path.relpath(p, d).split(os.sep):
+            if part == "." or part not in os.listdir(cur):
+                return part == "."
+            cur = os.path.join(cur, part)
+        return True
+    os.path.exists = cs_exists
+    try:
+        got = [os.path.relpath(c2build.tcpath(d, *a), d) for a in (("VC/Bin/c2.dll",), ("VC", "INCLUDE"),
+                                                                     ("SDK/Lib",), ("SDK/Include",))]
+    finally:
+        os.path.exists = real_exists
+    check("tcpath on a case-sensitive lower-case unpack: vc/bin/c2.dll, vc/include, sdk/lib, missing kept as written",
+          got, ["vc/bin/c2.dll", "vc/include", "sdk/lib", "sdk/Include"])
+    got = os.path.relpath(c2build.tcpath(d, "VC/Bin/c2.dll"), d)      # this filesystem (macOS: case-insensitive)
+    check("tcpath on this filesystem finds c2.dll", os.path.isfile(os.path.join(d, got)), True)
+
+
+tool_portability_tests()
 
 print("%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

@@ -23,6 +23,10 @@
 //!                   live over the next LIFE picks (default 0: dead before pick N)
 //!   nopref:N        pick N has no preferred register (so it rotates)
 //!   pref:N:REG      pick N prefers REG (as a copy from / lea of that register would)
+//!   rdrop:N         (cl 13.10) Riscify's GetReg call N does not happen (riscify.rs)
+//!   rins:N          (cl 13.10) one more GetReg call just before call N, in its block, with its busy set
+//!   want:TEMP=REG   how TEMP (a pick, a Riscify temp or another temp of the final code) got its register, and the
+//!                   single edits above that give it REG (also --want REGMAP.txt: every WANTS row of regmap output)
 //! N is a pick number of the chosen run (default: the body, the run with the most picks).
 //!
 //!   rasim scratch SNAP --target T.json [--top K] [EDIT...]
@@ -40,6 +44,12 @@ const SCR: [&str; 3] = ["eax", "ecx", "edx"];
 struct Snap {
     func: String,
     runs: Vec<Run>,
+    /// cl 13.10: Riscify's GetReg calls (riscify.rs)
+    #[serde(default)]
+    riscify: Vec<crate::riscify::RCall>,
+    /// temps of the final code that no modelled phase gave their register, with the phase that did
+    #[serde(default)]
+    unmodelled: Vec<crate::riscify::Unmod>,
 }
 #[derive(Deserialize)]
 struct Run {
@@ -76,6 +86,7 @@ struct Pick {
     spill: bool,
 }
 
+#[derive(Clone, PartialEq)]
 enum Edit {
     Drop(usize),
     Ins(usize, usize),
@@ -263,8 +274,302 @@ fn parse_edit(s: &str) -> Edit {
         ("ins", 3) => Edit::Ins(n(1), n(2)),
         ("nopref", 2) => Edit::NoPref(n(1)),
         ("pref", 3) if ["eax", "ecx", "edx", "esi", "edi", "ebx", "ebp"].contains(&f[2]) => Edit::Pref(n(1), f[2].into()),
-        _ => crate::die(&format!("bad edit {:?} (drop:N ins:N[:LIFE] nopref:N pref:N:REG)", s)),
+        _ => crate::die(&format!("bad edit {:?} (drop:N ins:N[:LIFE] nopref:N pref:N:REG rdrop:N rins:N want:TEMP=REG)", s)),
     }
+}
+
+/// The WANTS rows of `c2trace.py regmap` output (or VAR=REG lines) as (temp, register).
+fn want_file(path: &str) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| crate::die(&format!("{}: {}", path, e)));
+    let mut out = vec![];
+    for ln in text.lines() {
+        let t: Vec<&str> = ln.split_whitespace().collect();
+        if t.is_empty() || ln.starts_with('#') || ln.starts_with(' ') || ln.starts_with("var (IL)") || ln.starts_with("swap:") {
+            continue;
+        }
+        if t.len() == 1 {
+            if let Some((v, r)) = t[0].split_once('=') {
+                out.push((v.to_string(), r.to_string()));
+            }
+            continue;
+        }
+        if let Some(k) = t.iter().position(|x| *x == "WANTS") {
+            if let Some(r) = t.get(k + 1) {
+                out.push((t[0].to_string(), r.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// want:T=R for a scratch pick: how it got its register; every single drop:K / ins:K (K up to the pick), nopref and
+/// pref on the pick itself, that gives it R.
+fn want_pick(s: &Snap, k: usize, t: &str, r: &str) -> bool {
+    let run = &s.runs[k];
+    let named = |p: &Pick| p.tmp == t || p.instr.split(|c: char| c == ':' || c.is_whitespace()).next() == Some(t);
+    let Some(p) = run.picks.iter().find(|p| named(p)) else { return false };
+    println!("{}: scratch pick {} (RegAssign, {} {}; cursor {}){}", t, p.n, p.how, p.reg, p.cur,
+             if p.tmp != t { format!(", temp {} in the final code", p.tmp) } else { String::new() });
+    if p.reg == r {
+        println!("  it already has {}", r);
+        return true;
+    }
+    if !SCR.contains(&r) {
+        println!("  {} is not one of the rotation's registers (eax ecx edx): a pick gets it only by preference (a copy from / lea of {}) or by first fit when eax, ecx and edx are all busy or in its conflict set", r, r);
+    }
+    if p.busy.get(r).map_or(false, |o| o == "phys") {
+        println!("  {} holds a coloured value at this pick: no scratch edit frees it (that is Color's choice: `rasim need reg:`)", r);
+    }
+    let mut cands: Vec<(String, Edit)> = vec![];
+    for q in run.picks.iter().filter(|q| q.n < p.n) {
+        cands.push((format!("drop:{}", q.n), Edit::Drop(q.n)));
+    }
+    for q in run.picks.iter().filter(|q| q.n <= p.n) {
+        cands.push((format!("ins:{}", q.n), Edit::Ins(q.n, 0)));
+    }
+    cands.push((format!("nopref:{}", p.n), Edit::NoPref(p.n)));
+    cands.push((format!("pref:{}:{}", p.n, r), Edit::Pref(p.n, r.to_string())));
+    let base = replay(run, &[], false);
+    let mut hits = vec![];
+    for (lbl, e) in cands {
+        let out = replay(run, std::slice::from_ref(&e), false);
+        if out.iter().find(|o| o.n == p.n).map_or(false, |o| o.reg == r && o.modelled) {
+            let moved = out.iter().filter(|o| o.n != 0 && o.n != p.n)
+                .filter(|o| base.iter().find(|b| b.n == o.n).map_or(false, |b| b.reg != o.reg)).count();
+            hits.push(format!("  {:<12} pick {} gets {} ({} other picks change)", lbl, p.n, r, moved));
+        }
+    }
+    if hits.is_empty() {
+        println!("  no single scratch edit gives it {}", r);
+    } else {
+        for h in hits {
+            println!("{}", h);
+        }
+    }
+    true
+}
+
+fn want(s: &Snap, k: usize, targets: &[(String, String)]) {
+    if targets.len() > 1 {
+        joint(s, k, targets);
+        println!();
+        println!("per want:");
+    }
+    for (t, r) in targets {
+        if want_pick(s, k, t, r) || crate::riscify::want(&s.riscify, t, r) {
+            continue;
+        }
+        if let Some(u) = s.unmodelled.iter().find(|u| u.tmp == *t) {
+            println!("{}: {} at {} -- assigned by {}; rasim does not model that phase, so it has no edit to offer ({})",
+                     t, u.reg, u.off.map_or("?".into(), |o| format!("+0x{:x}", o)), u.phase, u.instr);
+            continue;
+        }
+        println!("{}: not a scratch pick, Riscify temp or other temp of {} in this snapshot (a Color value: `rasim want` / `need reg:` on a `regs --export` snapshot)", t, s.func);
+    }
+}
+
+/// A wanted register: a scratch pick of run k (its number) or a temp a Riscify GetReg call made (the call's number).
+#[derive(Clone, Copy, PartialEq)]
+enum Tg {
+    Pick(usize),
+    Call(usize),
+}
+
+/// One edit of the joint search: a scratch edit or a GetReg edit.
+#[derive(Clone, PartialEq)]
+enum JE {
+    S(Edit),
+    R(usize, bool), // (call, true = rdrop / false = rins)
+}
+
+fn je_label(e: &JE) -> String {
+    match e {
+        JE::S(Edit::Drop(n)) => format!("drop:{}", n),
+        JE::S(Edit::Ins(n, 0)) => format!("ins:{}", n),
+        JE::S(Edit::Ins(n, l)) => format!("ins:{}:{}", n, l),
+        JE::S(Edit::NoPref(n)) => format!("nopref:{}", n),
+        JE::S(Edit::Pref(n, r)) => format!("pref:{}:{}", n, r),
+        JE::R(n, true) => format!("rdrop:{}", n),
+        JE::R(n, false) => format!("rins:{}", n),
+    }
+}
+
+/// What a set of edits gives: (wanted registers that hold, per target; other registers that change).
+fn joint_eval(s: &Snap, k: usize, tg: &[(Tg, String)], set: &[&JE], base: &(Vec<Out>, Vec<crate::riscify::ROut>)) -> (Vec<bool>, usize) {
+    let run = &s.runs[k];
+    let se: Vec<Edit> = set.iter().filter_map(|e| if let JE::S(x) = e { Some(x.clone()) } else { None }).collect();
+    let re: Vec<crate::riscify::REdit> = set.iter().filter_map(|e| match e {
+        JE::R(n, true) => Some(crate::riscify::REdit::Drop(*n)),
+        JE::R(n, false) => Some(crate::riscify::REdit::Ins(*n)),
+        _ => None,
+    }).collect();
+    let so = if se.is_empty() { None } else { Some(replay(run, &se, false)) };
+    let ro = if re.is_empty() { None } else { Some(crate::riscify::replay(&s.riscify, &re, false)) };
+    let picks = so.as_ref().unwrap_or(&base.0);
+    let calls = ro.as_ref().unwrap_or(&base.1);
+    let ok: Vec<bool> = tg.iter().map(|(t, r)| match t {
+        Tg::Pick(n) => picks.iter().find(|o| o.n == *n).map_or(false, |o| o.reg == *r && o.modelled),
+        Tg::Call(n) => calls.iter().find(|o| o.n == *n).and_then(|o| o.reg.as_deref()) == Some(r.as_str()),
+    }).collect();
+    let mut side = 0;
+    if so.is_some() {
+        for o in picks.iter().filter(|o| o.n > 0 && !tg.iter().any(|(t, _)| *t == Tg::Pick(o.n))) {
+            if base.0.iter().find(|b| b.n == o.n).map_or(false, |b| b.reg != o.reg) {
+                side += 1;
+            }
+        }
+    }
+    if ro.is_some() {
+        for c in s.riscify.iter().filter(|c| !c.made.is_empty() && !tg.iter().any(|(t, _)| *t == Tg::Call(c.n))) {
+            let now = calls.iter().find(|o| o.n == c.n).map(|o| o.reg.clone());
+            let was = base.1.iter().find(|o| o.n == c.n).map(|o| o.reg.clone());
+            if now != was {
+                side += 1;
+            }
+        }
+    }
+    (ok, side)
+}
+
+/// want: with several targets: the smallest edit sets that give all of them their register at once (or the most
+/// of them), searched over single edits, pairs, then triples grown from the best pairs. Printed before the
+/// per-want answers.
+fn joint(s: &Snap, k: usize, targets: &[(String, String)]) {
+    let run = &s.runs[k];
+    let named = |p: &Pick, t: &str| p.tmp == t || p.instr.split(|c: char| c == ':' || c.is_whitespace()).next() == Some(t);
+    let mut tg: Vec<(Tg, String)> = vec![];
+    let mut skipped = vec![];
+    for (t, r) in targets {
+        if let Some(p) = run.picks.iter().find(|p| named(p, t)) {
+            tg.push((Tg::Pick(p.n), r.clone()));
+        } else if let Some(c) = s.riscify.iter().find(|c| c.made.iter().any(|m| m == t)) {
+            tg.push((Tg::Call(c.n), r.clone()));
+        } else {
+            skipped.push(t.clone());
+        }
+    }
+    let name = |i: usize| -> String { format!("{}={}", targets.iter().filter(|(t, _)| !skipped.contains(t)).nth(i).map_or("?", |x| x.0.as_str()), tg[i].1) };
+    println!("joint: {} wants{}", tg.len(),
+             if skipped.is_empty() { String::new() } else { format!(" ({} not a pick or Riscify temp, left out: {})", skipped.len(), skipped.join(" ")) });
+    if tg.is_empty() {
+        return;
+    }
+    let base = (replay(run, &[], false), crate::riscify::replay(&s.riscify, &[], false));
+    let (ok0, _) = joint_eval(s, k, &tg, &[], &base);
+    let n0 = ok0.iter().filter(|x| **x).count();
+    println!("  now: {} of {} hold{}", n0, tg.len(),
+             if n0 == tg.len() { String::new() } else { format!("; missing: {}", (0..tg.len()).filter(|&i| !ok0[i]).map(name).collect::<Vec<_>>().join(" ")) });
+    if n0 == tg.len() {
+        return;
+    }
+    // the pool: scratch edits up to the last wanted pick, GetReg edits in the wanted calls' blocks up to the call
+    let mut pool: Vec<JE> = vec![];
+    if let Some(last) = tg.iter().filter_map(|(t, _)| if let Tg::Pick(n) = t { Some(*n) } else { None }).max() {
+        for q in run.picks.iter().filter(|q| q.n <= last) {
+            if q.n < last {
+                pool.push(JE::S(Edit::Drop(q.n)));
+            }
+            pool.push(JE::S(Edit::Ins(q.n, 0)));
+        }
+        for (t, r) in &tg {
+            if let Tg::Pick(n) = t {
+                pool.push(JE::S(Edit::NoPref(*n)));
+                pool.push(JE::S(Edit::Pref(*n, r.clone())));
+            }
+        }
+    }
+    for (t, _) in &tg {
+        if let Tg::Call(n) = t {
+            let blk = s.riscify.iter().find(|c| c.n == *n).map(|c| c.block);
+            for c in s.riscify.iter().filter(|c| Some(c.block) == blk && c.n <= *n) {
+                for d in [true, false] {
+                    if d && c.n == *n {
+                        continue;
+                    }
+                    let e = JE::R(c.n, d);
+                    if !pool.contains(&e) {
+                        pool.push(e);
+                    }
+                }
+            }
+        }
+    }
+    let score = |ok: &[bool]| ok.iter().filter(|x| **x).count();
+    // (holds, -edits, -side) larger is better; repeated ins:N are allowed (two more temps), other repeats are not
+    let mut found: Vec<(usize, usize, Vec<usize>, Vec<bool>)> = vec![]; // (held, side, pool indices, ok)
+    let mut singles: Vec<(usize, usize, usize)> = vec![];
+    for i in 0..pool.len() {
+        let (ok, side) = joint_eval(s, k, &tg, &[&pool[i]], &base);
+        singles.push((score(&ok), side, i));
+        found.push((score(&ok), side, vec![i], ok));
+    }
+    let full = |f: &Vec<(usize, usize, Vec<usize>, Vec<bool>)>| f.iter().any(|x| x.0 == tg.len());
+    let rep_ok = |a: &JE, b: &JE| a != b || matches!(a, JE::S(Edit::Ins(..)));
+    if !full(&found) {
+        let lim = pool.len().min(400);
+        singles.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let top: Vec<usize> = singles.iter().take(lim).map(|x| x.2).collect();
+        for (x, &i) in top.iter().enumerate() {
+            for &j in &top[x..] {
+                if !rep_ok(&pool[i], &pool[j]) {
+                    continue;
+                }
+                let (ok, side) = joint_eval(s, k, &tg, &[&pool[i], &pool[j]], &base);
+                if score(&ok) > n0 {
+                    found.push((score(&ok), side, vec![i, j], ok));
+                }
+            }
+        }
+    }
+    if !full(&found) {
+        let mut pairs: Vec<&(usize, usize, Vec<usize>, Vec<bool>)> = found.iter().filter(|x| x.2.len() == 2).collect();
+        pairs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let seeds: Vec<Vec<usize>> = pairs.iter().take(40).map(|x| x.2.clone()).collect();
+        let mut seen: std::collections::HashSet<Vec<usize>> = std::collections::HashSet::new();
+        let mut more = vec![];
+        for sd in seeds {
+            for j in 0..pool.len() {
+                if sd.iter().any(|&i| !rep_ok(&pool[i], &pool[j])) {
+                    continue;
+                }
+                let mut v = sd.clone();
+                v.push(j);
+                v.sort();
+                if !seen.insert(v.clone()) {
+                    continue;
+                }
+                let set: Vec<&JE> = v.iter().map(|&i| &pool[i]).collect();
+                let (ok, side) = joint_eval(s, k, &tg, &set, &base);
+                if score(&ok) > n0 {
+                    more.push((score(&ok), side, v, ok));
+                }
+            }
+        }
+        found.extend(more);
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.len().cmp(&b.2.len())).then(a.1.cmp(&b.1)));
+    let best = found.first().map_or(0, |x| x.0);
+    if best <= n0 {
+        println!("  no set of up to three edits ({} candidates: drop/ins/nopref/pref up to the last wanted pick, rdrop/rins in the wanted calls' blocks) gives more than {}", pool.len(), n0);
+        return;
+    }
+    let nmin = found[0].2.len();
+    println!("  best: {} of {} with {} edit{} ({} candidates searched: singles, pairs{}){}", best, tg.len(), nmin, if nmin == 1 { "" } else { "s" },
+             pool.len(), if found.iter().any(|x| x.2.len() == 3) { ", triples from the best 40 pairs" } else { "" },
+             if best == tg.len() { "" } else { "; no set gives all" });
+    for f in found.iter().filter(|x| x.0 == best && x.2.len() == nmin).take(8) {
+        let lbl: Vec<String> = f.2.iter().map(|&i| je_label(&pool[i])).collect();
+        let miss: Vec<String> = (0..tg.len()).filter(|&i| !f.3[i]).map(name).collect();
+        let lost: Vec<String> = (0..tg.len()).filter(|&i| ok0[i] && !f.3[i]).map(name).collect();
+        println!("  {:<24} {} of {}; {} other register{} change{}{}", lbl.join(" "), f.0, tg.len(), f.1, if f.1 == 1 { "" } else { "s" },
+                 if miss.is_empty() { String::new() } else { format!("; still missing: {}", miss.join(" ")) },
+                 if lost.is_empty() { String::new() } else { format!(" (lost: {})", lost.join(" ")) });
+    }
+    let nmore = found.iter().filter(|x| x.0 == best && x.2.len() == nmin).count();
+    if nmore > 8 {
+        println!("  ... {} more of that size", nmore - 8);
+    }
+    println!("  (the edits are the per-want ones below, applied together; `rasim scratch SNAP EDIT...` replays a set)");
 }
 
 pub fn main(args: &[String]) {
@@ -272,6 +577,7 @@ pub fn main(args: &[String]) {
     let s: Snap = serde_json::from_str(&text).unwrap_or_else(|e| crate::die(&format!("{}: not a scratch snapshot (c2trace.py scratch --export): {}", args[0], e)));
     let (mut run, mut verbose, mut edits) = (None, false, vec![]);
     let (mut target, mut top) = (None, 25usize);
+    let (mut redits, mut wants) = (vec![], vec![]);
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -279,7 +585,32 @@ pub fn main(args: &[String]) {
             "-v" => verbose = true,
             "--target" => target = it.next().cloned(),
             "--top" => top = it.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(25),
+            "--want" => wants.extend(want_file(it.next().unwrap_or_else(|| crate::die("--want REGMAP.txt")))),
+            x if x.starts_with("want:") => match x[5..].split_once('=') {
+                Some((t, r)) => wants.push((t.to_string(), r.to_string())),
+                None => crate::die(&format!("bad {:?} (want:TEMP=REG)", x)),
+            },
+            x if x.starts_with("rdrop:") || x.starts_with("rins:") => {
+                let n = x.split(':').nth(1).and_then(|v| v.parse().ok()).unwrap_or_else(|| crate::die(&format!("bad edit {:?}", x)));
+                redits.push(if x.starts_with("rdrop:") { crate::riscify::REdit::Drop(n) } else { crate::riscify::REdit::Ins(n) });
+            }
             _ => edits.push(parse_edit(a)),
+        }
+    }
+    if !wants.is_empty() {
+        let k = run.map(|k| k.saturating_sub(1)).unwrap_or_else(|| s.runs.iter().position(|r| r.body).unwrap_or(0));
+        if k >= s.runs.len() {
+            crate::die("no such run");
+        }
+        return want(&s, k, &wants);
+    }
+    if !redits.is_empty() {
+        if s.riscify.is_empty() {
+            crate::die("rdrop/rins: this snapshot has no Riscify calls (cl 13.10 only; re-export with `c2trace.py scratch --export`)");
+        }
+        crate::riscify::whatif(&s.riscify, &redits);
+        if edits.is_empty() {
+            return;
         }
     }
     if let Some(t) = target {
@@ -291,6 +622,13 @@ pub fn main(args: &[String]) {
     }
     if edits.is_empty() {
         check(&s, run, verbose);
+        if !s.riscify.is_empty() {
+            crate::riscify::check(&s.riscify, verbose);
+        }
+        if !s.unmodelled.is_empty() {
+            println!("not modelled: {} temps of the final code got their register outside RegAssign, Color's pops and Riscify (want:TEMP=REG names the phase)",
+                     s.unmodelled.len());
+        }
     } else {
         let k = run.map(|k| k.saturating_sub(1)).unwrap_or_else(|| s.runs.iter().position(|r| r.body).unwrap_or(0));
         if k >= s.runs.len() {

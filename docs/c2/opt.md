@@ -313,6 +313,9 @@ unless `GoptCantCse` 10b518f0 objects (side effects) or the tuple is marked too 
 
 ---
 
+**Which reads have the same value number** (alias variables, dereferences of loaded pointers, the PAS index in the
+hash compare) and when `x op= y` becomes one instruction: docs/c2/loadcse.md, with `tools/loadcse.py`.
+
 ## 5. What kills a memory value
 
 The kill rules come from the alias ("points-at") sets built by interf.obj (`ItfBuildInterference` 10b73430) and
@@ -487,6 +490,28 @@ names.
    At /O1 only powers of two are expanded (`add eax,eax` for 2, `shl` otherwise); everything else is `imul`.
    **[C]** (/O1 not re-verified) Division: `/4` → `cdq; and edx,3; add; sar`, `/3` → magic `imul` + sign fix, unsigned `/10` → `mul`
    + `shr`, `%8` → `and 80000007h; jns; dec; or; inc`. **[C]** (k1 `k07` to `k10`; (re-verified, C++ game flags: `dv4`, `dv3`, `dvu`, `md8`.)
+7. **A null test after a dereference is deleted, and only a memory operand counts as one** (f3decomp R1050).
+   **[C code and IL; M on 14.00, 15.00, 13.10.3077, 13.10.3052]** `GdfInsertAssertions` 10b35240 walks every tuple's
+   destination and source operands; for each memory operand `[sym+K]` (leaf kind 6 whose base is a symbol, kind 2)
+   it enters the assertion `sym != 0` (HshEnterAssertion 0x2b8) after the tuple, unless the tuple also redefines the
+   base. Sweep 1 then folds a later `if (sym)` / `if (!sym)`. A value passed as an argument is not a dereference.
+   So it matters what a copy looks like **when GdfInsertAssertions runs**, not in the final code
+   (`tests/data/rules/R1050_nonnull_copy.cpp`, `R* c = (R*)Alloc(8); <copy>; if (c) Add(c);`, the same on all four
+   builds):
+
+   | copy form | IL at GdfInsertAssertions | `if (c)` |
+   |---|---|---|
+   | `*c = *src;`, `memcpy(c, src, sizeof(R))` or `memcpy(c, src, 4)` at the site, inline `Copy(d, s) { *d = *s; }`, inline helper with the constant size inside, `src->f = c->f;`, `c->r = 1;` | block assignment `[_c+0]:6008 <- [_src+0]:6008` (OPMBASSIGN already at the first IL dump, FgCoalesceLabels) or a field load / store | deleted |
+   | `MemCopy(c, src, sizeof(R))` with `inline` or `__forceinline` `MemCopy(void* d, const void* s, unsigned n) { memcpy(d, s, n); }` | OPINTRINSIC 172 (memcpy), `_c` only as an OPARG value; expanded to moves later | **kept** |
+   | `memset(c, 0, sizeof(R))`, also `memset(c, 0, 4)`, also through an inline helper | OPINTRINSIC 173 (memset) | **kept** |
+   | `memcpy(c, src, n)` with a variable n | OPINTRINSIC 172, a call to `_memcpy` in the end | **kept** |
+
+   The kept forms of a constant size are inline moves in the final code too (`mov [eax], ecx; mov [eax+4], ecx`),
+   with `test eax, eax` scheduled among the stores and the `je` after them. A constant-size `memcpy` written at the
+   site is a block assignment before c2's first pass (front end or reader [I]); inside an inline helper the size is a parameter when the
+   helper is read, so the intrinsic survives inlining and is only expanded after the assertions. In an original,
+   a null test that survives stores through the same pointer means one of the kept forms (icount `folded:nonnull`).
+   Applied: F3 0x00422420 (icount.md section 4).
 
 ---
 
@@ -512,6 +537,23 @@ branch L`. **[C]** (`gstage.sh l1 lp10`.) See il_fg.md §5.1 and rule 8 there.
    10b87f10: tuple kind 0x13 with id 0xde, or opcode `OPASM`). **[C]** (code; not probed; not re-verified.)
 4. The guard is then simplified like any compare: `i = 0; i < n` becomes `0 < n` (`test reg,reg; jle`), and
    with a constant bound it disappears. **[C]** (every l1 probe; (re-verified, C++ game flags: every `iv*` and `ut*` probe.)
+5. **A pointer loop's guard tests the head** (f3decomp R1276). `for (Node* p = h; p; p = p->next)`: copy
+   propagation in GlobalOptimize rewrites the guard `p != 0` to `h != 0` (IL at `@dop2_PreLowerGlobalOpts@4`:
+   `OPCMP _p 0`; at `@ItfFuncInterf2@4`: `OPCMP _h 0`). It is visible only when h keeps its own register (it is
+   used after the loop): `mov edi, eax; test edi, edi; mov esi, edi; je` tests the head, not the loop variable.
+   Lever: make the loop variable the definition and the kept head its copy (`Node* p = first(); Node* h = p;
+   for (; p; ...)`: `test esi, esi; mov edi, esi`). Same instruction count (icount: +0, no class; it is a
+   register difference for regmap). All four builds. **[C IL + probe tests/data/rules/R1276_guard_copyprop.cpp]**
+6. **The zero path of an inlined `return 0` is threaded past the loop test only without a copy** (f3decomp
+   R1280). `Node* cursor = (Node*)m->First(); while (cursor)`: GlobalOptimize decides the guard on the path where
+   the inlined `First()` set `cursor = 0` and that path jumps straight to the exit (at `@FgDoEarlyLateFlowOptsOnce@4`
+   it is already `jmp exit`). With a second variable in between (`void* start = m->First(); Node* cursor =
+   (Node*)start;`, also with equal types), the join block holds `cursor = start` before the compare, the guard
+   tests `start` (rule 5) and the path is not threaded: `xor eax, eax; test eax, eax; mov esi, eax; je`, one
+   instruction more (and esi saved on the early return). `cursor = ...` on its own line or one variable used as
+   the cursor thread like the direct form. All four builds. icount (`copy_ours --vs-func direct_orig`) reports
+   +1 as `structure` / `structure:inline` / `regalloc:callee-saved`: read such a kept `xor; test; je` join as
+   this construct. **[C IL + probe tests/data/rules/R1280_jump_thread.cpp]**
 
 ### 8.2 Invariant code motion (`GoptCodeMotionBlock` 10b504c0, `GoptInvariantCodeMotion` 10b51a60)
 
@@ -695,6 +737,14 @@ Probes, **[C]**:
 | `do { } while (i < 4)` | **not unrolled**; the same loop written `while`/`for` is | l3 `ur17`, `ur18`; (re-verified, C++ game flags: `udo`, `uwh`) |
 | `int` loops, unknown `n` | not unrolled | l1 `lp01`; l3 `ur14`; (re-verified, C++ game flags: `uin`, `iv1`) |
 | `float` sum or `a[i] = b[i]*2.0f`, unknown `n` | by 4: guard `n < 4`, main loop with count `((n-4)>>2)+1`, then a remainder loop | l3 `ur12`, `ur13`; (re-verified, C++ game flags: `ufn`) |
+| `r[i] = d[i] * k`, trip 3 (`float`, `double`, global / parameter / member scale, `this->v[i]`), also `for (n = 3; n > 0; --n) *r++ = *d++ * k` | complete, on 13.10.3077, 13.10.3052, 14.00, 15.00 alike | tests/data/rules/R1100_unroll3.cpp |
+| the same loop with exit test `i != 3`, or a pointer end test `r < e` with no integer counter | **not unrolled** (all four builds) | R1100_unroll3.cpp `u_ne`, `u_end` |
+
+**The exit test must be a relational compare.** `LurClassifyLoop` 10b90650 takes the canonical (countable) path only
+if `LurCanonicalBottomTested` 10b97a20 accepts the bottom branch: its condition code (tuple +0x0a & 0xf) must be 3..6
+(`<`, `<=`, `>`, `>=`; an `unsigned` counter is unrolled too); 1 and 2 (`==`, `!=`) are refused. So `for (i = 0; i != n; ++i)` is never unrolled,
+while `<` with the same trip count is. **[C code; M probes on all four builds]** (rules_xref.md R1100: an f3decomp
+note that "a constant-count loop over 3 floats is not unrolled" came from such a loop or from a call in the body.)
 
 ---
 

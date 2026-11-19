@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scratch-register (tmpreg) picks for one function, mapped to listing offsets.  Doc: docs/c2/tracer.md (`scratch`)
 
-usage: c2trace.py scratch <src> --func SUBSTR [--why] [--all] [--export snap.json] [--keep DIR] [-- <cl args>]
+usage: c2trace.py scratch <src> --func SUBSTR [--why] [--all] [--color] [--export snap.json] [--keep DIR] [-- <cl args>]
        c2trace.py scratch <src> --func SUBSTR --phase ORIG.s [--asm-func DEC] [--by case|block] [--top K]
                       [--no-scan] [--brief] [-- <cl args>]
 
@@ -19,7 +19,21 @@ next free of eax, ecx, edx from the function-wide cursor _NextIntPos, else first
          which is how an invisible pick shifts the registers of every later one
   instr  the instruction at pick time (IL dump syntax, see `il`)
 
---why (14.00 only) adds what RegAssign saw: the cursor after the pick, the candidate set (which of eax ecx edx were
+After the picks, rows marked C are registers in the code that are NOT scratch picks: values Color allocated (the
+same Color / ChoosePhysReg events as `regs`, traced in the same compile), at each listing offset where the final
+code writes one. By default only temporaries (t591, $S9: the ones that read like scratch temps; a load into a
+Color temp looks exactly like a pick in the listing); --color lists every Color variable. Why such a value got its
+register is `regs --why`, not this table.
+
+Rows marked R (cl 13.10): Riscify's GetReg calls, after RegSimpleAssign: the register a memory operand split off into
+a new temp gets (block, cursor > register, busy registers, temps made), and under it why the instruction was split
+or not and whether the split survived (not split: no memory operand / no free register; split, undone by
+RiscifyEarlyUndo or after Schedule; split, kept: what was scheduled in between). Rows marked ?: the other temps of the final
+code that no pick, Color pop or GetReg call gave a register, with the phase that did (IL at RewriteAsReal and at
+Riscify's entry). A pick whose IL name differs from the final code's ends with [temp tN in the final code].
+docs/c2/regalloc.md 6.6.
+
+--why (every c2 build: 14.00, 15.00, 13.10.3077, 13.10.3052; tools/c2builds/*.json hooks.scratch_x) adds what RegAssign saw: the cursor after the pick, the candidate set (which of eax ecx edx were
 free in _RegMap and not in the temp's conflict set), and for every pick that is not "the cursor's register, taken
 by rotation" the reason (preference taken / preference refused / register busy with which temp or coloured
 variable / conflict). --all lists every RegSimpleAssignBody run (EH funclets, then the body) instead of the body
@@ -50,7 +64,8 @@ HOOKS = [
 ]
 HOOKS = c2trace.c2build.hooks("scratch", HOOKS)   # another c2 build: the same 4 events (13.10: @RegSimpleAssign@4)
 
-# 14.00.50727.762 only: what RegAssign decides from (--why / --export). All addresses read in the code (regalloc.md §6).
+# What RegAssign decides from (--why / --export), 14.00.50727.762 addresses (regalloc.md §6); the other builds' tables
+# carry their own (hooks.scratch_x, below).
 REGMAP, REGAVAIL, SPEED, REGSYM = "10d0fd10", "10d0f9f0", "10d0d71c", 0x10D09F70   # _RegMap[92], regAvail[92], RegSym[92]*0x60
 INTREGS = ["eax", "ecx", "edx", "esi", "edi", "ebx", "ebp"]      # _IntPhysRegs 10d0cfd0 = 1 2 3 7 8 4 6 0
 RNAME = {0: "noreg", 1: "eax", 2: "ecx", 3: "edx", 4: "ebx", 5: "esp", 6: "ebp", 7: "esi", 8: "edi"}
@@ -81,11 +96,32 @@ HOOKS_X = [
 
 
 _IMGBASE = 0x10B00000
+
+# Where a temp of the final code got its register when it is neither a RegAssign pick nor a Color pop (`origins`):
+# IL dumps at RewriteAsReal's entry (end of Color) and, on cl 13.10, around Riscify, plus every GetReg call (the
+# register Riscify gives the load it splits off a memory operand; docs/c2/regalloc.md section 6.6). A build table's
+# hooks.origin has the same roles at its addresses; 14.00's are here.
+ORIGIN_ROLES = ("ra", "rp", "gr", "rm")
+ORIGIN = {"ra": "@RewriteAsReal@4=%s,g10d123ac>0>8>0>0x1c%%" % NAME}
+
+# Color's own allocations (the same events as `regs`, at this build's addresses), appended to the hooks of the
+# `scratch` table so that it can say which registers in the code are not scratch picks: Color@4 entry (the
+# function's name), a globreg just popped (its name), ChoosePhysReg's exit (the register it got).
+def _color_hooks():
+    import c2regs
+    return ["@Color@4=" + c2regs.HOOKS[0].split("=", 1)[1].split(",")[0], c2regs.HOOKS[2], c2regs.HOOKS[3]]
+if c2trace.c2build.table() is not None:
+    ORIGIN = c2trace.c2build.get("hooks", {}).get("origin", {})
 if c2trace.c2build.table() is not None and "scratch_x" in c2trace.c2build.get("hooks", {}):
     # a ported build with its own --why/--export events (tools/c2builds/*.json: hooks.scratch_x, globals._RegSym)
     HOOKS_X = c2trace.c2build.hooks("scratch_x", HOOKS_X)
     REGSYM = int(c2trace.c2build.get("globals")["_RegSym"], 16)
     _IMGBASE = int(c2trace.c2build.get("image_base"), 16)
+
+
+def origin_hooks():
+    """[(role, hook)] of this build: the IL dumps and GetReg events `origins` reads (see ORIGIN)."""
+    return [(r, ORIGIN[r]) for r in ORIGIN_ROLES if r in ORIGIN]
 
 
 def _hex(s):
@@ -99,14 +135,22 @@ def _words(s):
     return [_hex(x) for x in s.strip("[]").split()] if s and s.startswith("[") else None
 
 
-def parse_segments(log, funcpat):
+def parse_segments(log, funcpat, cbase=None, obase=None, oroles=()):
     """-> (runs, final IL at @Encode@4). One run per RegSimpleAssignBody call for the function (EH funclets, then
-    the body): dict(picks=[...], conf={reg number: set of temp ids} or None, blocks, spills, fixes, speed)."""
+    the body): dict(picks=[...], conf={reg number: set of temp ids} or None, blocks, spills, fixes, speed, and with
+    cbase (the index of _color_hooks() in the hook list) color={regs name: set of registers Color gave it}). With
+    obase (the index of origin_hooks() in the hook list; oroles their roles) every run also gets origin={'ra' / 'rp'
+    / 'rm': the function's IL at RewriteAsReal / Riscify / MdmAvoidMOBStalls, 'gr': GetReg calls}."""
     segs, final, on, enc, pend, stack = [], None, False, False, None, []
     seg = None
     regsym = REGSYM
+    cfunc, cname, color, grname = False, None, {}, {}
+    oname, ofunc, origin, odump, onames = None, False, {}, None, {}
     for ln in log.splitlines():
         if ln.startswith("T "):
+            if odump is not None:
+                odump.append(ln[2:])
+                continue
             if enc:
                 final.append(ln[2:])
             elif pend is not None and pend.get("text") is None:
@@ -120,13 +164,48 @@ def parse_segments(log, funcpat):
         f = head.split()
         ev, hk = f[0], int(f[3])
         v = c2trace._split(rest)
+        odump = None
+        if obase is not None and hk >= obase:              # IL dumps / GetReg calls (see origins)
+            role = oroles[hk - obase]
+            if role == "gr":
+                if ofunc and ev == "E" and len(v) >= 7:
+                    w = _words(v[0]) or []
+                    busy = w[2] if len(w) >= 3 and w[0] == 0 else 0
+                    origin.setdefault("gr", []).append(dict(busy=[RNAME[r] for r in sorted(RNAME) if r and busy >> r & 1],
+                        byte=bool(_hex(v[1])), cur=_hex(v[2]), tup=v[3], order=_words(v[4]) or [], count=_hex(v[5]),
+                        used=_words(v[6]) or [], reg=None))
+                elif ofunc and ev == "X" and origin.get("gr"):
+                    r = _hex(v[0]) if v else None
+                    origin["gr"][-1]["reg"] = None if r == 0 else RNAME.get(r, "?")      # 0: no register free
+            elif ev == "E":
+                nm = v[0].strip('"') if v else ""
+                if nm != oname:
+                    oname, ofunc = nm, c2trace.func_match(funcpat, v[0] if v else "")
+                    origin = onames.setdefault(nm, {}) if ofunc else {}
+                if ofunc:
+                    odump = origin[role] = []
+            continue
+        if cbase is not None and hk >= cbase:              # Color (before the picks of the same function)
+            c = hk - cbase
+            if ev == "E" and c == 0:
+                nm = v[0] if v else ""
+                if nm != cname:
+                    cname, cfunc, color, grname = nm, c2trace.func_match(funcpat, nm), {}, {}
+            elif ev == "E" and c == 1 and cfunc and len(v) >= 9:
+                grname[_hex(v[0])] = _grname(v)
+            elif ev == "X" and c == 2 and cfunc and len(v) >= 2 and grname.get(_hex(v[0])):
+                r = v[1].strip('"')
+                if r and r != "?" and not r.startswith("noreg"):
+                    color.setdefault(grname[_hex(v[0])], set()).add(r)
+            continue
         if ev == "E" and hk in (0, 3):
             hit = c2trace.func_match(funcpat, v[0] if v else "")
             if hk == 0:
                 on, enc = hit, False
                 if hit:
                     seg = dict(picks=[], conf=None, blocks=0, spills=0, fixes=[], speed=_hex(v[1]) if len(v) > 1 else None,
-                               T=set(), last=None, ptr={})
+                               T=set(), last=None, ptr={}, color=color if cfunc else {},
+                               origin=onames.setdefault(v[0].strip('"'), {}) if obase is not None else None)
                     segs.append(seg)
             else:
                 enc = hit and final is None
@@ -189,6 +268,207 @@ def parse_segments(log, funcpat):
         for k in ("T", "last", "ptr"):
             del s[k]
     return segs, final or []
+
+
+def _grname(v):
+    """The `regs` name of the globreg in a Color pop event (c2regs.parse: `this`, `local386`, `t591`, `$S9`)."""
+    import c2regs
+    skey, skind, sname = (c2regs.sval(x) if x else "?" for x in v[6:9])
+    if isinstance(sname, str) and sname.startswith('"') and sname.strip('"'):
+        nm = sname.strip('"')
+        return nm[1:] if nm.startswith("_") else nm
+    kind = skind & 0xff if isinstance(skind, int) else None
+    if not isinstance(skey, int):
+        return None
+    return "t%d" % skey if kind == 3 else "%s%d" % (c2regs.KIND.get(kind, "k%s_" % kind), skey)
+
+
+DSTREG = re.compile(r"\b(e[abcd]x|e[sd]i|ebp|[abcd][lhx]|[sd]i|bp)=([^\s:\]]+):")
+
+
+def color_rows(seg, final, picked, show_all=False):
+    """[(offset, register, regs name, instruction text)] for the final IL's destination operands that hold a value
+    Color allocated (not a scratch pick): temporaries only (t591, $S9: the ones that read like scratch temps),
+    every Color variable with show_all. Also the number of named-variable rows left out."""
+    import regmap
+    color, rows, hidden, off = seg.get("color") or {}, [], 0, 0
+    for l in final:
+        if not l.startswith("I "):
+            continue
+        f = l.split()
+        body = l.split("|", 1)[1] if "|" in l else ""
+        dst = body.split("<-", 1)[0]
+        for r, il in DSTREG.findall(dst):
+            nm = regmap.regs_name(il)
+            if il in picked or nm not in color:
+                continue
+            if show_all or re.fullmatch(r"t\d+|\$.*", nm):
+                rows.append((off, r, nm, "%s | %s" % (f[2], body.strip())))
+            else:
+                hidden += 1
+        off += int(f[4])
+    return rows, hidden
+
+
+TREG = re.compile(r"\b(e[abcd]x|e[sd]i|ebp|[abcd][lhx]|[sd]i|bp)=(t\d+):")
+_WIDE = {"al": "eax", "ah": "eax", "ax": "eax", "bl": "ebx", "bh": "ebx", "bx": "ebx", "cl": "ecx", "ch": "ecx",
+         "cx": "ecx", "dl": "edx", "dh": "edx", "dx": "edx", "si": "esi", "di": "edi", "bp": "ebp"}
+
+
+def _ilregs(lines):
+    """{temp: register} for every `reg=tN` operand of the I lines of an IL dump (the first register seen)."""
+    out = {}
+    for l in lines or []:
+        if l.startswith("I ") and "|" in l:
+            for r, t in TREG.findall(l.split("|", 1)[1]):
+                out.setdefault(t, _WIDE.get(r, r))
+    return out
+
+
+_PHYS = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "al", "ah", "ax", "bl", "bh", "bx", "cl", "ch", "cx",
+         "dl", "dh", "dx", "si", "di", "bp", "sp", "cc", "fcc"}
+
+
+def _memops(ln):
+    """The memory operands of an IL line at Riscify's entry: `[..]` (kind 6) and memory variables (kind 2: a name
+    without `reg=`; after RegSimpleAssign every register operand is written reg=tN or as a register)."""
+    if not ln or "|" not in ln:
+        return []
+    ops, out, depth, cur = ln.split("|", 1)[1].replace("<-", " "), [], 0, ""
+    for ch in ops:
+        depth += ch == "["
+        depth -= ch == "]"
+        if ch == " " and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    mem = []
+    for t in out:
+        t = t.strip()
+        if not t or t == "->" or t.startswith(";"):
+            continue
+        if t.startswith("["):
+            mem.append(t)
+            continue
+        nm = t.rsplit(":", 1)[0]
+        if "=" in nm or nm in _PHYS or re.fullmatch(r"-?\d+|pas\d+|regset|fconst|k\d+|L\w+", nm) or nm.startswith(("?", "@")):
+            continue
+        mem.append(t)
+    return mem
+
+
+def split_reason(c, rp_line, final):
+    """Why Riscify split (or did not split) the instruction of GetReg call c, and whether the split survived to the
+    final code (docs/c2/regalloc.md 6.6): a GetReg call is made for every instruction whose opcode has
+    _Opcode_dope & 0x400 (add adc and cmp or sbb sub test xor inc dec neg not push shifts rotates xchg; never
+    mov, lea, imul); the first memory operand (dst list first) is split unless GetReg found no register; a split is
+    undone by RiscifyEarlyUndo when the operation is 16-bit, and by Riscify_undo (PreEncode, after Schedule) when the
+    load is still right before its use (and the op right before the store)."""
+    if c["reg"] is None:
+        return "not split: GetReg found no free register"
+    mem = _memops(rp_line)
+    if not c["made"]:
+        if not mem:
+            return "not split: no memory operand (GetReg is called anyway: the cursor moves)"
+        return "not split: its memory operand %s was refused (type class 0x4000, leaf flag 0x20, or a byte operand with no byte register)" % mem[0][:40]
+    fin = "\n".join(final or [])
+    alive = [t for t in c["made"] if re.search(r"=%s:" % t, fin)]
+    if not alive:
+        if re.search(r"=(%s):[0-9a-f]*002\b" % "|".join(c["made"]), c.get("rmline") or ""):
+            return "split, undone by RiscifyEarlyUndo (a 16-bit operation)"
+        return "split, undone after Schedule (Riscify_undo: the load was still right before its use)"
+    # kept: what the scheduler put between the load and the use (or the op and the store)
+    il = [l for l in final or [] if l.startswith("I ") and "|" in l]
+    t = alive[0]
+    defs = [i for i, l in enumerate(il) if re.search(r"=%s:" % t, l.split("|", 1)[1].split("<-")[0])]
+    uses = [i for i, l in enumerate(il) if re.search(r"=%s:" % t, l.split("|", 1)[1].split("<-", 1)[-1])]
+    gaps = []
+    if defs and uses:
+        first = min([u for u in uses if u > defs[0]] or [defs[0]])
+        gaps = [il[i].split()[2] for i in range(defs[0] + 1, first)]          # between the load and its use
+        stores = [i for i in uses if i > first and il[i].split()[2] == "mov"]  # read-modify-write: the store
+        if stores:
+            gaps += [il[i].split()[2] for i in range(first + 1, stores[-1])]  # between the op and the store
+    if gaps:
+        return "split, kept: %s scheduled between the load and its use or store, so Riscify_undo leaves it" % " ".join(gaps[:4])
+    return "split, kept: the use no longer names %s as the split register (narrowed, e.g. test ecx,0x100 -> test ch,1), so Riscify_undo does not match it" % c["reg"]
+
+
+def riscify_calls(seg, pos, final=None):
+    """Riscify's GetReg calls for this function (cl 13.10; regalloc.md 6.6), in call order: dict(n, block (the
+    tuple's block in the IL after Riscify, counted from 1), busy, byte, cur (the cursor's register, None at a block
+    start), reg, made (the new temps of the riscified instruction that have reg), off, instr). Riscify walks every
+    block from its last instruction up; the cursor restarts at the block's start, and every call moves it, whether or
+    not the instruction is then split."""
+    o = seg.get("origin") or {}
+    calls, rp, rm = o.get("gr") or [], o.get("rp"), o.get("rm")
+    if not calls or rm is None:
+        return []
+    pre = set(re.findall(r"\b(t\d+):", "\n".join(rp or [])))
+    pre_l = {l.split()[1]: l for l in rp or [] if l.startswith("I ")}
+    lines, blk = {}, 0
+    for l in rm:
+        if l.startswith("B "):
+            blk += 1
+        elif l.startswith("I "):
+            lines[l.split()[1]] = (l, blk)
+    out = []
+    for k, c in enumerate(calls, 1):
+        ln, b = lines.get(c["tup"], (None, None))
+        made = []
+        if ln and c["reg"] and "|" in ln:
+            for r, t in TREG.findall(ln.split("|", 1)[1]):
+                if _WIDE.get(r, r) == c["reg"] and t not in pre and t not in made:
+                    made.append(t)
+        order = [RNAME.get(x, "?") if x else None for x in c["order"]]
+        cnt = c["count"] if c["count"] else len(order)
+        cur = c["cur"]
+        curr = order[cur] if cur is not None and 0 <= cur < len(order) and cur < cnt - 1 else None
+        at = pos.get(c["tup"])
+        h = ln.split() if ln else []
+        out.append(dict(n=k, block=b, busy=[r for r in c["busy"] if r != "esp"], byte=c["byte"], cur=curr, cur_idx=cur,
+                        reg=c["reg"], made=made, order=order, count=cnt,
+                        used=[RNAME[r] for r, w in enumerate(c["used"]) if w and r in RNAME and r and r != 5],
+                        off=None if at is None else at[0], op=h[2] if len(h) > 2 else "?",
+                        instr=ln.split("|", 1)[1].strip() if ln and "|" in ln else ""))
+        out[-1]["rmline"] = ln
+        out[-1]["why"] = split_reason(out[-1], pre_l.get(c["tup"]), final)
+        del out[-1]["rmline"]
+    return out
+
+
+def origins(seg, final, picked, rcalls):
+    """[(temp, register, offset, phase)] for every temp the final code gives a register that is neither a RegAssign
+    pick (picked: their temp names), a Color pop (seg['color']) nor a temp made by a Riscify call: where it got the
+    register, read from the IL dumps at RewriteAsReal (end of Color) and Riscify's entry (cl 13.10)."""
+    o = seg.get("origin") or {}
+    color = seg.get("color") or {}
+    made = {t for c in rcalls for t in c["made"]}
+    ra, rp, rm = _ilregs(o.get("ra")), _ilregs(o.get("rp")) if "rp" in o else None, _ilregs(o.get("rm")) if "rm" in o else None
+    out, seen, off = [], set(), 0
+    for l in final:
+        if not l.startswith("I "):
+            continue
+        f = l.split()
+        for r, t in TREG.findall(l.split("|", 1)[1] if "|" in l else ""):
+            if t in seen or t in picked or t in color or t in made:
+                continue
+            seen.add(t)
+            if t in ra:
+                ph = "Color: given %s before RewriteAsReal without a ChoosePhysReg pop (a temp tied to a fixed register)" % ra[t]
+            elif rp is not None and t in rp:
+                ph = "RewriteAsReal or RegSimpleAssign without a RegAssign call (a destination that takes its source's register)"
+            elif rp is not None and rm is not None and t in rm:
+                ph = "Riscify (no GetReg call of it matched)"
+            elif rp is not None:
+                ph = "after Riscify (RiscifyEarlyUndo, MdmAvoidMOBStalls or a later pass)"
+            else:
+                ph = "RewriteAsReal, RegSimpleAssign without a RegAssign call, or a later pass"
+            out.append((t, _WIDE.get(r, r), off, ph, "%s | %s" % (f[2], l.split("|", 1)[1].strip() if "|" in l else "")))
+        off += int(f[4])
+    return out
 
 
 def parse(log, funcpat):
@@ -277,9 +557,15 @@ def annotate(seg):
         p["why"] = "; ".join(why)
 
 
-def export(path, func, segs, pos):
+def export(path, func, segs, pos, rcalls=(), orig=()):
     body = max(range(len(segs)), key=lambda k: len(segs[k]["picks"])) if segs else None
     out = dict(kind="scratch", func=func, c2=c2trace.c2build.get("version", "14.00.50727.762"), order=INTREGS, scratch=SCR, runs=[])
+    if rcalls:          # Riscify's GetReg calls (cl 13.10): `rasim scratch` replays them
+        out["riscify"] = [dict(n=c["n"], block=c["block"], busy=c["busy"], byte=c["byte"], cur=c["cur_idx"],
+                               order=[r or "" for r in c["order"]], count=c["count"], used=c["used"], reg=c["reg"],
+                               made=c["made"], off=c["off"], op=c["op"], instr=c["instr"], why=c["why"]) for c in rcalls]
+    if orig:            # temps whose register no modelled phase gave
+        out["unmodelled"] = [dict(tmp=t, reg=r, off=o, phase=ph, instr=ins) for t, r, o, ph, ins in orig]
     for k, s in enumerate(segs):
         ps = []
         for p in s["picks"]:
@@ -309,6 +595,7 @@ def main(argv):
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--no-scan", action="store_true")
     ap.add_argument("--brief", action="store_true", help="--phase: only groups that differ")
+    ap.add_argument("--color", action="store_true", help="list every Color variable written in the code, not only temps")
     ap.add_argument("src")
     cl = []
     if "--" in argv:
@@ -323,10 +610,13 @@ def main(argv):
     if ext and c2trace.c2build.table() is not None and "scratch_x" not in c2trace.c2build.get("hooks", {}):
         sys.exit("scratch --why/--all/--export: the probes are not ported to c2 %s (no hooks.scratch_x in its table)"
                  % c2trace.c2build.name())
-    img, hk, rc, out, log = c2trace.run_trace(a.src, HOOKS_X if ext else HOOKS, cl, keep=a.keep)
+    hooks = HOOKS_X if ext else HOOKS
+    oh = origin_hooks()
+    img, hk, rc, out, log = c2trace.run_trace(a.src, hooks + _color_hooks() + [h for _, h in oh], cl, keep=a.keep)
     if rc:
         sys.stdout.write(out)
-    segs, final = parse_segments(log, a.func)
+    segs, final = parse_segments(log, a.func, cbase=len(hooks), obase=len(hooks) + len(_color_hooks()),
+                                 oroles=[r for r, _ in oh])
     segs = [s for s in segs if s["picks"]] or segs[:1]
     if not segs or not any(s["picks"] for s in segs):
         sys.exit("no scratch picks seen for %r" % a.func)
@@ -335,8 +625,12 @@ def main(argv):
     if ext:
         for s in segs:
             annotate(s)
+    picked = {"t%d" % p["tmp"] for x in segs for p in x["picks"] if p["tmp"] is not None}
+    named = picked | {m.group(1) for x in segs for p in x["picks"] for m in [re.match(r"\s*(t\d+):", _instr(p)[2])] if m}
+    rcalls = riscify_calls(segs[body], pos, final)
+    orig = origins(segs[body], final, named, rcalls)
     if a.export:
-        export(a.export, a.func, segs, pos)
+        export(a.export, a.func, segs, pos, rcalls, orig)
     if a.phase:
         asm = os.path.join(a.keep, os.path.splitext(os.path.basename(a.src))[0] + ".asm")
         return phase(a, segs[body]["picks"], pos, asm, a.export, body)
@@ -355,12 +649,42 @@ def main(argv):
             at = pos.get(p["instr"])
             off = "gone" if at is None else ("%05x" % at[0] + ("" if at[1] == op else "~"))
             ins = "%s %s|%s" % (op, " line %s " % line if line else "", txt)
+            m = re.match(r"\s*(t\d+):", txt)
+            if p["tmp"] is not None and (not m or m.group(1) != "t%d" % p["tmp"]):
+                ins += "   [temp t%d in the final code]" % p["tmp"]      # several IL names share one tmpreg
             if a.why:
                 print("%4d  %-8s %-4s %-4s %-4s %-11s %6s  %s%s" % (
                     p["n"], "%s>%s" % (p["cur"], p["cur_after"] or "?"), p["pref"] or "-", p["how"], p["reg"] or "?",
                     ",".join(p["cand"]) or "none", off, ("[%s]  " % p["why"]) if p["why"] else "", ins))
             else:
                 print("%4d  %-4s %-4s %-4s %-4s %6s  %s" % (p["n"], p["cur"], p["pref"] or "-", _how(p), p["reg"] or "?", off, ins))
+        if k == body:
+            crow, hidden = color_rows(s, final, picked, a.color)
+            print("# C: not a scratch pick. Color gave the value its register (`regs --why` says why); the numbered rows")
+            print("#    are RegAssign's scratch picks. Where the code writes it: %s" % (
+                "every Color variable" if a.color else "temporaries only, --color adds the named variables (%d rows)" % hidden))
+            for o, r, nm, ins in crow:
+                print("%4s  %-14s %-4s %6s  %s" % ("C", "Color " + nm, r, "%05x" % o, ins))
+            if rcalls:
+                print("# R: Riscify's GetReg calls (cl 13.10, after RegSimpleAssign; regalloc.md 6.6): it splits a memory operand"
+                      " off into a load to a new\n#    temp; GetReg rotates over %s, restarting at the top of"
+                      " each block, which Riscify walks from its last\n#    instruction up; every call moves the cursor,"
+                      " also when the instruction stays as it was. `rasim scratch` replays it (rdrop:N, rins:N)"
+                      % " ".join(r for r in rcalls[0]["order"] if r))
+                for c in rcalls:
+                    print("%4s  %3d blk %-3s %-9s %-4s %6s  busy %-23s %s | %s" % (
+                        "R", c["n"], c["block"] if c["block"] is not None else "?",
+                        "%s>%s" % (c["cur"] or "start", c["reg"] or "none"), c["reg"] or "none",
+                        "gone" if c["off"] is None else "%05x" % c["off"], ",".join(c["busy"]) or "-",
+                        ("made " + " ".join(c["made"]) if c["made"] else "(not split)") + (" byte" if c["byte"] else ""),
+                        "%s %s" % (c["op"], c["instr"][:90])))
+                    print("%4s  %3s %s" % ("", "", c["why"]))
+            if orig:
+                print("# ?: temps of the final code with no RegAssign pick, no Color pop and no Riscify call: where they"
+                      " got their register\n#    (from the IL at RewriteAsReal%s); `rasim` does not model these phases"
+                      % (" and at Riscify's entry" if "rp" in (segs[body].get("origin") or {}) else ""))
+                for t, r, o, ph, ins in orig:
+                    print("%4s  %-14s %-4s %6s  %s  [%s]" % ("?", t, r, "%05x" % o, ins[:80], ph))
         if ext and (s["spills"] or s["fixes"]):
             print("# this run: %d RegSpill, %d RegFixConflict (not modelled by rasim scratch)" % (s["spills"], len(s["fixes"])))
         if ext and s["conf"] is None:
@@ -451,11 +775,11 @@ def _ranges(ks):
 def orig_regs(picks, pos, asm, func, orig_path):
     """{pick n: (the original's register at the aligned instruction or None, why)}."""
     import regmap, tsweep
-    lst = tsweep.listing_offsets(asm, func)
+    lst = tsweep.listing_cs_offsets(asm, func)     # capstone of our bytes: the operand order of orig.s (test, xchg)
     offs = sorted(lst)
     ours = [regmap.norm((lst[o].split()[0], lst[o].split(None, 1)[1] if " " in lst[o] else "")) for o in offs]
     if orig_path.lower().endswith(".asm"):      # another compile's /FAs listing (a variant draft) as the "original"
-        ol = tsweep.listing_offsets(orig_path, func)
+        ol = tsweep.listing_cs_offsets(orig_path, func)
         src = [(ol[o].split()[0], ol[o].split(None, 1)[1] if " " in ol[o] else "") for o in sorted(ol)]
         src = [x for x in src if x[0] not in ("DD", "DB")]
     else:
@@ -590,4 +914,4 @@ def _seq(rs):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(c2trace.pipe_safe(main, sys.argv[1:]))

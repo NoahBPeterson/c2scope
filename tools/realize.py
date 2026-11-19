@@ -6,9 +6,11 @@ usage: realize.py edit    <tu.cpp> --func F EDIT [EDIT..] [--want-regs v=reg,..]
        realize.py --from-rasim auto|ANSWERS.txt|- <tu.cpp> --func F [--asm-vs ORIG.s] [--want-regs v=reg,..]
                           [--regmap REGMAP.txt] [--max-answers N] [--max-compiles N] [--with-store] [--no-callee]
                           [-- <cl args>]
-       realize.py measure <base.cpp> <variant.cpp> --func F [--keys] [-- <cl args>]
-       realize.py pairs   <probes.cpp> [--keys] [--only RE] [--diff] [-- <cl args>]
-   --c2 13.10 / 13.10.3052 / 15.00 as on every tool.
+       realize.py --from slots|scratch <tu.cpp> --func F --asm-vs ORIG.s [--max-compiles N] [--pairs 0|1|2] [-- <cl args>]
+       realize.py measure <base.cpp> <variant.cpp> --func F [--keys] [--slots] [--scratch] [-- <cl args>]
+       realize.py pairs   <probes.cpp> [--keys] [--slots] [--scratch] [--only RE] [--diff] [-- <cl args>]
+   --c2 13.10 / 13.10.3052 / 15.00 as on every tool. --asm-func DECORATED: the function of our listing scored
+   against --asm-vs when it is not --func itself (as tsweep's; default --func).
 
 The models answer in abstract edits; this tool goes the other way.
 
@@ -16,7 +18,12 @@ edit     EDIT is one abstract edit in the syntax `rasim need` / `rasim want` pri
            ref:VAR:B[:C]    one more reference to VAR in block B          unref:VAR:B    a reference fewer
            extend:VAR:B     VAR's range reaches block B                   drop:VAR:B     the range leaves B
            var:NAME:B[:C]   a new candidate referenced in B               P:B:+1 / -1    one more / fewer candidate in B
-           add:frame@V:n    n more frame symbol keys before V's first reference
+           add:frame@V:n    n more frame symbol keys before V's first reference;  sub:CLS@V:n  n fewer (V earlier)
+           uses:X=N  pos:X=P  conf+:A,B  conf-:A,B    the slot model's what-ifs (c2slots.py what)
+           ins:N  drop:N    a scratch pick more before pick N / pick N gone (rasim scratch)
+           alias2:CHAIN  ptrlocal:CHAIN  subobj:CHAIN   the load-reuse levers of docs/c2/loadcse.md (they change code)
+           byval:NAME       the calls of NAME (`*`: all) that return a class by value, through a by-value inline
+                            forwarding template (rwsweep's byval family; it changes code)
          Blocks are numbered as `c2trace.py regs --why` numbers them. The tool maps block B to source lines through
          the trace's line info, generates every catalogued construct for that edit kind at the statement boundaries
          of those lines (CONSTRUCTS below; docs/c2/realize.md has the measured table), compiles and traces each
@@ -24,29 +31,35 @@ edit     EDIT is one abstract edit in the syntax `rasim need` / `rasim want` pri
          it and the side effects listed after `also:`; `no`, with what it did instead), the code cost (`code`:
          aligned diff of the listings with registers masked, operands kept: 0 = code-neutral; `bag`: the same as a
          multiset without frame displacements: 0 = the same instructions in another order; `regs`: the diff with
-         registers), the registers of --want-regs, and with --asm-vs the regdiff against the original.
+         registers), the registers of --want-regs, and with --asm-vs the bdiff against the original.
          Several EDITs are realised one by one and then together. --list prints the candidates and stops.
          `ref:V:B` / `extend:V:B` for a V that is never modified (this, a read-only parameter) has one code-neutral
          form on 14.00 / 15.00: `if ((int)V & 1) S; else S;` around an assignment S of the block (eqif; merged
          after Color). Differences also list `tie:A>B` (equal priorities whose defOrd order flipped).
 --from-rasim   the pipeline. ANSWERS.txt is the output of `rasim need SNAP reg:..` / `rasim want SNAP regmap.txt`
          (`-`: stdin); `auto` makes it (regmap --all against --asm-vs, then rasim want). Three stages, stopping at
-         the first variant that matches (regdiff 0 with --asm-vs, otherwise the wanted registers with bag 0):
+         the first variant that matches (bdiff 0 with --asm-vs, otherwise the wanted registers with bag 0):
            1. each answer made of source-level edits, each edit through its code-neutral constructs;
            2. every structural code-neutral construct that touches a block an answer names (an order answer
               `before:A:B` is turned into blocks by `rasim need 'A>B'`), singly, then those that changed the
               allocation's inputs without changing an instruction together (per family, and all);
            3. stub bodies for the bodiless callees that receive a local's address (docs/c2/callee.md).
+         An answer of several edits is realised as products of each edit's best realisations; an edit without a
+         construct (canreg:, pref:, ..) is left out with a note; `before:` becomes `rasim need 'A>B'`'s edits.
+         regmap's swaps are asked of `rasim need` too. With no match, the closest variants are combined (--pairs).
          Prints `FOUND ... <variant.cpp>` or `NOT FOUND ... closest: ...`.
+--from slots|scratch   the same with the answers of the slot model (single what-ifs and model-ranked pairs against
+         the original's slot map) or of the scratch model (rasim's re-alignment scan, singles and pairs).
 measure  what did a source change do, in abstract edits: compiles both files and prints the difference of the two
          traces of F (per block P, references, ranges, new and lost candidates, constants, interference, copies,
          preferences, registers, priorities) and the code cost. With --keys also the symbol-key difference.
 pairs    the same for a probe file: every function named X__base is compared with each X__<variant> in the file
          (one compile). This is how the catalogue was measured: tests/data/realize.cpp, work/scratch/realize/.
 
-Variants are kept in work/realize/<tu>[@build]/ (or --keep DIR).
+Variants are kept in work/realize/<tu>-<dirhash>[@build]/ (or --keep DIR).
 """
 import argparse, difflib, json, os, re, shutil, subprocess, sys, tempfile, threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image import ROOT
@@ -91,6 +104,7 @@ class Fn:
     def __init__(self, fn, asm_text, asm_path):
         self.fn = fn
         self.name = fn["name"]
+        self.asm_path = asm_path
         self.snap = c2regs.export(fn)
         try:
             instrs = tsweep.listing_instrs(asm_path, self.name)
@@ -106,7 +120,11 @@ class Fn:
         self.np = ints[0] if ints else 1
         self.blocks = []            # (b, w, P, sorted line offsets)
         nb = max([b for (p, b) in fn.get("blkP", {}) if p == self.np] or [0])
-        bbof = {b: bb for b, w, P, bb in fn.get("bbs", [])} if self.np == 1 else {}
+        # BB of each block in the integer pass; `bbs` is pass 1's, so a float function (XMM / x87 passes first, the
+        # integer pass later) needs the per-pass map, or every block maps to no source line (Spore 0073afb0)
+        bbof = {b: bb for (p, b), bb in fn.get("blkbb", {}).items() if p == self.np}
+        if not bbof and self.np == 1:
+            bbof = {b: bb for b, w, P, bb in fn.get("bbs", [])}
         for b in range(1, nb + 1):
             w, P = fn["blkP"].get((self.np, b), (0, 0))
             self.blocks.append((b, w, P, sorted(fn["lines"].get(bbof.get(b), ()))))
@@ -336,8 +354,17 @@ def parse_edit(s):
     if k in ("before", "after", "interf", "nointerf", "copy", "nocopy", "pref", "noreg", "canreg") and len(f) >= 3:
         return dict(kind=k, var=f[1].split("@p")[0].split("#")[0], other=f[2].split("@p")[0].split("#")[0],
                     n=int(f[3]) if len(f) > 3 and re.match(r"-?\d+$", f[3]) else 1, text=s)
-    if k in ("drop", "ins") and len(f) == 2 and f[1].isdigit():
+    if k in ("drop", "ins") and 2 <= len(f) <= 3 and f[1].isdigit():
         return dict(kind="scratch_" + k, n=int(f[1]), text=s)
+    m = re.match(r"(alias2|ptrlocal|subobj|byval):(.+)$", s)
+    if m:
+        return dict(kind="load", lk=m.group(1), chain=m.group(2).replace(" ", ""), text=s)
+    m = re.match(r"(uses|size|pos):([^=]+)=(\d+)\^?$", s)
+    if m:
+        return dict(kind="slot", sk=m.group(1), var=m.group(2), n=int(m.group(3)), text=s)
+    m = re.match(r"(conf[+-]):([^,]+),(.+)$", s)
+    if m:
+        return dict(kind="slot", sk=m.group(1), var=m.group(2), other=m.group(3), text=s)
     raise SystemExit("cannot parse edit %r" % s)
 
 
@@ -506,6 +533,14 @@ def cmd_measure(a, cl):
         fa.name, len(fa.blocks), len(fa.code), len(fb.blocks), len(fb.code)))
     keys = key_delta(a.src, a.edits[0], a.func, a.func, cl) if a.keys else None
     print_delta("variant", d, keys)
+    if a.slots:
+        sa_, sb_ = slot_snap_tmp(a.src, fa.name, cl), slot_snap_tmp(a.edits[0], fb.name, cl)
+        sd_ = SlotDelta(sa_, sb_)
+        print("  slots: %s; offsets %s" % (" ".join(sd_.strings()) or "(no packer-input change)", sd_.where()))
+    if a.scratch:
+        pa_, pb_ = pick_snap_tmp(a.src, fa.name, cl), pick_snap_tmp(a.edits[0], fb.name, cl)
+        pd_ = PickDelta(pa_, pb_)
+        print("  picks: %d -> %d; %s" % (len(pd_.pa), len(pd_.pb), " ".join(pd_.strings()) or "(same picks)"))
     for s in d.strings(True):
         print("    " + s)
     for n, (x, y) in d.prio.items():
@@ -531,6 +566,30 @@ def cmd_pairs(a, cl):
             if m:
                 kf[(m.group(1), m.group(2))] = f
     rx = re.compile(a.only) if a.only else None
+    ss, ps = {}, {}
+    if getattr(a, "slots", False):
+        import c2slots
+        info, sfuncs, sasm, _d = c2slots.trace(a.src, "", cl, keep=os.path.join(t.dir, "slots"))
+        for F in sfuncs:
+            lst = {}
+            try:
+                lst = c2slots.attach_listing(F, c2slots.listing_slots(sasm, F["name"]))
+            except KeyError:
+                pass
+            ss[F["name"]] = c2slots.snapshot(F, info, lst)
+    if getattr(a, "scratch", False):
+        import c2scratch
+        sd = os.path.join(t.dir, "scratch")
+        _i, _h, _rc, _o, slog = c2trace.run_trace(a.src, c2scratch.HOOKS_X, cl, keep=sd, quiet=True)
+        for f in fns:
+            segs, final = c2scratch.parse_segments(slog, f.name)
+            segs = [x for x in segs if x["picks"]]
+            if segs:
+                for x in segs:
+                    c2scratch.annotate(x)
+                p = os.path.join(sd, re.sub(r"\W+", "_", f.name)[:60] + ".json")
+                c2scratch.export(p, f.name, segs, c2scratch.offsets(final))
+                ps[f.name] = (json.load(open(p)), p)
     for ctx in by:
         base = by[ctx].get("base")
         if base is None or (rx and not rx.search(ctx)):
@@ -543,17 +602,303 @@ def cmd_pairs(a, cl):
             d = Delta(base, f)
             keys = key_delta_f(kf[(ctx, "base")], kf[(ctx, v)]) if (ctx, "base") in kf and (ctx, v) in kf else None
             print_delta("  " + v, d, keys)
+            if base.name in ss and f.name in ss:
+                sd_ = SlotDelta(ss[base.name], ss[f.name])
+                print("%-26s   slots: %s; offsets %s" % ("", " ".join(sd_.strings()) or "(no packer-input change)", sd_.where()))
+            if base.name in ps and f.name in ps:
+                pd_ = PickDelta(ps[base.name][0], ps[f.name][0])
+                print("%-26s   picks: %d -> %d; %s" % ("", len(pd_.pa), len(pd_.pb), " ".join(pd_.strings()) or "(same picks)"))
             if a.diff and d.ident:
                 for ln in difflib.unified_diff(["%s %s" % x for x in base.code], ["%s %s" % x for x in f.code], lineterm="", n=1):
                     print("        " + ln)
     t.close()
 
 
+# ---------------------------------------------------------------- the other models' inputs: stack slots, scratch picks
+#
+# The slot model (tools/c2slots.py, docs/c2/slots.md) answers in `uses:X=N`, `pos:X=P`, `conf+:A,B`, `conf-:A,B`;
+# the scratch model (`rasim scratch`, tracer.md) in `ins:N` / `drop:N`. A variant is measured against the base by
+# tracing it once more with that model's hooks: the elements (or picks) of the two traces are matched by name and
+# source line, and the difference is printed in the model's own vocabulary.
+
+SLOT_KINDS = ("uses", "pos", "conf+", "conf-")
+PICK_KINDS = ("scratch_ins", "scratch_drop")
+
+
+def slot_snap(path, func, cl, keep=None):
+    """The c2slots snapshot of `func` in the source `path` (a traced compile with the `slots` hooks, kept in
+    <dir>/slots/), with `_asm` = that compile's listing."""
+    import c2slots
+    d = keep or os.path.join(os.path.dirname(os.path.abspath(path)), "slots")
+    info, funcs, asm, _d = c2slots.trace(path, func, cl, keep=d)
+    if not funcs:
+        raise RuntimeError("no stack packing seen for %s" % func)
+    F = funcs[0]
+    lst = {}
+    if os.path.exists(asm):
+        try:
+            lst = c2slots.attach_listing(F, c2slots.listing_slots(asm, F["name"]))
+        except KeyError:
+            lst = {}
+    s = c2slots.snapshot(F, info, lst)
+    s["_asm"] = asm
+    return s
+
+
+def slot_table(s):
+    """{stable element key: dict(i, uses, size, vis (rank in its size run), off, lod)}. Keys: the source name without
+    its block number (`_iy`), and for compiler temporaries `tv@L<line>/<size>` / `$T@L<line>/<size>` (their names
+    are symbol keys and numbers that move with any edit); a repeated key gets `#k`."""
+    import c2slots, collections
+    order = c2slots.base_order(s)
+    offs = {i: o for C in s["obs"]["cols"] for i, o in C["members"]}
+    cnt, out, key = collections.Counter(), {}, {}
+    lines = [(s["listing"].get(i) or {}).get("line") for i in order]
+    L0 = min([x for x in lines if x] or [0])
+    for i in order:
+        e = s["elems"][i]
+        nm = c2slots.ename(s, i) or ""
+        L = (s["listing"].get(i) or {}).get("line")
+        if not nm or nm.startswith("tv") or nm.startswith("$T") or re.match(r"\$S\d+", nm):
+            base = "%s@L%s/%d" % ("$T" if nm.startswith("$T") else "tv", (L - L0) if L else None, e["size"])
+        else:
+            base = re.sub(r"\$\d*$", "", nm)
+        k = base + ("#%d" % cnt[base] if cnt[base] else "")
+        cnt[base] += 1
+        key[i] = k
+    rank = collections.Counter()
+    for i in order:
+        e = s["elems"][i]
+        out[key[i]] = dict(i=i, uses=e["uses"], size=e["size"], vis=rank[e["size"]], ord=order.index(i), off=offs.get(i),
+                           param=e.get("param"), name=c2slots.ename(s, i))
+        rank[e["size"]] += 1
+    for i in order:
+        out[key[i]]["lod"] = {key[j] for j in (s["elems"][i].get("lod") or ()) if j in key}
+    return out
+
+
+class SlotDelta:
+    """What a source change did to the stack packer's input and result, in c2slots' what-if vocabulary."""
+
+    def __init__(self, sa, sb):
+        self.a, self.b = slot_table(sa), slot_table(sb)
+        A, Bt = self.a, self.b
+        self.uses = {k: (A[k]["uses"], Bt[k]["uses"]) for k in A if k in Bt and A[k]["uses"] != Bt[k]["uses"]}
+        self.new = sorted(set(Bt) - set(A))
+        self.gone = sorted(set(A) - set(Bt))
+        # visiting order among the elements both have, per size run
+        both = [k for k in A if k in Bt]
+        self.pos = {}
+        for sz in {A[k]["size"] for k in both}:
+            ka = sorted((k for k in both if A[k]["size"] == sz), key=lambda k: A[k]["vis"])
+            kb = sorted((k for k in both if Bt[k]["size"] == sz and A[k]["size"] == sz), key=lambda k: Bt[k]["vis"])
+            for n, k in enumerate(kb):
+                if ka.index(k) != n and k not in self.uses:
+                    self.pos[k] = (ka.index(k), n)
+        conf = lambda T, ks: {tuple(sorted((x, y))) for x in ks for y in T[x]["lod"] if y in ks and x != y}
+        ca, cb = conf(A, set(both)), conf(Bt, set(both))
+        self.conf = (sorted(cb - ca), sorted(ca - cb))
+        self.offs = {k: (A[k]["off"], Bt[k]["off"]) for k in both if A[k]["off"] != Bt[k]["off"]}
+        self.T = (sa["fn"].get("T"), sb["fn"].get("T"))
+
+    def strings(self):
+        out = ["uses:%s:%d>%d" % (k, x, y) for k, (x, y) in sorted(self.uses.items())]
+        out += ["pos:%s:%d>%d" % (k, x, y) for k, (x, y) in sorted(self.pos.items())]
+        out += ["new:%s" % k for k in self.new] + ["gone:%s" % k for k in self.gone]
+        out += ["conf+:%s,%s" % p for p in self.conf[0]] + ["conf-:%s,%s" % p for p in self.conf[1]]
+        return out
+
+    def where(self):
+        s = " ".join("%s:%s>%s" % (k, x, y) for k, (x, y) in sorted(self.offs.items()))
+        return ("T %s>%s " % self.T if self.T[0] != self.T[1] else "") + (s or "no element moved")
+
+    def empty(self):
+        return not self.strings()
+
+
+def slot_key_of(s, name):
+    """The slot_table key of an element named as c2slots' what-if names it (`_ny$`, `#4`, `tv310`)."""
+    import c2slots
+    i = c2slots.resolve(s, name)
+    for k, v in slot_table(s).items():
+        if v["i"] == i:
+            return k
+    return name
+
+
+def slot_agree(s, orig):
+    """(elements at the original's offset, elements seen in both): c2slots' map of the original against our listing."""
+    import c2slots
+    if orig is None or not os.path.exists(s.get("_asm") or ""):
+        return None
+    try:
+        om, _info = c2slots.orig_map(s, s["_asm"], orig)
+    except Exception:
+        return None
+    offs = {i: o for C in s["obs"]["cols"] for i, o in C["members"]}
+    return sum(1 for i, (o, n, t) in om.items() if offs.get(i) == o), len(om)
+
+
+def slot_verdict(w, sa, sb):
+    """(exact | yes | no, side effects, notes) for one slot what-if against the variant's snapshot: the asked
+    change must be there; `exact` also needs no other packer-input change and every element at the offset the
+    replay of the edit predicts."""
+    import c2slots
+    d = SlotDelta(sa, sb)
+    X = slot_key_of(sa, w["var"])
+    sk = w["sk"]
+    hit = False
+    if sk == "uses":
+        hit = X in d.uses and d.uses[X][1] == w["n"]
+    elif sk == "pos":
+        hit = X in d.b and d.b[X]["ord"] == w["n"]
+    elif sk in ("conf+", "conf-"):
+        pair = tuple(sorted((X, slot_key_of(sa, w["other"]))))
+        hit = pair in d.conf[0 if sk == "conf+" else 1]
+    mine = {"uses": "uses:%s:" % X, "pos": "pos:%s:" % X}.get(sk)
+    side = [s for s in d.strings() if not (mine and s.startswith(mine)) and not (sk.startswith("conf") and s.startswith(sk))]
+    if sk == "pos":
+        side = [s for s in side if not s.startswith("pos:")]
+    try:
+        res, _el = c2slots.run_edits(dict(sa, listing=dict(sa["listing"])), [w["text"]])
+        tab = slot_table(sa)
+        pred = {k: res["offs"].get(v["i"]) for k, v in tab.items()}
+        both = [k for k in pred if k in d.b]
+        ok = sum(1 for k in both if d.b[k]["off"] == pred[k])
+        note = "replay of the edit predicts %d of %d offsets" % (ok, len(both))
+        allok = ok == len(both)
+    except SystemExit as e:
+        note, allok = "replay failed: %s" % e, False
+    v = "no" if not hit else ("exact" if not side and allok else "yes")
+    return v, side, note, d
+
+
+def pick_snap(path, func, cl, keep=None):
+    """(the `rasim scratch` snapshot of func's picks as a dict, its path): a traced compile with the scratch hooks
+    (14.00 and every ported build: hooks.scratch_x), kept in <dir>/scratch/."""
+    import c2scratch
+    d = keep or os.path.join(os.path.dirname(os.path.abspath(path)), "scratch")
+    _img, _hk, rc, out, log = c2trace.run_trace(path, c2scratch.HOOKS_X, cl, keep=d, quiet=True)
+    segs, final = c2scratch.parse_segments(log, func)
+    segs = [x for x in segs if x["picks"]]
+    if not segs:
+        raise RuntimeError("no scratch picks seen for %s" % func)
+    for x in segs:
+        c2scratch.annotate(x)
+    p = os.path.join(d, "scratch.json")
+    c2scratch.export(p, func, segs, c2scratch.offsets(final))
+    js = json.load(open(p))
+    for run, seg in zip(js["runs"], segs):            # the pick's source line (relative to the function, as the
+        for q, sp in zip(run["picks"], seg["picks"]):  # regs trace numbers lines): where a construct must go
+            ln = c2scratch._instr(sp)[1]
+            q["line"] = int(ln) if ln and str(ln).lstrip("-").isdigit() else None
+    json.dump(js, open(p, "w"), indent=1)
+    return js, p
+
+
+def slot_snap_tmp(path, func, cl):
+    return slot_snap(path, func, cl, keep=tempfile.mkdtemp(prefix="realize_slots_"))
+
+
+def pick_snap_tmp(path, func, cl):
+    return pick_snap(path, func, cl, keep=tempfile.mkdtemp(prefix="realize_picks_"))[0]
+
+
+def _body_picks(snap):
+    runs = [r for r in snap["runs"] if r.get("body")] or snap["runs"][-1:]
+    return runs[0]["picks"] if runs else []
+
+
+def _pick_key(p):
+    t = re.sub(r"\bt\d+", "t", p.get("instr") or "")
+    t = re.sub(r":\d+", "", t)
+    t = re.sub(r"\b(e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp)=", "", t)
+    return (p.get("op"), t)
+
+
+class PickDelta:
+    """What a source change did to the scratch picks: picks inserted (`ins:N` = before base pick N, `gone` when the
+    new pick left no instruction), picks removed (`drop:N`), and aligned picks whose register changed."""
+
+    def __init__(self, sa, sb):
+        self.pa, self.pb = _body_picks(sa), _body_picks(sb)
+        ka, kb = [_pick_key(p) for p in self.pa], [_pick_key(p) for p in self.pb]
+        sm = difflib.SequenceMatcher(None, ka, kb, autojunk=False)
+        self.pairs, self.ins, self.drop = [], [], []
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == "equal":
+                self.pairs += list(zip(range(i1, i2), range(j1, j2)))
+                continue
+            if op == "replace" and i2 - i1 == j2 - j1:
+                self.pairs += list(zip(range(i1, i2), range(j1, j2)))       # the same picks, another instruction form
+                continue
+            nxt = self.pa[i2]["n"] if i2 < len(self.pa) else len(self.pa) + 1
+            for j in range(j1, j2):
+                self.ins.append((nxt, self.pb[j]))
+            for i in range(i1, i2):
+                self.drop.append(self.pa[i])
+        self.regs = [(self.pa[i], self.pb[j]) for i, j in self.pairs if self.pa[i]["reg"] != self.pb[j]["reg"]]
+
+    def strings(self):
+        out = ["ins:%d%s" % (n, "" if p.get("how") == "ROT" else "(%s)" % p.get("how")) +
+               ("(gone)" if p.get("off") is None else "") for n, p in self.ins]
+        out += ["drop:%d" % p["n"] for p in self.drop]
+        if self.regs:
+            out.append("regs:%d picks, first %d %s>%s" % (len(self.regs), self.regs[0][0]["n"], self.regs[0][0]["reg"],
+                                                          self.regs[0][1]["reg"]))
+        return out
+
+    def empty(self):
+        return not self.strings()
+
+
+def rasim_scratch(snap_path, edits):
+    """{base pick n: predicted register} after `rasim scratch SNAP EDITS` (only the picks it says change)."""
+    r = subprocess.run([RASIM, "scratch", snap_path] + list(edits), capture_output=True, text=True)
+    out = {}
+    for m in re.finditer(r"^\s+(\d+)\s+\S+\s+(\w+) -> (\w+)\s", r.stdout, re.M):
+        out[int(m.group(1))] = m.group(3)
+    for m in re.finditer(r"^\s+(\d+)\s+\S+\s+removed\b", r.stdout, re.M):
+        out[int(m.group(1))] = None
+    return out, r.stdout
+
+
+def pick_verdict(want_edits, base_snap_path, pd):
+    """(exact | yes | no, notes) for scratch edits [`ins:N`, `drop:N`, ..] against a measured PickDelta: the inserted
+    and removed picks must be the ones asked for, and every aligned pick must get the register rasim predicts."""
+    pred, _ = rasim_scratch(base_snap_path, want_edits)
+    wi = sorted(int(e.split(":")[1]) for e in want_edits if e.startswith("ins:"))
+    wd = sorted(int(e.split(":")[1]) for e in want_edits if e.startswith("drop:"))
+    rot_ins = sorted(n for n, p in pd.ins if p.get("how") == "ROT")
+    got_d = sorted(p["n"] for p in pd.drop)
+    bad = []
+    for i, j in pd.pairs:
+        a, b = pd.pa[i], pd.pb[j]
+        want = pred.get(a["n"], a["reg"])
+        if a["n"] in wd:
+            continue
+        if want is not None and b["reg"] != want:
+            bad.append("%d:%s want %s" % (a["n"], b["reg"], want))
+    notes = []
+    if rot_ins != wi:
+        notes.append("rotating picks inserted before %s, asked %s" % (rot_ins or "-", wi or "-"))
+    if got_d != wd:
+        notes.append("picks removed %s, asked %s" % (got_d or "-", wd or "-"))
+    if bad:
+        notes.append("%d picks off the prediction (%s)" % (len(bad), ", ".join(bad[:4])))
+    if not bad and not notes:
+        return "exact", []
+    if not bad:
+        return "yes", notes            # the registers come out as predicted by another set of picks
+    return "no", notes
+
+
 # ---------------------------------------------------------------- generators: an abstract edit -> source rewrites
 
 PRELUDE_RZ = ("template<class RzT> struct rz_g { static RzT v; };\n"
               "template<class RzT> __forceinline void rz_keep(RzT x) { rz_g<RzT>::v = x; }\n"
-              "template<class RzT> RzT rz_ret();\nextern int rz_ext(int);\n")
+              "template<class RzT> RzT rz_ret();\nextern int rz_ext(int);\n"
+              "template<class RzT> struct rz_sub { RzT v; __forceinline RzT& get() { return v; } };\n")
 SRC_KINDS = ("ref", "unref", "drop", "extend", "var", "P")
 # construct name -> (what it realises, measured code cost on 14.00; docs/c2/realize.md has the table)
 CONSTRUCTS = {
@@ -563,6 +908,11 @@ CONSTRUCTS = {
     "headdup": "the statement before an if/else written at the head of both arms (merged back after Color): its "
                "references leave the block of the test and count in each arm",
     "headhoist": "the reverse: a statement that starts both arms hoisted above the test",
+    "headret": "the statement before an if whose then-arm always leaves (return/break/continue) written at the head "
+               "of that arm and again after the if: `if (C) { S; A; return; } S; R` (a call too, e.g. a log call "
+               "on both paths). The copies are head-merged above the test after RegSimpleAssignBody when they get "
+               "the same scratch registers; the second copy's picks are hidden (ins:N before the first pick after "
+               "the if). 14.00 / 15.00; 13.10 keeps the copies",
     "callee": "a body for a bodiless callee that only reads through the parameter receiving &V: V stays one web "
               "across the call (docs/c2/callee.md); the true pattern is in the original's callee",
     "wrap": "a call argument through a by-value identity helper with a local, or `&x` through a bound reference: "
@@ -603,8 +953,10 @@ class Ctx:
         self.prelude = "".join(
             ln + "\n" for ln in (rwsweep.PRELUDE + PRELUDE_RZ).splitlines()
             if not any(re.search(r"(?:inline|__forceinline)[^;{]*\b%s\s*\(" % nm, self.text)
-                       for nm in re.findall(r"\b((?:hs|rz)_\w+)\s*\(", ln)))
-        out = a.keep or os.path.join(ROOT, "work", "realize", os.path.splitext(os.path.basename(a.src))[0])
+                       for nm in re.findall(r"\b((?:hs|rz)_\w+)\s*\(", ln))
+            and not any(re.search(r"\bstruct\s+%s\b" % nm, self.text) for nm in re.findall(r"\bstruct\s+(rz_\w+)", ln)))
+        # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory
+        out = a.keep or os.path.join(ROOT, "work", "realize", tsweep.out_name(a.src))
         if c2trace.c2build.table() and not a.keep:
             out += "@" + c2trace.c2build.name()
         shutil.rmtree(out, ignore_errors=True)
@@ -616,9 +968,35 @@ class Ctx:
         self.func = self.base.name
         self.fn, self.cls = find_def(self.text, self.func, helpersweep, rwsweep)
         self.B = rwsweep.Body(self.text, self.fn, self.cls)
+        _more_decls(self.B, rwsweep)
         self.line0 = self.text.count("\n", 0, self.fn[4])
         self.wantregs = dict(x.split("=") for x in a.want_regs.split(",")) if a.want_regs else {}
         self.keybase = None
+        self._slotbase = self._pickbase = None
+        self._orig_ins = None
+
+    def slotbase(self):
+        """The base's stack-packing snapshot (traced once, kept in base/slots/)."""
+        if self._slotbase is None:
+            self._slotbase = slot_snap(self.base_path, self.func, self.cl)
+        return self._slotbase
+
+    def pickbase(self):
+        """(the base's scratch-pick snapshot, its path) for `rasim scratch` (traced once, kept in base/scratch/)."""
+        if self._pickbase is None:
+            self._pickbase = pick_snap(self.base_path, self.func, self.cl)
+        return self._pickbase
+
+    def orig_ins(self):
+        if self._orig_ins is None and self.a.asm_vs:
+            import c2slots
+            self._orig_ins = c2slots.read_orig(self.a.asm_vs)
+        return self._orig_ins
+
+    def src_lineoff(self, L):
+        """A listing source line (1-based line of the compiled file: prelude + text) as a line offset in the
+        target's body (what lineoff() returns)."""
+        return L - 1 - self.prelude.count("\n") - self.line0
 
     def variant_text(self, edits, tail):
         t = self.text
@@ -662,8 +1040,68 @@ class Ctx:
         return all(reg in f.regs.get(v, []) and (len(self.base.regs.get(v, [])) != 1 or f.regs.get(v) == [reg])
                    for v, reg in self.wantregs.items())
 
-    def regdiff(self, f):
-        return tsweep.regdiff(f.instrs, self.orig) if self.orig is not None else None
+    def scored(self, f):
+        """The listing instructions scored against the original: F's own, or --asm-func's (as tsweep: the function
+        of our listing that corresponds to orig.s, when that is not --func itself)."""
+        af = getattr(self.a, "asm_func", None)
+        if not af or af == self.a.func:
+            return f.instrs
+        try:
+            return tsweep.listing_instrs(f.asm_path, af)
+        except Exception:
+            return []
+
+    def regdiff(self, f):       # the score against the original: tsweep.bdiff (byte-faithful; the old name kept)
+        return tsweep.bdiff(self.scored(f), self.orig) if self.orig is not None else None
+
+    def oldreg(self, f):        # the earlier score (aligned mnemonics + registers), printed alongside
+        return tsweep.regdiff(self.scored(f), self.orig) if self.orig is not None else None
+
+
+def _more_decls(B, rw):
+    """rwsweep's Body knows one variable per declaration (and none for `int a, b;`). Every declarator of a plain
+    declaration statement is added here (declaration token, the base type with the declarator's `*`), with its uses."""
+    added = []
+    TYQ = {"const", "unsigned", "signed", "struct", "class", "volatile", "long", "short"}
+    for i in B.starts:
+        q = i
+        while q < len(B.toks) and (re.match(r"[A-Za-z_]\w*$", B.toks[q][0]) or B.toks[q][0] in ("*", "&", "::", "<", ">")):
+            q += 1
+        if q >= len(B.toks) or B.toks[q][0] not in (",", "=", ";", "[") or q - i < 2:
+            continue
+        if B.toks[i][0] in rw.KEYWORDS - TYQ or B.paren[i]:
+            continue
+        # the declarator name is the last identifier before q; the type is what precedes it (no stars)
+        nm_k = q - 1
+        if not re.match(r"[A-Za-z_]\w*$", B.toks[nm_k][0]):
+            continue
+        tyk = [B.toks[k][0] for k in range(i, nm_k)]
+        stars = "".join(x for x in tyk if x in ("*", "&"))
+        base = " ".join(x for x in tyk if x not in ("*", "&")).replace(" :: ", "::")
+        if not base or not re.match(r"[A-Za-z_]", base):
+            continue
+        decls = [(nm_k, stars)]
+        j, d = q, 0
+        while j < len(B.toks) and not (B.toks[j][0] == ";" and d == 0):
+            x = B.toks[j][0]
+            d += x in ("(", "[", "{")
+            d -= x in (")", "]", "}")
+            if x == "," and d == 0:
+                k, st_ = j + 1, ""
+                while k < len(B.toks) and B.toks[k][0] in ("*", "&"):
+                    st_ += B.toks[k][0]
+                    k += 1
+                if k + 1 < len(B.toks) and re.match(r"[A-Za-z_]\w*$", B.toks[k][0]) and B.toks[k + 1][0] in (",", "=", ";", "["):
+                    decls.append((k, st_))
+            j += 1
+        for k, st_ in decls:
+            nm = B.toks[k][0]
+            if nm not in B.vars and nm not in rw.KEYWORDS:
+                B.vars[nm] = ((base + " " + st_).strip(), k)
+                added.append(nm)
+    for nm in added:
+        B.uses[nm] = [k for k, (x, s, _) in enumerate(B.toks) if x == nm and k != B.vars[nm][1]
+                      and (k == 0 or B.toks[k - 1][0] not in (".", "->", "::"))]
 
 
 def find_def(text, deco, hs, rw):
@@ -976,6 +1414,102 @@ def g_headdup2(c, V, lines):
                [(B.toks[i][1], B.toks[end - 1][2], new + "\n" * B.text.count("\n", B.toks[i][1], B.toks[end - 1][2]))], "")
 
 
+LEAVE = ("return", "break", "continue", "goto", "throw")
+
+
+def _leaves(B, a, z):
+    """Does the arm [a, z) always leave: its last statement (a braced arm: the last one directly inside the braces)
+    is a return, break, continue, goto or throw."""
+    if B.toks[a][0] == "{" and B.close.get(a) == z - 1:
+        inner = [s for s in B.starts if a < s < z - 1 and B.block[s] == a]
+        return bool(inner) and B.toks[inner[-1]][0] in LEAVE
+    return B.toks[a][0] in LEAVE
+
+
+def _plain_cond(B, a, z, rw):
+    """A condition that reads no memory and calls nothing (a call statement may move across it)."""
+    return not any(B.toks[k][0] in ("->", "[", "*", "(", ".", "++", "--") or B.toks[k][0] in rw.ASSIGN
+                   for k in range(a + 1, z))
+
+
+def g_headret(c, V, lines):
+    """`S; if (C) { A; return; } R` as `if (C) { S; A; return; } S; R`: the statement before an if whose then-arm
+    always leaves, written at the head of that arm and again after the if (the natural spelling of a call made on
+    both paths, a log call per branch). Head merging after RegSimpleAssignBody hoists the copies back above the
+    test when they got the same scratch registers, so the code is the source's and the copy after the if leaves its
+    picks behind: a hidden pick (`ins:N`) before the first pick after the if. S may be a call when the condition
+    reads no memory; a declaration only into a braced arm."""
+    B, rw = c.B, c.rw
+    for k in range(len(B.starts)):
+        s = rw._stmt(B, k)
+        if not s:
+            continue
+        i, j = s
+        ie = _ifstmt(B, j, rw) if j < len(B.toks) else None
+        if not ie or ie[3] is not None or B.toks[i][0] in ("case", "default", "else") + LEAVE:
+            continue
+        pc, a1, z1 = ie[:3]
+        if not _leaves(B, a1, z1):
+            continue
+        dm = rw.DECL.match(B.text, B.toks[i][1])
+        if dm and (B.toks[a1][0] != "{" or dm.group(2) in [B.toks[q][0] for q in range(j, pc)]):
+            continue
+        if not dm and not _simple(c, i, j):
+            continue
+        if not _mentions(c, V, i, j):
+            continue
+        near = {c.lineoff(i), c.lineoff(a1), c.lineoff(z1 - 1)}
+        if lines and not (near & lines):
+            continue
+        if not (_cond_safe(B, i, j, j + 1, pc, rw) or _plain_cond(B, j + 1, pc, rw)):
+            continue
+        txt = B.text[B.toks[i][1]:B.toks[j - 1][2]]
+        cond = B.text[B.toks[j][1]:B.toks[pc][2]]
+        arm = _arm(B, a1, z1)
+        new = "%s { %s %s } %s" % (cond, txt, arm, txt)
+        yield ("headret", "`%s` (line +%d) at the head of the leaving then-arm and again after the if" % (
+            txt[:40], c.lineoff(i)),
+               [(B.toks[i][1], B.toks[z1 - 1][2], new + "\n" * B.text.count("\n", B.toks[i][1], B.toks[z1 - 1][2]))], "")
+
+
+def _second_arm_heads(c, picks, n):
+    """Line offsets of the statements S right before an if whose second arm (the else arm, or the code after an if
+    whose then-arm leaves) starts with pick n: where a headdup / headret copy of S hides one pick before pick n."""
+    B, rw = c.B, c.rw
+    byn = {p["n"]: p.get("line") for p in picks}
+    ln = byn.get(n)
+    if ln is None:
+        return set()
+    out = set()
+    for k in range(1, len(B.starts)):
+        j = B.starts[k]
+        if B.toks[j][0] != "if":
+            continue
+        ie = _ifstmt(B, j, rw)
+        if not ie:
+            continue
+        pc, a1, z1, a2, z2 = ie
+        if a2 is not None:
+            lo, hi = c.lineoff(a2), c.lineoff(z2 - 1)
+        elif _leaves(B, a1, z1) and z1 < len(B.toks):
+            end = B.close.get(B.block[j], len(B.toks) - 1)
+            if z1 >= end:
+                continue
+            lo, hi = c.lineoff(z1), c.lineoff(end)
+        else:
+            continue
+        prev = byn.get(n - 1)
+        if not (lo <= ln <= hi) or (prev is not None and lo <= prev <= hi and prev > c.lineoff(z1 - 1)):
+            continue
+        i = B.starts[k - 1]
+        try:
+            if rw.stmt_end(B, i) == j:
+                out.add(c.lineoff(i))
+        except (IndexError, KeyError):
+            pass
+    return out
+
+
 def g_taildup(c, V, lines):
     """The statement after an if (with or without else) at the end of both arms (an if without else gets an else
     holding the copy). Tail merging runs after Color (FgTryTailMerge: fall-through against the jump, no size
@@ -1097,6 +1631,9 @@ def g_eqif(c, V, sts):
             continue
         toks = [B.toks[q][0] for q in range(i, j)]
         txt = B.text[B.toks[i][1]:B.toks[j - 1][2]]
+        if len(toks) > 2 and all(re.match(r"[A-Za-z_]\w*$", x) and x not in c.rw.KEYWORDS for x in toks[:2]) and \
+                toks[2] in ("(", ";", "=", "["):
+            continue                                   # `T v(..);`: a declaration, not a statement for an arm
         calls = "new" in toks or any(re.match(r"[A-Za-z_]", t) and t not in c.rw.KEYWORDS and toks[q + 1] == "("
                                      for q, t in enumerate(toks[:-1]))
         eq = next((q for q, t in enumerate(toks) if t in c.rw.ASSIGN or t in ("++", "--")), None)
@@ -1240,6 +1777,7 @@ def g_callee(c, V):
                 return True
         return False
     sites = {}                       # callee -> dict(m, owner, sig, names, params, ptr, ret, hits={arg index: var})
+    _decl_cache = {}                 # callee name -> its declarations in the unit (one regex pass per name)
     for i, (t, s, e) in enumerate(B.toks[:-1]):
         if not re.match(r"[A-Za-z_]", t) or t in c.rw.KEYWORDS or B.toks[i + 1][0] != "(":
             continue
@@ -1267,12 +1805,14 @@ def g_callee(c, V):
             sites[t]["hits"].update(hits)
             sites[t]["hits"].update({n: v for n, v in byref.items() if "&" in sites[t]["params"][n]})
             continue
-        decls = [m for m in re.finditer(r"^[ \t]*((?:__declspec\(\w+\)\s*)*(?:[\w:<>]+[ \t\*&]+)+)%s\s*\(([^;{}()]*?)\)\s*(const)?\s*(?:throw\s*\(\s*\))?\s*;"
+        decls = _decl_cache.get(t) if t in _decl_cache else None
+        if decls is None:
+          decls = _decl_cache[t] = [m for m in re.finditer(r"^[ \t]*((?:__declspec\(\w+\)\s*)*(?:[\w:<>]+[ \t\*&]+)+)%s\s*\(([^;{}()]*?)\)\s*(const)?\s*(?:throw\s*\(\s*\))?\s*;"
                                         % re.escape(t), text, re.M)
                  if not re.search(r"[-+/=.]|^\s*[&*\d]|,\s*[&*\d]", m.group(2))]
-        own = lambda m: [cn for cn, a_, z_ in _classes(text, c.hs) if a_ < m.start() < z_]
+        own = lambda m: [cn for cn, a_, z_ in classes if a_ < m.start() < z_]
         member = i > 0 and B.toks[i - 1][0] in (".", "->")
-        nsof = lambda pos: [nn for nn, a_, z_ in _spaces(text, c.hs) if a_ < pos < z_]
+        nsof = lambda pos: [nn for nn, a_, z_ in spaces if a_ < pos < z_]
         myns = nsof(c.fn[4])
         decls.sort(key=lambda m: (nsof(m.start()) != myns,
                                   0 if (own(m)[-1:] == [c.cls] and not member) else 1 if bool(own(m)) == member else 2))
@@ -1332,11 +1872,277 @@ def g_callee(c, V):
                [], "".join(stub(si, set(si["hits"])) for si in sl))
 
 
+def _stmt_span(c, st):
+    k = c.B.starts.index(st) if st in c.B.starts else None
+    return c.rw._stmt(c.B, k) if k is not None else None
+
+
+def _cond_vars(c, limit=3):
+    """Values to test in equal arms without a memory read: `this` and int / pointer variables that Color put in a
+    callee-saved register for their whole life in the base (the test is then register-only on every build)."""
+    out = []
+    keep = ("esi", "edi", "ebx", "ebp")
+    cand = (["this"] if c.cls else []) + [v for v in c.B.vars if v != "this"]
+    for v in cand:
+        regs = c.base.regs.get(v) or []
+        if regs and all(r in keep for r in regs) and _eqif_cond(c, v):
+            out.append(v)
+    return out[:limit]
+
+
+def _mention_stmts(c, V):
+    """Statement starts whose statement mentions V (directly; `this` also through members)."""
+    out = []
+    for st in c.B.starts:
+        s = _stmt_span(c, st)
+        if s and _mentions(c, V, *s) and (V != "this" or True):
+            if V in [c.B.toks[q][0] for q in range(*s)] or V == "this":
+                out.append(st)
+    return out
+
+
+def g_uneqif(c, V, lines):
+    """The reverse of eqif: `if (C) S; else S;` with equal arms already in the source written as S (the packer and
+    Color then see S once)."""
+    B, rw = c.B, c.rw
+    for i in range(1, len(B.toks) - 1):
+        if B.toks[i][0] != "if" or B.toks[i - 1][0] == "else" or B.paren[i]:
+            continue
+        ie = _ifstmt(B, i, rw)
+        if not ie or ie[3] is None:
+            continue
+        pc, a1, z1, a2, z2 = ie
+        s1, s2 = _arm(B, a1, z1), _arm(B, a2, z2)
+        if re.sub(r"\s+", "", s1) != re.sub(r"\s+", "", s2):
+            continue
+        if V and not _mentions(c, V, a1, z1) and not _mentions(c, V, i, pc + 1):
+            continue
+        if lines and c.lineoff(i) not in lines:
+            continue
+        old = B.text[B.toks[i][1]:B.toks[z2 - 1][2]]
+        body = s1 if s1.rstrip().endswith((";", "}")) else s1 + ";"
+        yield ("uneqif", "equal arms `if %s` at line +%d written once" % (B.text[B.toks[i + 1][1]:B.toks[pc][2]][:30], c.lineoff(i)),
+               [(B.toks[i][1], B.toks[z2 - 1][2], "{ %s }" % body + "\n" * old.count("\n"))], "")
+
+
+def _slot_elem(c, name):
+    """(stable key, base element, source variable or None, listing line offset or None) for a c2slots name."""
+    import c2slots
+    s = c.slotbase()
+    try:
+        i = c2slots.resolve(s, name)
+    except SystemExit as e:
+        raise RuntimeError(str(e))
+    tab = slot_table(s)
+    key = next(k for k, v in tab.items() if v["i"] == i)
+    nm = c2slots.ename(s, i) or ""
+    var = re.sub(r"\$.*$", "", nm).lstrip("_") if nm and not nm.startswith(("tv", "$")) else None
+    if var not in c.B.vars:
+        var = None
+    L = (s["listing"].get(i) or {}).get("line")
+    return key, tab[key], var, (c.src_lineoff(L) if L else None)
+
+
+def g_slot(c, w):
+    """Stack-slot what-ifs. The packer counts uses before FinalFlowOpts merges equal arms (slots.md rule 3), so a
+    statement written in two equal arms counts its slot references twice and a test that reads a stack local
+    counts as one more use and extends its life, while the code (after the merge) is unchanged."""
+    sk = w["sk"]
+    key, e, var, lo = _slot_elem(c, w["var"])
+    B = c.B
+    if var:
+        sts = _mention_stmts(c, var)
+    elif lo is not None:
+        sts = [st for st in B.starts if abs(c.lineoff(st) - lo) <= 0]
+    else:
+        sts = []
+    conds = _cond_vars(c)
+    out = []
+    if sk == "uses" and w["n"] > e["uses"]:
+        for W in conds:                                         # S (mentions X) twice: X's uses + its mentions
+            out += [g for g in g_eqif(c, W, sts) if g]
+        if var:                                                 # the test reads X: one use, 14.00 / 15.00 only
+            out += list(g_eqif(c, var, [st for st in B.starts if st > min(B.uses.get(var) or [0])][:8]))
+            out += list(g_headdup2(c, var, None)) + list(g_taildup(c, var, None)) + list(g_headdup(c, var, B.starts, None))
+    elif sk == "uses":
+        out += list(g_uneqif(c, var, None)) + list(g_headhoist(c, var, B.starts, None)) + list(g_tailhoist(c, var, None))
+    elif sk == "pos":
+        lines = {c.lineoff(st) for st in sts}
+        out += list(g_rw(c, "swap", lines))
+        for W in conds:
+            out += list(g_eqif(c, W, sts))
+    elif sk in ("conf+", "conf-"):
+        key2, e2, var2, lo2 = _slot_elem(c, w["other"])
+        if sk == "conf+":
+            for A, Bv in ((var, var2), (var2, var)):
+                if not A:
+                    continue
+                after = [st for st in B.starts if Bv and B.uses.get(Bv) and st > min(B.uses[Bv])]
+                out += list(g_eqif(c, A, after[:10]))           # a test of A after B's definition: A live there
+                for W in conds:
+                    out += list(g_eqif(c, W, [st for st in after if st in _mention_stmts(c, A)][:6]))
+        else:
+            for A in (var, var2):
+                if A:
+                    out += list(g_uneqif(c, A, None)) + list(g_tailhoist(c, A, None)) + list(g_headhoist(c, A, B.starts, None))
+    seen, res = set(), []
+    for g in out:
+        k_ = repr(g[2])
+        if k_ not in seen:
+            seen.add(k_)
+            res.append(g)
+    return res
+
+
+def g_pick(c, w):
+    """Scratch picks. `ins:N`: a statement written at the head or tail of both arms of an if (or in equal arms) whose
+    copies get the same scratch registers is merged after RegSimpleAssignBody: the second copy's picks moved the
+    cursor and left no instruction (a hidden pick before the first pick of the arm laid out second). `drop:N`: the
+    reverse (a merged copy written once), or the value given a name (a Color variable instead of a pick)."""
+    snap, _path = c.pickbase()
+    picks = _body_picks(snap)
+    byn = {p["n"]: p for p in picks}
+    n = w["n"]
+    near = [byn[k].get("line") for k in (n - 1, n, n + 1) if k in byn and byn[k].get("line") is not None]
+    lines = set()
+    for ln in near:
+        lines |= {ln - 1, ln, ln + 1}
+    out = []
+    if w["kind"] == "scratch_ins":
+        # the copy that hides the pick is the one in the arm laid out second: a statement right before an if whose
+        # second arm starts with pick n can sit far from the picks' lines (Fallout 3 0x00783280: a log call before
+        # `if (arg) { ...; return; }`, pick n the first one after the if). Natural spellings first: headret
+        hl = lines | _second_arm_heads(c, picks, n)
+        out += list(g_headret(c, None, hl))
+        out += list(g_headdup2(c, None, hl)) + list(g_headdup(c, None, c.B.starts, hl)) + list(g_taildup(c, None, lines))
+        for W in _cond_vars(c, 2):
+            out += list(g_eqif(c, W, [st for st in c.B.starts if c.lineoff(st) in lines]))
+        out += list(g_uneqif(c, None, lines))
+    else:
+        out += list(g_headhoist(c, None, c.B.starts, lines)) + list(g_tailhoist(c, None, lines)) + list(g_uneqif(c, None, lines))
+        out += list(g_rw(c, "wrap", lines, lambda d: d.startswith("arg hs_cp")))
+    seen, res = set(), []
+    for g in out:
+        k_ = repr(g[2])
+        if k_ not in seen:
+            seen.add(k_)
+            res.append(g)
+    return res
+
+
+def _member_type(c, name):
+    """The declared type of a struct member (or variable) `name` in the unit: `E** e;` -> `E**` (first declaration
+    found; a heuristic, a wrong type fails to compile and the variant is dropped). Comments are blanked first: a
+    trailing `// +0x0c` after the previous member would otherwise sit between its `;` and this declaration."""
+    text = re.sub(r"//[^\n]*|/\*.*?\*/", " ", c.text, flags=re.S)
+    for m in re.finditer(r"(?:^|[;{}])\s*((?:const\s+|unsigned\s+|signed\s+|struct\s+)*[A-Za-z_][\w:<>]*(?:\s*\*+)?)\s*"
+                         r"((?:\*?\s*\w+\s*,\s*)*)\*?\s*\b%s\s*(?:;|,|\[)" % re.escape(name), text):
+        ty = m.group(1).strip()
+        if ty.split()[0] not in c.rw.KEYWORDS - {"const", "unsigned", "signed", "struct"} and ty not in ("return", "else"):
+            return ty
+    return None
+
+
+def _chain_occ(c, chain):
+    """Token index ranges [i, j) of the target's occurrences of a member chain (`p->m`, `x.e`, `this->m`)."""
+    B = c.B
+    parts = re.findall(r"->|\.|[A-Za-z_]\w*", chain)
+    out, n = [], len(parts)
+    for i in range(len(B.toks) - n + 1):
+        if [B.toks[i + k][0] for k in range(n)] == parts and (i == 0 or B.toks[i - 1][0] not in (".", "->", "::")):
+            j = i + n
+            if j < len(B.toks) and B.toks[j][0] == "(":
+                continue                                   # a method call, not the member
+            out.append((i, j))
+    return out
+
+
+def g_load(c, w):
+    """The load-reuse levers of docs/c2/loadcse.md, which change code on purpose (the score decides):
+    alias2:CHAIN   two of CHAIN's later reads through one reference `T& rz_r = CHAIN;` (R3: a reference used twice
+                   never shares a load with the direct reads: one load becomes two or three);
+    ptrlocal:CHAIN the pointer member loaded into a local before the statement (`T* rz_q = p->q;`, R2: its
+                   dereferences keep one alias class: two loads become one);
+    subobj:CHAIN   the member read and updated through an inline method of a sub-object (`((rz_sub<T>*)&CHAIN)
+                   ->get()`): the update becomes `op [m], y` on 14.00 / 15.00 (C1 -> C2)."""
+    B = c.B
+    chain = w["chain"]
+    if w["lk"] == "byval":
+        # rwsweep's byval family: the calls of NAME (`*`: every call) returning a class by value, each through a
+        # generic by-value inline forwarding template (Spore 005f0a60)
+        out = [(f, d, e, "") for f, d, e in c.rw.gen_byval(B)
+               if chain == "*" or re.search(r"(?:^|[^\w])%s\s*\(" % re.escape(chain), d)]
+        if not out:
+            print("  %s: no call of it returning a class by value in the target" % chain)
+        return out[:12]
+    occ = _chain_occ(c, chain)
+    name = re.findall(r"\w+", chain)[-1]
+    ty = _member_type(c, name)
+    if not occ or not ty:
+        print("  %s: %s" % (chain, "no occurrence in the target" if not occ else "the type of %s was not found" % name))
+        return
+    st_of = lambda i: max(s for s in B.starts if s <= i)
+    out = []
+    if w["lk"] == "alias2":
+        import itertools
+        for (a_, b_) in itertools.combinations(range(1, len(occ)), 2):
+            st = st_of(occ[0][0])
+            if B.paren[st] or B.toks[st][0] in ("case", "default", "else"):
+                continue
+            eds = [(B.toks[st][1], B.toks[st][1], "%s& rz_r = %s; " % (ty, chain))]
+            eds += [(B.toks[occ[k][0]][1], B.toks[occ[k][1] - 1][2], "rz_r") for k in (a_, b_)]
+            out.append(("alias2", "`%s& rz_r = %s;` at line +%d, reads %d and %d of %d through it" % (
+                ty, chain, c.lineoff(st), a_ + 1, b_ + 1, len(occ)), eds, ""))
+        # one later read through it: a chain read only twice has no pair. The single use is substituted back for an
+        # int member, but a pointer member read through a reference bound in an earlier block is reloaded (probes
+        # work/scratch/a2probe lc__c, lc__g; Spore 009d3410 `Limb* const& lb`, 00724100); `(void)rz_r;` adds no use
+        for k in range(1, len(occ)):
+            st = st_of(occ[0][0])
+            if B.paren[st] or B.toks[st][0] in ("case", "default", "else") or st_of(occ[k][0]) == st:
+                continue
+            eds = [(B.toks[st][1], B.toks[st][1], "%s& rz_r = %s; " % (ty, chain)),
+                   (B.toks[occ[k][0]][1], B.toks[occ[k][1] - 1][2], "rz_r")]
+            out.append(("alias2", "`%s& rz_r = %s;` at line +%d, read %d of %d through it (one use)" % (
+                ty, chain, c.lineoff(st), k + 1, len(occ)), eds, ""))
+    elif w["lk"] == "ptrlocal":
+        seen = set()
+        for k, (i, j) in enumerate(occ):
+            st = st_of(i)
+            if st in seen or B.paren[st] or B.toks[st][0] in ("case", "default", "else"):
+                continue
+            seen.add(st)
+            blk = B.block[st]
+            end = B.close.get(blk, len(B.toks)) if blk else len(B.toks)
+            later = [(x, y) for x, y in occ if st <= x < end]
+            stop = next((x for x, y in later if y < len(B.toks) and B.toks[y][0] in c.rw.ASSIGN), None)
+            later = [(x, y) for x, y in later if stop is None or x < stop]
+            if len(later) < 2:
+                continue
+            eds = [(B.toks[st][1], B.toks[st][1], "%s rz_q = %s; " % (ty, chain))]
+            eds += [(B.toks[x][1], B.toks[y - 1][2], "rz_q") for x, y in later]
+            out.append(("ptrlocal", "`%s rz_q = %s;` at line +%d, %d uses through it" % (ty, chain, c.lineoff(st), len(later)), eds, ""))
+    elif w["lk"] == "subobj":
+        acc = lambda x, y: (B.toks[x][1], B.toks[y - 1][2], "((rz_sub<%s >*)&%s)->get()" % (ty, chain))
+        if len(occ) > 1:
+            out.append(("subobj", "every %s (%d) through an inline accessor of a sub-object" % (chain, len(occ)),
+                        [acc(x, y) for x, y in occ], ""))
+        for k in range(len(occ) - 1):
+            out.append(("subobj", "%s at lines +%d and +%d through an inline accessor of a sub-object" % (
+                chain, c.lineoff(occ[k][0]), c.lineoff(occ[k + 1][0])), [acc(*occ[k]), acc(*occ[k + 1])], ""))
+    return out[:12]
+
+
 def generate(c, w):
     """Candidate rewrites for one parsed edit, most specific construct first."""
     k = w["kind"]
     out = []
-    if k in ("ref", "extend", "var", "unref", "drop", "P"):
+    if k == "load":
+        out = g_load(c, w) or []
+    elif k == "slot":
+        out = g_slot(c, w)
+    elif k in PICK_KINDS:
+        out = g_pick(c, w)
+    elif k in ("ref", "extend", "var", "unref", "drop", "P"):
         blk = w["block"]
         sts = c.stmts(blk)
         lines = set(c.base.lines_of(blk))
@@ -1353,6 +2159,13 @@ def generate(c, w):
                 ls_ = [x for x in c.base.lines_of(blk) if x > 0]
                 rng = [st for st in c.B.starts if ls_ and min(ls_) <= c.lineoff(st) <= max(ls_)]
                 out += list(g_eqif(c, V, list(dict.fromkeys(sts + rng)) or c.stmts(blk, 1)))
+                # the same arms with the test on a value already in a callee-saved register, around a statement of
+                # the block that mentions V: V's reference comes from S's second copy, the test reads no memory
+                # (for a stack parameter on 13.10, where `(int)V & 1` keeps a memory test)
+                msts = [st for st in list(dict.fromkeys(sts + rng)) if st in _mention_stmts(c, V)]
+                for W in _cond_vars(c):
+                    if W != V:
+                        out += [("eqif2",) + g[1:] for g in g_eqif(c, W, msts)]
             if not V:
                 out += list(g_rw(c, "const", lines)) + list(g_guard(c, lines))
                 out += list(g_rw(c, "wrap", lines, lambda d: d.startswith("arg hs_cp") or d.startswith("hs_bind")))
@@ -1360,6 +2173,7 @@ def generate(c, w):
                 out += list(g_store(c, V, sts or c.stmts(blk, 1)))
         else:
             out += list(g_uncopy(c, V, sts or c.stmts(blk, 1)))
+            out += list(g_uneqif(c, V, lines))
             out += list(g_headdup(c, V, sts, lines)) + list(g_headhoist(c, V, sts, lines))
             out += list(g_tailhoist(c, V, lines))
             if not V or k == "P":
@@ -1369,6 +2183,42 @@ def generate(c, w):
     pick = set(c.a.constructs.split(",")) if c.a.constructs else None
     out = [v for v in out if not pick or v[0] in pick]
     return out[:c.a.limit] if c.a.limit else out
+
+
+def g_keys_earlier(c, w, nm):
+    """sub:CLS@V:n: n fewer keys of that class before V. V's key follows its first IL mention, not its declaration
+    (a bare `T V;` moves nothing): written as an initialised declaration `T V = 0;` some statements earlier in its
+    block, with the original `T V = e;` turned into `V = e;`, V is allocated before what those statements make
+    (the dead initialisation is removed; Spore 00bc9980). One variant per earlier statement of the block."""
+    B, rw = c.B, c.rw
+    if nm not in B.vars or B.vars[nm][1] < 0:
+        print("  %s is not a local declared in the target (a parameter, a temporary or an inline symbol): no construct" % nm)
+        return
+    ty, dk = B.vars[nm]
+    st0 = max(s for s in B.starts if s <= dk)
+    sp = _stmt_span(c, st0)
+    if not sp or "&" in ty or "[" in ty:
+        return
+    i, j = sp
+    toks = [B.toks[q][0] for q in range(i, j)]
+    if toks.count(",") and B.paren[i] == 0 and any(B.toks[q][0] == "," and B.paren[q] == 0 for q in range(i, j)):
+        return                                           # several declarators: not rewritten
+    init = re.search(SCALAR, ty) or "*" in ty or re.search(r"\b(u?int\d+_t|uint|uint\d+|int\d+|U?INT\d*|LONG|ULONG|HRESULT|ptrdiff_t|intptr_t|uintptr_t)\b", ty)
+    if not init:
+        return
+    dtext = B.text[B.toks[i][1]:B.toks[j - 1][2]]
+    m = re.match(r"(.*?)\b%s\b\s*(=\s*(.*?))?;$" % re.escape(nm), dtext, re.S)
+    if not m:
+        return
+    newdecl = ("%s = %s;" % (nm, m.group(3).strip())) if m.group(2) else ""
+    zero = "0"
+    tyt = re.sub(r"\bconst\b", "", m.group(1)).strip()
+    earlier = [s for s in B.starts if s < st0 and B.block[s] == B.block[st0] and B.toks[s][0] not in ("case", "default", "else")]
+    for s in reversed(earlier[-8:]):
+        pos = B.toks[s][1]
+        yield ("early", "`%s %s = %s;` at line +%d (%d statements earlier), the declaration at line +%d made %s" % (
+            tyt, nm, zero, c.lineoff(s), len([x for x in earlier if x >= s]), c.lineoff(i), "`%s`" % newdecl if newdecl else "nothing"),
+               [(pos, pos, "%s %s = %s; " % (tyt, nm, zero)), (B.toks[i][1], B.toks[j - 1][2], newdecl)], "")
 
 
 def g_keys(c, w):
@@ -1407,7 +2257,10 @@ def g_keys(c, w):
         before = [st for st in B.starts if c.lineoff(st) <= line and ok(st)]
         inblk = [st for st in B.starts if c.lineoff(st) == line and ok(st)]
         cand = (inblk[:1] or before[-1:])
-    if w["cls"] != "frame" or w["sign"] < 0:
+    if w["sign"] < 0:
+        yield from g_keys_earlier(c, w, nm)
+        return
+    if w["cls"] != "frame":
         return
     n = w["n"]
     if sym.inl:
@@ -1443,6 +2296,12 @@ def g_keys(c, w):
     for st in cand:
         pos = B.toks[st][1]
         n = w["n"]
+        # one statement that makes n frame keys at once: an empty inline helper with n by-value parameters
+        # (work/scratch/realize2/k1.cpp: +n frame and +n tmp keys, no code, all four builds)
+        h0 = c.text.rfind("\n", 0, c.fn[4]) + 1
+        hdef = "__forceinline void rz_k%d(%s) {} " % (n, ", ".join("int rz_a%d" % q for q in range(n)))
+        yield ("helperparams", "an empty inline helper with %d parameters called at line +%d (+%d frame, +%d tmp keys)" % (
+            n, c.lineoff(st), n, n), [(h0, h0, hdef), (pos, pos, "rz_k%d(%s); " % (n, ", ".join("0" * n)))], "")
         yield ("pad", "%d unused locals with initialisers at line +%d" % (n, c.lineoff(st)),
                [(pos, pos, "int " + ", ".join("rz_p%d = 0" % q for q in range(n)) + "; ")], "")
         yield ("pad", "%d unused locals in a nested scope at line +%d" % (n, c.lineoff(st)),
@@ -1492,6 +2351,46 @@ def measure(c, cands, want, tag0):
             return dict(k=k, err=str(e)[-160:], fam=fam, desc=desc)
         d = Delta(c.base, f)
         r = dict(k=k, fam=fam, desc=desc, d=d, f=f, path=path, regs=c.regs_ok(f), rd=c.regdiff(f))
+        if want["kind"] == "load":
+            r["v"], r["side"] = ("yes" if d.code else "no"), []
+            r["note"] = "load-reuse lever: the instructions changed by %d (it is meant to); the score decides" % d.code \
+                if d.code else "no instruction changed"
+            return r
+        if want["kind"] == "slot":
+            try:
+                sv = slot_snap(path, c.func, c.cl)
+            except Exception as e:
+                return dict(k=k, err="slots: " + str(e)[-140:], fam=fam, desc=desc)
+            r["v"], r["side"], r["note"], r["sd"] = slot_verdict(want, c.slotbase(), sv)
+            if r["v"] != "no" and d.code:
+                r["v"] = "no"
+                r["note"] += "; the instructions changed (code %d)" % d.code
+            elif r["v"] == "exact" and d.ident:
+                r["v"] = "yes"
+                r["note"] += "; registers moved (regs %d)" % d.ident
+            ag = slot_agree(sv, c.orig_ins())
+            if ag:
+                r["note"] += "; %d of %d elements at the original's offset (base %d)" % (ag + (slot_agree(c.slotbase(), c.orig_ins())[0],))
+                r["slot_agree"] = ag
+            return r
+        if want["kind"] in PICK_KINDS:
+            try:
+                pv, _pp = pick_snap(path, c.func, c.cl)
+            except Exception as e:
+                return dict(k=k, err="picks: " + str(e)[-140:], fam=fam, desc=desc)
+            pd_ = PickDelta(c.pickbase()[0], pv)
+            v, notes = pick_verdict(want.get("edits") or [want["text"]], c.pickbase()[1], pd_)
+            r["v"], r["side"] = v, pd_.strings()
+            r["note"] = "; ".join(notes) or "every pick as rasim predicts"
+            if v != "no" and d.code and not d.bag:
+                # the same instructions in another order: the scheduler's ties follow the new registers (Fallout 3
+                # 0x00783280: the hidden pick also gave the original's argument-load order)
+                r["v"] = "yes"
+                r["note"] += "; the same instructions in another order (code %d, bag 0)" % d.code
+            elif v != "no" and d.code:
+                r["v"] = "no"
+                r["note"] += "; the instructions changed (code %d)" % d.code
+            return r
         if want["kind"] == "key":
             import symkeys
             fs = [x for x in symkeys.trace(path, c.cl) if x.name == c.func]
@@ -1499,6 +2398,12 @@ def measure(c, cands, want, tag0):
             kd = r["keys"]
             ok = kd and kd.get("pred_n") and kd["pred_ok"] == kd["pred_n"]
             r["v"], r["side"] = ("exact" if ok and kd["sort_ok"] == kd["sort_n"] else "yes" if ok else "no"), []
+            if want["sign"] < 0 and kd and kd.get("sort_n") is not None:
+                # a sub: is realised by moving V, not by deleting symbols: the replay's keys differ by
+                # construction, the operand orders are what must come out
+                r["v"] = "yes" if kd["sort_ok"] == kd["sort_n"] and kd["flips"] else "no"
+            if r["v"] != "no" and d.code:
+                r["v"] = "no"
         else:
             r["v"], r["side"] = verdict(want, d)
         return r
@@ -1516,7 +2421,9 @@ def show(c, r, n=None):
     if r["regs"] is not None:
         extra += "  wanted registers: %s" % ("YES" if r["regs"] else "no")
     if r["rd"] is not None:
-        extra += "  regdiff %d" % r["rd"]
+        extra += "  bdiff %d" % r["rd"]
+        if r.get("f") is not None:
+            extra += " (regdiff %s)" % c.oldreg(r["f"])
     print("  %-5s %-9s code %d bag %d regs %d  %s%s" % (r["v"], r["fam"], d.code, d.bag, d.ident, r["desc"][:90], extra))
     side = r["side"] if r["v"] != "no" else d.strings()
     if side:
@@ -1526,6 +2433,10 @@ def show(c, r, n=None):
         print("        registers: %s" % d.regstr())
     if r.get("keys") is not None:
         print("        %s" % key_str(r["keys"]))
+    if r.get("sd") is not None:
+        print("        slots: %s; offsets %s" % (" ".join(r["sd"].strings()) or "-", r["sd"].where()[:160]))
+    if r.get("note"):
+        print("        %s" % r["note"])
     print("        %s" % os.path.relpath(r["path"], ROOT))
 
 
@@ -1537,8 +2448,8 @@ def hit(c, r):
 
 def cmd_edit(c, a):
     print("%s: %d blocks, %d instructions%s" % (c.func, len(c.base.blocks), len(c.base.code),
-                                               "" if c.orig is None else ", regdiff %d" % c.regdiff(c.base)))
-    best = []
+                                               "" if c.orig is None else ", bdiff %d (regdiff %d)" % (c.regdiff(c.base), c.oldreg(c.base))))
+    per = []
     for n, e in enumerate(a.edits):
         w = parse_edit(e)
         if w["kind"] in SRC_KINDS:
@@ -1561,23 +2472,31 @@ def cmd_edit(c, a):
             sum(1 for r in good if r["v"] != "no" and r["d"].bag == 0)))
         for r in good[:a.top]:
             show(c, r)
-        if good and good[0]["v"] != "no":
-            best.append(cands[good[0]["k"]])
-    if len(best) > 1 and not any(c.rw.overlap(x[2], y[2]) for i_, x in enumerate(best) for y in best[i_ + 1:] if x[2] and y[2]):
-        print("## all %d edits together (the best realisation of each)" % len(best))
-        try:
-            f, path = c.build("combined", [e for b in best for e in b[2]], "".join(b[3] for b in best))
-            d = Delta(c.base, f)
-            print_delta("  combined", d, extra="  %s" % os.path.relpath(path, ROOT))
-        except (Exception, SystemExit) as e:
-            print("  failed: %s" % str(e)[-160:])
+        for r in good:
+            r["edits"], r["tail"], r["for"] = cands[r["k"]][2], cands[r["k"]][3], e
+        per.append([r for r in good if r["v"] != "no"][:3])
+    if len(per) > 1 and all(per):
+        import itertools
+        combos = sorted(itertools.product(*per), key=lambda rs: sum(_score(r) for r in rs))
+        print("## the %d edits together: %d combinations of the best realisations of each (budget %d)" % (
+            len(per), len(combos), a.max_compiles))
+        st = dict(ncomp=0, closest=None, done=set(), pool=[])
+        for k, rs in enumerate(combos[:a.max_compiles]):
+            r = build_combo(c, list(rs), "combined%02d" % k, st)
+            if r is not None:
+                show(c, r)
+                if c.orig is not None and hit(c, r):
+                    print("FOUND: %s" % os.path.relpath(r["path"], ROOT))
+                    break
     print("variants: %s" % os.path.relpath(c.out, ROOT))
 
 
 def parse_answers(text):
     """rasim need / want output -> (wanted registers, [[edit, ..], ..] in the order printed)."""
     wants, answers = {}, []
-    pat = re.compile(r"\b((?:ref|unref|drop|extend|var|P|before|after|interf|nointerf|pref|copy|nocopy|noreg|canreg):[^\s,;]+)")
+    pat = re.compile(r"\b((?:ref|unref|drop|extend|var|P|before|after|interf|nointerf|pref|copy|nocopy|noreg|canreg):[^\s,;]+"
+                     r"|(?:add|sub):(?:frame|tmp|glob|other|hash)@[^\s,;]+|(?:uses|pos):[^\s,;=]+=\d+\^?|conf[+-]:[^\s,;]+,[^\s;]+"
+                     r"|(?:ins|drop):\d+(?::\d+)?\b)")
     for ln in text.splitlines():
         m = re.match(r"(\S+) \(pop \d+, prio -?\d+\): now \S+, wanted (\w+)", ln)
         if m:
@@ -1590,7 +2509,10 @@ def parse_answers(text):
             if int(m.group(1)) <= 0:
                 answers.append([m.group(2)])
             continue
-        head = re.split(r"\s{2,}", ln.strip())[0]
+        # an answer of several edits is printed `A  +  B  also moves: ..`: everything before the notes, not only
+        # the first column (which dropped the second half: Fallout 3 0x008d5510's `.. + canreg:input:ebx`)
+        head = re.split(r"\s{2,}(?!\+\s)(?<!\s\+\s\s)", ln.strip().split("also moves")[0].split("[I:")[0])
+        head = " ".join(h for h in head if not re.match(r"(deficit|block \d|\(|prio)", h)) if " + " in ln else head[0]
         eds = pat.findall(head)
         if eds and not ln.strip().startswith("not decidable"):
             answers.append(eds)
@@ -1604,20 +2526,317 @@ def auto_answers(c, a):
     snap = os.path.join(c.out, "base.json")
     json.dump(c.base.snap, open(snap, "w"))
     rm = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "c2trace.py"), "regmap", c.base_path, "--func", c.func,
-                         "--asm-vs", a.asm_vs, "--asm-func", c.func, "--all", "--"] + c.cl, capture_output=True, text=True, cwd=ROOT)
+                         "--asm-vs", a.asm_vs, "--asm-func", a.asm_func or c.func, "--all", "--"] + c.cl, capture_output=True, text=True, cwd=ROOT)
     open(os.path.join(c.out, "regmap.txt"), "w").write(rm.stdout)
     r = subprocess.run([RASIM, "want", snap, os.path.join(c.out, "regmap.txt")], capture_output=True, text=True)
-    open(os.path.join(c.out, "answers.txt"), "w").write(r.stdout)
+    text = r.stdout
+    # regmap names swaps (two values in each other's registers): ask the order model for the direction that is
+    # violated; its source-level answers go after rasim want's (Fallout 3 0x004ddab0: auto never asked)
+    for m in re.finditer(r"^swap: _?(\S+) \((\w+), wants (\w+)\) <-> _?(\S+) \((\w+), wants (\w+)\)", rm.stdout, re.M):
+        x, y = m.group(1), m.group(4)
+        for first, second in ((x, y), (y, x)):
+            q = subprocess.run([RASIM, "need", snap, "%s>%s" % (first, second)], capture_output=True, text=True)
+            if "VIOLATED" in q.stdout:
+                print("# regmap swap %s <-> %s: rasim need '%s>%s'" % (x, y, first, second))
+                text += "\n# rasim need '%s>%s'\n" % (first, second) + q.stdout
+    open(os.path.join(c.out, "answers.txt"), "w").write(text)
     print("# regmap: %s" % (rm.stdout.strip().splitlines() or ["(no output)"])[-1])
-    return r.stdout
+    return text
+
+
+# ---------------------------------------------------------------- answers of several edits, pair search
+
+ABSTRACT = ("before", "after", "interf", "nointerf", "copy", "nocopy", "pref", "noreg", "canreg")
+
+
+def answer_alternatives(c, ans, snap):
+    """An answer (a list of edits) -> ([[parsed edit alternatives] per realisable edit], [edits with no construct]).
+    An order edit `before:A:B` / `after:A:B` is replaced by the source-level edits `rasim need 'A>B'` says close
+    it (the first three); an edit of another abstract kind (canreg, pref, interf, ..) has no construct and is left
+    out: the rest of the answer is still realised (and reported as a half), since the model may be wrong about it
+    and a compile decides."""
+    alts, unreal = [], []
+    for e in ans:
+        try:
+            w = parse_edit(e)
+        except SystemExit:
+            unreal.append(e)
+            continue
+        if w["kind"] in ("before", "after"):
+            x, y = (w["var"], w["other"]) if w["kind"] == "before" else (w["other"], w["var"])
+            r = subprocess.run([RASIM, "need", snap, "%s>%s" % (x, y)], capture_output=True, text=True)
+            subs = [m.group(2) for m in re.finditer(r"^\s+deficit\s+(-?\d+)\s+(\S+)", r.stdout, re.M) if int(m.group(1)) <= 0]
+            ws = []
+            for s_ in subs[:3]:
+                try:
+                    ws.append(parse_edit(s_))
+                except SystemExit:
+                    pass
+            if ws:
+                alts.append(ws)
+            else:
+                unreal.append(e)
+        elif w["kind"] in ABSTRACT:
+            unreal.append(e)
+        else:
+            alts.append([w])
+    return alts, unreal
+
+
+def _score(r):
+    if r.get("rd") is not None:
+        return r["rd"]
+    return (0 if r.get("regs") else 1) * 100 + r["d"].bag
+
+
+def _note_closest(st, r):
+    sc = (_score(r), r["path"], r["desc"])
+    if st["closest"] is None or sc < st["closest"]:
+        st["closest"] = sc
+
+
+def measure_edit(c, a, w, tag, st):
+    """Every construct for one parsed edit, measured once per run (cached by the edit's text)."""
+    cache = c.__dict__.setdefault("_meas", {})
+    if w["text"] in cache:
+        return cache[w["text"]]
+    cands = [v for v in generate(c, w) if v[0] != "store" or a.with_store]
+    room = max(0, a.max_compiles - st["ncomp"])
+    cands = cands[:room]
+    if not cands:
+        cache[w["text"]] = ([], [])
+        return cache[w["text"]]
+    st["done"].update(repr((sorted(g[2]), g[3])) for g in cands)
+    good, bad = measure(c, cands, w, tag)
+    st["ncomp"] += len(cands)
+    for r in good:
+        r["edits"], r["tail"] = cands[r["k"]][2], cands[r["k"]][3]
+        r["for"] = w["text"]
+        _note_closest(st, r)
+        st["pool"].append(r)
+    print("  %s: %d candidates, %d realise it (%d with the same instructions)" % (
+        w["text"], len(cands), sum(1 for r in good if r["v"] != "no"), sum(1 for r in good if r["v"] != "no" and r["d"].bag == 0)))
+    for r in good[:2]:
+        show(c, r)
+    cache[w["text"]] = (good, cands)
+    return cache[w["text"]]
+
+
+def build_combo(c, rs, tag, st):
+    """One variant with the rewrites of several measured results; None when they overlap or do not compile."""
+    eds = [x for r in rs for x in r["edits"]]
+    for i_, r in enumerate(rs):
+        for q in rs[i_ + 1:]:
+            if r["edits"] and q["edits"] and c.rw.overlap(r["edits"], q["edits"]):
+                return None
+    try:
+        f, path = c.build(tag, eds, "".join(r["tail"] for r in rs))
+    except (Exception, SystemExit) as e:
+        print("  combination failed: %s" % str(e)[-120:])
+        st["ncomp"] += 1
+        return None
+    st["ncomp"] += 1
+    r = dict(k=0, fam="+".join(x["fam"] for x in rs), desc=" + ".join(x["desc"][:50] for x in rs), d=Delta(c.base, f),
+             f=f, path=path, regs=c.regs_ok(f), rd=c.regdiff(f), v="-", side=[], edits=eds, tail="".join(x["tail"] for x in rs))
+    _note_closest(st, r)
+    return r
+
+
+def realise_answer(c, a, alts, tag, st):
+    """Realise an answer made of several edits: every edit through its constructs (each alternative of an order
+    edit as well), then, for an answer of two or more edits, the products of the best realisations of each
+    (three per edit, ranked by their summed scores), within --max-compiles. -> the matching result or None."""
+    per = []
+    for n, ws in enumerate(alts):
+        got = []
+        for m, w in enumerate(ws):
+            good, cands = measure_edit(c, a, w, "%s%d_%d_" % (tag, n, m), st)
+            got += [r for r in good if r["v"] != "no"] or ([r for r in good if r["d"].bag == 0 and not r["d"].empty()][:1])
+            if len(alts) == 1:
+                for r in good:
+                    if hit(c, r):
+                        return r
+        got.sort(key=lambda r: (_score(r), r["d"].bag))
+        per.append(got[:3])
+    if len(per) < 2 or not all(per):
+        return None
+    import itertools
+    combos = sorted(itertools.product(*per), key=lambda rs: sum(_score(r) for r in rs))
+    k = 0
+    for rs in combos:
+        if st["ncomp"] >= a.max_compiles:
+            print("  (combinations stopped at --max-compiles %d)" % a.max_compiles)
+            break
+        r = build_combo(c, list(rs), "%sx%d" % (tag, k), st)
+        k += 1
+        if r is None:
+            continue
+        show(c, r)
+        if hit(c, r):
+            return r
+    return None
+
+
+def pair_search(c, a, st, top=8):
+    """No single answer matched: pairs (then triples) of the closest variants measured so far, each of which changed
+    the allocation's inputs, ranked by how much each lowered the score on its own (with an original) or by the
+    instructions they kept, within --max-compiles. Pairs of rewrites of one edit are skipped (they are alternatives)."""
+    if a.pairs == 0 or st["ncomp"] >= a.max_compiles:
+        return None
+    base = c.regdiff(c.base)
+    pool = [r for r in st["pool"] if not r["d"].empty() and r["d"].code <= (a.pair_code if base is not None else 0)]
+    if base is not None:
+        pool = [r for r in pool if r["rd"] is not None and r["rd"] <= base + a.pair_slack]
+    pool.sort(key=lambda r: (_score(r), r["d"].bag))
+    uniq, seen = [], set()
+    for r in pool:                       # one rewrite measured for several edits counts once
+        k_ = repr((r["edits"], r["tail"]))
+        if k_ not in seen:
+            seen.add(k_)
+            uniq.append(r)
+    pool = uniq[:top]
+    if len(pool) < 2:
+        return None
+    import itertools
+    gain = lambda r: (base - r["rd"]) if base is not None else -r["d"].bag
+    combos = []
+    for n in (2, 3)[:a.pairs]:
+        for rs in itertools.combinations(pool, n):
+            if len({r["for"] for r in rs}) < n:
+                continue
+            combos.append((-sum(gain(r) for r in rs), n, rs))
+    combos.sort(key=lambda x: (x[0], x[1]))
+    if combos:
+        print("## pair search: %d combinations of the %d closest variants (budget %d compiles)" % (
+            len(combos), len(pool), max(0, a.max_compiles - st["ncomp"])))
+    for k, (_g, n, rs) in enumerate(combos):
+        if st["ncomp"] >= a.max_compiles:
+            print("  (pair search stopped at --max-compiles %d)" % a.max_compiles)
+            break
+        r = build_combo(c, list(rs), "pr%03d" % k, st)
+        if r is None:
+            continue
+        show(c, r)
+        if hit(c, r):
+            return r
+    return None
+
+
+def slot_answers(c, a, top=12, pool=40):
+    """The slot model's answers against the original: c2slots' single edits, then pairs of the `pool` best-scoring
+    single edits with every single edit (the replay is a few ms), ranked by elements at the original's offset."""
+    import c2slots, itertools, io
+    s = c.slotbase()
+    om, info = c2slots.orig_map(s, s["_asm"], c.orig_ins())
+    target = {i: o for i, (o, n, t_) in om.items()}
+    score = lambda res: sum(1 for i, o in target.items() if res["offs"].get(i) == o)
+    base = c2slots.model_of(s).run(c2slots.base_order(s), record=True)
+    b0 = score(base)
+    print("# slots: %d of %d elements seen in both at the original's offset" % (b0, len(target)))
+    E = s["elems"]
+    singles = []
+    for i in E:
+        if E[i]["param"]:
+            continue
+        nm = "#%d" % i
+        for d in (-3, -2, -1, 1, 2, 3):
+            u = E[i]["uses"] + d
+            if u >= 1:
+                singles += ["uses:%s=%d" % (nm, u), "uses:%s=%d^" % (nm, u)]
+        lg = base["log"].get(i) or {}
+        for _c, why in lg.get("tries", []):
+            if isinstance(why, (list, tuple)) and why[0] == "conf":
+                singles.append("conf-:%s,#%d" % (nm, why[1]))
+        if lg and not lg.get("new"):
+            for m in base["created"][lg["res"]]["members"][:4]:
+                if m != i:
+                    singles.append("conf+:%s,#%d" % (nm, m))
+        order = c2slots.base_order(s)
+        run = [k for k, j in enumerate(order) if E[j]["size"] == E[i]["size"]]
+        singles += ["pos:%s=%d" % (nm, k) for k in run[:: max(1, len(run) // 12)]]
+
+    def sc(eds):
+        try:
+            res, _ = c2slots.run_edits(dict(s, listing=dict(s["listing"])), eds)
+        except (SystemExit, Exception):
+            return -1
+        return score(res)
+    one = sorted(((sc([e]), e) for e in singles), key=lambda x: -x[0])
+    rows = [(v, [e]) for v, e in one if v > b0]
+    for (v1, e1), e2 in itertools.product(one[:pool], singles):
+        if e2 == e1 or e2.split("=")[0].split(",")[0] == e1.split("=")[0].split(",")[0]:
+            continue
+        v = sc([e1, e2])
+        if v > max(b0, v1):
+            rows.append((v, sorted([e1, e2])))
+    best, seen = [], set()
+    for v, eds in sorted(rows, key=lambda r: (-r[0], len(r[1]))):
+        if tuple(eds) in seen:
+            continue
+        seen.add(tuple(eds))
+        best.append((v, eds))
+    for v, eds in best[:top]:
+        print("#   %3d of %d  %s   (%s)" % (v, len(target), " ".join(eds), ", ".join(
+            c2slots.ename(s, int(x[1:])) for x in re.findall(r"#\d+", " ".join(eds)))))
+    return [eds for v, eds in best[:top]]
+
+
+def scratch_answers(c, a, top=12, pool=8):
+    """The scratch model's answers against the original: `c2trace.py scratch --phase` (our picks against the
+    original's registers) and rasim's re-alignment scan of single inserted / removed picks, then the scan again on
+    top of each of the best `pool` singles (pairs), ranked by known picks on the original's register."""
+    d = os.path.join(c.out, "base", "phase")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "c2trace.py"), "scratch", c.base_path, "--func", c.func,
+                        "--phase", a.asm_vs, "--asm-func", a.asm_func or c.func, "--by", "block", "--keep", d, "--brief", "--top", "60", "--"] + c.cl,
+                       capture_output=True, text=True, cwd=ROOT)
+    open(os.path.join(c.out, "phase.txt"), "w").write(r.stdout + r.stderr)
+    snap, tgt = os.path.join(d, "scratch_snap.json"), os.path.join(d, "scratch_snap_target.json")
+    if not os.path.exists(tgt):
+        print("# scratch: no phase report (%s)" % (r.stderr.strip().splitlines() or ["?"])[-1])
+        return []
+
+    def scan(given):
+        q = subprocess.run([RASIM, "scratch", snap, "--target", tgt, "--top", "60"] + given, capture_output=True, text=True).stdout
+        m = re.search(r"baseline: (\d+) of (\d+) known picks", q)
+        b = int(m.group(1)) if m else 0
+        n = int(m.group(2)) if m else 0
+        out = [(b + int(x.group(2)), x.group(1)) for x in re.finditer(r"^edit (\S+) .*?picks ([+-]\d+)", q, re.M)]
+        return b, n, out
+    b0, n, one = scan([])
+    print("# scratch: %d of %d known picks on the original's register" % (b0, n))
+    rows = [(v, [e]) for v, e in one if v > b0]
+    for v1, e1 in sorted(one, key=lambda x: -x[0])[:pool]:
+        _b, _n, two = scan([e1])
+        delta = v1 - _b
+        rows += [(v + delta, sorted([e1, e2])) for v, e2 in two if v + delta > max(b0, v1)]
+    best, seen = [], set()
+    for v, eds in sorted(rows, key=lambda r: (-r[0], len(r[1]))):
+        if tuple(eds) not in seen:
+            seen.add(tuple(eds))
+            best.append((v, eds))
+    for v, eds in best[:top]:
+        print("#   %3d of %d  %s" % (v, n, " ".join(eds)))
+    return [eds for v, eds in best[:top]]
 
 
 def cmd_pipeline(c, a):
-    if a.from_rasim == "auto":
+    if a.from_model:
+        if not a.asm_vs:
+            sys.exit("--from %s needs --asm-vs (the original's disassembly)" % a.from_model)
+        text = ""
+        answers0 = slot_answers(c, a) if a.from_model == "slots" else scratch_answers(c, a)
+    elif a.from_rasim == "auto":
         text = auto_answers(c, a)
     else:
         text = sys.stdin.read() if a.from_rasim == "-" else open(a.from_rasim).read()
     wants, answers = parse_answers(text)
+    if a.from_model:
+        answers = answers0
+    if a.from_rasim == "auto" and os.path.exists(os.path.join(c.out, "regmap.txt")):
+        for ln in open(os.path.join(c.out, "regmap.txt")):
+            m = re.match(r"(\S+)\s+(\S+)\s+.*WANTS (\w+)", ln)
+            if m:
+                wants.setdefault(m.group(2), m.group(3))
     if a.regmap:
         for ln in open(a.regmap):
             m = re.match(r"(\S+)\s+(\S+)\s+.*WANTS (\w+)", ln)
@@ -1626,66 +2845,43 @@ def cmd_pipeline(c, a):
     for v, r in wants.items():
         c.wantregs.setdefault(v, r)
     print("%s: %d blocks, %d instructions%s; wanted: %s; %d answers read" % (
-        c.func, len(c.base.blocks), len(c.base.code), "" if c.orig is None else ", regdiff %d" % c.regdiff(c.base),
+        c.func, len(c.base.blocks), len(c.base.code), "" if c.orig is None else ", bdiff %d (regdiff %d)" % (c.regdiff(c.base), c.oldreg(c.base)),
         " ".join("%s=%s" % kv for kv in c.wantregs.items()) or "(none: give --want-regs or --asm-vs)", len(answers)))
-    tried, ncomp, closest = 0, 0, None
-    seen, nocon, done = set(), [], set()
+    st = dict(ncomp=0, closest=None, done=set(), pool=[])
+    tried, nocon, seen = 0, [], set()
+    snap = os.path.join(c.out, "base.json")
+    if not os.path.exists(snap):
+        json.dump(c.base.snap, open(snap, "w"))
     for ai, ans in enumerate(answers):
         if tried >= a.max_answers:
             break
-        key = tuple(ans)
-        if key in seen:
+        if tuple(ans) in seen:
             continue
-        seen.add(key)
-        ws = [parse_edit(e) for e in ans]
-        if any(w["kind"] not in SRC_KINDS for w in ws):
-            continue                       # an abstract change: ask rasim for the source-level form (need 'A>B')
-        gen = [[v for v in generate(c, w) if v[0] != "store" or a.with_store] for w in ws]
-        if not all(gen):
+        seen.add(tuple(ans))
+        alts, unreal = answer_alternatives(c, ans, snap)
+        if not alts:
             nocon.append(" + ".join(ans))
             continue
-        if ncomp + sum(map(len, gen)) > a.max_compiles:
+        if st["ncomp"] >= a.max_compiles:
             print("## stopping at --max-compiles %d" % a.max_compiles)
             break
         tried += 1
-        print("## answer %d: %s" % (tried, " + ".join(ans)))
-        per = []
-        for n, w in enumerate(ws):
-            cands = gen[n]
-            done.update(repr((sorted(g[2]), g[3])) for g in cands)
-            good, bad = measure(c, cands, w, "a%d_%d_" % (tried, n))
-            ncomp += len(cands)
-            print("  %s: %d candidates, %d realise it (%d with the same instructions)" % (
-                w["text"], len(cands), sum(1 for r in good if r["v"] != "no"),
-                sum(1 for r in good if r["v"] != "no" and r["d"].bag == 0)))
-            for r in good[:3 if len(ws) == 1 else 1]:
-                show(c, r)
-            per.append((good, cands))
-            for r in good:
-                if len(ws) == 1 and hit(c, r):
-                    print("FOUND after %d answers, %d compiles: %s (%s)" % (tried, ncomp, os.path.relpath(r["path"], ROOT), r["desc"]))
-                    if r not in good[:3]:
-                        show(c, r)
-                    return 0
-                sc = (r["rd"] if r["rd"] is not None else (0 if r["regs"] else 1) * 100 + r["d"].bag, r["path"], r["desc"])
-                if closest is None or sc < closest:
-                    closest = sc
-        if per and len(ws) > 1:
-            pick = [g[0] for g, _ in per if g and g[0]["v"] != "no"]
-            if len(pick) == len(ws):
-                ed = [e for r, (g, cands) in zip(pick, per) for e in cands[r["k"]][2]]
-                tail = "".join(cands[r["k"]][3] for r, (g, cands) in zip(pick, per))
-                try:
-                    f, path = c.build("a%d_all" % tried, ed, tail)
-                    ncomp += 1
-                    r = dict(k=0, fam="+".join(x["fam"] for x in pick), desc="the best realisation of each edit",
-                             d=Delta(c.base, f), f=f, path=path, regs=c.regs_ok(f), rd=c.regdiff(f), v="yes", side=[])
-                    show(c, r)
-                    if hit(c, r):
-                        print("FOUND after %d answers, %d compiles: %s" % (tried, ncomp, os.path.relpath(path, ROOT)))
-                        return 0
-                except (Exception, SystemExit) as e:
-                    print("  combination failed: %s" % str(e)[-160:])
+        print("## answer %d: %s%s" % (tried, " + ".join(ans), "   (no construct for %s: realised without it)" % ", ".join(unreal)
+                                      if unreal else ""))
+        found = realise_answer(c, a, alts, "a%d_" % tried, st)
+        if found:
+            print("FOUND after %d answers, %d compiles: %s (%s)" % (tried, st["ncomp"], os.path.relpath(found["path"], ROOT), found["desc"]))
+            return 0
+    found = pair_search(c, a, st)
+    if found:
+        print("FOUND by a pair of realisations after %d answers, %d compiles: %s (%s)" % (
+            tried, st["ncomp"], os.path.relpath(found["path"], ROOT), found["desc"]))
+        return 0
+    ncomp, closest, done = st["ncomp"], st["closest"], st["done"]
+    if a.from_model:
+        print("NOT FOUND in %d answers, %d compiles%s" % (tried, ncomp, "" if closest is None else
+                                                        "; closest: %s (%s)" % (os.path.relpath(closest[1], ROOT), closest[2])))
+        return 1
     if nocon:
         print("## %d answers have no code-neutral construct in this source (docs/c2/realize.md): %s%s" % (
             len(nocon), ", ".join(nocon[:10]), " ..." if len(nocon) > 10 else ""))
@@ -1785,8 +2981,18 @@ def cmd_pipeline(c, a):
             for r in rs:
                 if not any(c.rw.overlap(cands[r["k"]][2], cands[q["k"]][2]) for q in pick):
                     pick.append(r)
+            # each `copy` rewrite declares `rz_c`: number them apart, or the combination redeclares one name and
+            # renames every copied variable's later uses to it
+            edits, nc = [], 0
+            for r in pick:
+                es = cands[r["k"]][2]
+                if any(re.search(r"\brz_c\b", e[2]) for e in es):
+                    if nc:
+                        es = [(a, b, re.sub(r"\brz_c\b", "rz_c%d" % nc, t)) for a, b, t in es]
+                    nc += 1
+                edits += es
             try:
-                fn, path = c.build("st_all_" + f, [e for r in pick for e in cands[r["k"]][2]], "".join(cands[r["k"]][3] for r in pick))
+                fn, path = c.build("st_all_" + f, edits, "".join(cands[r["k"]][3] for r in pick))
             except (Exception, SystemExit) as e:
                 print("  %d %s rewrites together: failed (%s)" % (len(pick), f, str(e)[-100:]))
                 continue
@@ -1825,7 +3031,7 @@ def cmd_pipeline(c, a):
 
 def run(a, cl):
     c = Ctx(a, cl)
-    if a.from_rasim:
+    if a.from_rasim or a.from_model:
         return cmd_pipeline(c, a)
     return cmd_edit(c, a)
 
@@ -1847,7 +3053,10 @@ def main():
     ap.add_argument("--want-regs")
     ap.add_argument("--regmap")
     ap.add_argument("--asm-vs")
+    ap.add_argument("--asm-func", help="the function in our listing scored against --asm-vs (default --func), as in tsweep")
     ap.add_argument("--keys", action="store_true")
+    ap.add_argument("--slots", action="store_true", help="pairs / measure: also trace the stack packer and print what moved")
+    ap.add_argument("--scratch", action="store_true", help="pairs / measure: also trace the scratch picks and print what moved")
     ap.add_argument("--keys-from", help="edit add:..: a `symkeys.py export` of the base source (saves the keys trace)")
     ap.add_argument("--only")
     ap.add_argument("--diff", action="store_true", help="pairs / measure: print the listing diff of variants whose code changed")
@@ -1859,6 +3068,13 @@ def main():
     ap.add_argument("--keep")
     ap.add_argument("--with-store", action="store_true", help="--from-rasim: also try `rz_keep(V);` (one instruction of code: a diagnosis, never a match)")
     ap.add_argument("--max-compiles", type=int, default=60)
+    ap.add_argument("--pairs", type=int, default=1, help="pipeline: after the answers, combine the closest variants: "
+                    "0 off, 1 pairs, 2 pairs and triples (default 1)")
+    ap.add_argument("--pair-code", type=int, default=4, help="pair search: largest code change of a member (default 4)")
+    ap.add_argument("--pair-slack", type=int, default=0, help="pair search: a member may be this much worse than the base")
+    ap.add_argument("--from", dest="from_model", choices=("slots", "scratch"),
+                    help="answers from the slot model (c2slots search, single edits and model-ranked pairs) or the "
+                         "scratch model (rasim scratch --target scan, singles and pairs); needs --asm-vs")
     ap.add_argument("--no-callee", action="store_true", help="--from-rasim: skip the final callee-body stage")
     ap.add_argument("--constructs", help="comma-separated construct names (default: all catalogued for the edit kind)")
     a = ap.parse_intermixed_args(argv)

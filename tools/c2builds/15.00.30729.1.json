@@ -1,6 +1,11 @@
 {
  "symkeys_sort_ret": "51103972",
- "symkeys_skip": {"5113e3e0": 4, "5113e460": 4, "51143ca0": 4, "51143cd0": 4},
+ "symkeys_skip": {
+  "5113e3e0": 4,
+  "5113e460": 4,
+  "51143ca0": 4,
+  "51143cd0": 4
+ },
  "version": "15.00.30729.1",
  "c2_sha256": "e3dd31ec4cb066fdf27cea24efc37944bb9d6a2720e6310213217e571f288404",
  "image_base": "51030000",
@@ -641,6 +646,13 @@
   ],
   "regs_dec_exit": {
    "18": 12
+  },
+  "regs_cand": [
+   "510a4799=esi,esi>0x14,esi>0xa,esi>0x18,esi>0x18>4,esi>0x18>8>0,esi>0x18>0x1c,esi>0x18>0>4$",
+   "510a4890=esi>0x18"
+  ],
+  "origin": {
+   "ra": "?RewriteAsReal@@YIXPAUtagFUNC@@@Z=g51258400>0>0>4$,g51258400>0>8>0>0x1c%"
   }
  },
  "opsched": [

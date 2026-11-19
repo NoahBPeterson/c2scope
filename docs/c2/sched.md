@@ -49,7 +49,8 @@ model 13,795/13,798 picks (section 9).
    call, and the code after a call stays after it. **[C code, every probe]**
 4. **Dependencies (DAG edges)** **[C code; latencies from 13,798 edges, section 9]**. Edge types: 1 true (read
    after write), 2 anti (write after read), 4 output (write after write), 0x40 memory, 0x2000 volatile, 0x80000
-   control, combined. Registers (including esp and the flags) give true/anti/output edges. **Only a true edge has
+   control, combined. The memory bits split by direction **[C: traced edges, Spore 0x00598db0]**: 0x20 store → later load,
+   0x40 load → later store, 0x80 store → later store. Registers (including esp and the flags) give true/anti/output edges. **Only a true edge has
    a latency**, the producer's latency:
    - the P5 table `OpSchedInfoP5` 0x10cdd328 (12-byte rows: latency, cost, unit; dump: `work/scratch/sched/optab.txt`):
      mov/push/pop/lea/add/sub/and/or/xor/cmp/inc/dec/test/shifts 1, movzx/movsx 3, imul 10, mul 11, div 17,
@@ -70,6 +71,27 @@ model 13,795/13,798 picks (section 9).
    - two different globals: independent (m5, n4);
    - stack parameters and locals whose address is not taken: independent of everything (every probe: `mov reg,
      _p$` loads move freely).
+   4a. **The final address is not what is disambiguated** (f3decomp R1270, R1275). A store whose address was not
+     `base + constant` when the interference information was built (ItfBuildInterference, before GlobalOptimize)
+     keeps a whole-object (or other-pointer) reference after the address folds. It then gets memory edges from
+     every earlier store through the object and to every later one, although the listing shows `[esi+4]` next to
+     `[esi+20]`. **[C: IL at @ItfBuildInterference@4 + traced edges (`schedwant --edges`: `5 > 6 mem-output`,
+     `3 > 6 mem-output`) + probes tests/data/rules/R1270_store_index.cpp, R1275_member_ctor.cpp]**
+     - Index not a literal at that point: `int n = 0; s->size = n; s->buf[n] = 0;` (address `s+4 + _n`),
+       `s->buf[s->size = 0] = 0` (VC8's `_Eos`: `s+4 + t` with `t = 1*0` unfolded; 14.00/15.00 only, 13.10 folds
+       it and the store is free), `s->buf[s->size] = 0` after `s->size = 0`. A literal index, `const int n = 0`,
+       or an inline helper called with the literal (`Eos(s, 0)`: the argument is substituted at inline time) are
+       free. All four builds except the in-place form on 13.10.
+     - Through another pointer symbol: `char* q = s->buf; q[0] = 0;`, and **a member subobject's inlined
+       constructor**: its `this` becomes a local pointer (`s3 = this+12; [s3] = 0`), so in a derived constructor
+       the vtable store gains a successor and is pinned above the argument push and the EH state store
+       (`xor eax,eax; mov [esi], vtbl; mov [esi+12], eax; push edi; mov [state], eax; ...`), instead of sinking
+       to the call. `m.Clear()` (an inline member function, its `this` stays an expression), `Zero(int&)`, plain
+       member stores: no edge. All four builds.
+     - The effect: earlier stores of the object cannot sink past the pinned store, so they issue right after
+       their own operands (R1270: `mov [esi+24], 15` stays right after the size store instead of sinking to the
+       call). `schedwant.py` proposes it as **`alias:X`** (X gains store-to-store edges with every other pointer
+       store of the region) and prints these spellings.
 5. **Height** (`SchComputeStaticPriority` 0x10c71f00): walking the region backwards from its exit pseudo-node
    (height 0), **height(n) = 1 + max over successors s of (height(s) + latency(n→s))**. So height counts the
    instructions on the longest path to the end of the region, plus the latencies on it. **[C code; 13,798/13,798]**
@@ -148,6 +170,16 @@ model 13,795/13,798 picks (section 9).
       equal chains) come out in IL order, so swapping two source statements swaps them only when they tie.
 
 ## How to move an instruction from source
+
+`tools/schedwant.py SRC --func F --asm-vs orig.s` does this search: per region it reads the original's order (the
+region found in our code, the original's code aligned with it), replays rules 5-7 (exact on every region traced so
+far) and tries DAG perturbations: `unalias:X` (X loses its memory edges), `alias:X` (a pointer store X gains
+store-to-store edges with the region's other pointer stores: rule 4a's spellings, R1270/R1275), `cut:X>Y`,
+`ns:X±1`, and pairs. Spore
+0x00598db0: the original issues the row pointer load before the copy's two loads; `unalias` of both loads is the
+answer, and the copy from the parameters (`k2.instanceID = a0; ..; row = k2`, not from the address-taken `key`) is a
+byte match. When no perturbation helps, the pre-schedule order differs (an operand sort, statement order, or for
+reloads the allocator's insertion order; equal priorities fall back to it).
 
 Registers are allocated before this pass, so only priorities and dependencies can be changed:
 - Height and successor counts come from the DAG: adding or removing a use of a value, or changing which value

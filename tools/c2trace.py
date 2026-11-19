@@ -6,7 +6,8 @@ usage: c2trace.py install                      build c2trace.dll and patch the t
        c2trace.py il <src> --func S --diff PASS_A,PASS_B [-- <cl args>]   what the passes between A and B changed
        c2trace.py merges <src> --func S [--pairs] [-- <cl args>]   every tail/head merge and why each pair stopped
                                      (also `il --merges`; tools/c2merges.py)
-       c2trace.py scratch <src> --func S [-- <cl args>]   scratch-register picks -> listing offsets (c2scratch.py)
+       c2trace.py scratch <src> --func S [--why] [--color] [-- <cl args>]   scratch-register picks -> listing offsets, and
+                                     which registers are Color's instead (C rows); --why: why each pick (c2scratch.py)
        c2trace.py regs <src> [--func S] [--why a,b] [-- <cl args>]   register-allocation report (tools/c2regs.py)
        c2trace.py slots <src> --func S [--what EDIT..] [--orig ORIG.s] [--search] [-- <cl args>]   stack-slot packing:
                                      colours, elements, replay model, what-if (tools/c2slots.py)
@@ -44,7 +45,7 @@ from image import Image, ROOT
 import ccache, msvc
 
 TRACE = os.path.join(ROOT, "work", "toolchain", "vs2005-trace")
-TBIN = os.path.join(TRACE, "VC", "Bin")
+TBIN = c2build.tcpath(TRACE, "VC", "Bin")
 ORIG_C2 = os.path.join(ROOT, "Bin", "c2.dll")
 CAVE_RVA = 0x1D7BB0          # .text slack: VirtualSize ends at RVA 0x1d7bab, raw data at 0x1d8000
 TEXT_HDR_VSIZE = 0x1D6BAB
@@ -54,7 +55,7 @@ FILE_DELTA, NSEC = 0, 5     # .text RVA - file offset; number of sections (build
 DEFAULT_HOOKS = ["@Color@4=s1,s2", "@Spillcosts@12=s1,s2,s3"]
 if c2build.table():           # another c2 build: its own toolchain copies and cave addresses (tools/c2builds/*.json)
     TRACE = c2build.toolchain(True)
-    TBIN = os.path.join(TRACE, "VC", "Bin")
+    TBIN = c2build.tcpath(TRACE, "VC", "Bin")
     ORIG_C2 = c2build.orig_c2()
     CAVE_RVA, TEXT_HDR_VSIZE, ENTRY_RVA, IAT_LOADLIBRARYA = (int(c2build.get("patch")[k], 16) for k in (
         "cave_rva", "text_vsize", "entry_rva", "iat_loadlibrarya"))
@@ -73,12 +74,15 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
  *   i <len> <kind> <cc> <target-rva>   (optional, after hook) one displaced instruction; kind 0 copy verbatim,
  *                 1 jcc (cc = condition nibble), 2 jmp, 3 call: re-encoded rel32 to target
  *   max <n>       stop logging after n events
+ *   func <text>   (repeatable) log only while the decorated name of the function being compiled contains every
+ *                 <text> (read at [[[_CurFunc]+0]+4]; `set curfunc <VA>` for another build); logs "# func <n>"
  *   ilmax <n>     cap on tuples per '%' IL dump (default 2000000; env C2TRACE_ILMAX on the Python side)
  *   set <name> <hex>  another c2 build (tools/c2build.py): base = preferred image base, regname / opname = the
  *                 _RegName / _TupOpcodeName tables, opcount = entries in the latter, blk / len / mem = tuple layout
  *                 (extended dump only: ext / labtup / brcc / ehop / ulabop, see dumpilx); fename 1 = the plain dump
  *                 prints a CODEADDR leaf (call target) by the front-end name at sym+4 (13.10; logs "# fename 1")
  *   op <hex> <name>   name of an opcode the build's own table lacks (after `set opcount`)
+ *   set ilpas <off>  memory leaves also print "@<hex word at leaf+off>" (the PAS index; loadcse.py); logs "# ilpas"
  *   set fpdump 1 writes "# fpdump 1" (this DLL has the '&' dump); set bbin / bbstk: its BB offsets (13.10: 48, 60)
  * spec := base { '>' off } [ '#' n ]
  *   base: eax ecx edx ebx esp ebp esi edi | sN (stack word N at entry: s0 = return address, s1 = first stack arg)
@@ -191,6 +195,21 @@ static int rstr(DWORD a, char *c, int max) {
 }
 static BYTE rb(DWORD a) { DWORD w = 0; readd(a, &w); return (BYTE)w; }
 static DWORD rd(DWORD a) { DWORD w = 0; readd(a, &w); return w; }
+/* `func <text>` (repeatable) + `set curfunc <c2 VA of _CurFunc>`: log only while the function being compiled is
+ * named so: an event is written (and counted for `max`) only when the decorated name at [[[_CurFunc]+0]+4] contains
+ * every <text>. Without `func` lines everything is logged as before. Hooks keep running either way (exit frames are
+ * still tracked), so the filter changes the log only. c2trace.py writes it from C2TRACE_FUNC or run_trace(func=). */
+#define MAXFF 4
+static char ffilt[MAXFF][256]; static int nffilt; static DWORD CURFUNC = 0x10d123ac;
+static int infunc(void) {
+    char nm[1024]; DWORD f, s, n; int i, m = 0;
+    if (!nffilt) return 1;
+    if (!readd(CURFUNC + delta, &f) || !f || !readd(f, &s) || !s || !readd(s + 4, &n) || !n) return 0;
+    while (m < (int)sizeof nm - 1 && readd(n + m, &f) && (nm[m] = (char)f) != 0) m++;
+    nm[m] = 0;
+    for (i = 0; i < nffilt; i++) if (!strstr(nm, ffilt[i])) return 0;
+    return 1;
+}
 static void symname(DWORD x) {
     char c[64]; BYTE k;
     if (!x) { out("0"); return; }
@@ -201,6 +220,8 @@ static void symname(DWORD x) {
     else out("%c%d", k == 3 ? 't' : k == 0xd ? 'k' : 's', rd(x + 0x1c));
 }
 static int FENAME = 0;         /* `set fename 1` (13.10): CODEADDR leaves print the front-end symbol's name at sym+4 */
+static int ILPAS = 0;          /* `set ilpas <off>` (env C2TRACE_ILPAS): memory leaves also print "@<word at leaf+off>",
+                                * the INDIR points-at-set index (14.00: +0x1c); 0 = off, the dump is unchanged */
 static int cdname(DWORD s) {   /* a call / tail-jump target: its symbol is the front end's, name pointer at +4 ([sym+0]
                                 * is not a name record there: 13.10 printed another symbol's name or s0) */
     char c[80]; DWORD p, t;
@@ -227,7 +248,9 @@ static void leaf(DWORD l) {
         if (rd(l + LMEM)) { symname(rd(l + LMEM)); out("+"); }
         if (rd(l + LMEM + 8)) { leaf(rd(l + LMEM + 8)); out("+"); }
         if (rd(l + LMEM + 12)) { leaf(rd(l + LMEM + 12)); out("*%d+", 1 << (rb(l + 0x14) & 15)); }
-        out("%d]", (int)rd(l + LMEM + 4)); break;
+        out("%d]", (int)rd(l + LMEM + 4));
+        if (ILPAS) out("@%x", rd(l + ILPAS));
+        break;
     case 11: out("regset"); break;
     case 12: out("pas%d", rd(l + 0x18)); break;
     default: out("k%d", k);
@@ -578,6 +601,7 @@ static void __cdecl on_entry(int i, Regs *r) {
         stk[0] = (DWORD)(exits + 10 * depth);
         depth++;
     }
+    if (!infunc()) return;            /* `func` filter: another function is being compiled */
     if (seq < maxev) {
         out("E %lu %d %d %x %x %x %x %x %x %x %x |", seq, f ? depth - 1 : depth, h->id,
             r->eax, r->ecx, r->edx, r->ebx, r->ebp, r->esi, r->edi, esp0);
@@ -598,6 +622,7 @@ static void __cdecl on_exit_(Regs *r) {
     Hook *h = &hooks[f->hook];
     r->slot = f->ret;
     depth = k;
+    if (!infunc()) return;
     if (seq < maxev) {
         out("X %lu %d %d %x %x |", seq, k, h->id, r->eax, r->edx);
         emit(h->x, h->nx, r, NULL, f);
@@ -658,6 +683,8 @@ static void setvar(const char *nm, DWORD v) {
     else if (!strcmp(nm, "gloopp")) GLOOPP = (int)v;
     else if (!strcmp(nm, "gsps")) GSPS = (int)v;
     else if (!strcmp(nm, "gspl")) GSPL = (int)v;
+    else if (!strcmp(nm, "curfunc")) CURFUNC = v;
+    else if (!strcmp(nm, "ilpas")) { ILPAS = (int)v; out("# ilpas %x\n", ILPAS); }   /* marker: this DLL knows it */
 }
 
 static void install(BYTE *base) {
@@ -693,6 +720,8 @@ static void install(BYTE *base) {
         } else if (!strcmp(a, "op")) {
             char nm[20]; unsigned long v;
             if (sscanf(line, "op %lx %19s", &v, nm) == 2 && v >= OPCOUNT && v - OPCOUNT < 256) strcpy(opx[v - OPCOUNT], nm);
+        } else if (!strcmp(a, "func") && nffilt < MAXFF) {
+            if (sscanf(line, "func %255s", ffilt[nffilt]) == 1) nffilt++;
         } else if (!strcmp(a, "flush")) eachflush = 1;
     }
     fclose(fp);
@@ -700,6 +729,7 @@ static void install(BYTE *base) {
         logf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
     delta = (DWORD)base - imgbase;
     out("# c2trace base %x hooks %d\n", (DWORD)base, nhooks);
+    if (nffilt) out("# func %d\n", nffilt);             /* marker: this DLL filters by function (`func`) */
 
     code = (BYTE *)VirtualAlloc(NULL, 64 * MAXHOOK + 10 * MAXDEPTH + 64, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!code) return;
@@ -859,6 +889,15 @@ REMOTE_CLIENTS = _remote_clients()
 REMOTE_DEFAULT = REMOTE_CLIENTS[0][0] if REMOTE_CLIENTS else ""
 
 
+def remote_configured():
+    """Is a compile server configured (and not turned off with C2TRACE_REMOTE=0)? Tools that refuse to fall back to
+    wine (effectmine, icount) refuse only then: with no server configured, every traced compile is local anyway."""
+    v = os.environ.get("C2TRACE_REMOTE")
+    if v == "0":
+        return False
+    return bool(v) or bool(REMOTE_CLIENTS)
+
+
 def run_remote(args, cfg, log):
     """The traced compile on a Windows machine instead of under wine, or None to compile here (see REMOTE_CLIENTS).
     The client ships the source, the headers it reaches and the hook list, and writes the listing, object and trace
@@ -901,7 +940,7 @@ def _run_remote_client(client, args, cfg, log):
         if p.returncode != 75:
             break
         time.sleep(0.5 + 0.1 * attempt)
-    if p.returncode in (75, 76) or not os.path.exists(log):
+    if p.returncode in (75, 76) or (not os.path.exists(log) and p.returncode == 0):
         if os.environ.get("C2TRACE_REMOTE_DEBUG"):
             sys.stderr.write("c2trace: remote compile declined (%d), compiling here\n%s" % (
                 p.returncode, (p.stdout + p.stderr)[-1500:]))
@@ -1040,13 +1079,36 @@ def _split(s):
     return out
 
 
-def write_cfg(cfg, img, hooks, maxn=None, exit_all=False):
-    """The trace config c2trace.dll reads (%C2TRACE_CFG%) for these parsed hooks."""
+def func_filter(pat):
+    """The `func` lines of the trace config for a --func value: the decorated-name text it is looked up as
+    (func_pat), split around anonymous-namespace hashes (the DLL tests plain substrings; the hash depends on the
+    compile's path). [] selects everything."""
+    p = func_pat(pat) if pat else ""
+    return [x for x in _ANON_NS.split(p) if x and not x.isspace()][:4] if p else []
+
+
+def curfunc_va():
+    """c2 VA of _CurFunc (the FUNC being compiled) in this build."""
+    return c2build.get("globals", {}).get("_CurFunc", "10d123ac") if c2build.table() else "10d123ac"
+
+
+def write_cfg(cfg, img, hooks, maxn=None, exit_all=False, func=None):
+    """The trace config c2trace.dll reads (%C2TRACE_CFG%) for these parsed hooks. `func` (or the environment
+    variable C2TRACE_FUNC when func is None): log only while that function is compiled (DLL directive `func`)."""
+    if func is None:
+        func = os.environ.get("C2TRACE_FUNC") or None
     with open(cfg, "w") as f:
         if maxn is not None:
             f.write("max %d\n" % maxn)
+        ff = func_filter(func)
+        if ff:
+            f.write("set curfunc %s\n" % curfunc_va())
+            f.writelines("func %s\n" % x for x in ff)
         if os.environ.get("C2TRACE_ILMAX"):
             f.write("ilmax %d\n" % int(os.environ["C2TRACE_ILMAX"]))
+        if os.environ.get("C2TRACE_ILPAS"):          # memory leaves print their PAS index (tools/loadcse.py)
+            f.write("set ilpas %s\n" % (os.environ["C2TRACE_ILPAS"] if os.environ["C2TRACE_ILPAS"] != "1" else
+                                        c2build.get("dll", {}).get("ilpas_off", "1c")))
         if c2build.table():
             f.write("set base %s\n" % c2build.get("image_base"))
             f.writelines("set %s %s\n" % kv for kv in sorted(c2build.get("dll", {}).items()))
@@ -1062,7 +1124,8 @@ def write_cfg(cfg, img, hooks, maxn=None, exit_all=False):
 
 def func_pat(pat):
     """The text a --func value is looked up as in decorated names (shared by every subcommand and the sweeps).
-    `Class::method` -> `?method@Class@@` (nested: `N::C::m` -> `?m@C@N@@`; `C::C` / `C::~C` -> `??0C@@` / `??1C@@`);
+    `Class::method` -> `?method@Class@` (nested: `N::C::m` -> `?m@C@N@`; `C::C` / `C::~C` -> `??0C@` / `??1C@`):
+    the qualifiers' end is left open, so a class inside any enclosing namespace matches too (`?method@Class@NS@@`);
     `::name` -> a global function (`?name@@` in C++ names; for C names use the plain form);
     anything else (a plain name, `method@Class`, a full decorated name) is returned unchanged: a substring."""
     if not pat or "::" not in pat:
@@ -1071,32 +1134,45 @@ def func_pat(pat):
     if not parts:
         return pat
     name, scope = parts[-1], parts[:-1]
-    if scope and name == scope[-1]:
-        name = "?0"
-    elif scope and name == "~" + scope[-1]:
-        name = "?1"
-    return "?" + "@".join([name] + scope[::-1]) + "@@"
+    end = "@" if scope else "@@"
+    if scope and name in (scope[-1], "~" + scope[-1]):      # constructor / destructor: ??0C@ / ??1C@ (no @ after 0/1)
+        return "??" + ("1" if name[0] == "~" else "0") + "@".join(scope[::-1]) + end
+    return "?" + "@".join([name] + scope[::-1]) + end
 
 
 def func_decl(pat):
     """A --func value as the start of a decorated member name where one is needed to find the definition in the
-    source (rwsweep, helpersweep): `Class::method` and `method@Class` -> `?method@Class@@`; others unchanged."""
+    source (rwsweep, helpersweep): `Class::method` and `method@Class` -> `?method@Class@` (any enclosing namespace
+    still matches); others unchanged."""
     pat = func_pat(pat)
     m = re.fullmatch(r"(\w+)@(\w+)", pat or "")
-    return "?%s@%s@@" % m.groups() if m else pat
+    return "?%s@%s@" % m.groups() if m else pat
+
+
+_ANON_NS = re.compile(r"\?A0x[0-9a-fA-F]+@")
+
+
+def anon_ns(s):
+    """`s` with every anonymous namespace's hash removed (`?A0x1a2b3c4d@` -> `?A0x@`): cl hashes the source file's
+    path into it, so the same function is named differently when compiled at another path (a compile server)."""
+    return _ANON_NS.sub("?A0x@", s) if s and "?A0x" in s else s
 
 
 def func_match(pat, name):
-    """True when the decorated `name` is selected by the --func value `pat` (None or '' selects everything)."""
-    return not pat or func_pat(pat) in name
+    """True when the decorated `name` is selected by the --func value `pat` (None or '' selects everything).
+    Anonymous-namespace hashes are ignored on both sides (anon_ns)."""
+    p = anon_ns(func_pat(pat))
+    name = anon_ns(name.strip('"'))  # some callers pass the logged value with its quotes (c2scratch)
+    # the trace logs names cut to 79 characters: a full decorated name longer than that contains the cut name
+    return not pat or p in name or (len(name) >= 79 and len(p) > len(name) and p.startswith(name))
 
 
 def listing_proc(text, func):
     """(start, end) of the PROC..ENDP text of the function selected by `func` (any --func form) in a /FAsc listing;
     the first match wins.  KeyError when there is none."""
-    pat = func_pat(func) or ""
+    pat = anon_ns(func_pat(func) or "")
     for m in re.finditer(r"^(\S+)[ \t]+PROC\b", text, re.M):
-        if pat in m.group(1):
+        if pat in anon_ns(m.group(1)):
             return m.start(), text.index("ENDP", m.end())
     raise KeyError("%s PROC not in the listing" % func)
 
@@ -1110,11 +1186,37 @@ def split_cl(argv):
     return argv, []
 
 
-def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=False):
+def keep_path(keep):
+    """A --keep directory as an absolute path. Relative paths are taken against the caller's cwd, except that the
+    repository root is not a scratch place: from there a relative path outside work/ goes under work/keep/ (a
+    script that `cd`s here and passes its own relative `--keep b/k_x` wrote 512 such directories into the root)."""
+    if os.path.isabs(keep):
+        return keep
+    ab = os.path.abspath(keep)
+    root = os.path.abspath(ROOT)
+    if os.path.abspath(os.getcwd()) == root and ab.startswith(root + os.sep) and \
+            not ab.startswith(os.path.join(root, "work") + os.sep):
+        ab = os.path.join(ROOT, "work", "keep", os.path.relpath(ab, ROOT))
+        if not _KEEP_SAID:
+            _KEEP_SAID.append(1)
+            sys.stderr.write("c2trace: --keep %s is relative to the repository root: kept in %s instead\n" % (keep, ab))
+    return ab
+
+
+_KEEP_SAID = []
+
+
+def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=False, func=None):
     """Compile src with the traced c2; returns (img, hooks, rc, cl output, raw log text).
-    Relative `src` and `keep` paths are taken against the caller's cwd (resolved here, before anything runs elsewhere)."""
+    Relative `src` and `keep` paths are taken against the caller's cwd (resolved here, before anything runs elsewhere).
+    func: a --func value; events are then logged only while that function is compiled (write_cfg; default: the
+    environment variable C2TRACE_FUNC, unset = everything)."""
     src = os.path.abspath(src)
-    keep = os.path.abspath(keep) if keep else keep
+    if not os.path.isfile(src):
+        # before anything is written: a script that passed a relative source from the wrong cwd used to leave one
+        # keep directory per call with only c2trace.cfg in it (the stray b/k_wm_b000.. at the repository root)
+        sys.exit("c2trace: %s: no such source file" % src)
+    keep = keep_path(keep) if keep else keep
     if open(os.path.join(TBIN, "c2.dll"), "rb").read() == open(ORIG_C2, "rb").read() or \
             not os.path.exists(os.path.join(TBIN, "c2trace.dll")):
         sys.exit("traced toolchain not installed: uv run tools/c2trace.py install")
@@ -1123,7 +1225,7 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
     d = keep or tempfile.mkdtemp(prefix="c2trace_")
     os.makedirs(d, exist_ok=True)
     cfg, log = os.path.join(d, "c2trace.cfg"), os.path.join(d, "c2trace.log")
-    write_cfg(cfg, img, hooks, maxn, exit_all)
+    write_cfg(cfg, img, hooks, maxn, exit_all, func)
     if os.path.exists(log):
         os.remove(log)
     stem = os.path.splitext(os.path.basename(src))[0]
@@ -1142,7 +1244,7 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
         rc, out = info["rc"], info["out"]
     else:
         r = run_remote(args, cfg, log)
-        if r and any(x.startswith("set fpdump 1") for x in open(cfg)) and \
+        if r and os.path.exists(log) and any(x.startswith("set fpdump 1") for x in open(cfg)) and \
                 "# fpdump 1" not in open(log, errors="replace").read(4096):
             # the compile server's c2trace.dll predates the x87 view ('&', `set fpdump`): compile here instead
             if not _FPDUMP_SAID:
@@ -1151,7 +1253,7 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
                                  "redeploy %s there\n" % TBIN)
             os.remove(log)
             r = None
-        if r and any(x.startswith("set gdump 1") for x in open(cfg)) and \
+        if r and os.path.exists(log) and any(x.startswith("set gdump 1") for x in open(cfg)) and \
                 "# gdump 1" not in open(log, errors="replace").read(4096):
             # the same for the globreg view ('^', `set gdump`, c2regs.py --pieces)
             if not _FPDUMP_SAID:
@@ -1179,6 +1281,41 @@ def run_trace(src, hook_texts, cl, maxn=None, keep=None, exit_all=False, quiet=F
     else:
         shutil.rmtree(d, ignore_errors=True)
     return img, hooks, rc, out, text
+
+
+def pipe_safe(fn, *args):
+    """fn(*args), but a reader that goes away (`c2trace.py regmap ... | head`) ends the program quietly with status
+    141 (128 + SIGPIPE, as a C tool would), instead of a BrokenPipeError traceback. Only stdout's own pipe counts: a
+    broken pipe elsewhere (a socket) is re-raised."""
+    try:
+        try:
+            return fn(*args)
+        finally:                             # also on sys.exit (argparse --help): the buffer is written here
+            sys.stdout.flush()
+    except BrokenPipeError:
+        try:
+            sys.stdout.flush()
+            ours = _stdout_closed()
+        except BrokenPipeError:
+            ours = True
+        if not ours:
+            raise
+        try:                                 # the interpreter flushes stdout again at exit: send that to /dev/null
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        os._exit(141)
+
+
+def _stdout_closed():
+    """True when stdout is a pipe whose reader has closed it (a zero-byte write does not tell; poll does)."""
+    import select
+    try:
+        p = select.poll()
+        p.register(sys.stdout.fileno(), select.POLLOUT)
+        return any(ev & (select.POLLERR | select.POLLHUP) for _, ev in p.poll(0))
+    except (OSError, AttributeError, ValueError):
+        return True
 
 
 def main():
@@ -1219,4 +1356,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(pipe_safe(main))

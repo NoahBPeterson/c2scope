@@ -7,7 +7,16 @@ removed, and any extra strings the caller adds (a trace config, the traced c2.dl
 (`#include <...>`) are not hashed: they belong to the toolchain, which is fixed.
 
 Entries live in work/cache/<key>/ and hold the files the caller stored plus meta.json. Set CCACHE=0 to bypass,
-CCACHE=refresh to recompute and overwrite. `uv run tools/ccache.py stats|clear`.
+CCACHE=refresh to recompute and overwrite. `uv run tools/ccache.py stats|clear|prune`.
+
+Size cap: CCACHE_MAX_GB (default 20). At most once a minute (across processes) a store checks the total and, when it
+is over the cap, removes the least recently used entries (a hit refreshes an entry's time) down to 80% of the cap.
+Trace logs are large (up to hundreds of MB), so an uncapped cache filled the disk within a day.
+
+A compile that died with an internal compiler error (C1001 in the stored output) is never stored, and an entry
+holding one is a miss: a traced c2 can crash for reasons the key does not cover (the compile server's copy of the
+tracer, a transient failure there). One such crash at 09:24 on 2026-11-19 was replayed by every later run of
+icount_tests on 13.10 (`stmt` probe) until the entry was found; the same compile without the cache never crashed.
 """
 import hashlib, json, os, re, shutil, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -76,16 +85,34 @@ def get(k):
     if mode() in ("0", "refresh"):
         return None
     d = os.path.join(DIR, k)
-    return d if os.path.exists(os.path.join(d, "meta.json")) else None
+    if not os.path.exists(os.path.join(d, "meta.json")):
+        return None
+    try:
+        if _ice(meta(d)):
+            return None
+    except (OSError, ValueError):
+        return None
+    try:
+        os.utime(d)                   # least recently used order for prune()
+    except OSError:
+        pass
+    return d
 
 
 def meta(d):
     return json.load(open(os.path.join(d, "meta.json")))
 
 
+def _ice(info):
+    """True when info's compiler output reports an internal compiler error (not a function of the key)."""
+    out = info.get("out") if isinstance(info, dict) else None
+    return isinstance(out, str) and ("C1001" in out or "INTERNAL COMPILER ERROR" in out)
+
+
 def put(k, files, info):
-    """Store files ({name: path or None}) and info (JSON-able) under k. Returns the entry directory."""
-    if mode() == "0":
+    """Store files ({name: path or None}) and info (JSON-able) under k. Returns the entry directory, or None when
+    nothing was stored (CCACHE=0, or the compile died with an internal compiler error)."""
+    if mode() == "0" or _ice(info):
         return None
     d = os.path.join(DIR, k)
     tmp = d + ".tmp%d" % os.getpid()
@@ -100,11 +127,62 @@ def put(k, files, info):
         os.rename(tmp, d)
     except OSError:                   # another process stored the same key first
         shutil.rmtree(tmp, ignore_errors=True)
+    maybe_prune()
     return d
+
+
+def max_bytes():
+    try:
+        return float(os.environ.get("CCACHE_MAX_GB", "20")) * 1e9
+    except ValueError:
+        return 20e9
+
+
+def prune(limit=None):
+    """Remove least recently used entries until the cache is at most 80% of `limit` (default the cap); returns
+    (bytes before, bytes after)."""
+    limit = max_bytes() if limit is None else limit
+    entries = []
+    for name in os.listdir(DIR) if os.path.isdir(DIR) else []:
+        d = os.path.join(DIR, name)
+        try:
+            size = sum(e.stat().st_size for e in os.scandir(d) if e.is_file())
+            entries.append((os.stat(d).st_mtime, size, d))
+        except OSError:
+            continue
+    total = before = sum(e[1] for e in entries)
+    if total > limit:
+        for _t, size, d in sorted(entries):
+            if total <= 0.8 * limit:
+                break
+            shutil.rmtree(d, ignore_errors=True)
+            total -= size
+    return before, total
+
+
+def maybe_prune():
+    """prune() at most once a minute across processes (the mtime of work/cache/.prune)."""
+    import time
+    mark = os.path.join(DIR, ".prune")
+    try:
+        if time.time() - os.path.getmtime(mark) < 60:
+            return
+    except OSError:
+        pass
+    try:
+        open(mark, "a").close()
+        os.utime(mark)
+        prune()
+    except OSError:
+        pass
 
 
 def main():
     cmd = sys.argv[1:2] or ["stats"]
+    if cmd == ["prune"]:
+        b, a = prune()
+        print("%.1f GB -> %.1f GB (cap %.0f GB)" % (b / 1e9, a / 1e9, max_bytes() / 1e9))
+        return
     if cmd == ["clear"]:
         shutil.rmtree(DIR, ignore_errors=True)
         print("cleared", DIR)

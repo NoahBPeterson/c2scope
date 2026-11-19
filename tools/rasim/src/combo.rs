@@ -1202,6 +1202,7 @@ impl<'t> Run<'t> {
             colour: self.colours(n),
             pops: self.pops().into_iter().cloned().collect(),
             inferred: self.infs().into_iter().cloned().collect(),
+            why: vec![],
         }
     }
 }
@@ -1275,6 +1276,17 @@ impl<'a> Ctx<'a> {
         let p = self.prep(cs, want_desc)?;
         let out = self.exec(&p)?;
         Ok(Eval { out, desc: p.desc })
+    }
+
+    /// The free run of the given changes with the colourings of `webs` explained term by term (Outcome::why).
+    pub fn explain(&self, cs: &[&Cand], webs: &[usize]) -> Option<Outcome> {
+        let p = self.prep(cs, false).ok()?;
+        let mut md = p.md.clone();
+        if let Some(o) = &p.ord {
+            md.order = Some(self.uni.steps_ord(&self.m, o));
+        }
+        md.explain = webs.to_vec();
+        self.m.run(&md).ok()
     }
 
     /// Everything but the register model's run: the changes resolved, the edits applied, the step order.
@@ -1554,6 +1566,33 @@ fn search(cx: &Ctx, tg: &[(usize, u32)], given: &[Cand], opts: &Opts) {
                 .join(" ")),
             if holds { "  (holds)" } else { "" }
         );
+    }
+    // where the weights come from (regalloc.md 4): one line per register with a nonzero weight
+    let ws: Vec<usize> = tg.iter().map(|&(w, _)| w).collect();
+    if shown {
+        if let Some(ex) = cx.explain(&g, &ws) {
+            let mut said = false;
+            for &(w, r) in tg {
+                let (Some(p), Some((_, terms))) = (base.first_pop(w), ex.why.iter().find(|(v, _)| *v == w)) else { continue };
+                let lines: Vec<String> = ORDER.iter().filter(|&&q| p.avail >> q & 1 == 1 && p.w[q as usize] != 0).map(|&q| {
+                    let t = cx.m.weight_text(terms, q);
+                    format!("    {}:{} = {}", rname(q), p.w[q as usize], if t.is_empty() { "?".into() } else { t })
+                }).collect();
+                if lines.is_empty() {
+                    continue;
+                }
+                println!("  {} weights (wanted {}):", m.label(w), rname(r));
+                for l in lines {
+                    println!("{}", l);
+                }
+                said = true;
+            }
+            if said {
+                println!("  (weight: ChoosePhysReg's cost per register, the lowest available wins, ties to eax ecx edx esi edi ebx ebp; \
+                          an uncoloured neighbour adds its PREF counts and 100 x its benefit on its last register, the value's own PREFs \
+                          subtract; regalloc.md 4)");
+            }
+        }
     }
     let u0 = unmet(&base);
     if !shown {
@@ -2027,7 +2066,11 @@ pub fn cmd_want(s: &Snap, path: &str, given: &[String], opts: &Opts) {
         let Some(vi) = vi else { continue };
         if webs.is_empty() {
             if t[vi] != "ok" {
-                skipped.push(format!("{} ({}): not a value Color coloured (a scratch temporary: see `rasim scratch`)", name, t[vi..].join(" ")));
+                let nm = name.strip_prefix('_').unwrap_or(name);
+                match m.missing.iter().find(|x| x.name == nm) {
+                    Some(x) => skipped.push(format!("{} ({}): no row in the regs table: {}", name, t[vi..].join(" "), x.reason)),
+                    None => skipped.push(format!("{} ({}): not a value Color coloured (a scratch pick or a cl 13.10 Riscify temp: `c2trace.py scratch --export S.json`, then `rasim scratch S.json --want REGMAP.txt`)", name, t[vi..].join(" "))),
+                }
             }
             continue;
         }

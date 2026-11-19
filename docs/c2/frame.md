@@ -584,6 +584,9 @@ M&B `docs/codegen.md` §7 and vs2005 `docs/codegen.md` §2.
   slot (4 > 2·1).
 - `16-byte alignment, and esp,-16`: `FUNC+0x48` caps and raises slot alignment (`allotemp`, `colorElemental`).
   `StkSetStackAlignment` 0x10bed0a0 sets it [I: not read in detail].
+- A 16-byte-aligned local also changes **other** functions: on 14.00 and 15.00 one such function anywhere in the
+  unit (or /arch:SSE2) sets the module flag `_FHasMustAlign`, and then no `static` helper gets a register parameter
+  in ebx; on 13.10 only the callees of the aligned-local function lose it (f3decomp R850, ltcg.md 2.5) **[C, M]**.
 - vs2005 "compile: the /GS parameter shadow copy": Section 3.6. The copy is (almost certainly) present in the
   original too; the mismatch is ebx being spilled in our loop.
 

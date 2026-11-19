@@ -134,7 +134,7 @@ SSR+0x50 bits used by the driver (see il_sym for the record itself):
 | 0x40 | inline candidate (see above) | **C** use, **I** name |
 | 0x100 | has EH; with `-noehopt` it turns off global opts (MscProcessPragstat) | **C** |
 | 0x1000 | c1 wrote a callee list, so the function gets a CGNODE | readsym **C** |
-| 0x40000 | must-align; sets `_FHasMustAlign` (CgBottomUpOrder) | **C** |
+| 0x40000 | must-align; sets `_FHasMustAlign` (CgBottomUpOrder), which takes ebx from every static helper's register parameters (ltcg.md 2.5) | **C** |
 | bits 8,9,10,15,19 | copied into FUNC.flags 0x40000, 0x100000, 0x200000, 0x8000000, 0x400000 by RdrReadProc | **C** |
 
 ## 3. Compilation-level structures

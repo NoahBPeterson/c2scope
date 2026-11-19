@@ -22,6 +22,7 @@
   "iat_loadlibrarya": "166144"
  },
  "dll": {
+  "ilpas_off": "24",
   "gdump": "1",
   "gsbv32": "1",
   "gloop": "a6",
@@ -545,7 +546,10 @@
   "_OpSchedInfo": "108a7db8",
   "_Speed": "108a9208",
   "_RegMap": "108a74f0",
-  "_regAvail1": "108a7b1c"
+  "_regAvail1": "108a7b1c",
+  "_GetRegCursor": "108b022c",
+  "_GetRegCount": "108b0230",
+  "_RegUsedTbl": "108a7638"
  },
  "slots": {
   "sbv": {
@@ -732,7 +736,17 @@
    "1070e28e=esi,esi>0x1c,esi>0>0>4$,esi>0>0x1c,esi>0>4",
    "@ColMakeSplitPoint@16=ecx,ecx>4,ecx>0x14,eax,s2>0>0,s2>0>8,s2>0>4>0,s2>0>4>8",
    "@FPMakeSplitPoint@8=ecx,ecx>4,ecx>0x14,s1>0>0,s1>0>8,s1>0>4>0,s1>0>4>8"
-  ]
+  ],
+  "regs_cand": [
+   "1077c60c=esi,esi>0x14,esi>0xa,esi>0x18,esi>0x18>4,esi>0x18>8>0,esi>0x18>0x1c,esi>0x18>0>4$",
+   "1077c66b=esi>0x18"
+  ],
+  "origin": {
+   "ra": "@RewriteAsReal@4=g10881d74>0>0>4$,g10881d74>0>8>0>0x1c%",
+   "rp": "@Riscify@4=g10881d74>0>0>4$,g10881d74>0>8>0>0x1c%",
+   "gr": "@GetReg@8=s1>0#3,s2,g108b022c>0,s8,g108a9738#8,g108b0230>0,g108a7638#9/xeax",
+   "rm": "@MdmAvoidMOBStalls@4=g10881d74>0>0>4$,g10881d74>0>8>0>0x1c%"
+  }
  },
  "opnames": {
   "24a": "OPILLEGAL",
@@ -869,6 +883,7 @@
   "108692e0",
   "249"
  ],
+ "regs_cand_xclass": "4000",
  "regs_events": {
   "27": [
    "pop",

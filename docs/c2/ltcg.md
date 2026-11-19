@@ -123,6 +123,52 @@ still multiplies by its stack argument and the callers push 5, and the 6030 PDB 
 "FoldCmpSpeedWeight" inliner bonus for compares against constant arguments is reported elsewhere; no symbol of
 that name is in our 14.00 index and it was not examined **[not verified]**.
 
+### 2.5 Static helpers without /GL: ebx, struct parameters, entry loads (f3decomp R850, R860, R865) **[C, M on all four builds]**
+
+The private convention of 2.2 is not an LTCG feature only: in a plain /O2 compile a `static` function whose
+address is not taken (with a caller in the unit, `__declspec(noinline)` so it is not inlined) gets it on 14.00,
+15.00, 13.10.3077 and 13.10.3052 alike (`tests/data/rules/R850_mustalign.cpp`: `; _m$ = ebx` on every build).
+Three rules decide which parameters arrive in registers. Checks: `rules_calls_tests()` in tests/run_tests.py;
+rows in rules_xref.md.
+
+**ebx and must-align (R850).** MdmFlexParams lowers the budget to 2 and excludes ebx when
+`MdmWillUseEbxConservative` is true (this function needs ebx for an aligned frame) or when a second test says so;
+the second test is per build:
+
+| build | second test | set by | so |
+|---|---|---|---|
+| 14.00 | global `_FHasMustAlign` (10d08fe0), tested at MdmFlexParams+0x372 10c597d2 | `CgBottomUpOrder` 10b05c05: any function of the unit's entry list with SSR+0x50 & 0x40000 (has a 16-byte-aligned local, also one from an inlined callee); `CgBuildCallGraph` 10b056f4: Module+0x450 > 2 (/arch:SSE2); WPA's `WpaBUEnterTupList` (an SSE instruction that faults unaligned, LTCG) | **module-wide**: one aligned-local function before or after the helper takes ebx from every static helper; so does /arch:SSE2 with no aligned local at all |
+| 15.00 | global `?FHasMustAlign@@3HA` (512470d8), MdmFlexParams+0x377 51230a47 | CgBottomUpOrder 51058235, CgBuildCallGraph 51057d05 (the same two tests) | the same as 14.00 |
+| 13.10.3077 / 3052 | CGNODE+0x50 bit 0x1000 of the helper (`[[FUNC]+0x99]+0x50`, tested at 1074b26e / 1074c0cd) | `CgSetCallerHasMustAlign` 1070c93e: for each function with the must-align bit 0x40000 (13.10's SSR+0x69), its callees and theirs (`CgPropagateHasMustAlign`) | **per call graph**: only a helper called (directly or through other functions) from an aligned-local function loses ebx; an unrelated aligned function and /arch:SSE2 change nothing |
+
+Traced (`C2TRACE_FUNC='?helper@@'`): 14.00 `-H '@MdmFlexParams@4=g10d08fe0>0'` gives 0 with the aligned type only
+declared, 1 with an aligned-local function after the helper; 13.10 `-H '1074b268=eax>0x99>0x50'` gives 0x11
+without and 0x1011 with the aligned function as the helper's caller. An aligned type that is only declared, or a
+`static` / `inline` function with an aligned local that is never compiled, does not set the flag (measured on 14.00
+and 13.10). Consequence for 14.00 / 15.00 matching: a static helper that matches alone and differs in its file
+(an ebx entry load in one, a stack parameter in the other) depends on whether **any** function in the file has an
+aligned local or the file is built with /arch:SSE2. On 13.10 look at the helper's callers instead.
+
+**Struct parameters (R860).** A by-value struct parameter, even one holding a single pointer, is never a register
+parameter. Two type gates, both the TyGetIndex list {1, 2, 4, 7, 8, 10}: `ReachingOccurGenKill` inserts the entry
+enter-load only for parameters of those types (below), and MdmFlexParams marks a parameter fixed (SYM+0x35) when
+`MdmCanAlloRegType` 10c56370 rejects its type (traced: type 0x6004 on 14.00, 0x5004 on 13.10 -> 0; the pointer
+0x1004 -> 1). The placement of the load is not what decides: with the struct read in the entry block
+(`R860_structparam.cpp /DENTRY`) its load is the function's first instruction and it still stays on the stack, on
+all four builds. 15.00 does not keep the struct in a register at all (no MdmCanAlloRegType call for it [I]: rejected
+by the SYM test before it).
+
+**Entry loads (R865).** `ReachingOccurGenKill` 10b56f20 (Globregs' data flow), when SSR+0xb4 ("may be flexible",
+set by MdmAllowFlexParams) is nonzero, calls `CmdInsertEnter` for every register-typed parameter, at the top of the
+entry block (call site 14.00 10b56fb0, 15.00 510a55ae, 13.10.3077 1077e8e7, 13.10.3052 10782217). So in a function
+that may get a private convention every register parameter's load is in the entry block before the prologue end,
+where MdmFlexParams then finds it; in an ordinary function the load goes where its register range starts (the
+loop preheader in `R865_enterload.cpp`: `mov ecx, [info]` after three calls). Probe on the call site: extern
+`late` 0 hits, static 2. A parameter loaded at the top that cannot become a register parameter (ebp, an x87 load,
+a parameter also used as memory, ebx under R850) stays an early `mov reg, [esp+N]`: the static `late` on 15.00
+unrolls its loop and loads `info` into ebp as its third instruction. In a listing, an early load of a parameter that
+is first used much later means a static function.
+
 ## 3. Kill sets **[C]**
 
 **Recording.** `MscCollectUsedRegs` 10ba2030 walks the callee's final instruction list and collects every register

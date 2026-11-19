@@ -27,10 +27,15 @@ first; read `docs/c2/tracer.md` for every tool's details. Every tool prints its 
 |---|---|---|
 | Registers only (same instructions) | `c2trace.py regmap` (which variable wants which register) | `rasim want SNAP regmap.txt` for the source edits that fix them |
 | Two values in swapped callee-saved registers | `c2trace.py regs --why A,B` (priority per block) | `rasim need SNAP 'A>B'` or `reg:A=esi` |
-| eax/ecx/edx choices (scratch temporaries) | `c2trace.py scratch --why` | `rasim scratch SSNAP drop:N` / `ins:N` |
+| eax/ecx/edx choices (scratch temporaries) | `c2trace.py scratch --why` | `rasim scratch SSNAP drop:N` / `ins:N`; several `want:` at once: the joint edit set is printed first |
+| A variable missing from the `regs` table | its "not in the table" line (volatile, address-taken, propagated away, spilled, left without a register) | the phase named there |
 | eax/ecx/edx a step off in many later switch cases | `c2trace.py scratch --phase orig.s` (phase per case, first divergence) | its scan: the one inserted/removed pick that re-aligns most cases |
 | x87 operand order, commutative operand order | `symkeys.py sites` | `symkeys.py levers` for natural edits that move a key; `levers --site L:A>B ...` for several sites at once |
+| A load reused in a register where the original reloads it (or the reverse), `op [m], y` against load/op/store | `loadcse.py` (each read: reused or reloaded and the rule; each store: RMW formed or why not) | docs/c2/loadcse.md §4 constructs; `rwsweep --families unalias` |
 | Instruction order (loads, stores, cmp placement) | `c2sched.py` (scheduler decisions) | `c2trace.py il --diff` between passes |
+| Instruction order inside one scheduling region (a load issued after a store, a reload first) | `schedwant.py SRC --func F --asm-vs orig.s` (the original's order per region, replayed; the DAG changes that give it: `unalias:X`, `alias:X`, `cut:X>Y`, `ns:X+1`) | `unalias` of a copy's loads: copy from the parameters, not an address-taken local (Spore 00598db0); `alias` of a store: a non-literal index or a member's inlined constructor pins earlier stores (sched.md rule 4a) |
+| Operand order that `symkeys levers` cannot move (SU or count decides) | `sulever.py SRC --func F --site 'LINE:A>B'` (which weight component decides, what each operand needs, regrouping) | `--spell 'TEXT' --asm-vs orig.s` compiles the catalogue spellings (`(*(unsigned*)&lo & 0xff)`: SU1, same code; Spore 0068c6d0) |
+| An aggregate local whose fields sit elsewhere (displacements of one local off, `slots --orig` votes split) | `framefields.py SRC --func F --orig orig.s` (per element: our field offsets against the original's, extent, order-only differences) | a key in front: the original passes `pair<key, value>` (Spore 00e2c840) |
 | Reloads after a loop in the wrong order | `rasim check SNAP --predict` (split-piece numbering) | regalloc.md 3.6.9: first-mention order, dead mentions |
 | A function that calls others with addresses of its locals | `calleesum.py EXE --caller VA` | `calleesum.py EXE CALLEE_VA --proto '...'` generates the stub body |
 | Anything, when you have no idea | `rwsweep.py` over the function (mechanical rewrites, each compiled and scored) | `tsweep.py` with `{{a<|>b}}` alternatives you write |
@@ -39,6 +44,7 @@ first; read `docs/c2/tracer.md` for every tool's details. Every tool prints its 
 | Stack offsets differ (`_x$`/`$T`/`tv` slots in other places, same code) | `c2trace.py slots SRC --func F --orig orig.s` (colours, visiting order, every colour refused and why; ours against the original's slots) | `--search` (single edits: uses, visiting position, a conflict) and `c2slots.py what SNAP uses:X=N` to try one; rules: docs/c2/slots.md |
 | /GL + /LTCG code | `c2ltcg.py` (traces at link time) | docs/c2/ltcg.md when present |
 | A model answer (`ref:V:B`, `extend:V:B`, `P:B:+1`, `add:frame@V:n`) you cannot spell in C++ | `realize.py edit SRC --func F EDIT` (each catalogued construct applied at the block's source lines, compiled, checked) | `realize.py --from-rasim auto SRC --func F --asm-vs orig.s` runs regmap, `rasim want` and the rewrites until one matches; catalogue: docs/c2/realize.md |
+| A model answer realize has no construct for (`drop:N`, `uses:X=N`, `conf-:A,B`, `pref:V:REG`, `before:A:B`, `sched:A>B`, a key count) | `effectmine.py mine SRC --func F --want EFFECT --asm-vs orig.s` (generic mutations of the function and its unit, each compiled traced, every model's effect recorded in a database) | `effectmine.py table`: per mutation class, how often it produced each effect elsewhere; docs/c2/effectmine.md |
 
 `SNAP` comes from `c2trace.py regs SRC --func F --export snap.json -- FLAGS`; `SSNAP` from `c2trace.py scratch ...
 --export s.json`. `rasim` is `tools/rasim/target/release/rasim`.
@@ -79,11 +85,19 @@ From `docs/c2/frontend.md`, `immcand.md`, `symkeys.md` and `x87.md`; each is an 
 ## Pitfalls
 
 - Do not compare against a listing from another compiler build or other flags.
-- `regdiff` counts aligned differences including registers; a shape-only difference (registers masked) of 0
-  means the code is right and only allocation differs.
+- `bdiff` (the default score of tsweep, rwsweep, helpersweep and realize) counts aligned instructions that differ
+  as the bytes encode them: registers, displacements, immediates, operand order and size; relocations, call/jump
+  targets and padding are masked. `regdiff` is the same count over mnemonics and registers only: it cannot see a
+  wrong displacement or immediate (an x87 sum in another order scores 0). A shape-only difference (registers
+  masked) of 0 means the code is right and only allocation differs.
 - Doc rules carry [C] (seen in code, trace or compile) or [I] (inferred). Re-check an [I] rule with a probe
   before building on it.
-- Model coverage gaps: x87 on 13.10 goes through a separate pass, FPColor (docs/c2/x87.md section 11): `regs
-  --all-classes --why` and `rasim check / need 'A>B'` cover its priorities and order, but whether a web stays on
-  the x87 stack (FPCheckColorability) is read from the trace, not predicted; `symkeys` is not
-  ported to 13.10.3052.
+- Model coverage gaps:
+  - On 13.10, x87 goes through a separate pass, FPColor (docs/c2/x87.md section 11). It is modelled:
+    `rasim check / need 'A>B'` and `need stack:V`.
+  - On 14.00 and 15.00, x87 values are coloured in Color like the integer registers (class 1). Their Color
+    decisions are read from the trace, not predicted. The mapping onto the x87 stack afterwards is modelled
+    (docs/c2/x87.md section 12: `rasim check --predict`, `need stack:V`): which calls kill the stack, fxch,
+    pops, fldz and airlocks.
+  - Split points made between rounds are still read from the trace.
+  - Reference costs of split pieces were checked on 14.00 only.

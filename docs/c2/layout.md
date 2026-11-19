@@ -206,6 +206,38 @@ that fits in a byte, a register source instead of an immediate).
   which is also what M&B found on 13.10 for widget_mgr::set_size ("the earlier jump keeps its copy").
   **[C for that shape; I in general]**
 
+## 6a. Loop-head alignment: when a loop head gets an `npad` (f3decomp R1300)
+
+The pad is decided in the encoder, while offsets are being assigned: `EncSetOffsets` (14.00 10b24480, at +0x1b1)
+and again in `EncLengthenBranches` (10b24ee0) call **`AlignmentWins`** (14.00 10b243f0; 15.00 51070960;
+13.10.3077 107a448f; 13.10.3052 107b3bae; the same code on all four builds, 13.10 reads the length byte at
+tuple +0x16 instead of +0x1c). **[C code on every build; probe tests/data/rules/R1300_loop_pad.cpp, 180 functions,
+198 loop heads per build, 0 mismatches against the rule below on all four builds]**
+
+1. **Which labels.** The label's symbol must have flag `+0x43 & 4` (the listing shows these labels as `$LL..`
+   or `$LC..` on 14.00/15.00; a `$LN..` back-edge target is never padded), and `_Speed` (/O2; the probe at /O1
+   has no `npad` on any build),
+   `_Globopt_flag`, `!_Wvm_flag`, `!_FWvmSafe`. On 13.10 every backward-jump target in the probe followed the rule.
+   On 14.00/15.00 some x87 loops lose the flag (their head is a `$LN` label): `f[i] = f[i]*2.5f + f[i+1]` is never
+   padded there, while 13.10 pads it by the rule **[M; why the flag is lost: not traced]**.
+2. **The rule.** Let o = the head's offset mod 16 before padding (need = 16 - o); o = 0 needs nothing.
+   - **o >= 9 (need <= 7): pad**, always.
+   - **o <= 8 (need >= 8):** walk the instructions from the head, summing encoded lengths (cum), and stop after
+     the first CALL / RETURN / BRANCH / SWITCH tuple (kinds 15, 16, 18, 20) or once cum reaches 16. Count
+     A = instructions with cum <= 16 (they would fit in the first line if the head were aligned) and F =
+     instructions with o + cum <= 16 (they fit in what is left of the current line). **Pad iff F < 3 and F < A.**
+   - The pad is `need` bytes: one `npad need` tuple (0xa9) before the label (`lea esp,[esp]`, `lea ecx,[ecx]`,
+     `mov edi,edi`, `jmp` over a long pad...).
+3. **Why f3decomp saw "<= 7, or 8 for big loops".** Their loops started with short instructions: with three
+   instructions in the first 8 bytes, F >= 3 for every need >= 8 and nothing is padded. A need of 8 is padded when
+   fewer than 3 instructions fit in 8 bytes (an outer loop starting with a 6-byte compare). **Needs of 9 to 15 are
+   padded too** when the head's first instructions are long: in the probe 9, 10, 11, 12, 13, 14 and 15 all occur
+   padded. Example (probe f82, o = 2): `mov eax, ecx` (2), `and eax, 63` (3), `add DWORD PTR _g[eax*4], 1234567H`
+   (11): F = 2 (the 11-byte add would cross the line), A = 3, so a 14-byte pad. That is how the 14 pad bytes of
+   their 0x00715d80 arise.
+4. **For matching.** A pad present in one listing and missing in the other comes from the head's offset (code
+   before the loop) or from the first one to three instructions of the loop body; nothing else is read.
+
 ## 7. Open
 
 - The sparse-switch split: settled in §3.2 (it is c2's reader; isel.md §9.4 has the pivot rule).

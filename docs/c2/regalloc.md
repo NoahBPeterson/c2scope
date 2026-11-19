@@ -64,7 +64,7 @@ MdmFixEbxIntrinsics, then **Color** 0x10b0cf40. After that, `dop2_CodegenUpdate`
 
 | Pass | Module | What it does |
 |---|---|---|
-| `Globregs` 10b563f0 | globregs.obj | picks candidates (`GrgIdentifyCandidates` 10b562e0, `EnumerateSymbols` 10b568f0), reaching defs, enterloads (`Enterloads` 10b588e0: OPENTERLOAD 0x295 / OPEXITSAVE 0x296 at range boundaries), lifetimes (`ComputeLifetimes` 10b59a20), then `CreateGlobregs` 10b5abe0 (one GLOBREG per lifetime) and `RewriteAsGlobregs` 10b5ae50 (operands now point at the GLOBREG) **[C names/calls; per-step detail I]** |
+| `Globregs` 10b563f0 | globregs.obj | picks candidates (`GrgIdentifyCandidates` 10b562e0, `EnumerateSymbols` 10b568f0), reaching defs, enterloads (`Enterloads` 10b588e0: OPENTERLOAD 0x295 / OPEXITSAVE 0x296 at range boundaries; in a function that may get a private convention, SSR+0xb4, `ReachingOccurGenKill` first puts every register-typed parameter's enter-load at the top of the entry block, ltcg.md 2.5), lifetimes (`ComputeLifetimes` 10b59a20), then `CreateGlobregs` 10b5abe0 (one GLOBREG per lifetime) and `RewriteAsGlobregs` 10b5ae50 (operands now point at the GLOBREG) **[C names/calls; per-step detail I]** |
 | `Color` 10b0cf40 | color.obj | the colouring loop (section 3); x86 cost hooks are in colormd.obj (`Cmd*`) **[C]** |
 | `RegSimpleAssignBody` 10bda210 | regasg.obj | assigns tmpregs one instruction at a time (section 6) **[C]** |
 | `FPColor` 10c33550 | fpreg.obj | x87 stack registers, called from Color at 10b0d106 when FUNC+0xac & 0x20, which is not set by default; normal x87 code is class-1 GFx colouring plus X87MapGFxToSTx (x87.md) **[C]** |
@@ -391,6 +391,22 @@ The head `g` of `_SortedGlobregs` is unlinked, then, in this order:
 
 Each action returns a set of web numbers or null (eax, kept in esi at 10b0d489). **A non-null set starts a split
 round before the next pop** (3.6.6), provided the list is not empty (10b0d264).
+
+**Expressions in both arms (f3decomp R871).** The first test decides whether a split piece of a spilled counter gets a
+register. `tests/data/rules/R871_branchrow.cpp`: a loop counter `i` under pressure (four values take esi, edi, ebx, ebp)
+is split on every build, and its head piece (the `i = 0` def through the loop head) is popped
+- with one use of `i` (`row = data + i*stride` once above the `if`): 2 refs, benefit 0, several blocks, so
+  `SpillOrDefer`; the final code reads `imul eax, [i]` and stores `mov [i], 0`;
+- with the same expression written in both arms: 3 refs, benefit 4, coloured (ecx); the final code has
+  `xor ecx, ecx` shared by `i = 0` and the count test, a `jmp` over the reload at the back edge, `imul eax, ecx`.
+
+The two copies are **not** merged before allocation: GlobalOptimize's CSE only removes an expression that is available
+on every path, and the arms are siblings, so the IL at Color has two `imul`s (`c2trace.py il --at @Color@4`). They
+are merged after Color by `FgTryHeadMerge` (dop2_FinalFlowOpts; `c2trace.py merges` reports "head of a jcc: merged, 3
+instructions") on 14.00 and 15.00; on 13.10 the scheduled arms differ at the `imul` (the add is folded into the
+address), so both `imul eax, ecx` stay. The allocation (pops, prios 40/25 against 40/15) is the same on all four
+builds. So "the pre-CSE uses still count" is right in effect but there is no CSE involved: Globregs and Color run after
+GlobalOptimize and simply see both uses. **[C trace on 13.10.3077, 13.10.3052, 14.00, 15.00]**
 
 #### 3.6.2 `SpillOrDefer` 10b0d690 **[C]**
 
@@ -1040,6 +1056,11 @@ meantime becomes a preference even if 4.3 did not make it one (in that same pass
 - A value strongly avoids a neighbour's last remaining register: +100·benefit. **[C trace]** 0x00e0a0b0: `t332`
   sees ebp:800 because two neighbours have only ebp left (`mid`, benefit 2, and `p4`, benefit 6); `dst` sees
   ebp:600 for `p4` alone.
+- `rasim need SNAP reg:V=R` prints these terms per register under each target (`ebx:400 = +400 ebx is the last
+  register left to imm0 (the constant 0) (benefit 4; 100 x benefit), its only register from the start: a byte value
+  ...`). M&B 0x4ea290: every value coloured while the immediate candidate `0` (23 references, benefit 4, fl5 & 0x80:
+  a byte value live across calls, so ebx, the one callee-saved register with a byte form, is all it can have) is
+  queued sees ebx:400; `rc` takes ebx at pop 10 and the immediate is then taken off the list. **[C trace]**
 - Consequence for swaps between two callee-saved registers: the value coloured first takes the earlier register
   unless something raises that register's weight for it. A neighbour that prefers it (+1) or has nothing else left
   (+100·benefit) is enough, because all other weights are usually 0.
@@ -1244,6 +1265,103 @@ sets in the snapshot (one pick each); a what-if assumes the edit leaves Color's 
 lifetimes alone, which a real source edit often does not (replacing an argument in eA also changed which
 values Color handles).
 
+
+### 6.6 Registers no pick and no Color pop gave: Riscify (cl 13.10) and the other paths **[C code and trace on 13.10.3077, 13.10.3052; I where marked]**
+
+Not every temp of the final code got its register from a `RegAssign` pick or a `ChoosePhysReg` pop. `c2trace.py
+scratch` now names the others (rows `R` and `?`, tracer.md); found from Mount & Blade 0x529c30, 0x43c9c0 and
+0x524420 (cl 13.10.3077).
+
+**Riscify (cl 13.10 only).** `dop2_CodegenUpdate` calls `@Riscify@4` (3077: 1078511f, 3052: 107873ee) right after
+`RegSimpleAssign`; 14.00 and 15.00 have no such pass (their CodegenUpdate goes from RegSimpleAssignBody to Sizeext /
+MdmFlexParams), so this is a 13.10 difference. Riscify walks every block **from its last instruction up**, with the
+block's live-out registers (BLOCK+0x44) as the busy set, and for each candidate instruction asks `@GetReg@8` (3077:
+10785179, 3052: 10786b9d; its only callers are two sites in Riscify) for a register; a split instruction becomes a load
+of the memory operand into a new temp plus the register form: `add eax, [edx+ecx*4]` -> `mov esi, [edx+ecx*4];
+add eax, esi` (0x529c30 t437), `or [edx], ecx` -> `mov esi, [edx]; or esi, ecx; mov [edx], esi` (0x43c9c0 t386, t385).
+GetReg(busy, byte):
+1. pass 0: the entries of `_IntPhysRegs` (eax ecx edx esi edi ebx ebp; ebx / ebp zeroed when not available) after the
+   cursor (3077: [108b022c], 3052: [108b0228]), wrapping, up to but not including the cursor's own entry, that are set
+   in a per-register table (3077: 108a7638, 3052: 108a7634; every allocatable register in the traces seen), not
+   busy, and for a byte value one of eax ecx edx ebx;
+2. pass 1: the entries from the first one up to the cursor, without the table test;
+3. first fit over the list (stopping at its first empty entry); 0 if nothing is free.
+The cursor is set to the entry taken, **by every call**, also when Riscify then leaves the instruction as it was (most
+calls: compares, pushes, `add esp`), and it is reset to the last entry (so the next call starts at eax) at the top
+of every block (10784dfb). A byte value whose first answer is not byte-addressable gets a second call with the byte
+flag (1074982f). `rasim scratch` replays the rule: every call of riscify.c (3077, 3052), 0x529c30 (17 of 17, one of
+them finding no register free), 0x43c9c0 (17 of 17) and 0x524420 (34 of
+34), cursor right at every call. **[C]**
+
+**Which instructions are split, and which splits survive** (13.10.3077 addresses, 3052 in brackets where read;
+traced on tests/data/riscify.c, riscify2.c and M&B 0x43c9c0). **[C code and trace unless marked]**
+
+- Riscify runs only when `_Speed` is set (/O2, /Ot) and `_PogoFlag != 1` (1078511f). `dop2_CodegenUpdate` then runs
+  `MdmAvoidMOBStalls` if `_Gcpu > 5` (108a91e0; 6 in every compile seen) and `RiscifyEarlyUndo(_Gcpu == 7 ? 0 : 2)`
+  (10774ff9..10775042).
+- **GetReg is called for every instruction whose opcode has `_Opcode_dope[op] & 0x400`** (table 10870dc0, tested at
+  10784f43 / 10784f4a): xchg push inc dec neg not rcl rcr rol ror sar shl shr adc add and cmp or sbb sub test xor
+  (and `_eaddGCref`). **mov, lea and imul never get a call**, so they never move the cursor and are never split. The
+  call is made whether or not the instruction has a memory operand: the register forms (`add esp, 4`, `push esi`,
+  `cmp eax, ecx`) are the "not split" rows, and they move the cursor too.
+- The busy set: the block's live-out registers (BLOCK+0x44); walking up, each instruction's dst registers are
+  cleared (not the fixed ones, `_RegAttrib & 2`) and its src registers added.
+- **The split** (1078925c..107892a5 [1078db72..1078dbbb]): if GetReg gave a register R, the dst operand list and
+  then the src list (107852b7) are scanned for the first memory operand, kind 2 (a memory variable: stack slot,
+  local, global) or kind 6 (`[reg+..]`). It is split by `CopyOperand(tuple, leaf, R, dst?)` (10789304 [1078dc1a]),
+  which also sets `_RegUsed[R]`; a memory dst becomes load, op, store with the same R. It is refused when its type
+  class is 0x4000 (`type & 0xf000`), when its leaf has `+0x14 & 0x20` (meaning not identified **[I]**), or for a byte
+  operand (`type & 0xfff == 1`) when R is esi, edi or ebp and a second, byte-only GetReg finds nothing (10749824).
+  If GetReg finds no register (0, 107852a7) the instruction stays. Nothing else decides: not test against cmp, not the
+  immediate's size, not the block's pressure (except through GetReg finding nothing).
+- **Undo 1, `RiscifyEarlyUndo(size)`**: puts back the splits (`+9 & 4`) whose operation has `type & 0xfff == size`:
+  with argument 2 (every /G6 compile) only 16-bit operations; under /G7 (argument 0) every split.
+  `MdmAvoidMOBStalls` undoes nothing (the 0x43c9c0 IL is the same before and after it) **[C trace; I for its
+  mechanism]**.
+- **Undo 2, `Riscify_undo`** (107b29e8 / 107b29ff [107896d0]) in `dop2_PreEncode`, after `Schedule` and before
+  `MdmSuperHack`, when `_Speed && _Gcpu != 7`: `RiscUndoOne` (107b7d09 [1078dd58]) on every split tuple puts the
+  memory operand back when `mov R, [m]; op R, x; mov [m], R` are still adjacent with the same R (read-modify-write),
+  or when `mov R, [m]` is right before the op, R is not a dst of it and appears once in its srcs (a load);
+  `test R, R` (R twice) becomes `cmp [m], 0`, at PreEncode only for an absolute address (kind 6 without base or
+  index).
+- So **a split survives only when the scheduler moved something between the load and its use (or between the op
+  and the store)**, or when a later pass renamed R in the use (0x43c9c0 R14: `test ecx, 0x100` became `test ch, 1`,
+  so `RegnumFindInLeafList(ecx)` fails). tests/data/riscify2.c: `rmw0` (`p[i] |= b` alone) is split into esi and
+  put back (final `or [eax+ecx*4], edx`, no push esi: undoing a split whose R is above edx makes `_RegUsed` and the
+  callee saves be recomputed); `rmw`, with calls before it, keeps `mov edx, [..]; or edx, eax; pop edi; mov [..],
+  edx`. This replaces an earlier [I] reading ("undone when the register is a callee-saved one the function does not
+  otherwise save"): the dropped save is a consequence of the undo, not its cause.
+
+`c2trace.py scratch` prints the reason under every R row (`not split: no memory operand`, `not split: GetReg
+found no free register`, `split, undone by RiscifyEarlyUndo`, `split, undone after Schedule`, `split, kept: <ops>
+scheduled between the load and its use or store`, `split, kept: the use no longer names R`), read from the IL at
+Riscify's entry, after it and at Encode; `rasim scratch want:` repeats it for the call and the calls before it.
+
+What it means: a Riscify temp's register is decided by the GetReg calls before it **in the walk**, i.e. by the
+candidate instructions (any of the opcodes above, with or without a memory operand) after it in the same block.
+0x43c9c0 t385/t386 (the split of `or [out], ecx`, call R15) get esi because call R14 (`test [orig], 0x100`, split
+into t387 in ecx) comes first in the walk; without it (`rasim scratch SNAP rdrop:14`) they get eax, the original's
+register. The original splits that test too (its `mov ecx, [esp+0x10]; test ch, 1`), so `rdrop:14` is not the
+original's history: for R15 to get eax the original must have had no candidate instruction between the OR and the
+block's end at Riscify time, or the OR already in register form (`mov eax, [edx]; or eax, ecx` from the IL, nothing
+for Riscify to split), which gives its tail without the `mov eax, esi` **[I]**. Ten spellings were traced (a named
+`v` for `out->v[0]` before or after the OR, nested ifs, the OR in both arms of the queue test, a pointer alias,
+other operand orders): none gives the original's tail; the closest, the OR repeated in both arms, gives the
+non-empty arm its own block and the eax split but does not merge the arms back (10/14 against 9/13 now).
+0x529c30 t437 gets esi from cursor eax; one more call before it in the walk (`rins:3`) gives edi, the original's.
+These are the what-ifs `rasim scratch` answers (`want:t437=edi`); `rdrop:K` means instruction K is gone, in
+another block, or one of mov / lea / imul, not merely without a memory operand.
+
+**Other temps with no record** (the `?` rows), read from the IL at `RewriteAsReal`'s entry (end of Color) and, on
+13.10, at Riscify's entry:
+- registered before RewriteAsReal without a ChoosePhysReg pop: call results (eax), `this` copies into ecx, a temp
+  chain that ends in a copy to a fixed register (`mov eax=t144 <- t82` gives t82, t151, t147 eax); on 13.10 that
+  happens between `InitialSplitPoints`' entry and the first `Spillcosts` **[C for the window, I for the mechanism]**;
+- registered between RewriteAsReal and Riscify, with no RegAssign call: the destination of a two-address
+  instruction whose source dies there (`and edi=t89 <- edi=_k, 15`) **[C for the window, I for the mechanism]**;
+- a RegAssign pick under another IL name: the pick's tmpreg is shared by several IL temps (0x524420 pick 25 is `mov
+  t728 <- eax=t815` and the final code's t814 is the same tmpreg), so the pick is listed with `[temp t814 in the final
+  code]`. **[C]**
 
 ## 7. Which values reach Color: the candidate rule (`GrgIdentifyCandidates`, `EnumerateSymbols`) **[C]**
 

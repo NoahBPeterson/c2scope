@@ -85,6 +85,8 @@ pub struct Web {
     pub traced: Option<u32>, // the register c2 gave it
     pub prio: i64,
     ins_prefs: Option<[i64; NREG]>, // PREF list when first queued (cross-check of the event model)
+    pub imm: Option<String>,        // an immediate candidate: its constant ("0", "&g_x")
+    pub byte: bool,                 // queued needing a byte register (GLOBREG fl5 & 0x80)
 }
 
 pub struct TNbr {
@@ -124,6 +126,7 @@ pub struct Model {
     radj: Vec<BTreeSet<usize>>, // reverse of adj
     rpadj: Vec<BTreeSet<usize>>,
     pub notes: Vec<String>,
+    pub missing: Vec<crate::SMissing>, // locals and parameters with no row (c2regs.py), for the error messages
     nbl: Vec<Vec<(usize, bool)>>, // adj[x] and radj[x] merged, ascending, with "in adj[x]"
     ptl: Vec<Vec<(usize, bool)>>, // padj[x] and rpadj[x] merged, ascending, with "in padj[x]"
     bylabel: HashMap<String, usize>, // label(w) -> w for each coloured web that `find_scan` resolves so
@@ -213,6 +216,8 @@ pub struct Mods {
     /// a web whose range was extended, with the webs it newly overlaps. If it runs out of registers before it is
     /// coloured, c2 splits it; the model keeps the piece that covers the extension (see `run`).
     pub ext: Vec<(usize, Vec<usize>)>,
+    /// webs whose colouring `run` explains term by term (Outcome::why); nothing else changes
+    pub explain: Vec<usize>,
 }
 
 impl Mods {
@@ -295,10 +300,29 @@ impl Inf {
     }
 }
 
+#[derive(Default)]
 pub struct Outcome {
     pub colour: Vec<Option<u32>>,
     pub pops: Vec<PopOut>,
     pub inferred: Vec<Inf>, // relations used that the trace only shows from the other side
+    /// `Mods::explain`: per explained colouring, where each register's weight came from (`Model::weight_text`)
+    pub why: Vec<(usize, Vec<WhyW>)>,
+}
+
+/// One term of a ChoosePhysReg weight (regalloc.md 4): `web` adds `amount` to register `reg`.
+#[derive(Clone, Debug)]
+pub struct WhyW {
+    pub reg: u32,
+    pub amount: i64,
+    pub web: usize,
+    pub kind: WhyK,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WhyK {
+    NbrPref(i64),  // an uncoloured neighbour's PREF count for the register (it may still take it); its benefit
+    NbrLast(i64, u32), // the register is an uncoloured neighbour's only one left: 100 x its benefit; its first avail set
+    Own,           // the value's own PREF count, subtracted
 }
 
 /// The free simulation's state of one web.
@@ -394,6 +418,8 @@ impl<'a> Sim for Rec<'a> {
 trait Sink {
     fn pop(&mut self, p: PopOut);
     fn inf(&mut self, l: Inf);
+    /// the terms of an explained colouring (Mods::explain); only the first colouring of a web is kept
+    fn why(&mut self, _web: usize, _t: Vec<WhyW>) {}
 }
 
 impl Sink for Outcome {
@@ -402,6 +428,11 @@ impl Sink for Outcome {
     }
     fn inf(&mut self, l: Inf) {
         self.inferred.push(l)
+    }
+    fn why(&mut self, web: usize, t: Vec<WhyW>) {
+        if !self.why.iter().any(|(v, _)| *v == web) {
+            self.why.push((web, t))
+        }
     }
 }
 
@@ -517,6 +548,7 @@ impl Model {
             adj: vec![],
             padj: vec![],
             radj: vec![],
+            missing: s.missing.clone(),
             rpadj: vec![],
             notes: vec![],
             nbl: vec![],
@@ -555,6 +587,11 @@ impl Model {
                     traced: None,
                     prio: 0,
                     ins_prefs: None,
+                    imm: s.passes.iter().filter_map(|p| p.grs.get($gr)).find_map(|g| g.imm.as_ref())
+                        .and_then(|v| v.get("text")).and_then(|t| t.as_str()).map(String::from),
+                    byte: s.inserts.iter().flatten().filter(|e| e.gr.as_deref() == Some($gr) && e.npass == $np)
+                        .find_map(|e| e.x.as_ref().and_then(|x| x.get("fl5")).and_then(|f| f.as_u64()))
+                        .map_or(false, |f| f & 0x80 != 0),
                 });
                 done.push(false);
                 inited.push(false);
@@ -765,7 +802,11 @@ impl Model {
         }
         let hits: Vec<usize> = col().filter(|&i| self.webs[i].name == sel).collect();
         match hits.len() {
-            0 => Err(format!("no coloured globreg named {}", sel)),
+            0 => Err(match self.missing.iter().find(|x| x.name == sel || x.name.split(' ').any(|n| n == sel)) {
+                Some(x) => format!("no coloured globreg named {}: {} {} has no row in the regs table: {}", sel,
+                                   if x.kind.is_empty() { "the" } else { &x.kind }, sel, x.reason),
+                None => format!("no coloured globreg named {}", sel),
+            }),
             1 => Ok(hits[0]),
             _ => Err(format!(
                 "{} is coloured {} times; use {}",
@@ -944,7 +985,7 @@ impl Model {
         let mut moved = vec![];
         let order = self.order(mods.order.as_ref(), &mods.moves, &mut moved)?;
         let mut st = RunSt::new(self.webs.len());
-        let mut out = Outcome { colour: vec![], pops: vec![], inferred: moved.into_iter().map(Inf::Text).collect() };
+        let mut out = Outcome { inferred: moved.into_iter().map(Inf::Text).collect(), ..Default::default() };
         for (x, r, c) in &mods.prefs {
             st.ws[*x].prefs[*r as usize] += c;
         }
@@ -1095,6 +1136,7 @@ impl Model {
             merge_into(&self.nbl[x], add.map(|y| (y, self.adj[x].contains(&y))), &mut merged);
         }
         let xpiece = st.get(x).piece;
+        let mut why: Vec<WhyW> = vec![];
         for &(y, in_adj) in if extra { &merged[..] } else { &self.nbl[x][..] } {
             let ys = st.get(y);
             if y == x || !ys.live || has(&mods.del_e, x, y) {
@@ -1111,13 +1153,22 @@ impl Model {
                 out.inf(Inf::Nb(y, x));
             }
             contrib(ys, &mut w, 1);
+            if mods.explain.contains(&x) {
+                why_terms(ys, y, &mut why);
+            }
             nbw.push(y);
         }
         {
             let xs = st.get(x);
             for r in 1..NREG {
                 w[r] -= xs.prefs[r];
+                if xs.prefs[r] != 0 && mods.explain.contains(&x) {
+                    why.push(WhyW { reg: r as u32, amount: -xs.prefs[r], web: x, kind: WhyK::Own });
+                }
             }
+        }
+        if mods.explain.contains(&x) {
+            out.why(x, std::mem::take(&mut why));
         }
         let xav = st.get(x).avail;
         let Some(r) = Self::pick(xav, &w) else {
@@ -1230,7 +1281,7 @@ impl Model {
         let order = self.order(mods.order.as_ref(), &[], &mut moved)?;
         let (n, ni) = (self.webs.len(), self.items.len());
         let mut st = RunSt::new(n);
-        let mut out = Outcome { colour: vec![], pops: vec![], inferred: moved.into_iter().map(Inf::Text).collect() };
+        let mut out = Outcome { inferred: moved.into_iter().map(Inf::Text).collect(), ..Default::default() };
         let mut hist: Vec<Vec<(u32, WebSt)>> = vec![vec![(0, WebSt::default())]; n];
         let (mut wrote_off, mut wrote, mut tick_at, mut pops_at, mut inf_at) = (vec![], vec![], vec![], vec![], vec![]);
         let mut tl: Vec<Vec<(u32, u8)>> = vec![vec![]; n];
@@ -1644,6 +1695,49 @@ fn contrib(s: &WebSt, w: &mut [i64; NREG], sign: i64) {
         if s.avail.count_ones() == 1 {
             w[s.avail.trailing_zeros() as usize] += sign * 100 * s.ben;
         }
+    }
+}
+
+/// The terms `contrib` adds for neighbour y, one per register (for `Mods::explain`).
+fn why_terms(s: &WebSt, y: usize, out: &mut Vec<WhyW>) {
+    if s.ben <= 0 {
+        return;
+    }
+    for r in 1..NREG {
+        if s.avail >> r & 1 == 1 && s.prefs[r] != 0 {
+            out.push(WhyW { reg: r as u32, amount: s.prefs[r], web: y, kind: WhyK::NbrPref(s.ben) });
+        }
+    }
+    if s.avail.count_ones() == 1 {
+        out.push(WhyW { reg: s.avail.trailing_zeros(), amount: 100 * s.ben, web: y, kind: WhyK::NbrLast(s.ben, s.init_av) });
+    }
+}
+
+impl Model {
+    /// The weight of register r at an explained colouring, as a sum of its terms: "400 = ebx is the last register
+    /// left to rc (benefit 4): +100 x 4".
+    pub fn weight_text(&self, terms: &[WhyW], r: u32) -> String {
+        let who = |w: usize| match &self.webs[w].imm {
+            Some(c) => format!("{} (immediate candidate: the constant {} in a register)", self.label(w), c),
+            None => self.label(w),
+        };
+        let t: Vec<String> = terms.iter().filter(|w| w.reg == r).map(|w| match w.kind {
+            WhyK::NbrLast(b, init) => format!(
+                "+{} {} is the last register left to {} (benefit {}; 100 x benefit), {}",
+                w.amount, rname(r), who(w.web), b,
+                if init == 1 << r && self.webs[w.web].byte && r == 4 {
+                    "its only register from the start: a byte value (GLOBREG fl5 & 0x80) live across a call, and ebx is \
+                     the one callee-saved register with a byte form".to_string()
+                } else if init == 1 << r {
+                    format!("its only register from the start (avail {} when queued: the others are killed where it is live)", rname(r))
+                } else {
+                    format!("the others it had ({}) were taken by values coloured before",
+                            ORDER.iter().filter(|&&q| q != r && init >> q & 1 == 1).map(|&q| rname(q)).collect::<Vec<_>>().join(" "))
+                }),
+            WhyK::NbrPref(_) => format!("+{} {} (an uncoloured neighbour) prefers {} ({} PREF)", w.amount, who(w.web), rname(r), w.amount),
+            WhyK::Own => format!("{} its own preference for {} ({} PREF: copies with {})", w.amount, rname(r), -w.amount, rname(r)),
+        }).collect();
+        t.join(", ")
     }
 }
 

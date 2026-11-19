@@ -24,7 +24,9 @@ Options: `-H/--hook` (repeatable), `--exit` (log returns of every entry hook), `
 N events), `--raw` (raw log), `--keep DIR` (keep `c2trace.cfg`, `c2trace.log`, the `.obj` and the `/FAsc` listing).
 Options may come anywhere before `--`, before or after the source path; everything after `--` goes to cl
 unchanged. A relative source or `--keep` path is taken against the caller's cwd (resolved before the compile;
-this holds for every subcommand, which all go through `run_trace`). Earlier, `src --keep d -- /O2` could fail
+this holds for every subcommand, which all go through `run_trace`), except that from the repository root a relative
+`--keep` outside `work/` goes to `work/keep/` (the root is not a scratch place), and a missing source stops the run
+before any directory is made. Earlier, `src --keep d -- /O2` could fail
 in argparse and a relative `--keep` did not reach the compile under wine or on the compile server.
 `install` writes the patched c2.dll and c2trace.dll by rename, so compiles that are running keep the old copy.
 
@@ -181,6 +183,35 @@ On the default c2 build `regs` also records what the register choice is made fro
 - six probes on Spillcosts' PREF sites (10b1082d, 10b10883, 10b10c31, 10b10d9c, 10b10e5f, 10b11238): the globreg,
   the register and the other side of the copy.
 
+**Locals and parameters with no row.** After the table, `regs` lists every local and parameter of the function
+that has no globreg row, with the reason, e.g. (M&B 0x4bd4d0 with `int len = strlen(line);`):
+
+```text
+  not in the table (locals and parameters with no globreg row; `regs --why` cannot break these down):
+    value param a globreg; left without a register when pop 8 gave key ebp (UpdateAffectedGlobregs, neighbour): taken off the list before its turn, so it lives in memory
+    line  param a globreg; left without a register when pop 8 gave key ebp (UpdateAffectedGlobregs, neighbour): taken off the list before its turn, so it lives in memory
+    c     local = local8 in the table (its symbol has no name record by Color)
+```
+
+The reasons, by the phase that dropped the variable (tests/data/regmissing.c has one of each):
+- not seen by GrgIdentifyCandidates, but in the IL at `dop2_PreLowerGlobalOpts`' entry: every reference removed by
+  GlobalOptimize (copy or constant propagation, CSE, dead stores), or, if it is still in the IL at Color, only its
+  address is used (`&s`, an aggregate whose fields became separate unnamed locals);
+- seen, never made a candidate: volatile (leaf flag 0x40), no SSR, a type class or type the candidate test rejects
+  (regalloc.md section 7);
+- a candidate with no globreg: address-taken (in the aliased set), or kept in memory before Color with N references
+  left (a cheap symbol, `GrgSpillCheapSyms` **[I]**), or no reference left by Color;
+- a globreg that was never popped: SpillObvious spilled it (benefit) or folded its def into its use (CmdSubstDef),
+  or it was left without a register when a neighbour was coloured (`mark nbr` then `remove` in the decisions;
+  the pop that took its last register is named).
+Hooks (key `regs_cand` of each build table, built in for 14.00): a probe in GrgIdentifyCandidates just after its
+call-target test (the leaf, its flags, type word, the symbol, its kind dword, SSR, key and name; 14.00 10b56361,
+15.00 510a4799, 13.10.3077 1077c60c, 13.10.3052 107936fe), one on the store that makes a leaf a candidate (10b563c2,
+510a4890, 1077c66b, 10793759), and an IL dump at `@dop2_PreLowerGlobalOpts@4`. The snapshot has them as `missing`
+(`name, kind, reason`), and `rasim need` / `want` print the reason when asked about such a variable (`rasim: no
+coloured globreg named line: param line has no row in the regs table: ...`). Unnamed locals (`local9`) are
+grouped on one line. **[C]**
+
 Snapshot fields added (older readers ignore them): `pops[].choice = {avail, prefs, nbrs[], partners[]}`,
 `inserts[]`, `pref_events[]`, `regnames`. Registers are c2 numbers; an avail set is decoded from the first SBV
 chunk (bit n of chunk `base` = register `base + n`). A build table for another c2 (tools/c2builds) has only the
@@ -252,7 +283,7 @@ Not covered by `regs`: scratch picks (see `scratch`), names for temporaries (sho
 
 | form | matches |
 |---|---|
-| `Class::method` (`N::C::m`, `C::C`, `C::~C`) | names starting with `?method@Class@@` (`?m@C@N@@`, `??0C@@`, `??1C@@`) |
+| `Class::method` (`N::C::m`, `C::C`, `C::~C`) | names containing `?method@Class@` (`?m@C@N@`, `??0C@`, `??1C@`): the qualifier list is left open, so `C::m` also selects `C` inside any namespace (`?m@C@N@@`) and `N::C::m` a `C` nested deeper (`?m@C@N@O@@`) |
 | `::name` | the C++ global function `?name@@...` |
 | anything else: `tessellate`, `init_screen@CharSheet`, `_sum`, a full decorated name | a substring of the decorated name, as before |
 
@@ -415,6 +446,11 @@ DLL writes `# fename 1` into the log when it knows the directive; a compile serv
 older copy lacks it, and c2trace.py then says so on stderr: copy
 `work/toolchain/<build>-trace/VC/Bin` there again, or set `C2TRACE_REMOTE=0`.
 
+**PAS index of memory operands.** With `C2TRACE_ILPAS=1` (or `=<hex offset>`) every memory operand of the dump also
+prints the INDIR leaf's points-at-set index: `[t128:1004+0]@7:1004`. The offset is the build table's `dll.ilpas_off`
+(default 0x1c, 14.00 and 15.00; 0x24 on 13.10). Off by default; the output is then unchanged. The DLL logs `# ilpas`.
+`tools/loadcse.py` uses it (docs/c2/loadcse.md §5).
+
 ## `merges`: every tail and head merge, and why a pair stopped
 
 ```sh
@@ -489,6 +525,77 @@ Encode shows `gone`. That is the hidden-pick case: it moved the cursor but left 
 the instruction is still there with another opcode (`mov` → `xor`, `lea` → `add`). IL order is not layout
 order: EH unwind code, for example, is assigned first and laid out last.
 
+**C rows: registers that are not scratch picks.** A load into a temporary that Color allocated reads exactly like
+a scratch pick in the listing (`mov eax, DWORD PTR ?g_river_mask_b`). After the picks the table lists, marked `C`,
+each place the final code writes a value Color gave a register: the same compile also traces Color's pops and
+`ChoosePhysReg` (the `regs` events 0, 2, 3 at the build's addresses), and every destination `reg=var` of the final
+IL whose var Color coloured is a row. Default: temporaries only (`t591`, `$S9`); `--color` lists the named
+variables too. Why such a value got its register is `regs --why`. Mount & Blade 0x46bc70 (13.10), the mask temp:
+
+```text
+  20  ecx  -    ROT  ecx   0031a  mov  line 61 | t444:2004 <- ?g_river_mask_a@@3IA:2004
+...
+# C: not a scratch pick. Color gave the value its register (`regs --why` says why); the numbered rows
+#    are RegAssign's scratch picks. Where the code writes it: temporaries only, --color adds the named variables (38 rows)
+   C  Color $S9      eax   00315  mov | eax=_$S9:2004 <- ?g_river_mask_b@@3IA:2004
+```
+
+**R and ? rows: the temps with no pick and no Color pop** (regalloc.md 6.6). On cl 13.10, `Riscify` runs after
+RegSimpleAssign and splits memory operands off into loads to new temps, whose registers come from `GetReg`; neither
+`regs` nor the picks saw them (Mount & Blade 0x529c30 t437, 0x43c9c0 t385/t386). The same compile now traces every
+GetReg call (hooks `origin` of the build table: `@Riscify@4` and `@MdmAvoidMOBStalls@4` with the IL, `@GetReg@8`
+with the busy set, byte flag, cursor and the instruction), and lists them as `R` rows: the block, cursor > register,
+the busy registers and the temps the call made (`(not split)`: the call still moved the cursor). Every other temp of
+the final code with a register and no pick, pop or GetReg call is a `?` row with the phase that gave it, read from
+the IL at `RewriteAsReal`'s entry (all builds) and Riscify's entry (13.10): "Color: given eax before RewriteAsReal
+without a ChoosePhysReg pop", "RewriteAsReal or RegSimpleAssign without a RegAssign call", "after Riscify". A pick
+whose IL name at pick time is not the final code's name (several IL temps share one tmpreg) ends with
+`[temp t814 in the final code]` (0x524420: pick 25 `mov t728 <- eax=t815` is the final code's t814). **[C]**
+
+```text
+   R    3 blk 2   eax>esi   esi    00036  busy eax,ecx,edx             made t437 | add eax=t470:1004 cc:8000 <- eax=t470:1004 esi=t437:1004
+   R   15 blk 20  ecx>esi   esi    0014c  busy ecx,edx                 made t385 t386 | or esi=t385:2004 cc:8000 <- esi=t386:2004 ecx=t400:2004
+```
+
+The snapshot (`--export`) has them as `riscify` (one entry per call) and `unmodelled` (the `?` temps). `rasim scratch
+SNAP` adds `riscify: 17 of 17 GetReg calls predicted (register); cursor right at 17 of 17; temps made: ...`, and
+`rdrop:N` / `rins:N` are what-ifs on the calls (`rdrop:14` on 0x43c9c0: t385 t386 esi -> eax, the original's).
+`rasim scratch SNAP want:t437=edi` (or `--want regmap.txt`, every WANTS row) says how a temp got its register and
+which single edit gives it the wanted one: for a pick drop:K / ins:K / nopref / pref, for a Riscify temp rdrop:K /
+rins:K in its block (0x529c30: `rins:3` gives t437 edi), and for a `?` temp the phase, which rasim does not model.
+Riscify does not exist on 14.00 and 15.00 (no `R` rows there). **[C]**
+
+Under every `R` row is the reason Riscify split the instruction or not and whether the split survived
+(regalloc.md 6.6): `not split: no memory operand (GetReg is called anyway: the cursor moves)`, `not split: GetReg
+found no free register`, `not split: its memory operand ... was refused`, `split, undone by RiscifyEarlyUndo (a
+16-bit operation)`, `split, undone after Schedule (Riscify_undo: the load was still right before its use)`,
+`split, kept: mov test pop scheduled between the load and its use or store` (0x43c9c0 R15) or `split, kept: the use
+no longer names ecx` (R14, `test ecx, 0x100` narrowed to `test ch, 1`). It is read from the IL at Riscify's entry
+(the memory operands), after it (the temps made) and at Encode (whether they are still there, and what lies
+between the load, the use and the store). The snapshot has it as `riscify[].why`; `rasim scratch want:` prints it
+for the call and for the calls before it in the walk. Test: tests/data/riscify2.c (`rmw0` undone, `rmw` kept).
+
+**Several wants at once.** With more than one `want:` (or `--want regmap.txt`), `rasim scratch` first searches for
+the edit sets that satisfy all of them together, and prints the per-want answers after it:
+
+```text
+$ rasim scratch s4b1930.json --want regmap.txt          # M&B 0x4b1930: picks 5-9 one rotation step off
+joint: 5 wants
+  now: 0 of 5 hold; missing: t215=edx t212=edx t214=eax t213=ecx t203=eax
+  best: 5 of 5 with 1 edit (27 candidates searched: singles, pairs)
+  ins:5                    5 of 5; 0 other registers change
+  ins:4                    5 of 5; 1 other register change
+  ...
+```
+
+The candidates are drop:K / ins:K up to the last wanted pick, nopref / pref:N:REG of each wanted pick, and rdrop:K /
+rins:K in the blocks of the wanted Riscify temps (up to their call). Every single edit is replayed, then every pair
+(ins:K twice is allowed: two more temps), then, if no pair satisfies all, triples grown from the best 40 pairs. The
+sets are ranked by wants held, then fewer edits, then fewer other registers moved (picks that are not wanted and
+change, and Riscify temps that change or disappear); when no set holds all, the best ones say which wants remain.
+A set is a command line: `rasim scratch SNAP ins:5` replays it. **[C model; the edit is still a hypothesis until a
+compile confirms it]**
+
 Worked example, Fallout 3 0x008e7d40 (fn3-test checkpoint chk_6207ebabb831472ba89d, compiled after the pack
 unit): every pick lands on the original's register except picks 7 (+0xa8), 13 (+0x166) and 14 (+0x1b1). All
 three are ordinary rotation picks, so the late `push [mem]` split is not involved. Reading the original's
@@ -549,7 +656,9 @@ simply "the cursor's register by rotation", the reason in brackets: `preferred e
 lea)`, `preference edx refused: busy phys`, `eax busy phys` (a coloured variable or a value Color placed holds
 it), `eax busy t162` (an earlier temp still live), `ecx conflict` (free now, but in the temp's conflict set: it is
 needed before the temp dies). `--all` lists every `RegSimpleAssignBody` run (EH funclets, then the body); the
-default is still the body only, and the default table is unchanged. These options are 14.00-only (15 hooks: the
+default is still the body only. These options work on every c2 build (14.00, 15.00, 13.10.3077, 13.10.3052: each
+build table's `hooks.scratch_x` has the same events at its addresses; port-1310.md section 13: 1014 of 1014 M&B
+picks and cursors). The events (15 hooks: the
 4 of the plain table plus `_RegMap`/`regAvail`/cursor/preference at `RegAssign`, `RegResetRegMap`, `RegSpill`,
 `RegFixConflict`, and 7 probes inside `RegBuildGlobalConflict` from which the conflict sets are rebuilt). **[C]**
 
@@ -640,6 +749,31 @@ bytes. The names available are listed in the script's docstring:
 - `reg`, `pops`;
 - the scratch picks `cur(n)`, `sreg(n)`, `rot(n)`, `off(n)`, `gone()`, `sat(offset)`;
 - `ins(offset)` and `dst(offset)` from our listing;
+- `bdiff` (the default `--metric` with `--asm-vs`; `--asm-func` defaults to `--func`): the **byte-faithful** score,
+  and the ranking key of tsweep, rwsweep, helpersweep and realize. Definition: both sides become capstone text (the
+  original's `orig.s` as it is; ours by decoding the listing's code bytes, so frame variables, `OFFSET`s and the
+  listing's spellings disappear), each instruction one key: the mnemonic and every operand as encoded (registers,
+  memory operand with its displacement, immediates mod 2^32, operand order and size). Masked: a relocated field
+  (`A`; ours by the object's relocation table when the `.obj` sits next to the listing, else by the listing's
+  symbols (`OFFSET x`, a bare symbol immediate, a non-frame symbol in a memory operand); both sides by image-address range: 0x400000..0x4000000, or the 64 MB from the
+  function's 16 MB boundary for a function above that), call targets (`T`), jump targets (`L`), alignment padding (a
+  run of pads is one key; the image's `jmp` over a pad, also in several parts like npad 14's `jmp X; lea esp, [esp];
+  jmp X; lea ecx, [ecx]; X:`, is part of the pad), our in-procedure data and the original's jump/index tables after the code. Alignment
+  (since 2026-11-12): regdiff's sequence alignment over the instruction *shapes* (mnemonic plus the registers of
+  each operand, displacements and immediates masked), so exchanged or moved stack slots no longer break the
+  alignment (F3 0x007bc740 r2_pad28: 125 with the old full-key alignment, 46 now, regdiff 4). Count: unmatched
+  instructions 1 per side (our trailing EH funclets ignored); each aligned pair whose full keys differ (a
+  displacement, immediate or operand size) 1; each aligned jump whose target aligns to another instruction than
+  the original's 1; each change of the byte offset between consecutive aligned pairs 1 (where our code moves
+  against the original's: an encoding of another length, an inserted or dropped instruction).
+  `tsweep._bparts(ours, orig)` returns the parts (`fields`, `jumps`, `shifts`, and `moved`, the aligned pairs at
+  another offset, which is not counted). 0 = the original's instruction stream up to the masks. Validation
+  (2026-11-12, 2.3k listings of 146 functions, cmpobj byte verdicts): bdiff 0 never had differing bytes, every byte
+  match had bdiff 0, and on the benchmark functions bdiff ranked the byte-best variant at least as high as regdiff
+  on 64 of 65 by cmpobj bytes and 66 of 66 by aligned bytes. The shift term was kept because it beat the same
+  score without it on both measures (63/65 and 65/66). The older full-key bdiff, on those listings: 61/65 and
+  64/66. Without code bytes in the listing it falls back to regdiff. Python:
+  `tsweep.bdiff(ours, orig)` with `ours = listing_instrs(..)`, `orig = orig_instrs(..)` (or another listing);
 - `regdiff`: an **aligned** difference against a `VA mnemonic operands` disassembly of the original: instructions
   (mnemonic plus registers) left unmatched by a sequence alignment, both sides counted, our trailing EH funclets
   ignored. `posdiff` is the old positional count. Use `regdiff`: one inserted instruction shifts every later line
@@ -648,13 +782,15 @@ bytes. The names available are listed in the script's docstring:
   names inside symbols (`??_C@_01..@?$CL?$AA@` is not `cl`), capstone's `imul r, r, imm` for the listing's
   `imul r, imm`, and alignment padding (the listing's `npad n` against `lea r, [r]`, `nop`, `mov edi, edi` or a
   `jmp` over the pad; a run of pad instructions counts as one). Mount & Blade `CharSheet::init_screen`: 102 before
-  for the draft, 5 after, all of it the one real difference;
+  for the draft, 5 after, all of it the one real difference. regdiff is blind to displacements and immediates (an
+  x87 sum in another order, another parameter loaded, a store of a register instead of an immediate all score 0 or
+  better): rank by `bdiff`, keep regdiff for comparisons with older numbers;
 - `hinge(x, t)`.
 
 Traces are cached (tools/ccache.py, below), so re-scoring a finished sweep with a different metric takes seconds
 (64 variants in 19 s).
 
-Variants go to `work/tsweep/<template>/vNNN/`, which keeps the traces' listings. Checked on 0x008e7d40 with a
+Variants go to `work/tsweep/<template>-<hash of its directory>/vNNN/`, which keeps the traces' listings. Checked on 0x008e7d40 with a
 4-variant grid: it reproduces the measured trade-off (named local: dst(0xa8) = eax but `this` 83, regdiff 174; the
 draft: ecx, 79, regdiff 7).
 
@@ -673,6 +809,19 @@ rasim need   snap.json reg:this=esi reg:center=ebp        # which changes (sourc
 rasim want   snap.json regmap.txt                         # the same, targets read from `c2trace.py regmap` output
 rasim fold   snap.json t                                  # does a reload fold into t; the single edit that folds it
 ```
+
+`rasim ... | head` ends quietly: rasim restores the default SIGPIPE action, so a closed stdout ends it with status
+141 in every subcommand (it panicked with "failed printing to stdout: Broken pipe"); c2trace.py, regmap.py,
+c2scratch.py and c2regs.py do the same for BrokenPipeError on stdout (`c2trace.pipe_safe`).
+
+**x87 on cl 14.00 / 15.00 (`x87stack.rs`, x87.md section 12).** `regs --export` on these builds runs one more
+traced compile (`tools/c2x87.py`; `C2X87=0` skips it) and adds the key `x87`: the GF form at
+BuildLiveOnEntryAndExitSets (`%` dump plus the `^` globreg view for the block edges), the mapped code at FPPeeps,
+every call's kill set (LoAddCallScratchRegs exit) and every earlier body's x87 push count (MscCollectUsedRegs).
+`rasim check SNAP --predict` then prints `x87 stack (X87MapGFxToSTx, cl 14.00) F: calls N of N kill sets predicted;
+blocks N of N mapped exactly (N of N x87 instructions in order); airlocks N of N` (`-v`: each call's reason and
+each block that differs), and `rasim need SNAP stack:V` answers what splits, reloads or keeps V. No DLL change: the
+hooks use the existing `%` and `^` specs and resolve their addresses from the build's own index.
 
 **x87 on cl 13.10 (`fpcolor.rs`).** A 13.10 snapshot also carries FPColor's passes and events (key `fp`).
 `rasim check` (and `check --predict`) then adds a line like
@@ -775,6 +924,13 @@ registers: 26 of 26 int colourings predicted from the simulated state (26 of 26 
 - *traced inputs*: the formula applied to exactly what ChoosePhysReg read (a check of the formula alone).
 - *state divergences*: places where c2's avail set or PREF list differs from the model's (re-queues and every
   neighbour sighting are compared too). After a divergence the replay continues from the traced state.
+
+`rasim need SNAP reg:V=R ...` prints, under each target's line, where every nonzero weight of its colouring comes
+from (ChoosePhysReg, regalloc.md 4): an uncoloured neighbour's PREF count (`+1 t5 (an uncoloured neighbour) prefers
+ecx`), 100 x benefit of a neighbour whose last register it is (and whether that was its only register from the
+start, e.g. a byte value live across a call, which can only have ebx, or the others were taken), and the value's
+own PREFs (`-5 its own preference for eax`). M&B 0x4ea290: `i`'s `ebx:400` is the immediate candidate `0` (benefit 4)
+with ebx only. The terms come from a free run of the model with the given changes (`Mods::explain`). **[C]**
 
 Trace facts, not predictions: the initial avail sets, the neighbour list and partner list of each colouring, the
 Spillcosts preference events, and which globregs are split, spilled or deferred.
@@ -893,7 +1049,7 @@ self-checked.
 | b100.c (port1310), one target / two targets `--depth 3` | 542 | 51 s / 173 s; 51 s / 173 s | 13 s / 37 s; 14 s / 38 s |
 | M&B `CharSheet::init_screen` (csn.json), `need reg:t261=esi` | 308 | 6.1 s / 17 s | 1.9 s / 5.5 s |
 
-Wall times on the 10-core Mac (rasim runs locally; only traced compiles go to the laptop), shared with other agents
+Wall times on a 10-core machine (rasim runs locally; only traced compiles go to the compile server), shared with other agents
 (load 25 to 200), so they spread. On b250 the time is now spread over all kinds of change (shares of the run time, one target): `extend:` 42 %, `ref:`/`unref:` 20 %, order
 changes 24 %, interference and copy 12 %. It is still short of a minute: most of what is simulated is a web that
 differs only in its available registers or benefit, in a way the colourings that touch it cannot see (two thirds of
@@ -1278,6 +1434,27 @@ prints our registers, the votes and a verdict (`ok`, `WANTS r`, `mixed`, judged 
 split ranges and inlined locals that share a name are handled), then the swaps (A has what B wants and vice
 versa), which become `rasim need 'A>B'` constraints.
 
+**Our side is read from the bytes.** orig.s is capstone text, and the listing (MASM) writes some instructions'
+operands in the other order for the same bytes: `test` and `xchg` are `test reg, r/m` in the listing and
+`test r/m, reg` in capstone (`84 c3` is the listing's `test al, bl`, capstone's `test bl, al`). Compared as text,
+every `test r8, r8` gave each operand a vote for the other's register: on Mount & Blade 0x46bc70 four of five
+WANTS and all three swaps were that. regmap, `scratch --phase`, tsweep's `regdiff`/`posdiff` and realize's
+regmap input therefore read our instructions as capstone decodes the listing's code bytes (`tsweep.cs_text`,
+`listing_cs_offsets`); where only the text is usable (a listing without code bytes; `slots --orig` and
+framefields, which need the operands' slot names) it is put in capstone's order (`tsweep.canon_listing`: test and
+xchg swapped, fcomip/fucomip named fcompi/fucompi). Checked on 14.00 and 13.10 listings: imul (2 and 3 operands),
+cmpxchg, xadd, shld/shrd, bt/bsf and the x87 two-operand forms keep their order (tests/data/testorder.c).
+
+**Commutative two-address ops are voted by role.** `add ebp, eax` (original) and `add eax, ebp` (ours) compute the
+same sum; only the register the result goes to differs. For add, adc, and, or, xor, imul and test with two register
+operands, the result (the variable the final IL writes) is voted by the destination's position, and a source that
+the original has in the other position votes for its own register: no WANTS for the operands. Before, Mount &
+Blade 0x524420 gave `t728 WANTS ebp` and `base mixed` besides the sum's `t814 WANTS ebp`; now only t814, with a
+`note:` line saying that the original's result sits in the other operand's register (the IL's operand order:
+symkeys.py), not a register choice (tests/data/twoaddr.c). Every non-ok integer row also gets a `from:` line: Color
+(a globreg: `rasim want`), a scratch pick or a Riscify call (`rasim scratch ... want:`), or the phase of a `?` temp.
+**[C]**
+
 **Every register class is covered**, on 14.00, 13.10 and 15.00 (the final IL names all of them):
 - integer rows first, unchanged, in the format `rasim want` reads;
 - then `# XMM values (Color class 6): N checked, M agree everywhere` and one row per XMM value (15.00 writes the
@@ -1362,8 +1539,10 @@ finds no sites, as the rule predicts.
 `tools/rwsweep.py tu.cpp --func DECORATED [--asm-vs orig.s] [--want 'A>B' --pass K] [--families ...] [--vars v,w]`
 does not assume a rule. It enumerates mechanical, meaning-preserving rewrites of the target's own body, compiles
 each once with the regs trace, and reports per variant: `shape` (aligned diff against the baseline with registers
-masked; 0 = code-neutral), `regs` (the same with registers), `regdiff` against the original and the change of the
-`--want` gap. Code-neutral variants that help are then combined and verified. Families:
+masked; 0 = code-neutral), `regs` (the same with registers), `bdiff` against the original (the sort key) and
+`regdiff`, and the change of the `--want` gap. Its baseline numbers are tsweep's: before 2026-11-12 rwsweep had its
+own alignment that did not merge runs of padding, so its regdiff was higher by the number of extra pad
+instructions (1 to 10 on the benchmark drafts). Code-neutral variants that help are then combined and verified. Families:
 
 | family | rewrite |
 |---|---|
@@ -1425,6 +1604,27 @@ each variant and reports whether the edit happened, what else moved (as abstract
 traces) and the code cost. The catalogue (edit kind x construct, on the three builds), the pipeline's stages and
 the validation runs are in docs/c2/realize.md. **[C]** (tests/run_tests.py, realize checks, on all four builds)
 
+## Function filter: log only while one function is compiled (`C2TRACE_FUNC`, `func`)
+
+A big TU traced at many passes writes every function's events and IL dumps (Mount & Blade 0x47cfe0: 10 MB for
+16 IL hooks, 270 KB filtered; a 60-pass `icount` trace of a large TU would be hundreds of MB). The DLL can log only
+while a chosen function is being compiled:
+
+- config directive `func <text>` (up to 4): an event (entry or exit) is written, and counted for `max`, only when
+  the decorated name of the function being compiled (`[[[_CurFunc]+0]+4]`, the same name the `il` header prints)
+  contains every `<text>`; `set curfunc <VA>` gives `_CurFunc` for another build (c2trace.py writes it from the
+  build table's `globals._CurFunc`; 14.00: 10d123ac). Hooks still run and exit frames are still tracked, so only
+  the log changes. The DLL writes `# func <n>` into the log when it filters.
+- `run_trace(..., func=PAT)` writes the lines for a `--func` value (func_pat; split around anonymous-namespace
+  hashes, which depend on the compile's path). Without it the environment variable `C2TRACE_FUNC=PAT` does the
+  same for any tool (`C2TRACE_FUNC='?eA@@' uv run tools/c2trace.py regs ...`).
+- `c2trace.py il` and `icount.py` pass their `--func` by default (their reports are by function anyway; output
+  unchanged). The other subcommands do not, because some of their events fire outside the function's own
+  compile (helpers inlined into it are compiled first under their own names); use `C2TRACE_FUNC` with them when the
+  trace is too big and the events you need are the function's own.
+- A compile server whose c2trace.dll predates the directive ignores it (no `# func` line) and logs everything;
+  the Python side filters by name as before, so results are the same, only bigger. Builds: all four.
+
 ## Compile cache (`tools/ccache.py`)
 
 `c2trace.run_trace` (so `regs`, `il`, `scratch`, `regmap`, `tsweep`) and `chk.py` cache by content: the
@@ -1465,8 +1665,8 @@ different). Fixed **[C, unit test in tests/run_tests.py]**:
   difference 13 bytes before, 0 after.
 - `ltcgstub.py cmp` (two linked images, the same operand guess on both sides) also masks aligned runs of 2+
   image-address dwords: the table entries differ by the image base and were compared raw.
-- Not affected: `regdiff`, `regmap`, `realize --asm-vs`, `rwsweep`/`tsweep` scores (text and operand shapes, not
-  bytes), `calleesum` (no byte comparison).
+- Not affected: `regdiff`, `bdiff` (capstone text with relocated fields masked by symbol and address range, not
+  raw bytes), `regmap`, `calleesum` (no byte comparison).
 
 ## Limits
 

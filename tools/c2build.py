@@ -24,7 +24,8 @@ A non-default build is described by tools/c2builds/<build>.json:
                           il_default, default; scratch_x = c2scratch.HOOKS_X for scratch --why/--export;
                           regs_dec = c2regs.DEC_HOOKS, the decision events of `regs --export` / `rasim check
                           --predict`, appended after regs; regs_dec_exit = {regs hook index: decision event} for
-                          an event read at that hook's exit)
+                          an event read at that hook's exit); origin = {ra, rp, gr, rm}: the IL at RewriteAsReal
+                          and (13.10) at Riscify / MdmAvoidMOBStalls, and every GetReg call (c2scratch.ORIGIN)
   regs_events             {regs hook index: extra event} (13.10: the FPColor events)
   regs_ops                {enterload, last}: OPENTERLOAD and the first pseudo-opcode (hex), which the decision
                           rules compare with (copied into the snapshot as `c2.ops`)
@@ -99,12 +100,29 @@ def hooks(key, default):
     return h[key]
 
 
+def tcpath(base, *parts):
+    """`base/parts...` with each part looked up case-insensitively when the exact spelling is missing: a toolchain
+    unpacked in lower case (`vc/bin`, `vc/include`, ...) on a case-sensitive filesystem (Linux, WSL) is found under
+    the canonical names VC/Bin, VC/INCLUDE, VC/LIB, SDK/Include, SDK/Lib. On a case-insensitive filesystem (macOS)
+    the exact spelling always exists. A part found in no spelling is kept as written (the path does not exist)."""
+    p = str(base)
+    for part in (q for x in parts for q in str(x).replace("\\", "/").split("/") if q):
+        q = os.path.join(p, part)
+        if not os.path.exists(q) and os.path.isdir(p):
+            low = part.lower()
+            hit = sorted(n for n in os.listdir(p) if n.lower() == low)
+            if hit:
+                q = os.path.join(p, hit[0])
+        p = q
+    return p
+
+
 def toolchain(trace=False):
     return os.path.join(ROOT, "work", "toolchain", "c2-" + name() + ("-trace" if trace else ""))
 
 
 def orig_c2():
-    return os.path.join(toolchain(), "VC", "Bin", "c2.dll")
+    return tcpath(toolchain(), "VC", "Bin", "c2.dll")
 
 
 def index_rows():
@@ -145,7 +163,7 @@ def setup(argv):
     a = ap.parse_args(argv)
     if t is None:
         sys.exit("setup is for non-default builds: pass --c2 13.10 (the 14.00 toolchain is set up by release/setup.py)")
-    c2 = os.path.join(a.src, "bin", "c2.dll")
+    c2 = tcpath(a.src, "bin", "c2.dll")
     if not os.path.isfile(c2):
         sys.exit("no %s" % c2)
     got = sha256(c2)
@@ -157,14 +175,14 @@ def setup(argv):
     tc = toolchain()
     if not os.path.isdir(tc):
         os.makedirs(os.path.join(tc, "VC"))
-        shutil.copytree(os.path.join(a.src, "bin"), os.path.join(tc, "VC", "Bin"))
-        shutil.copytree(os.path.join(a.src, "include"), os.path.join(tc, "VC", "INCLUDE"))
-        shutil.copytree(os.path.join(a.src, "lib"), os.path.join(tc, "VC", "LIB"))
+        shutil.copytree(tcpath(a.src, "bin"), os.path.join(tc, "VC", "Bin"))
+        shutil.copytree(tcpath(a.src, "include"), os.path.join(tc, "VC", "INCLUDE"))
+        shutil.copytree(tcpath(a.src, "lib"), os.path.join(tc, "VC", "LIB"))
         if a.sal and os.path.isfile(os.path.join(a.sal, "sal.h")):
             shutil.copy(os.path.join(a.sal, "sal.h"), os.path.join(tc, "VC", "INCLUDE", "sal.h"))
         os.makedirs(os.path.join(tc, "SDK"))
         for sub in ("Include", "Lib"):
-            src = os.path.realpath(os.path.join(a.sdk, sub))
+            src = os.path.realpath(tcpath(a.sdk, sub))
             if os.path.isdir(src):
                 os.symlink(src, os.path.join(tc, "SDK", sub))
             else:

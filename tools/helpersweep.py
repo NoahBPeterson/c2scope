@@ -17,14 +17,15 @@ Steps:
      to `&hs_bind(EXPR)` (`template<class T> T& hs_bind(T& x) { T& r = x; return r; }` is prepended: no types
      needed);
   3. trace the baseline and every single rewrite (regs + scratch; cached): the gap of the constraint A>B at
-     Spillcosts pass K (prio(B) - prio(A), as tsweep's prio), whether the code changed (aligned diff against the
-     baseline listing) and whether the scratch picks changed;
+     Spillcosts pass K (prio(B) - prio(A), as tsweep's prio), whether the code changed (tsweep.bdiff against the
+     baseline listing: displacements and immediates count) and whether the scratch picks changed;
   4. predict combinations: P enters the priority formula linearly, so the gap of a set of rewrites in different
      places is the sum of their single gaps (rasim's model); rank the code-neutral sets that close the gap,
      fewest rewrites first;
-  5. compile the best --verify sets and report the real gap, code change and (with --asm-vs) regdiff.
+  5. compile the best --verify sets and report the real gap, code change and (with --asm-vs) bdiff and regdiff.
 """
 import argparse, itertools, os, re, shutil, sys
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image import ROOT
@@ -61,14 +62,24 @@ def match_brace(text, i):
     return len(text)
 
 
-DEF = re.compile(r"(?:(\w+)\s*::\s*)?(~?\w+)\s*\(([^;{}()]*(?:\([^()]*\)[^;{}()]*)*)\)\s*(?:const\s*)?(?::[^{;]*)?\{")
+DEF = re.compile(r"(?:(\w+)\s*::\s*)?(~?\w+|operator\s*(?:\(\)|\[\]|new\b|delete\b|[-+*/%^&|~!=<>,]+))\s*"
+                 r"\(([^;{}()]*(?:\([^()]*\)[^;{}()]*)*)\)\s*(?:const\s*)?(?::[^{;]*)?\{")
+# MSVC's operator codes (`??4Class@@` is Class::operator=), the name as functions() spells it (spaces removed)
+OPCODES = {"2": "new", "3": "delete", "4": "=", "5": ">>", "6": "<<", "7": "!", "8": "==", "9": "!=", "A": "[]",
+           "C": "->", "D": "*", "E": "++", "F": "--", "G": "-", "H": "+", "I": "&", "J": "->*", "K": "/", "L": "%",
+           "M": "<", "N": "<=", "O": ">", "P": ">=", "Q": ",", "R": "()", "S": "~", "T": "^", "U": "|", "V": "&&",
+           "W": "||", "X": "*=", "Y": "+=", "Z": "-=", "_0": "/=", "_1": "%=", "_2": ">>=", "_3": "<<=", "_4": "&=",
+           "_5": "|=", "_6": "^="}
 
 
 def functions(text):
     """[(name, params text, body start, body end)] for every function-like definition with a body."""
     out = []
-    for m in DEF.finditer(text):
-        name = m.group(2)
+    # comments blanked (same offsets): `// ids (provisional): triples (a, b)` before a definition otherwise reads as
+    # a constructor `ids(provisional) : <initialisers>` whose match swallows the real definition's head
+    bare = re.sub(r"//[^\n]*|/\*.*?\*/", lambda c: re.sub(r"[^\n]", " ", c.group(0)), text, flags=re.S)
+    for m in DEF.finditer(bare):
+        name = re.sub(r"\s+", "", m.group(2))
         if name in ("if", "while", "for", "switch", "catch", "return", "sizeof"):
             continue
         b = m.end() - 1
@@ -78,13 +89,24 @@ def functions(text):
 
 
 def body_of(text, func_decorated):
-    """The target's definition: match `Class::Name(` from the decorated name ?Name@Class@@..."""
-    m = re.match(r"\?(\w+)@(\w+)@@", func_decorated)
+    """The target's definition: match `Class::Name(` from the decorated name ?Name@Class@@... or the open --func
+    form ?Name@Class@ (c2trace.func_decl; any enclosing namespace)."""
+    m = re.match(r"\?(\w+)@(\w+)@", func_decorated)   # ?Name@Class@[Ns@..]@
     name, cls = (m.group(1), m.group(2)) if m else (func_decorated.strip("?_@"), None)
+    c = re.match(r"\?\?([01])(\w+)@", func_decorated)   # ??0Class@@ constructor, ??1Class@@ destructor
+    if c:
+        name, cls = ("~" if c.group(1) == "1" else "") + c.group(2), c.group(2)
+    t = re.match(r"\?(\w+)@\?\$(\w+)@", func_decorated)            # ?Name@?$Class@<args>@@: a class template's member
+    if t:
+        name, cls = t.group(1), t.group(2)
+    o = re.match(r"\?\?(_[0-6]|[2-9A-Z])(?:\?\$)?(\w+)@", func_decorated)  # ??4Class@@ / ??4?$Tmpl@..: operator=
+    if o and o.group(1) in OPCODES:
+        name, cls = "operator" + OPCODES[o.group(1)], o.group(2)
     for fn in functions(text):
         if fn[0] == name:
             head = text[max(0, fn[4] - 200):fn[2]]
-            if cls is None or re.search(r"\b%s\s*::\s*%s\s*\(" % (cls, name), text[fn[4] - len(cls) - 4:fn[2]]) \
+            pat = r"\s*".join(re.escape(ch) for ch in name) if name.startswith("operator") else re.escape(name)
+            if cls is None or re.search(r"\b%s\s*::\s*%s\s*\(" % (cls, pat), text[fn[4] - len(cls) - 4:fn[2]]) \
                     or cls in head:
                 return fn
     sys.exit("definition of %s not found in the TU" % func_decorated)
@@ -191,9 +213,10 @@ def used_helpers(text, target, fns):
 
 def apply_sites(text, sites):
     """Rewrite the chosen sites (back to front) and prepend hs_bind."""
+    pre = "" if re.search(r"(?:inline|__forceinline)[^;{]*\bhs_bind\s*\(", text) else BIND   # an earlier variant as input
     for s, e, expr in sorted(sites, reverse=True):
         text = text[:s] + "&hs_bind(" + expr + ")" + text[e:]
-    return BIND + text
+    return pre + text
 
 
 def prio_at(snap, name, k):
@@ -258,7 +281,7 @@ def main():
     hdr_dir = os.path.dirname(os.path.abspath(a.tu))
     text = re.sub(r'#include "([^"/][^"]*)"', lambda m: '#include "%s"' % os.path.join(hdr_dir, m.group(1))
                   if os.path.exists(os.path.join(hdr_dir, m.group(1))) else m.group(0), text)
-    a.func = c2trace.func_decl(a.func)         # Class::method or method@Class -> ?method@Class@@
+    a.func = c2trace.func_decl(a.func)         # Class::method or method@Class -> ?method@Class@ (any namespace)
     fns = functions(text)
     target = body_of(text, a.func)
     helpers = used_helpers(text, target, fns)
@@ -268,7 +291,8 @@ def main():
             sites.append((fn[0],) + s)
     sites = sorted(set(sites), key=lambda x: x[1])
     print("%d helpers used by the target, %d rewrite sites" % (len(helpers), len(sites)), flush=True)
-    out = os.path.join(ROOT, "work", "helpersweep", os.path.splitext(os.path.basename(a.tu))[0])
+    # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory
+    out = os.path.join(ROOT, "work", "helpersweep", tsweep.out_name(a.tu))
     if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory
         out += "@" + c2trace.c2build.name()
     shutil.rmtree(out, ignore_errors=True)
@@ -303,7 +327,7 @@ def main():
             print("  s%03d %-22s %-40s  failed: %s" % (i, fn[:22], expr[:40], err))
             continue
         dg = (r.gap(A, B, a.k) or 0) - (g0 or 0)
-        code = tsweep.regdiff(r.instrs, base.instrs)
+        code = tsweep.bdiff(r.instrs, base.instrs)
         picks = r.picks != base.picks
         rows.append((i, dg, code, picks))
         print("  s%03d %-22s %-40s  dgap %+4d  code %s  picks %s" % (i, fn[:22], expr[:40], dg,
@@ -323,14 +347,15 @@ def main():
     for n, _, ids, pred in combos[:a.verify]:
         r = build("c_" + "_".join("%03d" % i for i in ids), [sites[i] for i in ids])
         gap = r.gap(A, B, a.k)
-        code = tsweep.regdiff(r.instrs, base.instrs)
-        rd = tsweep.regdiff(r.instrs, orig) if orig else None
+        code = tsweep.bdiff(r.instrs, base.instrs)
+        rd = tsweep.bdiff(r.instrs, orig) if orig else None
         print("  %-24s predicted gap %+d  real %+d  code vs base %d%s" % (
-            "+".join("s%03d" % i for i in ids), pred, gap, code, "" if rd is None else "  regdiff vs original %d" % rd))
+            "+".join("s%03d" % i for i in ids), pred, gap, code,
+            "" if rd is None else "  vs original: bdiff %d regdiff %d" % (rd, tsweep.regdiff(r.instrs, orig))))
         if rd is not None and (best is None or rd < best[0]):
             best = (rd, ids)
     if best:
-        print("best: %s (regdiff %d) -> %s" % ("+".join("s%03d" % i for i in best[1]), best[0],
+        print("best: %s (bdiff %d) -> %s" % ("+".join("s%03d" % i for i in best[1]), best[0],
                                                os.path.join(out, "c_" + "_".join("%03d" % i for i in best[1]))))
     for i in sorted({i for c in combos[:a.verify] for i in c[2]}):
         fn, s, e, expr = sites[i]

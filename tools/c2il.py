@@ -157,7 +157,7 @@ def main(argv):
     if a.diff and len(at) < 2:
         sys.exit("--diff needs at least two passes: --diff PASS_A,PASS_B")
     spec = SPEC[:-1] if a.plain and SPEC.endswith("%+") else SPEC
-    img, hk, rc, out, log = c2trace.run_trace(a.src, [p + spec for p in at], cl, keep=a.keep)
+    img, hk, rc, out, log = c2trace.run_trace(a.src, [p + spec for p in at], cl, keep=a.keep, func=a.func)
     if rc:
         sys.stdout.write(out)
     passes = parse(log, hk, a.func)

@@ -33,22 +33,34 @@ Families (all keep the meaning of the program):
           leave a reference at allocation time and no code
   reread  after `X = p->m;`, a later use of X (before the next call or write) is spelled `(p->m)` again; the
           meaning is kept only if nothing stores to that memory in between, so check the hits by eye
+  unalias  a reference or pointer alias of a member chain (`T& r = p->m;`, `T* q = &p->m;`, `T*& pf = flags;`)
+          removed, its uses spelled as the chain: such an alias, used twice or more, is a variable c2 does not
+          copy-propagate, so its reads never share a load with the chain's own reads (docs/c2/loadcse.md R2, R3)
   recompute  (not in the default set; --families recompute) `V = E;` with E made of literals and pure math calls
           (`dq = sqrt(13.0 / 8.0);`) is written again before a later statement that uses V after a call: the same
           value, computed once as before, but V is then one live range per call-free stretch instead of one
           across the calls (float values: docs/c2/x87.md section 10)
+  byval   a call that returns a class by value (`map.find(&key)`, the return type found in the unit's declarations)
+          passed through a generic by-value inline forwarding template placed at file scope before the target:
+          `rz_bv_find1(map, &key)`, `template <class M, class A0> inline typename M::It rz_bv_find1(M& m,
+          const A0& a0) { return m.find(a0); }`. It changes code: the result is read from the wrapper's return
+          temporary, not through the returned pointer `[eax]` (Spore 005f0a60, with `alias` on the iterator: MATCH)
 
 Measures per variant:
   shape    aligned diff against the baseline with every register except esp masked: 0 = the same instructions
            in the same order, only registers may differ ("code-neutral")
   regs     aligned diff against the baseline including registers: 0 = nothing changed at all
-  regdiff  (--asm-vs) aligned diff against the original, registers included: the number to bring to 0
+  bdiff    (--asm-vs) the byte-faithful score against the original (tsweep.bdiff: whole instructions, with
+           displacements and immediates; relocations, call/jump targets and padding masked): the number to bring
+           to 0, and the sort key
+  regdiff  (--asm-vs) the same alignment over mnemonic + registers only (tsweep.regdiff)
   dgap     (--want A>B) change of prio(B) - prio(A); the constraint holds when the gap is <= 0
 
 Output: every variant that changed something, best first; then combinations of the code-neutral ones that
-helped (gaps add up, as in helpersweep), compiled and reported. Variants stay in work/rwsweep/<tu>/.
+helped (gaps add up, as in helpersweep), compiled and reported. Variants stay in work/rwsweep/<tu>-<dirhash>/.
 """
 import argparse, difflib, itertools, os, re, shutil, sys
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image import ROOT
@@ -87,8 +99,9 @@ class Body:
 
     def __init__(self, text, fn, cls):
         self.text, self.cls = text, cls
-        name, params, b, e, _ = fn
+        name, params, b, e, d = fn
         self.b, self.e = b, e
+        self.d = d                      # where the definition's name starts (the return type may come before it)
         self.toks = lex(text, b, e)
         n = len(self.toks)
         self.paren = [0] * n            # paren depth before the token
@@ -111,7 +124,8 @@ class Body:
         # statement starts: token index following `;` `{` `}` at paren depth 0, not before `else`/`}`
         self.starts = []
         for i in range(1, n - 1):
-            if self.toks[i - 1][0] in (";", "{", "}") and self.paren[i] == 0 and self.toks[i][0] not in ("else", "}"):
+            # (`)` after the `;` of an empty for-increment `for (a; b; )` sits at depth 0 once closed: not a start)
+            if self.toks[i - 1][0] in (";", "{", "}") and self.paren[i] == 0 and self.toks[i][0] not in ("else", "}", ")"):
                 if self.toks[i - 1][0] == "}" and self.toks[i][0] in ("while",):      # do { } while
                     continue
                 self.starts.append(i)
@@ -172,6 +186,52 @@ class Body:
         return self.text[self.toks[i][1]:self.toks[j - 1][2]]
 
 
+def _call_arg(B, i, j):
+    """(callee name, argument index) when tokens [i, j) are one whole argument of a call `f(..)` / `p->f(..)`."""
+    if not i or B.toks[i - 1][0] not in ("(", ",") or j >= len(B.toks) or B.toks[j][0] not in (",", ")"):
+        return None
+    d, k, idx = 0, i - 1, 0
+    while k >= 0:
+        t = B.toks[k][0]
+        if t in (")", "]"):
+            d += 1
+        elif t in ("(", "["):
+            if d == 0:
+                break
+            d -= 1
+        elif t == "," and d == 0:
+            idx += 1
+        k -= 1
+    if k < 1 or B.toks[k][0] != "(" or not re.match(r"[A-Za-z_]\w*$", B.toks[k - 1][0]) or B.toks[k - 1][0] in KEYWORDS:
+        return None
+    return B.toks[k - 1][0], idx
+
+
+_PARAMS = {}
+
+
+def ref_params(text, name):
+    """Indices of the parameters of every declaration of function `name` in the unit that are non-const lvalue
+    references (`bool& any`): an argument there must stay an lvalue, so hs_id / hs_cp (prvalues) cannot wrap it
+    (C2664 `bool` to `bool &`, Spore 0073afb0). Overloads are merged: an index counts if any overload has it."""
+    key = (id(text), name)
+    if key not in _PARAMS:
+        out = set()
+        for m in re.finditer(r"\b%s\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)\s*(?:const\s*)?[{;:]" % re.escape(name), text):
+            for k, prm in enumerate(m.group(1).split(",")):
+                prm = re.sub(r"=.*", "", prm)
+                if re.search(r"(?<!&)&(?!&)", prm) and not re.search(r"\bconst\b[^&]*&", prm):
+                    out.add(k)
+        _PARAMS[key] = out
+    return _PARAMS[key]
+
+
+def _lvalue_arg(B, i, j):
+    """Is [i, j) passed to a non-const reference parameter of a function declared in the unit?"""
+    ca = _call_arg(B, i, j)
+    return bool(ca) and ca[1] in ref_params(B.text, ca[0])
+
+
 def gen_wrap(B):
     seen = set()
     for v, uses in B.uses.items():
@@ -180,7 +240,7 @@ def gen_wrap(B):
                 if (i, j) in seen:
                     continue
                 seen.add((i, j))
-                expr, w = B.src(i, j), B.written(i, j)
+                expr, w = B.src(i, j), B.written(i, j) or _lvalue_arg(B, i, j)
                 decl = j < len(B.toks) and B.toks[j][0] in ASSIGN and i in B.starts and v == "this"
                 for h in (("hs_bind",) if w else ("hs_id", "hs_cp", "hs_bind")):
                     if (h == "hs_bind" and expr == "this") or decl:
@@ -203,14 +263,162 @@ def gen_wrap(B):
                 if d == 0:
                     break
             k += 1
-        for a, z in args:
+        refs = ref_params(B.text, t)
+        for ai, (a, z) in enumerate(args):
             if z - a < 2 or (z - a == 2 and B.toks[a][0] == "&") or B.toks[a][0] in ("hs_id", "hs_cp"):
                 continue
-            if B.toks[a][0] == "&" or (a, z) in seen:
+            if B.toks[a][0] == "&" or (a, z) in seen or ai in refs:      # a prvalue cannot bind to T&
                 continue
             expr = B.src(a, z)
             for h in ("hs_id", "hs_cp"):
                 yield ("wrap", "arg %s(%s) of %s" % (h, expr[:40], t), [(B.toks[a][1], B.toks[z - 1][2], "%s(%s)" % (h, expr))])
+
+
+SCALAR = set("void bool char short int long float double unsigned signed size_t wchar_t __int64 uint8_t uint16_t "
+             "uint32_t uint64_t int8_t int16_t int32_t int64_t uint uchar ushort ulong BOOL DWORD WORD BYTE HRESULT".split())
+
+
+def byval_returns(text):
+    """{function name: [(return type text, enclosing class or None, nested)]} for the declarations in the unit whose
+    return type is a class by value (no pointer or reference, a struct/class/template the unit defines or names).
+    `nested`: the type is declared inside the enclosing class (`struct AreaMap { struct It {..}; It find(..); }`),
+    so a wrapper template spells it `typename M::It`."""
+    bare = re.sub(r"//[^\n]*|/\*.*?\*/", lambda c: re.sub(r"[^\n]", " ", c.group(0)), text, flags=re.S)
+    classes = []                                  # (name, body start, body end)
+    for m in re.finditer(r"\b(?:struct|class|union)\s+(?:__declspec\([^)]*\)\s*)?(\w+)\s*(?::[^{;]*)?\{", bare):
+        b = m.end() - 1
+        classes.append((m.group(1), b, helpersweep.match_brace(bare, b)))
+    out = {}
+    for m in re.finditer(r"(?:^|[;{}:])\s*(?:(?:static|virtual|inline|__forceinline|explicit)\s+)*((?:const\s+)?"
+                         r"(?:typename\s+)?[A-Za-z_][\w:]*(?:\s*<[^;{}()]*?>)?(?:::\w+)?)\s+"
+                         r"(?:\w+\s*::\s*)?([A-Za-z_]\w*)\s*\(", bare):
+        rt, name = m.group(1).strip(), m.group(2)
+        base = re.sub(r"\b(const|typename)\b", " ", rt).strip()
+        if name in KEYWORDS or base in SCALAR or base.split()[0] in KEYWORDS | {"return", "else", "new", "delete"} \
+                or name == base or name.startswith("rz_") or name.startswith("hs_"):
+            continue
+        if not _is_class(bare, base):
+            td = re.search(r"\btypedef\s+(?:typename\s+)?([^;{}]+?)\s+%s\s*;" % re.escape(base.split("::")[-1]), bare)
+            if not td or "*" in td.group(1) or "&" in td.group(1) or not _is_class(bare, td.group(1)):
+                continue
+        pos = m.start(2)
+        enc = [c for c in classes if c[1] < pos < c[2]]
+        enc = min(enc, key=lambda c: c[2] - c[1]) if enc else None
+        nested = bool(enc) and bool(re.search(r"\b(?:struct|class|union)\s+%s\b|\btypedef\b[^;]*\b%s\s*;" % (
+            re.escape(base), re.escape(base)), bare[enc[1]:enc[2]]))
+        ent = (rt, enc[0] if enc else None, nested)
+        if ent not in out.setdefault(name, []):
+            out[name].append(ent)
+    return out
+
+
+def _file_scope_pos(text, at):
+    """Where a declaration can go at file scope before position `at` (a definition's name): before the outermost
+    brace block (namespace, class) around it, else on the line after the previous `;` or `}` (the definition's return
+    type and the comments above it stay together after the insertion)."""
+    bare = re.sub(r"//[^\n]*|/\*.*?\*/", lambda c: re.sub(r"[^\n]", " ", c.group(0)), text, flags=re.S)
+    for m in re.finditer(r"\b(?:namespace|struct|class)\s*\w*\s*(?::[^{;]*)?\{", bare[:at]):
+        b = m.end() - 1
+        if helpersweep.match_brace(bare, b) > at:
+            return text.rfind("\n", 0, m.start()) + 1
+    p = max(bare.rfind(";", 0, at), bare.rfind("}", 0, at))
+    if p < 0:
+        return text.rfind("\n", 0, at) + 1
+    nl = text.find("\n", p)
+    return nl + 1 if 0 <= nl < at else text.rfind("\n", 0, at) + 1
+
+
+def _obj_start(B, k):
+    """Token index where the object expression ending just before token k (`.` / `->`) starts, or None."""
+    j = k - 1
+    while j >= 0:
+        t = B.toks[j][0]
+        if t == "]":
+            d = 0
+            while j >= 0:
+                d += B.toks[j][0] == "]"
+                d -= B.toks[j][0] == "["
+                j -= 1
+                if d == 0:
+                    break
+            continue
+        if not re.match(r"[A-Za-z_]\w*$", t) or t in KEYWORDS - {"this"}:
+            return None
+        if j > 0 and B.toks[j - 1][0] in (".", "->"):
+            j -= 2
+            continue
+        return j
+    return None
+
+
+def gen_byval(B):
+    """A call returning a class by value passed through a generic by-value inline forwarding template:
+    `map.find(&key)` -> `rz_bv_find(map, &key)` with
+    `template <class M, class A0> inline typename M::It rz_bv_find(M& m, const A0& a0) { return m.find(a0); }`
+    placed at file scope before the target (outside its namespace or class). The returned object then goes through
+    the wrapper's own return temporary: Spore 005f0a60 (`it = r2_find(m, k)`, then the erase through a reference
+    to `it`: MATCH) read the iterator from the temp instead of through the returned pointer `[eax]`."""
+    rets = byval_returns(B.text)
+    if not rets:
+        return
+    fn_at = getattr(B, "d", B.b)
+    n = len(B.toks)
+    for i in range(1, n - 1):
+        t = B.toks[i][0]
+        if t not in rets or B.toks[i + 1][0] != "(":
+            continue
+        prev = B.toks[i - 1][0]
+        if prev in (".", "->"):
+            j = _obj_start(B, i - 1)
+            if j is None:
+                continue
+            obj = B.src(j, i - 1)
+            obj = "*" + obj if prev == "->" else obj
+            kinds = [e for e in rets[t] if e[1]]
+            start = j
+        elif prev in ("::",):
+            continue
+        else:
+            kinds = [e for e in rets[t] if e[1] is None]
+            if B.cls and any(e[1] == B.cls for e in rets[t]):
+                kinds, obj = [e for e in rets[t] if e[1] == B.cls], "*this"
+            else:
+                obj = None
+            start = i
+        if not kinds:
+            continue
+        # the argument list
+        d, k, a0, args = 0, i + 1, i + 2, []
+        while k < n:
+            x = B.toks[k][0]
+            d += x in ("(", "[")
+            d -= x in (")", "]")
+            if (x == "," and d == 1) or d == 0:
+                if k > a0:
+                    args.append(B.src(a0, k))
+                a0 = k + 1
+                if d == 0:
+                    break
+            k += 1
+        if k >= n:
+            continue
+        rt, owner, nested = kinds[0]
+        na = len(args)
+        wname = "rz_bv_%s%s" % (t, na)
+        tps = (["class M"] if obj else []) + ["class A%d" % q for q in range(na)]
+        prm = (["M& m"] if obj else []) + ["const A%d& a%d" % (q, q) for q in range(na)]
+        call = ("m.%s" % t if obj else t) + "(%s)" % ", ".join("a%d" % q for q in range(na))
+        rts = "typename M::%s" % rt.split("::")[-1] if (nested and obj) else rt
+        if not tps:
+            continue                               # a free function without arguments: nothing to deduce
+        decl = "template <%s> inline %s %s(%s) { return %s; }\n" % (", ".join(tps), rts, wname, ", ".join(prm), call)
+        if wname in B.text:
+            continue
+        at = _file_scope_pos(B.text, fn_at)
+        repl = "%s(%s)" % (wname, ", ".join(([obj] if obj else []) + args))
+        yield ("byval", "%s through a by-value inline wrapper (returns %s) at body line %d" % (
+            B.src(start, k + 1)[:50], rts, B.text.count("\n", B.b, B.toks[i][1])),
+            [(at, at, decl), (B.toks[start][1], B.toks[k][2], repl)])
 
 
 def gen_alias(B):
@@ -304,7 +512,13 @@ def gen_split(B):
         if not s:
             continue
         m = DECL.match(B.text, B.toks[s[0]][1])
-        if m and m.group(3) == "=" and m.group(2) in B.vars and "&" not in m.group(1) and "const" not in m.group(1):
+        depth, multi = 0, False                 # `T a = x, b = y;`: `T a; a = x, b = y;` would not declare b
+        for q in range(s[0], s[1]):
+            t = B.toks[q][0]
+            depth += t in ("(", "[", "{") or -(t in (")", "]", "}"))
+            multi = multi or (t == "," and depth == 0)
+        if m and not multi and m.group(3) == "=" and m.group(2) in B.vars and "&" not in m.group(1) and \
+                "const" not in m.group(1):
             yield ("split", "%s %s" % (m.group(1), m.group(2)),
                    [(m.start(), m.end(), "%s %s; %s =" % (m.group(1), m.group(2), m.group(2)))])
 
@@ -618,9 +832,34 @@ TOUCH = [("void", "(void)%s; "), ("nop", "hs_nop(%s); "), ("nopref", "hs_nopr(%s
          ("scope", "{ hs_bind(%s); } ")]
 
 
+def _top_const(ty):
+    """Is a variable of declared type `ty` not assignable (`const int`, `T* const`, `const T&`)?"""
+    t = ty.replace("&", " ").strip()
+    if re.search(r"\bconst$", t):
+        return True
+    return "*" not in t and bool(re.search(r"\bconst\b", t))
+
+
+def _is_class(text, ty):
+    """Is `ty` (no pointer) a class type: a template instance or a struct/class/union the unit defines?"""
+    if "*" in ty:
+        return False
+    base = re.sub(r"\b(const|volatile|struct|class|union)\b|&", " ", ty).strip()
+    if "<" in base:
+        return True
+    nm = base.split("::")[-1].strip()
+    return bool(nm) and bool(re.search(r"\b(?:struct|class|union)\s+(?:__declspec\([^)]*\)\s*)?%s\s*[{:]" % re.escape(nm), text))
+
+
 def gen_touch(B):
-    """A statement that uses V and does nothing, at every statement boundary where V is in scope."""
+    """A statement that uses V and does nothing, at every statement boundary where V is in scope. Forms that cannot
+    compile for V's declared type are left out: `V = V;` for a const V, `if (V)` / `__assume(V != 0)` for a class."""
     for v, (ty, decl) in B.vars.items():
+        skip = set()
+        if _top_const(ty):
+            skip.add("self")
+        if v != "this" and _is_class(B.text, ty):
+            skip |= {"if", "assume"}
         for st in B.starts:
             if decl >= st or B.toks[st][0] in ("case", "default"):
                 continue
@@ -633,7 +872,7 @@ def gen_touch(B):
             pos = B.toks[st][1]
             line = B.text.count("\n", B.b, pos)
             for nm, fmt in TOUCH:
-                if v == "this" and nm in ("self", "scope", "nopref"):
+                if (v == "this" and nm in ("self", "scope", "nopref")) or nm in skip:
                     continue
                 yield ("touch", "%s %s at body line %d" % (nm, v, line), [(pos, pos, fmt.replace("%s", v))])
 
@@ -698,7 +937,52 @@ def gen_recompute(B):
                    [(B.toks[st][1], B.toks[st][1], "%s = %s; " % (x, expr)) for st in sites])
 
 
-FAMILIES = {"const": gen_const, "guard": gen_guard, "paren": gen_paren, "cflow": gen_cflow, "touch": gen_touch, "wrap": gen_wrap, "alias": gen_alias, "swap": gen_swap, "split": gen_split, "reread": gen_reread, "recompute": gen_recompute}
+UNALIAS = re.compile(r"(?:const\s+)?[A-Za-z_][\w:<>]*(?:\s+const)?\s*((?:\*\s*(?:const\s*)?)*[*&])\s*(?:const\s+)?([A-Za-z_]\w*)\s*=\s*(&?)\s*"
+                     r"((?:this|[A-Za-z_]\w*)(?:\s*(?:->|\.)\s*[A-Za-z_]\w*|\s*\[[^\]\[;]*\])*)\s*;")
+
+
+def gen_unalias(B):
+    """docs/c2/loadcse.md: a reference or pointer alias of a member chain (`T& r = p->m;`, `T* q = &p->m;`,
+    `T*& rp = flags;`) used twice or more is a variable c2 does not copy-propagate, so reads through it never share
+    a value with reads of the chain itself (R3), and a stored-through alias of a pointer gives its statements their
+    own alias class (R2). Variant: the declaration removed and every use spelled as the chain. Same meaning while
+    nothing the chain reads (its root variable) is assigned in the alias's scope; checked on the root only."""
+    for k, st in enumerate(B.starts):
+        m = UNALIAS.match(B.text, B.toks[st][1])
+        if not m or m.end() > B.e:
+            continue
+        kind, name, amp, chain = m.group(1)[-1], m.group(2), m.group(3), m.group(4)
+        if (kind == "&") == bool(amp):
+            continue
+        root = re.match(r"\w+", chain).group()
+        decl = next((j for j in range(st, len(B.toks)) if B.toks[j][1] == m.start(2)), None)
+        if decl is None:
+            continue
+        end = B.close.get(B.block[st], len(B.toks) - 1)
+        uses = [i for i in range(decl + 1, end) if B.toks[i][0] == name and B.toks[i - 1][0] not in (".", "->", "::")]
+        if not uses or any(B.written(i, i + 1) and kind == "*" for i in uses):
+            continue
+        if root in B.uses and any(decl < i < end and B.written(i, B.chain_end(i)) and B.chain_end(i) == i + 1
+                                  for i in B.uses.get(root, ())):
+            continue
+        if kind == "*" and any(B.toks[i - 1][0] == "&" for i in uses):
+            continue
+        dend = next(j for j in range(st, len(B.toks)) if B.toks[j][0] == ";") + 1
+        edits = [(B.toks[st][1], B.toks[dend - 1][2], "")]
+        for i in uses:
+            if kind == "&":
+                edits.append((B.toks[i][1], B.toks[i][2], "(" + chain + ")"))
+            elif B.toks[i - 1][0] == "*" and (i < 2 or not re.match(r"[\w)\]]", B.toks[i - 2][0][-1:])
+                                              or B.toks[i - 2][0] in KEYWORDS):
+                edits.append((B.toks[i - 1][1], B.toks[i][2], "(" + chain + ")"))
+            else:
+                edits.append((B.toks[i][1], B.toks[i][2], "(&" + chain + ")"))
+        line = B.text.count("\n", B.b, B.toks[st][1])
+        yield ("unalias", "%s %s%s = %s%s removed at body line %d (%d uses)" % (
+            "ref" if kind == "&" else "ptr", kind, name, amp, chain, line, len(uses)), edits)
+
+
+FAMILIES = {"const": gen_const, "guard": gen_guard, "paren": gen_paren, "cflow": gen_cflow, "touch": gen_touch, "wrap": gen_wrap, "alias": gen_alias, "swap": gen_swap, "split": gen_split, "reread": gen_reread, "recompute": gen_recompute, "unalias": gen_unalias, "byval": gen_byval}
 
 
 def explicit_this(text, fn, cls):
@@ -730,10 +1014,19 @@ def body_of(text, func):
     return helpersweep.body_of(text, func)
 
 
+def prelude_for(text):
+    """PRELUDE without the helpers the source already defines (an earlier rwsweep or realize variant as the input:
+    a second copy is C2995)."""
+    return "".join(ln + "\n" for ln in PRELUDE.splitlines()
+                   if not any(re.search(r"(?:inline|__forceinline)[^;{]*\b%s\s*\(" % nm, text)
+                              for nm in re.findall(r"\b(hs_\w+)\s*\(", ln)))
+
+
 def apply(text, edits):
+    pre = prelude_for(text)
     for s, e, r in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
         text = text[:s] + r + text[e:]
-    return PRELUDE + text
+    return pre + text
 
 
 def overlap(e1, e2):
@@ -776,6 +1069,31 @@ class Run:
         return g
 
 
+def plan_combos(rows, variants, b0, g0, max_combo):
+    """(code-neutral singles that help, code-changing singles that lower the bdiff, combinations to compile as
+    (predicted gap, size, ids), best first). rows: rwsweep's measured singles (i, shape, bd, dgap); b0: the
+    baseline's bdiff (None without --asm-vs); g0: the baseline's gap (None without --want).
+    With --asm-vs, singles that lower the bdiff while changing the code are combined too (each other and with the
+    code-neutral ones): two code changes that each move toward the original often add up (Spore 0099f110: four
+    such singles and no combination row before)."""
+    good = [r for r in rows if r["shape"] == 0 and ((r["dgap"] or 0) < 0 or (b0 is not None and r["bd"] < b0))]
+    good.sort(key=lambda r: ((r["dgap"] or 0), r["bd"] or 0))
+    better = []
+    if b0 is not None:
+        better = sorted((r for r in rows if r["shape"] != 0 and r["bd"] < b0), key=lambda r: (r["bd"], r["shape"], r["i"]))
+    pool = good[:12] + better[:8]
+    combos = []
+    for n in range(2, max_combo + 1):
+        for c in itertools.combinations(pool, n):
+            if any(overlap(variants[x["i"]][2], variants[y["i"]][2]) for x, y in itertools.combinations(c, 2)):
+                continue
+            pred = None if g0 is None else g0 + sum(x["dgap"] or 0 for x in c)
+            gain = 0 if b0 is None else sum(x["bd"] - b0 for x in c)        # bdiff gains added up: a ranking only
+            combos.append((pred if pred is not None else 0, gain, n, [x["i"] for x in c]))
+    combos.sort()
+    return good, better, [(pred, n, ids) for pred, _g, n, ids in combos]
+
+
 def main():
     argv = sys.argv[1:]
     cl = []
@@ -788,7 +1106,7 @@ def main():
     ap.add_argument("--asm-vs")
     ap.add_argument("--want", help="A>B: A must be coloured before B")
     ap.add_argument("--pass", dest="k", type=int, default=2)
-    ap.add_argument("--families", default="wrap,alias,swap,split,reread,touch,cflow,paren,guard,const")
+    ap.add_argument("--families", default="wrap,alias,swap,split,reread,touch,cflow,paren,guard,const,unalias,byval")
     ap.add_argument("--vars", help="comma-separated: only rewrites that mention one of these variables")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--max-combo", type=int, default=2)
@@ -802,8 +1120,10 @@ def main():
     hdr = os.path.dirname(os.path.abspath(a.tu))
     text = re.sub(r'#include "([^"/][^"]*)"', lambda m: '#include "%s"' % os.path.join(hdr, m.group(1))
                   if os.path.exists(os.path.join(hdr, m.group(1))) else m.group(0), text)
-    a.func = c2trace.func_decl(a.func)         # Class::method or method@Class -> ?method@Class@@
-    m = re.match(r"\?(\w+)@(\w+)@@", a.func)
+    a.func = c2trace.func_decl(a.func)         # Class::method or method@Class -> ?method@Class@ (any namespace)
+    # a full decorated `?method@Class@@..` given by hand: one @ fewer also selects a class inside a namespace
+    tfunc = a.func[:-1] if re.fullmatch(r"\?\w+@\w+@@", a.func) else a.func
+    m = re.match(r"\?(\w+)@(\w+)@", a.func)   # a namespaced class too
     cls = m.group(2) if m else None
     raw = text
     text, nthis = explicit_this(text, body_of(text, a.func), cls)
@@ -811,6 +1131,10 @@ def main():
     B = Body(text, fn, cls)
     variants = []
     for fam in a.families.split(","):
+        if fam == "this":                      # applied to the baseline itself (explicit_this above), no variants
+            continue
+        if fam not in FAMILIES:
+            sys.exit("unknown family %r (families: this, %s)" % (fam, ", ".join(FAMILIES)))
         variants += list(FAMILIES[fam](B))
     if a.vars:
         pat = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, a.vars.split(","))))
@@ -826,35 +1150,40 @@ def main():
         for i, v in enumerate(variants):
             print("  v%04d %-6s %s" % (i, v[0], v[1]))
         return
-    out = os.path.join(ROOT, "work", "rwsweep", os.path.splitext(os.path.basename(a.tu))[0])
+    # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory
+    out = os.path.join(ROOT, "work", "rwsweep", tsweep.out_name(a.tu))
     if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory
         out += "@" + c2trace.c2build.name()
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
-    orig = [tsweep._key(x) for x in tsweep.orig_instrs(a.asm_vs)] if a.asm_vs else None
+    orig = tsweep.orig_instrs(a.asm_vs) if a.asm_vs else None
 
     def build(tag, src_text, keep=False):
         d = os.path.join(out, tag)
         os.makedirs(d, exist_ok=True)
         p = os.path.join(d, tag + ".cpp")
         open(p, "w").write(src_text)
-        return Run(p, a.func, cl, d, keep)
+        return Run(p, tfunc, cl, d, keep)
 
-    def rd(r):
-        if orig is None:
-            return None
-        sm = difflib.SequenceMatcher(None, r.keys, orig, autojunk=False)
-        blocks = [x for x in sm.get_matching_blocks() if x.size]
-        if not blocks:
-            return len(r.keys) + len(orig)
-        matched = sum(x.size for x in blocks)
-        return (blocks[-1].a + blocks[-1].size - matched) + (len(orig) - matched)
+    def rd(r):          # tsweep's own scores, so every tool reports the same baseline
+        return None if orig is None else tsweep.regdiff(r.instrs, orig)
 
-    base0 = build("orig", PRELUDE + raw)
+    def bd(r):
+        return None if orig is None else tsweep.bdiff(r.instrs, orig)
+
+    base0 = build("orig", prelude_for(raw) + raw)
+    if prelude_for(raw):
+        # the helper templates are declarations before the function: on 13.10 their count alone has been seen to flip
+        # a scheduling tie (Mount & Blade 0x4b9110, 2 vs 5 declarations); every variant carries them, so say so
+        raw0 = build("raw", raw)
+        if raw0.keys != base0.keys:
+            print("WARNING: the helper prelude alone changes the code (%s); variants are measured against the "
+                  "baseline with it" % ("bdiff %d -> %d" % (bd(raw0), bd(base0)) if orig is not None else "regs"),
+                  flush=True)
     base = build("base", apply(text, []), keep=True)
     g0 = base.gap(A, Bn, a.k) if A else None
     print("baseline: %d instructions%s%s%s" % (
-        len(base.instrs), "" if orig is None else ", regdiff %d" % rd(base),
+        len(base.instrs), "" if orig is None else ", bdiff %d, regdiff %d" % (bd(base), rd(base)),
         "" if g0 is None else ", gap %+d (%s %s, %s %s)" % (g0, A, helpersweep.prio_at(base.snap, A, a.k), Bn,
                                                            helpersweep.prio_at(base.snap, Bn, a.k)),
         "" if not nthis else "; %d member calls given `this->` (%s)" % (
@@ -880,31 +1209,32 @@ def main():
             if a.all:
                 print("  v%04d failed: %s | %s" % (i, variants[i][1], err))
             continue
-        rows.append(dict(i=i, shape=adiff(r.shape, base.shape), regs=adiff(r.keys, base.keys), rd=rd(r),
+        rows.append(dict(i=i, shape=adiff(r.shape, base.shape), regs=adiff(r.keys, base.keys), rd=rd(r), bd=bd(r),
                          dgap=None if g0 is None or r.gap(A, Bn, a.k) is None else r.gap(A, Bn, a.k) - g0, n=len(r.instrs)))
     same = [r for r in rows if r["regs"] == 0 and not r["dgap"]]
     print("%d measured, %d failed to compile, %d changed nothing (no register, no priority)" % (len(rows), failed, len(same)))
-    r0 = rd(base)
+    r0, b0 = rd(base), bd(base)
     shown = [r for r in rows if a.all or r not in same]
-    shown.sort(key=lambda r: (r["rd"] if r["rd"] is not None else 0, r["shape"], r["dgap"] or 0, r["i"]))
-    print("   id   family shape regs %s%s  rewrite" % ("regdiff " if orig is not None else "", "dgap " if A else ""))
+    shown.sort(key=lambda r: (r["bd"] if r["bd"] is not None else 0, r["shape"], r["dgap"] or 0, r["i"]))
+    print("   id   family shape regs %s%s  rewrite" % ("bdiff regdiff " if orig is not None else "", "dgap " if A else ""))
     for r in shown:
         fam, desc, _ = variants[r["i"]]
         print("  v%04d %-6s %5d %4d %s%s  %s" % (
-            r["i"], fam, r["shape"], r["regs"], "" if orig is None else "%4d%s  " % (r["rd"], "*" if r["rd"] < r0 else " "),
+            r["i"], fam, r["shape"], r["regs"], "" if orig is None else "%5d%s %6d  " % (
+                r["bd"], "*" if r["bd"] < b0 else " ", r["rd"]),
             "" if not A else ("%+4d " % r["dgap"] if r["dgap"] is not None else "   ? "), desc))
-    # combinations of code-neutral variants that helped
-    good = [r for r in rows if r["shape"] == 0 and ((r["dgap"] or 0) < 0 or (orig is not None and r["rd"] < r0))]
-    good.sort(key=lambda r: ((r["dgap"] or 0), r["rd"] or 0))
-    print("%d code-neutral variants improve the gap or the regdiff" % len(good))
-    combos = []
-    for n in range(2, a.max_combo + 1):
-        for c in itertools.combinations(good[:12], n):
-            if any(overlap(variants[x["i"]][2], variants[y["i"]][2]) for x, y in itertools.combinations(c, 2)):
-                continue
-            pred = None if g0 is None else g0 + sum(x["dgap"] or 0 for x in c)
-            combos.append((pred if pred is not None else 0, n, [x["i"] for x in c]))
-    combos.sort()
+    # combinations of the variants that helped
+    good, better, combos = plan_combos(rows, variants, b0 if orig is not None else None, g0, a.max_combo)
+    print("%d code-neutral variants improve the gap or the bdiff" % len(good))
+    if orig is not None:
+        print("%d variants that change the code improve the bdiff (combined too)" % len(better))
+    # a variant that reaches the original is the answer whatever its shape against the draft (Spore 0073afb0: a wrap
+    # with shape 2 and bdiff 0, which the line above does not count)
+    if orig is not None:
+        for r in rows:
+            if r["bd"] == 0:
+                print("  v%04d %s: bdiff 0 against the original (MATCH candidate: check the bytes)" % (
+                    r["i"], variants[r["i"]][1]))
     for pred, n, ids in combos[:a.verify]:
         tag = "c_" + "_".join("%04d" % i for i in ids)
         try:
@@ -914,7 +1244,7 @@ def main():
             continue
         print("  %-16s shape %d regs %d%s%s" % (
             "+".join("v%04d" % i for i in ids), adiff(r.shape, base.shape), adiff(r.keys, base.keys),
-            "" if orig is None else "  regdiff %d" % rd(r),
+            "" if orig is None else "  bdiff %d regdiff %d" % (bd(r), rd(r)),
             "" if g0 is None else "  gap predicted %+d real %s" % (pred, r.gap(A, Bn, a.k))))
     print("variants: %s/v<id>/v<id>.cpp" % out)
 

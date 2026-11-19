@@ -23,6 +23,9 @@
 //!                                          FPCheckColorability from the snapshot's x87 view, and `need A>B` on
 //!                                          x87 webs answers from that list)
 //!   rasim need SNAP stack:V                cl 13.10: what keeps x87 web V on the stack (its blockers at
+//!                                          FPCheckColorability ...); cl 14.00 / 15.00 with the snapshot's x87 key
+//!                                          (x87stack.rs): V's pieces, the blocks it is on the stack in, fldz and
+//!                                          airlocks, and which calls keep it or force its reload
 //!                                          FPCheckColorability, and whether popping V before each would keep it)
 //!   rasim order SNAP [--pass N] [--top K] [EDIT...]
 //!                                          priority order of pass N, after the edits; changes are marked
@@ -47,9 +50,14 @@
 //!   rasim fold SNAP VAR                    does a reload (OPENTERLOAD web, a split piece) fold into VAR, and the
 //!                                          single edit that would make it fold (fold.rs, regalloc.md 3.6.10)
 //!
-//!   rasim scratch SSNAP [--run K] [-v] [drop:N ins:N[:LIFE] nopref:N pref:N:REG ...]
+//!   rasim scratch SSNAP [--run K] [-v] [drop:N ins:N[:LIFE] nopref:N pref:N:REG rdrop:N rins:N ...]
 //!                                          scratch-register picks (scratch.rs): predict them from a
-//!                                          `c2trace.py scratch --export` snapshot; with edits, which picks change
+//!                                          `c2trace.py scratch --export` snapshot; with edits, which picks change;
+//!                                          on cl 13.10 also Riscify's GetReg calls (riscify.rs; rdrop/rins)
+//!   rasim scratch SSNAP want:TEMP=REG... | --want REGMAP.txt
+//!                                          for a scratch pick or a Riscify temp: how it got its register and the
+//!                                          single edits that give it REG; a temp no modelled phase assigned is named
+//!                                          with the phase that did
 //!
 //! CHANGE (register choice; VAR is a name, or name@pN for the piece coloured as pop N):
 //!   before:A:B  after:A:B   A is coloured just before / just after B
@@ -77,7 +85,9 @@ mod fpcolor;
 mod fold;
 mod pieces;
 mod predict;
+mod riscify;
 mod scratch;
+mod x87stack;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::exit;
 
@@ -91,6 +101,15 @@ struct Snap {
     inserts: Option<Vec<SInsert>>,
     #[serde(default)]
     pref_events: Option<Vec<SPrefEv>>,
+    /// locals and parameters with no row, and why (c2regs.py `missing`)
+    #[serde(default)]
+    missing: Vec<SMissing>,
+}
+#[derive(Deserialize, Clone)]
+pub struct SMissing {
+    pub name: String,
+    pub kind: String,
+    pub reason: String,
 }
 /// One InsertInList call: the globreg's avail set and PREF list as it enters the priority list.
 #[derive(Deserialize)]
@@ -102,6 +121,9 @@ struct SInsert {
     avail: Option<Vec<u32>>,
     ben: Option<i64>,
     prefs: Option<Vec<(u32, i64)>>,
+    /// the record's flags and counts (fl5: 0x80 = needs a byte register)
+    #[serde(default)]
+    x: Option<serde_json::Value>,
 }
 /// One preference added by Spillcosts; src = the coloured globreg on the other side of the copy, if any.
 #[derive(Deserialize)]
@@ -156,6 +178,9 @@ struct SBlock {
 struct SGr {
     name: String,
     terms: Vec<STerm>,
+    /// an immediate candidate's constant ({text, kind, size, value}; c2regs.py export)
+    #[serde(default)]
+    imm: Option<serde_json::Value>,
 }
 #[derive(Deserialize)]
 struct STerm {
@@ -1252,7 +1277,25 @@ fn cmd_blocks(s: &Snap, n: Option<u32>, vars: &[String]) {
     println!();
 }
 
+// `rasim need ... | head`: Rust ignores SIGPIPE, so println! on a closed pipe panics ("failed printing to stdout:
+// Broken pipe"). Restore the default action (as C programs have it), so the process ends quietly with status 141
+// when its reader goes away, in every subcommand.
+#[cfg(unix)]
+fn default_sigpipe() {
+    extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+#[cfg(not(unix))]
+fn default_sigpipe() {}
+
 fn main() {
+    default_sigpipe();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
         eprintln!("{}", include_str!("main.rs").lines().take_while(|l| l.starts_with("//!")).map(|l| l.trim_start_matches("//!").trim_start_matches(' ')).collect::<Vec<_>>().join("\n"));
@@ -1286,6 +1329,9 @@ fn main() {
     if args[0] == "need" {
         // cl 13.10 x87: what keeps a web on the stack (FPCheckColorability, fpcolor.rs)
         if let Some(v) = rest.iter().find_map(|c| c.strip_prefix("stack:")) {
+            if x87stack::cmd_need_stack(&args[1], v) {
+                return; // 14.00 / 15.00 snapshot with the x87 key (x87stack.rs)
+            }
             return fpcolor::cmd_need_stack(&args[1], v);
         }
     }
@@ -1314,6 +1360,7 @@ fn main() {
             let pm = rest.iter().any(|a| a == "--pieces").then(|| rest.iter().any(|a| a == "--chain"));
             predict::main_with(&args[1], rest.iter().any(|a| a == "-v"), false, pm);
             fpcolor::cmd_check(&args[1], true, rest.iter().any(|a| a == "-v"));
+            x87stack::cmd_check(&args[1], rest.iter().any(|a| a == "-v"));
         }
         "check" => {
             cmd_check(&s);

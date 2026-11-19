@@ -10,7 +10,9 @@ Back ends: cl 14.00.50727.762 (default), 13.10.3077, 13.10.3052, 15.00.30729.1. 
 traced compiles (probe file named); **[I]** = inferred. Probe sources: `work/scratch/realize/p1.cpp` .. `p10.cpp` (p5..p10: merges after Color, equal arms, statement order)
 (recorded outputs `work/scratch/realize/out/<probe>_<build>.txt`), regression file `tests/data/realize.cpp`.
 Every row below was measured on 14.00 and repeated on 13.10.3077 and 15.00 with the same result unless a build is
-named; `tests/data/realize.cpp` also on 13.10.3052.
+named; `tests/data/realize.cpp` also on 13.10.3052. The slot, scratch-pick and key constructs of rules 10 to 13 and
+sections 2.5, 2.6 and 2.8 were measured on all four builds: probes `work/scratch/realize2/` (`s1.cpp`, `s2.cpp`,
+`p1.cpp`, `k1.cpp`, `r1.cpp`, outputs `out/<probe>_<build>.txt`), regression file `tests/data/realize2.cpp`.
 
 ## 0. Summary for a decompiler
 
@@ -71,6 +73,35 @@ named; `tests/data/realize.cpp` also on 13.10.3052.
    statements exchanged flip the defOrd tie of equal-priority values (`tie:A>B` in the difference) and can drop an
    interference. The scheduler runs after Color but keeps source order for independent instructions in most
    probes, so the instructions are the same (bag 0) and their order usually differs. **[C: p6 sw/sst/sad/sgl, p10]**
+10. **Stack slots are packed before the equal arms are merged.** StkStackAlloc runs in dop2_CodegenUpdate, after
+    RegSimpleAssignBody and before dop2_FinalFlowOpts (il_pipeline.md 5c..5f), so the packer counts what rule 8's
+    arms contain: a statement S written as `if (C) S; else S;` counts each of its slot references twice
+    (`uses:X=+r`), and a test `(int)X & 1` of a stack local X is one more use of X and keeps X live up to the
+    test (`conf+:X,B` for a B defined before it: **[I]**, the probes' pairs conflicted already). After packing the arms are merged and the test deleted: the
+    instructions are the source's, only frame offsets move. The test on a stack local is deleted on 14.00 / 15.00
+    and kept on 13.10 (both builds: a memory test, one instruction); S duplicated with the test on a value in a
+    register works on every build when S merges (rule 8's conditions). **[C: realize2/s1 sc eqa, sp eqb, all four
+    builds; tests/data/realize2.cpp]**
+11. **A pick hidden by a merge.** Head and tail merges run after RegSimpleAssignBody too: a statement written at
+    the end of both arms of an if (taildup) or at their head (headdup) whose two copies get the same scratch
+    registers is merged, and the copy that goes still moved the rotation cursor. That is `ins:N`: one rotating pick
+    more before the first pick of the arm laid out second, no instruction more; the later picks rotate as `rasim
+    scratch SNAP ins:N` predicts. Whether the copies get the same registers depends on the picks between them (one
+    rotation cycle is three picks): realize.py tries every placement near pick N and keeps the ones whose every
+    pick comes out as predicted. **[C: realize2/p1 pt, ph; all four builds identical]** In a function without
+    an EH frame on 14.00 / 15.00 these merges are the only code-neutral source of a hidden pick found (§2.5.1);
+    the copy can sit far from pick N: a call before `if (C) { ..; return; }` written at the head of that arm and
+    again after the if (`headret`) hides a pick before the first pick after the if (Fallout 3 0x00783280, §2.5.1).
+12. **A frame key moves to the first IL mention of its symbol**, not to the declaration (a bare `T m;` earlier
+    moves nothing): `T m = 0;` some statements earlier in the block, the original declaration made an assignment,
+    puts m's key before the keys of those statements (`sub:frame@m:n`, the dead store is removed: code 0 on all
+    four builds; Spore 00bc9980's hand fix, now generated). Many keys at one statement: n unused initialised locals
+    (+n frame), an empty inline helper with n by-value parameters (+n frame and +n tmp keys), an initialised
+    array of n ints (+3 frame, +n tmp). **[C: realize2/k1 kd, kp, all four builds]**
+13. **Two or more edits.** An answer of several edits is realised edit by edit and then as products of the best
+    three realisations of each, ranked by their summed scores; when no answer matches, the closest variants
+    measured so far are combined in pairs. The model ranks the candidates where it can: the slot model replays
+    every pair of single what-ifs (a few ms each), the scratch model rescans on top of each good single edit.
 
 ## 1. How a construct is measured
 
@@ -186,6 +217,74 @@ reference): it becomes a Color variable, the pick disappears, the instructions s
 write the named single-use value back into its expression. Both also change P of the block (2.3). **[C: p2 nm,
 nmeh, ehb; p3 hcp]**
 
+Measured with `realize.py pairs --scratch` (picks of the two traces aligned by instruction; `ins:N` = a pick
+inserted before base pick N, `(gone)` = it left no instruction) on `work/scratch/realize2/p1.cpp`; the same on
+14.00, 15.00, 13.10.3077 and 13.10.3052:
+
+| Construct | Picks | Code | Probe |
+|---|---|---|---|
+| the statement after an if (one pick) written at the end of both arms (`taildup`), the arm laid out second has 2 picks | `ins:3(gone)`, the next two picks rotate one step (as `rasim scratch ins:3` predicts: verdict `exact`) | 0 (registers 8) | p1 pt; tests/data/realize2.cpp |
+| the same, second arm with 1 pick | `ins:4(gone)`, nothing rotates (the later picks are forced) | 0 | p1 pt1 |
+| the statement before an if written at the head of both arms (`headdup`) | one pick more (`ins:5`, `ins:4`), no register moved | 0 | p1 ph, ph1 |
+| a single-use value named (`int t = p->a + q->b; gi = t;`) | nothing (the copy is propagated before Color) | 0 | p1 pn |
+| equal arms whose condition needs a scratch register (`if ((p->a + q->c) & 1)`) | the condition's load stays: not a hidden pick | +5 instructions | sc1 eq1, eq2 |
+| `hs_cp(x)` around a call argument (`wrap`) | depends; Spore 00a12c90 `hs_cp((int*)mpEnd)` gave the original's picks (the model's answer was `drop:14`) | 0 | §4.4 |
+
+`realize.py edit SRC --func F ins:N` / `drop:N` generates headdup, taildup, equal arms (with the test on a
+register value) and the reverse rewrites within a line of the picks N-1..N+1, plus `hs_cp` for `drop:`. For `ins:N`
+it also takes the statement right before every if whose second arm (the else arm, or the code after an if whose
+then-arm leaves) starts with pick N, wherever it is, and tries `headret` there first (§2.5.1). The verdict
+traces the variant's picks: `exact` = the inserted and removed picks are the ones asked for and every aligned pick
+has the register `rasim scratch BASE EDITS` predicts; `yes` = the registers are as predicted with other picks, or
+every pick as predicted and the same instructions in another order (`bag 0`: the scheduler's ties follow the new
+registers); `no` otherwise or when an instruction changed (registers masked).
+
+#### 2.5.1 The `ins` family: which natural shapes hide a pick (14.00, no EH frame)
+
+A hidden pick is a RegAssign rotation pick whose instruction is deleted after RegSimpleAssignBody. The passes that
+delete instructions there are the late flow opts (head and tail merging, FgDoLateFlowOpts in dop2_PostCodegenFlowOpts
+and dop2_FinalFlowOpts), LateGlobalOptimize (redundant copies and loads, dead definitions; isel.md §11.2) and
+MscClean (a `mov` between registers known equal; isel.md §11.3). For the last two the rotated register would have to
+hold the value already and the temp's uses would have to vanish with it; no natural shape probed does that. Probes:
+`work/f3_783280/probe/q1.cpp` .. `q5.cpp` (`gone.py` lists every pick whose instruction is gone), regression file
+`tests/data/realize_ins.cpp`.
+
+| Shape | Picks | Code | Builds | Probe |
+|---|---|---|---|---|
+| `S; if (C) { A; return; } R` written `if (C) { S; A; return; } S; R` (`headret`; also with `else S;`, the same IL), S a call such as a log call made on both paths | the copy after the if hidden (`ins:N(gone)` before the first pick after the if); the later picks rotate one step as `rasim scratch` predicts | 0 (registers move) | 14.00, 15.00; 13.10 keeps both copies (+3 instructions) | q3 hr, hc; q4; tests/data/realize_ins.cpp hr |
+| the same with 3 rotation picks in the arm after S | the copies get different registers: not merged | +5 instructions | all | q3 h3; realize_ins.cpp h3 |
+| the same when one arm defers S's `add esp` into a later cdecl call's cleanup (or pushes a callee-saved register only in one arm) | S's load merged, its call not | changes (7, 16) | 14.00 | q4 first drafts, q5 |
+| statement before an if/else at the head of both arms (`headdup`), after it at the end of both (`taildup`) | §0 rule 11 | 0 | all four | realize2/p1 ph, pt |
+| a short statement after a switch (no edit: the compiler's own tail duplication) | the join statement is in the cases at RegSimpleAssignBody (duplicated before Color **[I]**), two copies with the same register merged back: one hidden pick in the draft as written | 0 | 14.00 | q2 md__sw |
+
+Which copy goes: the one in the arm laid out second, so the hidden pick sits just before that arm's first pick,
+however far the statement is from pick N. The copies merge only when they get the same registers: the picks in the
+first arm after S must leave the cursor where S's copy in the second arm starts (k + m = 0 mod 3 for k picks in S and
+m rotation picks in the arm, unless forced picks realign it), and the stack depth must match at both copies.
+
+No hidden pick, same probe conditions (q1, q2; cl 14.00 /O2): a bool getter result in an `int`; `unsigned char`
+returned and widened; `(flags & 0x100) != 0`, `!!x`, `x ? 1 : 0` into a global; in the flag test, `(flags & 0x100)`,
+a bit field, the flag through a ternary into a `bool` or `int` (`test mem, imm` or a Color variable: a pick fewer,
+`drop:`); a pointer cast to `int` and back, `(Act*)` of a base or `void*` return, `static_cast` at offset 0, an
+inline wrapper around the call; a named `bool` for an `&&` condition, the flag through a ternary or an
+early-assigned bool; a reload of a member after a store to it, a twice-read member across a call, a store and reload
+through another pointer; a struct copied through a local or in a chain; `(void)p->b`, a dead local, a dead copy
+around a call; `&p->arr[i]` and `&p->arr[3]` through a pointer local, a member address as an argument; `x = y = 0`,
+a `char c = 0` stored twice; `gj = p->b` at the head of both arms before a call that differs per arm (q2 ma__head).
+
+**Fallout 3 0x00783280** (`work/f3_783280/`; cl 14.00 `/O2 /GS /EHsc /Gy`, no EH frame). The draft had every
+instruction but the flag test in eax (`test al, 1`) where the original has ecx; `scratch --phase` said `ins:15`
+(one hidden pick between the last Point copy of the arg branch's 0x39 case and the flag load), and no construct
+was generated there: the copy that hides it is the call `FUN_0061b850(DAT_00f6552c, 0, "", 0, DAT_00dbcbd0);`
+twelve lines earlier, before `if (arg) { ...; return; }`. Written at the head of the arg branch and again after it,
+the copies are head-merged above `cmp [esp+34h], bl` and the second one's `mov eax, [DAT_00f6552c]` pick is gone:
+all 8 pick groups exact, and the byte compare against the executable is **0 real differences** of 612 bytes (17
+relocation-only), which also fixes the x/y argument-load order (the scheduler follows the registers). The call
+with an empty string at both entries of the branch is most likely a debug-log macro with a different message per
+branch whose text is compiled out in release. `realize.py edit ins:15` now lists it first (`headret`, verdict
+`yes`: every pick as predicted, the same instructions in another order; bdiff 2 = the two TLS fields the stand-in
+`g_tls` relocates, regdiff 0). **[C]**
+
 ### 2.6 Symbol keys: `add:frame@V:n`, `sub:frame@V:n`
 
 Measured with `pairs --keys` on p4 (an x87 function with two inline helpers). 14.00 and 15.00 give the same
@@ -266,6 +365,90 @@ Two things from Fallout 3 0x00806ab0 (§4) that a key edit has to respect: the k
 (the same total spread over eight expansions fixed the target site and flipped two others), and a temp-class
 side effect can move a whole block of 32.
 
+**Moving a key earlier, and many keys at one point** (`work/scratch/realize2/k1.cpp`, `pairs --keys`; the same
+counts and code 0 on all four builds):
+
+| Construct | Keys | Code | Probe |
+|---|---|---|---|
+| `unsigned m = 0;` two statements earlier in the loop body, `unsigned m = e;` made `m = e;` (`early`) | 3 named keys move (m before the two statements' symbols), counts unchanged | 0 | k1 kd; Spore 00bc9980 |
+| the same one statement earlier | 0 moved there (nothing is allocated in between) | 0 | Spore 00bc9980 |
+| an empty `__forceinline` helper with 4 by-value parameters called once (`helperparams`) | frame+4, tmp+4, at that statement | 0 | k1 kp h4, h4u (unnamed parameters the same) |
+| 4 unused initialised locals (`pad`) | frame+4 | 0 | k1 kp pad4 |
+| `int a[4] = {0};` unused | frame+3 (the array and two field views), tmp+4 | 0 | k1 kp arr |
+
+`sub:CLS@V:n` is realised by `early` at each of the 8 statements before V's declaration in its block; the verdict
+is the operand-order replay (symkeys `sort_sig`: every order as `whatif` predicts and at least one flipped), since
+the replay's `sub:` deletes symbols where the source moves V. Spore 00bc9980: `sub:frame@_m:2` gives two `yes`
+variants (2 and 3 statements earlier), bdiff 28 to 24 (regdiff 6 to 2): the hand fix of the benchmark. A natural
+spelling of +17..+44 frame keys at one point was not found: the single-statement constructs above add tmp keys as
+well (helper) or are padding (`pad`).
+
+### 2.8 Stack slots: `uses:X=N`, `pos:X=P`, `conf+:A,B`, `conf-:A,B`
+
+The slot model's what-ifs (`c2slots.py what`, `slots --search`; slots.md section 3). Measured with `realize.py
+pairs --slots` (the packer traced in both functions, elements matched by name, temporaries by size and line):
+
+| Construct | Packer | Code | Builds | Probe |
+|---|---|---|---|---|
+| `if ((int)a & 1) S; else S;` with a a stack local, S any statement that merges (rule 8) | `uses:_a +1`; a live up to the test, so `conf+` with what is defined before it **[I]** (in the probe a and b conflict already) | 0 | 14.00, 15.00; 13.10 keeps the memory test (+2 instructions) | realize2 sc eqa |
+| `if ((int)s & 1) S; else S;`, s in a register, S reads the stack local a | `uses:_a +1` per mention in S | 0 on 13.10; 14.00 / 15.00 selected `add r, [a]` instead of a load here (+3) | all four (packer) | realize2 sp eqb |
+| the same around `s ^= b` | `uses:_b +1`, b and a exchange slots | 0, s in another register (Color sees the split block) | all four | s1 sc eqs |
+| a statement that reads b written at the head of both arms of an existing if (`headdup`) | `uses:_b +1` | the read is not merged back here (+2 instructions) | all four | s1 sh hdup |
+| two statements exchanged (`swap`) | `pos` of the two | the scheduler keeps the new order (code 3; 13.10 bag 0) | all four | s1 sp swap |
+| a block scope `{ }` around an address-taken local, or the declaration moved to the function's scope | no conflict changes: the packer's liveness is dataflow, not scope | Color sees another candidate (code 3..7) | all four | s2 scb, scn |
+
+`uses:X=N` above X's count is generated as the first two rows (every statement that mentions X, with the test on
+each value Color keeps in a callee-saved register; and the test on X itself), headdup and taildup of X's
+statements; below it, the reverse rewrites (equal arms or duplicated heads and tails written once). `pos:X=P`:
+exchanges of X's statements and the equal-arms forms. `conf+:A,B`: the test of A after B's first mention.
+`conf-:A,B`: only the reverse rewrites; nothing shortens a range without code. Temporaries (`tv`, `$T`) are placed by
+their listing line. The verdict: `exact` = the asked change, nothing else in the packer's input, and every offset
+where the replay of the edit puts it; `yes` = the asked change with side effects; `no` when an instruction changed.
+With `--asm-vs` each row also says how many elements sit at the original's offset (c2slots' map).
+
+### 2.9 References for values eqif cannot test
+
+| Construct | Realises | Code | Builds | Probe |
+|---|---|---|---|---|
+| `if ((int)W & 1) S; else S;` with W a value in a callee-saved register and S a statement of B that mentions V (`eqif2`) | one more reference to each of S's variables in B's arms, V included; W +1 | 0 (regs 4) where `if ((int)m & 1)` on the stack parameter m costs +1 instruction | all four | realize2/r1 rp eqs / eqm |
+| equal arms already in the source written once (`uneqif`) | `unref:` / `uses:` the reverse of eqif | 0 when the source's arms merged | | |
+
+### 2.10 Loads: `alias2:CHAIN`, `ptrlocal:CHAIN`, `subobj:CHAIN` (docs/c2/loadcse.md)
+
+The load-reuse rules of loadcse.md as edits; unlike the rest of this page they change code on purpose (one load
+more or fewer, an `op [m], y`), so the verdict is only "the instructions changed" and the score against the
+original decides. The member's type is taken from its declaration in the unit (a wrong guess does not compile and
+is dropped). Counts are loads / stores / read-modify-writes of the member in the generated variant
+(`work/scratch/realize2/lc1.cpp`, `lccount.py`, `out/lc1_realize.txt`; the same as loadcse's own probes
+`work/scratch/loadcse/cons/table.txt` A15, B1, C2):
+
+| Edit | Rewrite | 14.00 | 15.00 | 13.10.3077 | 13.10.3052 |
+|---|---|---|---|---|---|
+| `alias2:p->m` (three reads) | `int& rz_r = p->m;` before the first, the 2nd and 3rd read through it (R3) | L1 → L3 | L1 → L3 | L1 → L3 | L1 → L3 |
+| `ptrlocal:p->q` (`p->q->m` tested and updated) | `Q* rz_q = p->q;` before the statement, the block's uses through it (R2) | L2 S1 → L1 S1 | same | same | same |
+| `subobj:w->e` (`x = w->e[-1]; --w->e;`) | every use (or two adjacent ones) through `((rz_sub<E**>*)&w->e)->get()` (C1 → C2) | L1 S1 → RMW1 | → RMW1 | → L2 S1 | → L2 S1 |
+| `alias2:p->m` (two reads, `m` a pointer) | `Q*& rz_r = p->m;` before the first, the second read (in a later block) through it: one use | L1 → L2 | L1 → L2 | L1 (substituted) | L1 (substituted) |
+| `byval:find` (`m.find(&k).node`, find returning a class by value) | `rz_bv_find1(m, &k)`, a generic by-value inline forwarding template at file scope before the target (rwsweep `byval`) | the result read from the wrapper's return temporary, not through `[eax]` | same | same | same |
+
+Two reads: a chain read only twice has no pair of later reads, so `alias2:` offers each later read alone through the
+reference. A single use of the reference is substituted back (GoptSingleUseCopyProp) for an **int** member: no
+change (probes `work/scratch/a2probe` lb, ld). A **pointer** member read through a reference bound in an earlier
+block is reloaded even with that one use (lc__c, lc__g; Spore 009d3410 `Limb* const& lb`: bdiff 32 → 25 on x2.cpp).
+On 13.10 (both builds) that single use is substituted too: no reload. A dead mention `(void)rz_r;` adds no
+use. **[C]** (14.00, 15.00 probes; the test records all four builds:
+`tests/data/toolgaps.cpp` lt__base.)
+
+`byval:NAME` (`*`: every such call) takes the return type from the unit's declarations (a nested type is spelled
+`typename M::T`, a typedef of a class counts) and places the template before the target's outermost namespace or
+class. Spore 005f0a60 by machine: `byval` 20 → 10, then `rwsweep --families alias` on that variant (`iterator&
+rw_a = it`) → 0, the hand-found MATCH. Spore 006b19e0 (r2_b / r2_c): the node is then read from the temporary as in
+the original, but into eax and copied to ebp: bdiff 25 → 32, 21 → 28; rwsweep on that variant then finds
+`hs_bind(node)` (or `ref node`): 22 and 18, below the drafts' 25 and 21 (no match; work/bench/spore/006b19e0/r3_*). Overloads of one name with different return
+types (`iterator erase(iterator)`, `unsigned erase(const K&)`) are not told apart: the wrong one does not compile.
+
+`rz_sub` is a one-member template with an inline `get()` that the tool's prelude defines. Through the accessor at
+one use only (the read) nothing changes (lc1 `A92_subobj1`). Regression: `tests/data/realize2.cpp` la/lp/lw.
+
 ### 2.7 x87 live ranges ("V must not be one range across the calls")
 
 x87.md §10 is the catalogue: assigning the value again per row, a variable per row or a block-scoped variable
@@ -331,10 +514,40 @@ registers with `bag 0`):
 3. stub bodies for every bodiless callee that receives the address of a local: per parameter "only reads", for
    all callees "reads and writes, keeps nothing", and "reads only everywhere".
 
+**Edits of the other models** (`edit`, and as answers): `uses:X=N[^]`, `pos:X=P`, `conf+:A,B`, `conf-:A,B` (names as
+`c2slots.py what` takes them: `_ny$`, `#4`, `tv310`; section 2.8), `ins:N[:k]`, `drop:N` (`rasim scratch`; 2.5),
+`add:CLS@V:n` / `sub:CLS@V:n` (2.6). For these the variant is traced a second time with that model's hooks (the
+base once, in `base/slots/` or `base/scratch/`) and the verdict is the model's own: the packer's input and the
+replayed offsets, or the picks against `rasim scratch BASE EDITS`.
+
+**Answers from the slot and scratch models**: `realize.py --from slots|scratch SRC --func F --asm-vs ORIG.s`.
+`slots`: c2slots' map of the original against our listing, every single what-if (uses ±3, visiting positions,
+the refused conflicts and the colour mates), and every pair of the 40 best singles with any single, replayed and
+ranked by elements at the original's offset; `scratch`: `c2trace.py scratch --phase ORIG.s --by block`, rasim's
+re-alignment scan of single `ins:` / `drop:`, and the scan again on top of each of the 8 best (pairs), ranked by
+known picks on the original's register. The 12 best answers are realised as below.
+
+**Answers of two edits, and pair search.** Every answer is realised edit by edit (each construct measured once per
+run, whatever answer names it); an answer of two or more edits then as the products of the best three
+realisations of each, ranked by summed score, until `--max-compiles`. An order edit (`before:A:B`) inside an
+answer becomes the source-level edits `rasim need 'A>B'` names (the first three, as alternatives); an edit with no
+construct (`canreg:`, `noreg:`, `pref:`, `interf:`, ..) is left out and the rest is still realised, with a note
+(Fallout 3 0x008d5510's `ref:this:N + canreg:input:ebx` used to be skipped whole). When no answer matched,
+`--pairs 1` (default; 2 adds triples, 0 off) combines the closest variants measured so far (each changed the
+allocation's input, changed at most `--pair-code` instructions, was no worse than the base) in pairs, ranked by
+how much each lowered the score alone. In `edit` mode several edits are combined the same way.
+
+**Swaps.** In `auto` mode the `swap: A (r1, wants r2) <-> B ..` lines of regmap are turned into `rasim need 'A>B'`
+(the violated direction); its source-level answers follow rasim want's (Fallout 3 0x004ddab0: `ref:j:12:2`,
+`unref:pb:12`, ..). regmap's `WANTS` rows also fill the wanted registers.
+
+The score against the original is `tsweep.bdiff` (byte-faithful: the listing's bytes decoded and compared with
+`orig.s`, relocations and branch targets masked); rows print the old `regdiff` next to it.
+
 A stub found in stage 3 is a hypothesis about the original's callee: check it with `calleesum.py EXE VA` or
 replace it by the decompiled body.
 
-Files: variants and traces in `work/realize/<tu>[@build]/` (or `--keep DIR`), with `base.json` (the snapshot),
+Files: variants and traces in `work/realize/<tu>-<dirhash>[@build]/` (or `--keep DIR`), with `base.json` (the snapshot),
 `regmap.txt` and `answers.txt` in pipeline mode. Limits of the rewriter: it works on the target's own body with
 `rwsweep`'s tokenizer (a function template or `template <> R f<T>(..)` specialisation is found by its `??$name@` decorated name; macros that hide statements are not seen); `copy` refuses loops and
 address-of-uninitialised cases by simple rules, a wrong rewrite fails to compile or shows up as changed code.
@@ -470,7 +683,52 @@ Not run: Fallout 3 0x008e7d40 (its draft unit did not compile here on its own); 
 `do_rm_il`, not allocation edits, so there is no model answer to start from).
 
 
+### 4.4 The benchmark's stalled register, slot, scratch and operand-order functions (2026-11-12)
+
+The functions of `work/bench/{spore,mb,f3}/RESULTS.md` in those classes, re-run with the constructs of 2.5, 2.6,
+2.8, 2.9, the two-edit answers, the swap answers and the pair search. Each from the benchmark's working draft, with
+`--max-compiles 40 --max-answers 12`; `auto` = `--from-rasim auto`, `slots` / `scratch` = `--from slots|scratch`.
+Score: bdiff (tsweep's byte-faithful default since this run), regdiff in brackets. Driver
+`work/scratch/realize2/bench/run.py`, outputs `bench/<proj>_<va>_<mode>.txt`, variants `work/realize2b/<job>/`.
+"Before" is the benchmark's recorded outcome.
+
+| Function | Class | Before | Mode | After | What happened |
+|---|---|---|---|---|---|
+| Spore 00a12c90 | scratch | STALLED (12) | scratch | **MATCH** (Spore's fingerprint check), bdiff 13 → 0 | answer 1 `drop:14` (12 of 12 picks); its `hs_cp` construct `FUN_00a11310((int*)pos, hs_cp((int*)mpEnd), ..)`; 3 compiles |
+| Fallout 3 0x008d5510 | registers | STALLED (40) | auto | **BYTE-EXACT** (bench.py cmp --local: real 0, reloc 13), bdiff 41 → 1 (regdiff 0) | stage 2: `self->Attach(created);` written at the end of both arms (taildup); 37 compiles. bdiff's 1 is the EH handler's `push OFFSET` (an unresolved relocation in our object), reported to the score's owner. The pair answers `ref:this:N + canreg:input:ebx` are now read whole; the canreg half has no construct |
+| Spore 00bc9980 | operand order | IMPROVED (6 → 2, by hand) | edit `sub:frame@_m:2` | bdiff 17 → 13 (6 → 2), not a match | the hand fix, now generated (`early`, 2.6); the IV base and the comiss order remain |
+| Fallout 3 0x00a520c0 | registers | IMPROVED (66 → 17, by hand) | auto | bdiff 68 → 19 (66 → 17) | the same swap the benchmark found, now by stage 2 alone |
+| Fallout 3 0x00694950 | registers | STALLED (44) | auto | bdiff 58 → 55 (regdiff 44 → 46) | a callee stub (hypothesis); the constant-0 candidate is not modelled |
+| Mount & Blade 0048be00 | registers | IMPROVED (59 → 30, rwsweep) | auto | bdiff 59 → 36 | equal arms on n around `d = ..` (code 12): worse than the benchmark's `hs_cp(this)` |
+| Spore 005ec030 | registers | STALLED (46) | auto | 46 | 13 answers (`unref:local4`, order answers): a compiler local and a 6-statement body; 2 compiles |
+| Spore 0073afb0 | registers | STALLED (94) | auto | 94 | 40 answers, 8 compiles, nothing moved |
+| Mount & Blade 005325b0 | registers | STALLED (13) | auto | 14 (13) | the answers now carry their halves (`.. + noreg:mainp:eax`, `+ pref:mainp:ecx`: no construct); `ref:g:2`: eqif keeps the memory test (+29); eqif2 needs a statement of blocks 2-3 that mentions g, there is none |
+| Fallout 3 0x004ddab0 | registers | STALLED (14) | auto | 14 | the swap answers are now asked (`ref:j:12:2`, `unref:pb:12`, ..): 37 compiles, none moves j/pb without code |
+| Fallout 3 0x00984d00 | registers | STALLED (12) | auto | 12 | post-call reloads into callee-saved registers: outside the models |
+| Fallout 3 0x0053dd40 | registers | STALLED (10) | auto | **BYTE-EXACT** (bench.py cmp --local: real 0, reloc 22), bdiff 12 → 1 (regdiff 0) | stage 2 after the swap answer `rasim need 'eventList>scriptObj'` named blocks 1-16: `DAT_00f50b78 = 255` stored as `(signed char)-1` (`const`, immcand.md): eventList edi, scriptObj ebp. bdiff's 1 is the EH handler's `push OFFSET` again. Before, the run never compiled: the callee-stub generator re-read the 40k-line unit per declaration (13 min); fixed (12 s) |
+| Mount & Blade 004785e0 | slots | STALLED (42 B) | slots | 42 | slot model: best single 14 of 17, and no pair does better (316 singles x 40); every construct changes code on 13.10 (memory test, Color) |
+| Mount & Blade 0042a480 | slots | STALLED (rd 0) | slots | 20 | pairs reach 12 of 15 (single 11): `conf-:_tmp,_t + uses:_t=3`, a removed conflict and a lower count: no construct |
+| Mount & Blade 004b3ce0 | slots | STALLED (16 B) | slots | 16 | 17 of 23; no single or pair improves the model's match |
+| Fallout 3 0x009c7730, 0x0054d850, 0x008ec700 | slots | STALLED | slots | unchanged | no improving answer (009c7730: the slot map of an aligned frame is off by 4, slots.md bug) |
+| Fallout 3 0x00aab4a0, 0x007bc740 | slots | STALLED / IMPROVED | slots | unchanged | answers are `pos:` / `conf-:` only; swaps and equal arms gave nothing or code |
+| Spore 006b19e0 | slots / scratch | IMPROVED (57 → 35, by hand) | both | 97 (57) on the draft | the slots already agree (2 of 2); the scratch model reads 2 of 10 picks: no realisable answer |
+| Mount & Blade 0051ee80 | scratch | STALLED (10) | scratch | 12 (10) | pairs reach 82 of 82 known picks (`drop:3 drop:5`, ..; singles 81): no construct near picks 3-6 (hs_cp leaves the picks, equal arms around calls change code) |
+| Mount & Blade 0044be50, 0051c5a0 | scratch | IMPROVED / STALLED | scratch | 32, 25 | `drop:6` (66 of 67; hs_cp moved picks elsewhere, 32 → 40), `drop:9`..`ins:13` (8 of 8): the one taildup site stores a constant (`g_map_flags.f2 = 0`), no pick to hide: same picks |
+| Fallout 3 0x00aa3000 | scratch | STALLED (16) | scratch | 20 (16) | `drop:8` (19 of 20): hs_cp around the CopyMem arguments leaves the picks |
+| Spore 0068c6d0; M&B 00412150, 004e6a70, 004952f0, 00432860; Fallout 3 0x00a72450, 0x009c57b0, 0x005c50a0, 0x009c80e0, 0x00806ab0 | operand order | STALLED | not re-run | - | no model answer to realise: levers find no key edit (n-ary sorts by weight, SU decisions, unnamed operands, x87 stack residency); 0x00806ab0's +17 frame keys: the single-statement constructs of 2.6 add tmp keys too |
+
+Count: 3 new matches (Spore 00a12c90, Fallout 3 0x008d5510 and 0x0053dd40, all byte-checked), 1 hand fix reproduced by the
+tool (00bc9980), 1 benchmark improvement reproduced without the hand step (0x00a520c0).
+
 ## 5. Not verified, and what would help
+
+- The slot and scratch models often name what no construct can do: lower use counts (`uses:X=N` below the
+  count), removed conflicts (`conf-:`) and dropped picks (`drop:N`) have no code-neutral spelling except undoing
+  a duplication that is already in the source. Every stall of 4.4 in these classes is of that kind.
+- `ins:N` through taildup needs the two copies to get the same registers (rule 11); only probes and the
+  benchmark's candidates were measured. eqif around a statement with picks breaks the merge (2.1).
+- The pair search ranks by the model only for slots and scratch; for rasim answers and the closest-variant pairs
+  it ranks by each member's own score.
 
 - Everything in section 2 is from small probes plus the functions of section 4. A construct that is
   code-neutral in a probe can still move a scratch pick or a scheduling decision in a large function; the tool

@@ -24,6 +24,11 @@ with the numbers the decision is made from:
   cands   the registers ChoosePhysReg considered (only free ones are tried) with their preference weight;
           the lowest weight wins, ties go to the earlier one in eax ecx edx esi edi ebx ebp
 
+After the table: every local and parameter with no row ("not in the table"), with the phase that dropped it:
+propagated away by GlobalOptimize, only its address used, volatile, a type the candidate test rejects,
+address-taken, kept in memory before Color, or a globreg spilled, folded or left without a register before its pop
+(the pop that took its last register is named). Exported as `missing`.
+
 Globregs are popped in priority order, so a variable that should have got a register another one got must
 outrank it: compare their prio (and the per-block terms that make it up), not the source order. Short-lived
 single-def temporaries are not globregs: regasg's scratch pass gives them eax/ecx/edx later (regalloc.md §4).
@@ -152,6 +157,21 @@ FP0 = None
 if (c2trace.c2build.get("hooks") or {}).get("regs_fp"):
     FP0 = len(HOOKS)
     HOOKS = HOOKS + c2trace.c2build.get("hooks")["regs_fp"]
+# Locals and parameters with no row (report section "not in the table", export key `missing`): every memory-variable
+# leaf GrgIdentifyCandidates looks at (the probe just after its call-target test: the leaf, its flags (+0x14: 0x40 =
+# volatile), type word (+0xa), the symbol, its kind dword (byte 0 = kind, byte 1 & 2 = address-taken), SSR, key and
+# name), every leaf it turns into a register candidate (the store of kind 1), and the IL at dop2_PreLowerGlobalOpts'
+# entry (before GlobalOptimize) for the variables whose references the global optimiser removed.  A build table gives
+# its own two probes as hooks.regs_cand (and regs_cand_xclass: the type class the test excludes, hex).
+_CAND14 = ["10b56361=esi,esi>0x14,esi>0xa,esi>0x18,esi>0x18>4,esi>0x18>8>0,esi>0x18>0x1c,esi>0x18>0>4$",
+           "10b563c2=esi>0x18"]
+CAND0 = None
+_cand = _CAND14 if c2trace.c2build.name() == c2trace.c2build.DEFAULT else (c2trace.c2build.get("hooks") or {}).get("regs_cand")
+if _cand:
+    CAND0 = len(HOOKS)
+    _c0 = HOOKS[0].partition("=")[2].split(",")
+    HOOKS = HOOKS + list(_cand) + ["@dop2_PreLowerGlobalOpts@4=%s,%s" % (_c0[0], [x for x in _c0 if x.endswith("%")][0])]
+CAND_XCLASS = int(c2trace.c2build.get("regs_cand_xclass") or "5000", 16)
 FPEVN = ["blk", "edge", "use", "enter", "def", "ins", "pass", "split", "check", "ce_end", "ce_join", "ce_post",
          "ce_ext", "press", "init", "rm", "keep", "csp", "fsp"]
 # check / init entries also carry the x87 view of the function ('&' spec: "T X" lines, c2trace.dll dumpfp), stored per
@@ -476,7 +496,14 @@ def parse(log, funcpat):
     funcs, cur, cls, grs, pend = [], None, None, {}, None
     ch = None                             # the row ChoosePhysReg is colouring (choice events 13..17)
     npass, blk, terms = 0, None, {}       # terms[gr] = (pass, [(block, w, P, blkcost, delta)])
+    early, etl = None, False              # candidate events of the function being compiled (before its Color)
     for ln in log.splitlines():
+        if etl and ln.startswith("T "):
+            f = ln.split()
+            if f[1] == "I":
+                early["il"].append(ln[2:])
+            continue
+        etl = False
         if ln.startswith("T ") and cur is not None and cur.get("il") is not None:
             f = ln.split()
             if f[1] == "G":                        # the globreg view (--pieces): into the dump opened last
@@ -501,6 +528,17 @@ def parse(log, funcpat):
         f = head.split()
         ev, hk = f[0], int(f[3])
         v = [sval(x) for x in c2trace._split(rest)]
+        if CAND0 is not None and CAND0 <= hk < CAND0 + 3 and ev == "E":
+            k = hk - CAND0
+            if k == 2:                               # dop2_PreLowerGlobalOpts: a new function
+                early = dict(name=v[0].strip('"') if isinstance(v[0], str) else "?", il=[], leaves=[], conv=set())
+                etl = True
+            elif early is not None and k == 0 and len(v) >= 8:
+                early["leaves"].append(dict(flags=v[1] if isinstance(v[1], int) else 0, ty=v[2] & 0xffff if isinstance(v[2], int) else None,
+                                            sym=v[3], kw=v[4] if isinstance(v[4], int) else 0, ssr=v[5], key=v[6], name=_grname(v[7], v[6], v[4])))
+            elif early is not None and k == 1:
+                early["conv"].add(v[0])
+            continue
         if ev == "E" and hk == 0:
             name = v[0].strip('"') if isinstance(v[0], str) else "?"
             cur = dict(name=name, rows=[], il=True, lines={}, bb=None, ilb={}, bbs=[],
@@ -508,6 +546,9 @@ def parse(log, funcpat):
                 if c2trace.func_match(funcpat, name) else None
             if cur is not None:
                 funcs.append(cur)
+                if early is not None and early["name"] == name:
+                    cur["cand"] = early
+            early = None
             grs, terms, npass = {}, {}, 0
             continue
         if cur is None:
@@ -764,6 +805,10 @@ def export(fn):
     if fn.get("refcosts"):
         # additive (--pieces): [npass, tuple, globreg number, cost, s|d] for every reference Spillcosts costs
         snap["refcosts"] = fn["refcosts"]
+    ms = missing(fn)
+    if ms is not None:
+        # additive: locals and parameters with no row, and why (report section "not in the table")
+        snap["missing"] = [dict(name=n, kind=k, reason=r) for n, k, r in ms]
     if fn.get("ilb"):
         # additive (rasim fold, regalloc.md 3.6.10): the IL at Color's entry, block by block in stream order, each
         # line "I <tuple> <opcode> <line offset> <len> | dsts <- srcs" of the plain dump
@@ -917,6 +962,135 @@ def _fpwhy(fn, r):
     return out
 
 
+_ILSYM = re.compile(r"(?<![\w?@$])(_[A-Za-z]\w*):[0-9a-f]+")
+
+
+def missing(fn):
+    """[(name, kind, reason)] for every local and parameter of fn with no row in the table: from GrgIdentifyCandidates'
+    leaves (not a candidate, and the test that refused it), the globreg events (made, then spilled, folded or left
+    without a register before its pop) and the IL before GlobalOptimize (every reference optimised away)."""
+    c = fn.get("cand")
+    if c is None:
+        return None
+    rows = {r["name"] for r in fn["rows"]}
+    rowname = {r["pop"]: r for r in fn["rows"]}
+    syms = {}                                      # name -> {kind, at, leaves, conv}
+    for lf in c["leaves"]:
+        k = lf["kw"] & 0xff
+        if k not in (4, 5):
+            continue
+        e = syms.setdefault(lf["name"], dict(kind=KIND[k], at=bool(lf["kw"] >> 8 & 2), leaves=[], conv=False,
+                                             alias="%s%s" % (KIND[k], lf["key"]) if isinstance(lf.get("key"), int) else None))
+        e["leaves"].append(lf)
+        e["conv"] |= lf["sym"] in c["conv"]
+    early = []
+    for ln in c["il"]:
+        head, _, ops = ln.partition("|")
+        hf = head.split()
+        call = len(hf) > 2 and "call" in hf[2].lower()
+        srcs = ops.partition("<-")[2].split()
+        for m in _ILSYM.finditer(ops):
+            nm = m.group(1)
+            if nm.startswith("__") or call and srcs and srcs[0].startswith(nm + ":"):
+                continue
+            nm = nm[1:]
+            if nm not in early:
+                early.append(nm)
+    color_il = " ".join(" ".join(v) for v in fn.get("ilb", {}).values())
+    dec = fn.get("dec") or []
+    ins = fn.get("inserts") or []
+    out = []
+    for nm in list(syms) + [n for n in early if n not in syms]:
+        e = syms.get(nm)
+        if nm in rows:
+            continue
+        if e is not None and e["alias"] in rows and e["alias"] != nm:
+            out.append((nm, e["kind"], "= %s in the table (its symbol has no name record by Color)" % e["alias"]))
+            continue
+        incolor = re.search(r"(?<![\w?@$])_%s:" % re.escape(nm), color_il) is not None
+        if e is None:
+            if incolor:
+                out.append((nm, "?", "only its address is used (&%s, or an aggregate whose fields are separate locals): "
+                            "it lives in memory" % nm))
+            else:
+                out.append((nm, "?", "every reference was removed before GrgIdentifyCandidates, by GlobalOptimize (copy "
+                            "or constant propagation, CSE, dead stores): its value lives in the values it was copied into"))
+            continue
+        note = " (address-taken)" if e["at"] else ""
+        if not e["conv"]:
+            lf = e["leaves"][0]
+            if any(l["flags"] & 0x40 for l in e["leaves"]):
+                why = "volatile (leaf flag 0x40): GrgIdentifyCandidates leaves it in memory"
+            elif not lf["ssr"]:
+                why = "no SSR (not a user variable): not a candidate"
+            elif lf["ty"] is not None and lf["ty"] & 0xf000 == CAND_XCLASS:
+                why = "its type (word %04x, class %04x) is excluded by GrgIdentifyCandidates' type-class test" % (lf["ty"], CAND_XCLASS)
+            else:
+                why = ("not a register candidate: its type (word %s) is not enregisterable (a struct, array or a size "
+                       "the type table rejects), or global optimisation is off" % ("%04x" % lf["ty"] if lf["ty"] is not None else "?"))
+            out.append((nm, e["kind"], why + note))
+            continue
+        # a candidate: did it get a globreg, and what happened to it?
+        grs = [x["gr"] for x in ins if (x.get("x") or {}).get("name") == nm and "gr" in x]
+        grs += [d["gr"] for d in dec if d.get("t") == "so" and d.get("name") == nm and d["gr"] not in grs]
+        if not grs:
+            if e["at"]:
+                why, note = ("address-taken: a candidate in the aliased set (_GrgBvAliasedCands) that no globreg was "
+                             "made for, so it lives in memory"), ""
+            elif incolor:
+                nref = len(re.findall(r"(?<![\w?@$])_%s:" % re.escape(nm), color_il))
+                why = ("a register candidate left in memory before Color: no globreg was made (%d reference%s left at "
+                       "Color; a cheap symbol, GrgSpillCheapSyms [I])" % (nref, "" if nref == 1 else "s"))
+            else:
+                why = ("a register candidate whose references were all gone by Color (folded into other "
+                       "instructions or removed as dead after GrgIdentifyCandidates)")
+            out.append((nm, e["kind"], why + note))
+            continue
+        why = None
+        for g in grs:
+            ev = []
+            for d in dec:
+                if d.get("gr") != g:
+                    continue
+                if d.get("t") == "so" and d.get("name") not in (nm, None) and ev:
+                    break                          # the record was recycled for another value
+                ev.append(d)
+                if d.get("t") == "remove":
+                    break
+            ts = [d["t"] for d in ev]
+            so = next((d for d in ev if d["t"] == "so"), None)
+            if any(d["t"] == "subst" and d.get("ok") for d in ev):
+                why = "a globreg with %s references; SpillObvious folded its def into its use (CmdSubstDef)" % (so or {}).get("nrefs", "?")
+            elif "spill" in ts and so is not None and ts.index("spill") <= ts.index("so") + 2:
+                why = ("a globreg; SpillObvious spilled it before colouring (nrefs %s, benefit %s: no gain from a register)"
+                       % (so.get("nrefs"), so.get("ben")))
+            elif "remove" in ts:
+                rm = ev[ts.index("remove")]
+                mk = [d for d in ev if d["t"] == "mark"]
+                by = rowname.get(rm["after_pop"])
+                if mk and any(d["site"] in ("nbr", "nbr8") for d in mk) and by is not None:
+                    why = ("a globreg; left without a register when pop %d gave %s %s (UpdateAffectedGlobregs, "
+                           "%sneighbour): taken off the list before its turn, so it lives in memory"
+                           % (by["pop"], by["name"], by["out"] or "?", "byte-register " if any(d["site"] == "nbr8" for d in mk) else ""))
+                elif "spill" in ts:
+                    why = "a globreg; spilled after pop %d (it stays in memory)" % rm["after_pop"]
+                else:
+                    why = "a globreg; its record was retired after pop %d (%s)" % (rm["after_pop"], " ".join(ts))
+            if why:
+                break
+        out.append((nm, e["kind"], (why or "a globreg that was never popped (events: %s)" % " ".join(
+            d["t"] for d in dec if d.get("gr") in grs)) + note))
+    named = [m for m in out if not re.fullmatch(r"(local|param)\d+", m[0])]
+    anon = [m for m in out if m not in named]
+    if anon:
+        by = {}
+        for nm, kind, why in anon:
+            by.setdefault(why, []).append(nm)
+        for why, nms in by.items():
+            named.append((" ".join(nms), "", "unnamed locals (aggregate fields or compiler-made), " + why))
+    return named
+
+
 def report(funcs, all_classes, why=()):
     out = []
     for fn in funcs:
@@ -932,6 +1106,12 @@ def report(funcs, all_classes, why=()):
                 r["pop"], w, r["name"], r["kind"], r["prio"], r["ben"], r["refs"], r["dord"], r["out"] or "-",
                 " ".join(r["cands"]), "  [%s]" % CLASS.get(r["cls"], "class %s" % r["cls"]) if all_classes else "")
                 + _immnote(r.get("imm")))
+        ms = missing(fn)
+        if ms:
+            out.append("  not in the table (locals and parameters with no globreg row; `regs --why` cannot break these down):")
+            wm = max([len(m[0]) for m in ms if m[1]] or [4])
+            for nm, kind, reason in ms:
+                out.append("    %-*s %-5s %s" % (wm, nm, kind, reason) if kind else "    %s: %s" % (reason, nm))
         for r in rows:
             if not _whysel(r, why):
                 continue
@@ -1007,9 +1187,11 @@ def main(argv):
                 path = a.export % re.sub(r"[^\w@$]+", "_", fn["name"])[:120]
                 json.dump(export(fn), open(path, "w"), indent=0)
                 print("# exported %s (%s)" % (path, fn["name"]))
+            _add_x87(a, funcs)
         else:
             json.dump(export(funcs[0]), open(a.export, "w"), indent=0)
             print("# exported %s (%s)" % (a.export, funcs[0]["name"]))
+        _add_x87(a, funcs)          # 14.00 / 15.00: snapshot key x87 (tools/c2x87.py)
     if a.block is not None:
         for fn in funcs:
             print(block_view(fn, a.block, a.npass))
@@ -1020,5 +1202,26 @@ def main(argv):
     return rc
 
 
+def _add_x87(a, funcs):
+    """14.00 / 15.00: the x87 stack decisions after Color (tools/c2x87.py, docs/c2/x87.md section 12) as snapshot key
+    x87, from one more traced compile; skipped on 13.10 (FPColor) and with C2X87=0."""
+    if os.environ.get("C2X87") == "0" or c2trace.c2build.name().startswith("13.10"):
+        return
+    try:
+        import c2x87
+        paths = [a.export % re.sub(r"[^\w@$]+", "_", fn["name"])[:120] for fn in funcs] if "%s" in a.export \
+            else [a.export]
+        fx, callees = c2x87.collect(a.src, a.func or "", a.cl)
+        import json
+        for p in paths:
+            snap = json.load(open(p))
+            for f in fx:
+                if f["name"] == snap.get("func"):
+                    snap["x87"] = c2x87.export(f, callees, a.cl)
+                    json.dump(snap, open(p, "w"), indent=0)
+    except SystemExit as e:
+        sys.stderr.write("c2regs: no x87 key (%s)\n" % e)
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(c2trace.pipe_safe(main, sys.argv[1:]))

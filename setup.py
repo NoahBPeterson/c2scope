@@ -74,11 +74,12 @@ def check_toolchain(vs):
         fail("no toolchain given", "pass --vs2005 /path/to/vs2005 (the directory that contains VC/ and SDK/)")
     vs = os.path.abspath(os.path.expanduser(vs))
     need = ["VC/Bin/cl.exe", "VC/Bin/c1xx.dll", "VC/Bin/c2.dll", "VC/INCLUDE", "VC/LIB", "SDK/Include", "SDK/Lib"]
-    missing = [n for n in need if not os.path.exists(os.path.join(vs, n))]
+    from c2build import tcpath   # case-insensitive: a lower-case unpack (vc/bin, ...) on Linux/WSL
+    missing = [n for n in need if not os.path.exists(tcpath(vs, n))]
     if missing:
         fail("%s lacks %s" % (vs, ", ".join(missing)),
              "point --vs2005 at the directory holding VC/ and SDK/ (f3decomp: the vs2005 directory its setup unpacks)")
-    got = sha256(os.path.join(vs, "VC/Bin/c2.dll"))
+    got = sha256(tcpath(vs, "VC/Bin/c2.dll"))
     if got != C2_SHA256:
         fail("VC/Bin/c2.dll is not the expected build (sha256 %s...)" % got[:16],
              "the tools need VS2005 SP1 c2.dll 14.00.50727.762 (sha256 %s)" % C2_SHA256)
@@ -97,7 +98,8 @@ def link_toolchain(vs):
     os.makedirs(os.path.join(HERE, "Bin"), exist_ok=True)
     dst = os.path.join(HERE, "Bin", "c2.dll")
     if not os.path.exists(dst) or sha256(dst) != C2_SHA256:
-        shutil.copy(os.path.join(vs, "VC/Bin/c2.dll"), dst)
+        from c2build import tcpath
+        shutil.copy(tcpath(vs, "VC/Bin/c2.dll"), dst)
     ok("work/toolchain/vs2005 -> %s; Bin/c2.dll" % vs)
 
 
@@ -156,15 +158,16 @@ def wine_prefix():
 
 def traced_toolchain(vs):
     step(7, "traced toolchain work/toolchain/vs2005-trace")
+    from c2build import tcpath   # the copy uses the canonical names; the source may be a lower-case unpack
     tr = os.path.join(TC, "vs2005-trace")
-    binsrc, bindst = os.path.join(vs, "VC", "Bin"), os.path.join(tr, "VC", "Bin")
+    binsrc, bindst = tcpath(vs, "VC", "Bin"), os.path.join(tr, "VC", "Bin")
     if not os.path.isdir(bindst):
         shutil.copytree(binsrc, bindst, symlinks=False)
     for sub in ("VC/INCLUDE", "VC/LIB", "SDK"):
         p = os.path.join(tr, sub)
         if not os.path.exists(p):
             os.makedirs(os.path.dirname(p), exist_ok=True)
-            os.symlink(os.path.join(vs, sub), p)
+            os.symlink(tcpath(vs, sub), p)
     import c2trace
     patched = os.path.exists(os.path.join(bindst, "c2trace.dll")) and sha256(os.path.join(bindst, "c2.dll")) != C2_SHA256
     if not patched:

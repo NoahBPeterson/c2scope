@@ -890,6 +890,50 @@ def image_callee_pop(image):
     return pop
 
 
+def _prologue(ins, m0=None):
+    """Addresses of the prologue's frame instructions (callee-saved pushes, sub esp / __chkstk, push ebp; mov ebp,
+    esp, an aligned frame's `and esp`, the /GS cookie): pushes there are not call arguments. The scheduler mixes
+    other instructions into the prologue (M&B 004362e0: `mov eax, [esp+0x18]` first, then `sub esp, 8; push ebx;
+    mov ebx, [esp+0x20]; push ebp; ..`): those are stepped over, so the scan ends only at a call, a jump, a pop or
+    a push that cannot be the prologue's (a register pushed twice, or `push ecx` after the frame or other code).
+    Stopping at the first of them counted the callee-saved pushes as the first call's arguments, and that call
+    (callee pops) popped them: every later depth 16 off."""
+    out, saved, other = set(), set(), False
+    alloc = False
+    for k in range(min(len(ins), 32)):
+        a, mn, ops = ins[k]
+        if (k == 0 and m0) or (k == 1 and m0 and mn == "call"):
+            out.add(a)
+            alloc = True
+            continue
+        if mn == "push":
+            if ops in ("ebx", "ebp", "esi", "edi") and ops not in saved:
+                saved.add(ops)
+                out.add(a)
+                continue
+            if ops == "ecx" and not (other or alloc or saved):
+                out.add(a)                  # `push ecx` for a 4-byte frame: first, before anything else
+                alloc = True
+                continue
+            break
+        if (mn == "sub" and ops.startswith("esp,")) or (mn == "and" and ops.startswith("esp,")) or \
+                (mn == "mov" and ops == "ebp, esp"):
+            out.add(a)
+            alloc = alloc or mn == "sub"
+            continue
+        if (mn == "mov" and re.match(r"e[a-d]x, dword ptr \[0x[0-9a-f]+\]$", ops)) or \
+                (mn == "xor" and re.match(r"e[a-d]x, e[bs]p$", ops)):
+            # the /GS cookie load (`mov eax, [cookie]`, `xor eax, ebp|esp`) sits inside an aligned frame's prologue
+            # (`push ebp; mov ebp, esp; and esp, -16; mov eax, [cookie]; sub esp, N; push ebx ..`)
+            out.add(a)
+            continue
+        if mn in ("call", "pop", "ret", "leave", "enter") or mn.startswith("j") or mn.startswith("push") or \
+                mn.startswith("pop") or re.match(r"esp\b", ops) or (mn == "lea" and ops.startswith("esp")):
+            break
+        other = True                        # an instruction the scheduler moved in: stepped over
+    return out
+
+
 def orig_slots(ins, callee_pop=None):
     """[(index into ins, [frame keys])] and the frame summary. A key is the operand's address relative to the
     return-address slot at entry (0 = the return address, +4 the first stack argument; esp operands: displacement
@@ -903,22 +947,13 @@ def orig_slots(ins, callee_pop=None):
     if m0:
         frame = _num(m0.group(1))
     # prologue: callee-saved pushes, sub esp / __chkstk, push ebp; mov ebp, esp: not call arguments
-    pro = 0
-    while pro < len(ins) and pro < 12:
-        mn, ops = ins[pro][1], ins[pro][2]
-        if (mn == "push" and ops in ("ebx", "ebp", "esi", "edi", "ecx")) or (mn == "sub" and ops.startswith("esp,")) \
-                or (mn == "mov" and ops == "ebp, esp") or (pro == 0 and m0) or (pro == 1 and m0 and mn == "call") \
-                or (mn == "and" and ops.startswith("esp,")):
-            pro += 1
-        else:
-            break
-    prologue = {ins[k][0] for k in range(pro)}
+    prologue = _prologue(ins, m0)
     # call targets the caller cleans up after (an `add esp, N` within a few instructions of some call to them): cdecl
     cdecl = set()
     for k, (_, mn, ops) in enumerate(ins):
         if mn != "call":
             continue
-        for k2 in range(k + 1, min(k + 6, len(ins))):
+        for k2 in range(k + 1, min(k + 64, len(ins))):     # the scheduler can defer the `add esp` a long way (F3 009c7730: 42)
             m2, o2 = ins[k2][1], ins[k2][2]
             if m2 == "add" and o2.startswith("esp,"):
                 cdecl.add(ops)
@@ -1006,9 +1041,10 @@ def orig_slots(ins, callee_pop=None):
 def orig_map(s, asm, ins, callee_pop=None):
     """{element idx: (orig offset in our packer's coordinates, votes, total)} by aligning our listing with ins."""
     import regmap, tsweep
-    lst = tsweep.listing_offsets(asm, s["func"])
+    lst = tsweep.listing_offsets(asm, s["func"])           # the text: its operands carry the slot names
     offs = sorted(lst)
-    ours = [regmap.norm((lst[o].split()[0], lst[o].split(None, 1)[1] if " " in lst[o] else "")) for o in offs]
+    ours = [regmap.norm(tsweep.canon_listing(lst[o].split()[0], lst[o].split(None, 1)[1] if " " in lst[o] else ""))
+            for o in offs]                                 # in capstone's operand order, as orig (test, xchg)
     orig = [(mn, ops) for _, mn, ops in ins]
     slots, info = orig_slots(ins, callee_pop)
     okeys = dict(slots)
@@ -1031,7 +1067,17 @@ def orig_map(s, asm, ins, callee_pop=None):
                 diffs[key > 0][key - L["loff"]] += 1
     # the listing gives locals relative to the return-address slot in an ESP frame and params relative to 4 below
     # it (ebp-style), so the two regions get their own shift
-    CL = diffs[False].most_common(1)[0][0] if diffs[False] else 0
+    # the locals' shift: the one that puts the most elements at our offset (then the most votes). Counting votes
+    # alone lets a few scalars with many uses outvote every array (F3 009c7730: 4-byte locals in other slots, the
+    # 16-byte arrays all in place)
+    def _fit(c):
+        n = 0
+        for e, v in votes.items():
+            key = v.most_common(1)[0][0]
+            L = s["listing"][e]
+            n += key <= 0 and L.get("loff") is not None and key - c == L["loff"]
+        return (n, diffs[False][c])
+    CL = max(diffs[False], key=_fit) if diffs[False] else 0
     CP = diffs[True].most_common(1)[0][0] if diffs[True] else (CL if s["fn"].get("ebp") else CL - 4)
     out = {}
     for e, v in votes.items():
