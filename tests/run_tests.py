@@ -889,8 +889,95 @@ def rdiff_tests():
              ["push edi", "push esi", "mov esi, ecx", "pop esi", "pop edi", "ret"])[0], 1)
 
 
+
+def judge_tests():
+    """tools/judge.py on synthetic code: what instruction selection, allocation, scheduling and layout change is
+    EQUIVALENT; a changed store, branch or loop body is a MISMATCH."""
+    import collections, judge as J
+
+    def ins(lines, base):           # `call ?name`: our side's callee by name (the listing's), as a relocation
+        out = []
+        for k, l in enumerate(lines):
+            mn, _, ops = l.partition(" ")
+            sym = None
+            if mn == "call" and ops.startswith("?"):
+                sym, ops = (ops.strip(), False, False), hex(base + 4 * k + 5)
+            out.append(J.Ins(base + 4 * k, mn, ops.strip(), sym=sym, text=l))
+        return out
+
+    def addr(lines, base):          # jump targets written as L<k>: the k-th instruction
+        return [re.sub(r"\bL(\d+)", lambda m: hex(base + 4 * int(m.group(1))), l) for l in lines]
+
+    def v(a, b, func="?f@@YAHPAH@Z"):
+        return J.judge(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), func,
+                       image=(0x400000, 0x4000000))["verdict"]
+    vj = v
+    p = ["mov eax, dword ptr [esp + 4]"]
+    check("judge: other registers, lea against add, inc against add 1: EQUIVALENT",
+          v(p + ["lea ecx, [eax + 8]", "inc dword ptr [ecx]", "mov eax, ecx", "ret"],
+            ["mov edx, dword ptr [esp + 4]", "add edx, 8", "add dword ptr [edx], 1", "mov eax, edx", "ret"]),
+          "EQUIVALENT")
+    check("judge: a split read-modify-write against one instruction: EQUIVALENT",
+          v(p + ["mov ecx, dword ptr [eax + 0x184]", "or ecx, 1", "mov dword ptr [eax + 0x184], ecx", "ret"],
+            p + ["or dword ptr [eax + 0x184], 1", "ret"]), "EQUIVALENT")
+    check("judge: `= 1` against `|= 1`: MISMATCH",
+          v(p + ["mov dword ptr [eax + 0x184], 1", "ret"], p + ["or dword ptr [eax + 0x184], 1", "ret"]),
+          "MISMATCH")
+    check("judge: two independent stores in either order: EQUIVALENT",
+          v(p + ["mov dword ptr [eax + 4], 1", "mov dword ptr [eax + 8], 2", "ret"],
+            p + ["mov dword ptr [eax + 8], 2", "mov dword ptr [eax + 4], 1", "ret"]), "EQUIVALENT")
+    check("judge: a store moved across a load of the same field: MISMATCH",
+          v(p + ["mov ecx, dword ptr [eax + 4]", "mov dword ptr [eax + 4], 1", "mov eax, ecx", "ret"],
+            p + ["mov dword ptr [eax + 4], 1", "mov ecx, dword ptr [eax + 4]", "mov eax, ecx", "ret"]), "MISMATCH")
+    br = ["mov eax, dword ptr [esp + 4]", "test eax, eax", "je L5", "mov eax, 1", "ret", "mov eax, 2", "ret"]
+    inv = ["mov ecx, dword ptr [esp + 4]", "cmp ecx, 0", "jne L5", "mov eax, 2", "ret", "mov eax, 1", "ret"]
+    check("judge: test r, r against cmp r, 0 with the branch inverted and the blocks swapped: EQUIVALENT",
+          vj(br, inv), "EQUIVALENT")
+    check("judge: the same with the returned values exchanged: MISMATCH",
+          vj(br, [x.replace("eax, 2", "eax, 9").replace("eax, 1", "eax, 2").replace("eax, 9", "eax, 1") for x in inv]),
+          "MISMATCH")
+    loop = ["mov ecx, dword ptr [esp + 4]", "xor eax, eax", "add eax, dword ptr [ecx]", "add ecx, 4",
+            "cmp ecx, dword ptr [esp + 8]", "jb L2", "ret"]
+    loop2 = ["mov edx, dword ptr [esp + 4]", "xor eax, eax", "mov ecx, dword ptr [edx]", "add eax, ecx",
+             "add edx, 4", "cmp edx, dword ptr [esp + 8]", "jb L2", "ret"]
+    check("judge: a loop in other registers, the load folded or not: EQUIVALENT", vj(loop, loop2), "EQUIVALENT")
+    check("judge: the loop stepping 8 instead of 4: MISMATCH",
+          vj(loop, [x.replace("edx, 4", "edx, 8") for x in loop2]), "MISMATCH")
+    check("judge: a call's arguments and its result",
+          (v(["push 5", "push dword ptr [esp + 8]", "call ?g@@YAHHH@Z", "add esp, 8", "ret"],
+             ["push 5", "push dword ptr [esp + 8]", "call 0x478f30", "add esp, 8", "ret"]),
+           v(["push 5", "push dword ptr [esp + 8]", "call ?g@@YAHHH@Z", "add esp, 8", "ret"],
+             ["push 6", "push dword ptr [esp + 8]", "call 0x478f30", "add esp, 8", "ret"])),
+          ("EQUIVALENT", "MISMATCH"))
+    fx = ["mov eax, dword ptr [esp + 4]", "fld dword ptr [eax]", "fld dword ptr [eax + 4]", "fmul dword ptr [eax + 8]",
+          "faddp st(1)", "fstp dword ptr [eax + 12]", "ret"]
+    check("judge: faddp st(1) is st(1) + st(0), popped: a changed operand of the lost half is a MISMATCH",
+          (v(fx, fx), v(fx, [x.replace("[eax + 8]", "[eax + 0xc]") for x in fx])), ("EQUIVALENT", "MISMATCH"))
+    fm = ["mov eax, dword ptr [esp + 4]", "fld dword ptr [eax]", "fld dword ptr [eax + 4]", "fmul st(1)",
+          "fstp dword ptr [eax + 12]", "fstp st(0)", "ret"]
+    check("judge: fmul st(1) (no pop) is st(0) = st(0) * st(1): the other factor changed is a MISMATCH",
+          (v(fm, fm), v(fm, [x.replace("fld dword ptr [eax]", "fld dword ptr [eax + 8]") for x in fm])),
+          ("EQUIVALENT", "MISMATCH"))
+    two = ["mov ecx, dword ptr [esp + 4]", "test ecx, ecx", "je L5", "call ?a@@YAXXZ", "ret", "call ?b@@YAXXZ", "ret"]
+    two_r = ["mov ecx, dword ptr [esp + 4]", "test ecx, ecx", "jne L5", "call 0x478f30", "ret", "call 0x478f80", "ret"]
+    def vk(a, b, known):
+        return J.judge(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), "?f@@YAXPAH@Z",
+                       image=(0x400000, 0x4000000), known=known)["verdict"]
+    check("judge: two callees swapped between the paths: EQUIVALENT under a free pairing, MISMATCH once the "
+          "project's symbol map anchors it",
+          (vk(two, two_r, {}), vk(two, two_r, {"?a@@YAXXZ": 0x478f30, "?b@@YAXXZ": 0x478f80})),
+          ("EQUIVALENT", "MISMATCH"))
+    job = dict(id="t", func="?f@@YAHPAH@Z", image=[0x400000, 0x4000000],
+               ours=[[i.addr, i.mn, i.ops, None] for i in ins(addr(loop, 0), 0)],
+               orig=[[i.addr, i.mn, i.ops] for i in ins(addr(loop2, 0x401000), 0x401000)])
+    ms = J.mutants(job, per_kind=4)
+    got = collections.Counter(J.judge_job(m)["verdict"] for m in ms)
+    check("judge: no mutant of the loop's original is EQUIVALENT (%d mutants)" % len(ms), got["EQUIVALENT"], 0)
+
+
 bdiff_tests()
 rdiff_tests()
+judge_tests()
 
 
 
