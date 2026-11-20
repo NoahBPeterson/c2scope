@@ -1166,7 +1166,38 @@ def etype(model, s):
     return model + "." + k
 
 
-def code_types(code, base_bdo):
+def okey(code, missing=0):
+    """A measured variant's sort key against the original: (rdiff, bdiff); a record written before rdiff was kept
+    has only its bdiff ("bdo"), and is ranked by it."""
+    b = code.get("bdo")
+    if b is None:
+        return (missing, missing)
+    r = code.get("rdo")
+    return (r if r is not None else b, b)
+
+
+def ocmp(code, base):
+    """-1 / 0 / 1: the variant against the base on the original, rdiff first and bdiff the tie-break (bdiff alone
+    when either lacks an rdiff); None without an original. base: {"bdo", "rdo"} (Miner.base_osc)."""
+    if base is None or code.get("bdo") is None or base.get("bdo") is None:
+        return None
+    if code.get("rdo") is not None and base.get("rdo") is not None:
+        x, y = (code["rdo"], code["bdo"]), (base["rdo"], base["bdo"])
+    else:
+        x, y = code["bdo"], base["bdo"]
+    return (x > y) - (x < y)
+
+
+def ogain(code, base):
+    """How much closer to the original than the base (rdiff when both have one, else bdiff); 0 without one."""
+    if base is None or code.get("bdo") is None:
+        return 0
+    if code.get("rdo") is not None and base.get("rdo") is not None:
+        return base["rdo"] - code["rdo"]
+    return base["bdo"] - code["bdo"]
+
+
+def code_types(code, base):
     t = []
     if code.get("ident") == 0 and code.get("bytes"):
         t.append("C.frame")                    # the same instructions and registers, other stack offsets
@@ -1178,18 +1209,19 @@ def code_types(code, base_bdo):
         t.append("C.bag0")
     else:
         t.append("C.changed")
-    if code.get("bdo") is not None and base_bdo is not None:
-        if code["bdo"] < base_bdo:
+    c = ocmp(code, base)                       # C.bdiff-/+: closer / farther by (rdiff, bdiff) (names kept)
+    if c is not None:
+        if c < 0:
             t.append("C.bdiff-")
-        elif code["bdo"] > base_bdo:
+        elif c > 0:
             t.append("C.bdiff+")
         if code["bdo"] == 0:
             t.append("C.match")
     return t
 
 
-def rec_types(rec, base_bdo):
-    ts = set(code_types(rec["code"], base_bdo))
+def rec_types(rec, base):
+    ts = set(code_types(rec["code"], base))
     for m in "RSLKQM":
         for s in rec["eff"].get(m, []):
             ts.add(etype(m, s))
@@ -1349,6 +1381,7 @@ class Miner:
         self.c = GenCtx(self.text, self.func, self.base.fn)
         self.c._mtype = {}
         self.base_bdo = self.bdo(self.base.fn)
+        self.base_osc = None if self.base_bdo is None else dict(bdo=self.base_bdo, rdo=self.rdo(self.base.fn))
         self.ctl = {}
         self.ctl_lock = threading.Lock()
 
@@ -1398,6 +1431,9 @@ class Miner:
 
     def bdo(self, fn):
         return tsweep.bdiff(fn.instrs, self.orig) if self.orig is not None else None
+
+    def rdo(self, fn):
+        return tsweep.rdiff(fn.instrs, self.orig) if self.orig is not None else None
 
     def slot_agree(self, s):
         if self.orig is None:
@@ -1449,6 +1485,7 @@ class Miner:
             return rec
         eff, code = regs_effects(ref.fn, fn)
         code["bdo"] = self.bdo(fn)
+        code["rdo"] = self.rdo(fn)
         rec["code"] = code
         rec["eff"]["R"] = eff
         rec["sig_same"] = ilsig(fn) == ref.sig
@@ -1498,7 +1535,7 @@ class Miner:
                 rec.setdefault("ferr", {})[feat] = "compare: " + str(e)[:200]
 
     def write(self, rec):
-        rec["types"] = rec_types(rec, self.base_bdo) if rec.get("ok") else []
+        rec["types"] = rec_types(rec, self.base_osc) if rec.get("ok") else []
         rec["null"] = is_null(rec)
         _lock_append(DB, json.dumps(rec, sort_keys=True))
 
@@ -1633,7 +1670,7 @@ def want_hit(w, rec, miner):
     eff = rec.get("eff", {})
     m, k = w["m"], w["kind"]
     if m == "C":
-        return (rec["code"].get("bdo") is not None and miner.base_bdo is not None and rec["code"]["bdo"] < miner.base_bdo), ""
+        return ocmp(rec["code"], miner.base_osc) == -1, ""
     if m == "S":
         for s in eff.get("S", []):
             if re.match(r"%s:%d(\D|$)" % (k, w["n"]), s):
@@ -1818,10 +1855,9 @@ def overlap(e1, e2):
 
 
 def score_rec(rec, miner, wants):
-    """Lower is better: wanted effects missed, then bdiff against the original, then code changed."""
+    """Lower is better: wanted effects missed, then (rdiff, bdiff) against the original, then code changed."""
     hits = sum(1 for w in wants if want_hit(w, rec, miner)[0])
-    bdo = rec["code"].get("bdo")
-    return (-hits, bdo if bdo is not None else 0, rec["code"].get("code", 999))
+    return (-hits,) + okey(rec["code"]) + (rec["code"].get("code", 999),)
 
 
 def run_mine(a, cl):
@@ -1847,7 +1883,8 @@ def run_mine(a, cl):
         w["type"] = want_type(w, M)
     print("%s: %d instructions, %d blocks, build %s%s; base compiled (%s)" % (
         M.func, len(M.base.fn.code), len(M.base.fn.blocks), M.build,
-        "" if M.base_bdo is None else ", bdiff %d against the original" % M.base_bdo, M.out), flush=True)
+        "" if M.base_bdo is None else ", rdiff %s, bdiff %d against the original" % (M.base_osc["rdo"], M.base_bdo),
+        M.out), flush=True)
     cands = generate(M.c)
     for i, v in enumerate(cands):
         v["helpers"] = sorted(helpers_used([tuple(e) for e in v["edits"]], v["tail"]))
@@ -1919,7 +1956,7 @@ def run_mine(a, cl):
         print("STOP: %d traced compiles were declined by the compile server; refused to run them under wine" %
               len(_LOCAL), flush=True)
     for r in measured:
-        r["types"] = rec_types(r, M.base_bdo) if r.get("ok") else []
+        r["types"] = rec_types(r, M.base_osc) if r.get("ok") else []
         r["null"] = is_null(r)
     recs += measured
     dt = time.time() - t0
@@ -1962,11 +1999,12 @@ def report(M, recs, wants, stats, dt):
         print("  %-26s %3d %3d %3d | %3d | %s" % (cls, len(rs), len(o), len(nn), len(neu),
                                                  " ".join("%s:%d" % kv for kv in tc.most_common(8))))
     if M.orig is not None:
-        best = sorted(ok, key=lambda r: (r["code"].get("bdo", 1 << 30), r["code"].get("code", 0)))[:10]
-        print("\n## best against the original (base bdiff %s)" % M.base_bdo)
+        best = sorted(ok, key=lambda r: okey(r["code"], 1 << 30) + (r["code"].get("code", 0),))[:10]
+        print("\n## best against the original (base rdiff %s, bdiff %s)" % (
+            (M.base_osc or {}).get("rdo"), M.base_bdo))
         for r in best:
-            print("  bdiff %4s  code %3d  %-24s %s" % (r["code"].get("bdo"), r["code"].get("code", -1), r["cls"],
-                                                       r["desc"][:90]))
+            print("  rdiff %4s bdiff %4s  code %3d  %-24s %s" % (r["code"].get("rdo"), r["code"].get("bdo"),
+                                                                 r["code"].get("code", -1), r["cls"], r["desc"][:90]))
     for w in wants:
         answer(M, recs, w, stats)
 
@@ -1980,14 +2018,14 @@ def answer(M, recs, w, stats):
         h, note = want_hit(w, r, M)
         if h:
             hits.append((r, note))
-    hits.sort(key=lambda t: (t[0]["code"].get("bdo") if t[0]["code"].get("bdo") is not None else 0,
-                             t[0]["code"].get("code", 999), len(t[0]["eff"].get(w["m"], []))))
+    hits.sort(key=lambda t: okey(t[0]["code"]) + (t[0]["code"].get("code", 999), len(t[0]["eff"].get(w["m"], []))))
     print("  this function: %d measured variants produce it" % len(hits))
     for r, note in hits[:12]:
         side = [s for s in r["eff"].get(w["m"], []) if s != note][:4]
         print("   %-24s code %3d bag %3d%s  %s\n%s     %s%s" % (
             r["cls"], r["code"].get("code", -1), r["code"].get("bag", -1),
-            "" if r["code"].get("bdo") is None else " bdiff %d" % r["code"]["bdo"], r["desc"][:80], " " * 3, note,
+            "" if r["code"].get("bdo") is None else " rdiff %s bdiff %d" % (r["code"].get("rdo"), r["code"]["bdo"]),
+            r["desc"][:80], " " * 3, note,
             ("   also: " + " ".join(side)) if side else ""))
     rows = []
     for cls, s in stats.items():
@@ -2015,8 +2053,7 @@ def deep_search(M, recs, wants, wl, stats, a):
                    if re.search(r"\b_?%s\b" % re.escape(n), e))
     ok = [r for r in recs if r.get("ok") and not r.get("null") and r["code"].get("code") == 0 and r.get("edits")
           and not r["cls"].startswith(("pair", "chain", "decl", "deffn", "move")) and r.get("base_edits") is None]
-    ok.sort(key=lambda r: (-mention(r), -(M.base_bdo - r["code"]["bdo"]) if r["code"].get("bdo") is not None and
-                           M.base_bdo is not None else 0, len(sum((r["eff"].get(m, []) for m in "RSLKQMF"), []))))
+    ok.sort(key=lambda r: (-mention(r), -ogain(r["code"], M.base_osc), len(sum((r["eff"].get(m, []) for m in "RSLKQMF"), []))))
     beams = ok[:a.depth_beam]
     if not beams:
         return []
@@ -2062,7 +2099,7 @@ def deep_search(M, recs, wants, wl, stats, a):
         if M.compiles >= limit:
             return None
         r = M.measure(v)
-        r["types"] = rec_types(r, M.base_bdo) if r.get("ok") else []
+        r["types"] = rec_types(r, M.base_osc) if r.get("ok") else []
         r["null"] = is_null(r)
         M.write(r)
         with lock:
@@ -2079,14 +2116,15 @@ def deep_search(M, recs, wants, wl, stats, a):
     print("  %d second edits measured" % len(out))
     for w in wants:
         hits = [r for r in out if r.get("ok") and want_hit(w, r, M)[0]]
-        hits.sort(key=lambda r: (r["code"].get("bdo") or 0, r["code"].get("code", 999)))
+        hits.sort(key=lambda r: okey(r["code"]) + (r["code"].get("code", 999),))
         print("  want %s: %d" % (w["text"], len(hits)))
         for r in hits[:6]:
             print("    code %3d%s  %s" % (r["code"].get("code", -1), "" if r["code"].get("bdo") is None else
-                                       " bdiff %d" % r["code"]["bdo"], r["desc"][:140]))
+                                       " rdiff %s bdiff %d" % (r["code"].get("rdo"), r["code"]["bdo"]), r["desc"][:140]))
     if M.orig is not None:
-        for r in sorted([r for r in out if r.get("ok")], key=lambda r: r["code"].get("bdo", 1 << 30))[:5]:
-            print("    best: bdiff %s code %s  %s" % (r["code"].get("bdo"), r["code"].get("code"), r["desc"][:140]))
+        for r in sorted([r for r in out if r.get("ok")], key=lambda r: okey(r["code"], 1 << 30))[:5]:
+            print("    best: rdiff %s bdiff %s code %s  %s" % (r["code"].get("rdo"), r["code"].get("bdo"),
+                                                           r["code"].get("code"), r["desc"][:140]))
     return out
 
 
@@ -2096,8 +2134,7 @@ def pair_search(M, recs, wants, a):
 
     def gain(r):
         g = 0.0
-        if M.base_bdo is not None and r["code"].get("bdo") is not None:
-            g += M.base_bdo - r["code"]["bdo"]
+        g += ogain(r["code"], M.base_osc)
         g += 3 * sum(1 for w in wants if want_hit(w, r, M)[0])
         return g
     good = sorted((r for r in ok if gain(r) > 0), key=lambda r: -gain(r))[:14]
@@ -2124,7 +2161,7 @@ def pair_search(M, recs, wants, a):
                  meta=dict(parts=[x["cls"], y["cls"]]), id="p%s_%s" % (x.get("id"), y.get("id")),
                  ctx=dict(where="pair"))
         r = M.measure(v)
-        r["types"] = rec_types(r, M.base_bdo) if r.get("ok") else []
+        r["types"] = rec_types(r, M.base_osc) if r.get("ok") else []
         r["null"] = is_null(r)
         M.write(r)
         with lock:

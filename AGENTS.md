@@ -94,7 +94,11 @@ From `docs/c2/frontend.md`, `immcand.md`, `symkeys.md` and `x87.md`; each is an 
 ## Pitfalls
 
 - Do not compare against a listing from another compiler build or other flags.
-- `bdiff` (the default score of tsweep, rwsweep, helpersweep and realize) counts aligned instructions that differ
+- `rdiff` ranks variants in tsweep, rwsweep, helpersweep, realize and effectmine, with `bdiff` as the tie-break.
+  It is bdiff up to register and frame-slot choice and the scheduler's moves: one changed instruction can shift
+  the allocator's registers for the rest of the function, which bdiff counts on every line and rdiff does not. A
+  match is still bdiff 0.
+- `bdiff` counts aligned instructions that differ
   as the bytes encode them: registers, displacements, immediates, operand order and size; relocations, call/jump
   targets and padding are masked. `regdiff` is the same count over mnemonics and registers only: it cannot see a
   wrong displacement or immediate (an x87 sum in another order scores 0). A shape-only difference (registers

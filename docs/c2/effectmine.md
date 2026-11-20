@@ -69,7 +69,8 @@ traced (column denominators, section 4). Features named by `--want` are traced f
 **Effect types.** Each effect string has a type that generalises across functions: `R.ref+`, `R.P-`, `R.before`,
 `R.pref+`, `R.reg`, `S.ins`, `S.drop`, `L.uses+`, `L.conf-`, `L.off`, `K.frame+`, `K.flips`, `Q.flip`, `M.load-`,
 and for the code `C.same` / `C.frame` (only stack offsets) / `C.regsonly` / `C.bag0` / `C.changed`, `C.bdiff-` /
-`C.bdiff+` (against the original), `C.match` (bdiff 0). A variant with no effect and the same bytes is `null`.
+`C.bdiff+` (closer to / farther from the original: by `(rdiff, bdiff)` since 2026-11-20, tracer.md `rdiff`; a
+record measured before then has no rdiff and is compared by bdiff), `C.match` (bdiff 0). A variant with no effect and the same bytes is `null`.
 
 **Helper controls.** Rewrites that need a helper template (`hs_id`, `hs_cp`, `rz_sub`, `em_cr`, ..) add declarations
 before the function, and on 13.10 a declaration count alone flips the order of two loads (Mount & Blade 0x4b9110,

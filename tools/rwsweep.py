@@ -59,9 +59,12 @@ Measures per variant:
   shape    aligned diff against the baseline with every register except esp masked: 0 = the same instructions
            in the same order, only registers may differ ("code-neutral")
   regs     aligned diff against the baseline including registers: 0 = nothing changed at all
+  rdiff    (--asm-vs) the score against the original up to register choice, frame-slot choice and scheduling moves
+           (tsweep.rdiff): the sort key and what "better" means; a variant with a lower rdiff is closer even when
+           its bdiff is higher (a renaming ripple is not distance)
   bdiff    (--asm-vs) the byte-faithful score against the original (tsweep.bdiff: whole instructions, with
            displacements and immediates; relocations, call/jump targets and padding masked): the number to bring
-           to 0, and the sort key
+           to 0; the tie-break
   regdiff  (--asm-vs) the same alignment over mnemonic + registers only (tsweep.regdiff)
   dgap     (--want A>B) change of prio(B) - prio(A); the constraint holds when the gap is <= 0
 
@@ -1273,17 +1276,18 @@ class Run:
 
 
 def plan_combos(rows, variants, b0, g0, max_combo):
-    """(code-neutral singles that help, code-changing singles that lower the bdiff, combinations to compile as
-    (predicted gap, size, ids), best first). rows: rwsweep's measured singles (i, shape, bd, dgap); b0: the
-    baseline's bdiff (None without --asm-vs); g0: the baseline's gap (None without --want).
+    """(code-neutral singles that help, code-changing singles that lower the score, combinations to compile as
+    (predicted gap, size, ids), best first). rows: rwsweep's measured singles (i, shape, bd, rv, dgap); b0: the
+    baseline's (rdiff, bdiff) (None without --asm-vs); g0: the baseline's gap (None without --want).
     With --asm-vs, singles that lower the bdiff while changing the code are combined too (each other and with the
     code-neutral ones): two code changes that each move toward the original often add up (Spore 0099f110: four
     such singles and no combination row before)."""
-    good = [r for r in rows if r["shape"] == 0 and ((r["dgap"] or 0) < 0 or (b0 is not None and r["bd"] < b0))]
-    good.sort(key=lambda r: ((r["dgap"] or 0), r["bd"] or 0))
+    sc = lambda r: (r.get("rv") or 0, r["bd"] or 0)         # rdiff first, bdiff the tie-break
+    good = [r for r in rows if r["shape"] == 0 and ((r["dgap"] or 0) < 0 or (b0 is not None and sc(r) < b0))]
+    good.sort(key=lambda r: ((r["dgap"] or 0),) + sc(r))
     better = []
     if b0 is not None:
-        better = sorted((r for r in rows if r["shape"] != 0 and r["bd"] < b0), key=lambda r: (r["bd"], r["shape"], r["i"]))
+        better = sorted((r for r in rows if r["shape"] != 0 and sc(r) < b0), key=lambda r: sc(r) + (r["shape"], r["i"]))
     pool = good[:12] + better[:8]
     combos = []
     for n in range(2, max_combo + 1):
@@ -1291,7 +1295,7 @@ def plan_combos(rows, variants, b0, g0, max_combo):
             if any(overlap(variants[x["i"]][2], variants[y["i"]][2]) for x, y in itertools.combinations(c, 2)):
                 continue
             pred = None if g0 is None else g0 + sum(x["dgap"] or 0 for x in c)
-            gain = 0 if b0 is None else sum(x["bd"] - b0 for x in c)        # bdiff gains added up: a ranking only
+            gain = 0 if b0 is None else tuple(sum(sc(x)[k] - b0[k] for x in c) for k in (0, 1))  # added up: a ranking
             combos.append((pred if pred is not None else 0, gain, n, [x["i"] for x in c]))
     combos.sort()
     return good, better, [(pred, n, ids) for pred, _g, n, ids in combos]
@@ -1374,6 +1378,9 @@ def main():
     def bd(r):
         return None if orig is None else tsweep.bdiff(r.instrs, orig)
 
+    def rv(r):
+        return None if orig is None else tsweep.rdiff(r.instrs, orig)
+
     base0 = build("orig", prelude_for(raw) + raw)
     if prelude_for(raw):
         # the helper templates are declarations before the function: on 13.10 their count alone has been seen to flip
@@ -1386,7 +1393,7 @@ def main():
     base = build("base", apply(text, []), keep=True)
     g0 = base.gap(A, Bn, a.k) if A else None
     print("baseline: %d instructions%s%s%s" % (
-        len(base.instrs), "" if orig is None else ", bdiff %d, regdiff %d" % (bd(base), rd(base)),
+        len(base.instrs), "" if orig is None else ", rdiff %d, bdiff %d, regdiff %d" % (rv(base), bd(base), rd(base)),
         "" if g0 is None else ", gap %+d (%s %s, %s %s)" % (g0, A, helpersweep.prio_at(base.snap, A, a.k), Bn,
                                                            helpersweep.prio_at(base.snap, Bn, a.k)),
         "" if not nthis else "; %d member calls given `this->` (%s)" % (
@@ -1412,25 +1419,26 @@ def main():
             if a.all:
                 print("  v%04d failed: %s | %s" % (i, variants[i][1], err))
             continue
-        rows.append(dict(i=i, shape=adiff(r.shape, base.shape), regs=adiff(r.keys, base.keys), rd=rd(r), bd=bd(r),
+        rows.append(dict(i=i, shape=adiff(r.shape, base.shape), regs=adiff(r.keys, base.keys), rd=rd(r), bd=bd(r), rv=rv(r),
                          dgap=None if g0 is None or r.gap(A, Bn, a.k) is None else r.gap(A, Bn, a.k) - g0, n=len(r.instrs)))
     same = [r for r in rows if r["regs"] == 0 and not r["dgap"]]
     print("%d measured, %d failed to compile, %d changed nothing (no register, no priority)" % (len(rows), failed, len(same)))
-    r0, b0 = rd(base), bd(base)
+    r0, b0, v0 = rd(base), bd(base), rv(base)
     shown = [r for r in rows if a.all or r not in same]
-    shown.sort(key=lambda r: (r["bd"] if r["bd"] is not None else 0, r["shape"], r["dgap"] or 0, r["i"]))
-    print("   id   family shape regs %s%s  rewrite" % ("bdiff regdiff " if orig is not None else "", "dgap " if A else ""))
+    shown.sort(key=lambda r: (r["rv"] if r["rv"] is not None else 0, r["bd"] if r["bd"] is not None else 0, r["shape"],
+                              r["dgap"] or 0, r["i"]))
+    print("   id   family shape regs %s%s  rewrite" % ("rdiff bdiff regdiff " if orig is not None else "", "dgap " if A else ""))
     for r in shown:
         fam, desc, _ = variants[r["i"]]
         print("  v%04d %-6s %5d %4d %s%s  %s" % (
-            r["i"], fam, r["shape"], r["regs"], "" if orig is None else "%5d%s %6d  " % (
-                r["bd"], "*" if r["bd"] < b0 else " ", r["rd"]),
+            r["i"], fam, r["shape"], r["regs"], "" if orig is None else "%5d%s %5d %6d  " % (
+                r["rv"], "*" if (r["rv"], r["bd"]) < (v0, b0) else " ", r["bd"], r["rd"]),
             "" if not A else ("%+4d " % r["dgap"] if r["dgap"] is not None else "   ? "), desc))
     # combinations of the variants that helped
-    good, better, combos = plan_combos(rows, variants, b0 if orig is not None else None, g0, a.max_combo)
-    print("%d code-neutral variants improve the gap or the bdiff" % len(good))
+    good, better, combos = plan_combos(rows, variants, (v0, b0) if orig is not None else None, g0, a.max_combo)
+    print("%d code-neutral variants improve the gap or the score" % len(good))
     if orig is not None:
-        print("%d variants that change the code improve the bdiff (combined too)" % len(better))
+        print("%d variants that change the code improve the score (rdiff, then bdiff; combined too)" % len(better))
     # a variant that reaches the original is the answer whatever its shape against the draft (Spore 0073afb0: a wrap
     # with shape 2 and bdiff 0, which the line above does not count)
     if orig is not None:
@@ -1447,7 +1455,7 @@ def main():
             continue
         print("  %-16s shape %d regs %d%s%s" % (
             "+".join("v%04d" % i for i in ids), adiff(r.shape, base.shape), adiff(r.keys, base.keys),
-            "" if orig is None else "  bdiff %d regdiff %d" % (bd(r), rd(r)),
+            "" if orig is None else "  rdiff %d bdiff %d regdiff %d" % (rv(r), bd(r), rd(r)),
             "" if g0 is None else "  gap predicted %+d real %s" % (pred, r.gap(A, Bn, a.k))))
     print("variants: %s/v<id>/v<id>.cpp" % out)
 

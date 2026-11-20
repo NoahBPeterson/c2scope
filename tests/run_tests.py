@@ -855,7 +855,42 @@ def bdiff_tests():
     check("bdiff: listing vs its linked image: 0 (3 functions)", got, [0, 0, 0])
 
 
+def rdiff_tests():
+    """tsweep.rdiff: register renaming, frame-slot renaming and scheduling moves are not distance; a read through
+    the wrong register, a moved incoming argument, another displacement and a swapped base/index are."""
+    import tsweep
+
+    def sc(ours, orig):
+        k = lambda xs: tsweep.bkeys([tuple(x.split(" ", 1)) if " " in x else (x, "") for x in xs])
+        r = tsweep._rscore(k(ours), k(orig))
+        return r["n"], r["renamed"]
+    body = ["mov eax, dword ptr [esp + 4]", "mov ecx, dword ptr [eax]", "push ecx", "push eax", "call 0x401000",
+            "ret"]
+    ren = [x.replace("ecx", "edx").replace("eax", "ecx") for x in body]
+    check("rdiff: the same code with other registers is 0 (two values renamed)", sc(body, ren), (0, 2))
+    check("rdiff: a read through the register that holds the other value counts",
+          sc(["mov eax, dword ptr [esp + 4]", "mov ecx, dword ptr [esp + 8]", "push eax", "ret"],
+             ["mov eax, dword ptr [esp + 4]", "mov ecx, dword ptr [esp + 8]", "push ecx", "ret"])[0], 1)
+    fr = ["push ebp", "mov ebp, esp", "mov dword ptr [ebp - 8], eax", "mov dword ptr [ebp - 4], ecx",
+          "mov edx, dword ptr [ebp - 8]", "push edx", "mov edx, dword ptr [ebp - 4]", "push edx", "pop ebp", "ret"]
+    check("rdiff: a frame laid out at other offsets is 0 (two slots renamed)",
+          sc(fr, [x.replace("ebp - 8", "ebp - 12").replace("ebp - 4", "ebp - 8") for x in fr]), (0, 2))
+    check("rdiff: another incoming argument counts (arguments are not renamed)",
+          sc(["mov eax, dword ptr [esp + 4]", "ret"], ["mov eax, dword ptr [esp + 8]", "ret"])[0], 1)
+    check("rdiff: a moved instruction counts 1, not 2",
+          sc(["mov ecx, 5", "mov edx, 6", "mov eax, 7", "ret"], ["mov edx, 6", "mov eax, 7", "mov ecx, 5", "ret"])[0], 1)
+    check("rdiff: base and index swapped count 1 (the IL's operand order), not a register cascade",
+          sc(["mov eax, dword ptr [esp + 4]", "mov ecx, dword ptr [esp + 8]", "mov edx, dword ptr [eax + ecx + 8]",
+              "push edx", "ret"],
+             ["mov eax, dword ptr [esp + 4]", "mov ecx, dword ptr [esp + 8]", "mov edx, dword ptr [ecx + eax + 8]",
+              "push edx", "ret"])[0], 1)
+    check("rdiff: a callee-saved register saved in another order is one move, not a wrong read",
+          sc(["push esi", "push edi", "mov esi, ecx", "pop edi", "pop esi", "ret"],
+             ["push edi", "push esi", "mov esi, ecx", "pop esi", "pop edi", "ret"])[0], 1)
+
+
 bdiff_tests()
+rdiff_tests()
 
 
 
@@ -1151,12 +1186,15 @@ def toolgap_tests():
     m = re.search(r"(\d+) measured, (\d+) failed to compile", r.stdout)
     check("rwsweep byval and wrap: every variant compiles", (int(m.group(2)), int(m.group(1)) > 2) if m else None, (0, True))
     # combinations: with --asm-vs, code-changing singles that lower the bdiff are combined (Spore 0099f110)
-    rows = [dict(i=0, shape=0, bd=9, dgap=None), dict(i=1, shape=4, bd=8, dgap=None), dict(i=2, shape=2, bd=7, dgap=None),
-            dict(i=3, shape=3, bd=12, dgap=None)]
+    rows = [dict(i=0, shape=0, bd=9, rv=5, dgap=None), dict(i=1, shape=4, bd=8, rv=5, dgap=None),
+            dict(i=2, shape=2, bd=7, rv=5, dgap=None), dict(i=3, shape=3, bd=12, rv=5, dgap=None)]
     var = [("x", "", [(k * 10, k * 10 + 1, "")]) for k in range(4)]
-    good, better, combos = rwsweep.plan_combos(rows, var, 10, None, 2)
+    good, better, combos = rwsweep.plan_combos(rows, var, (5, 10), None, 2)
     check("rwsweep combinations: improving code-changing singles are combined too, best gain first",
           ([x["i"] for x in good], [x["i"] for x in better], [c[2] for c in combos]), ([0], [2, 1], [[2, 1], [0, 2], [0, 1]]))
+    rows[3]["rv"] = 3       # a higher bdiff with a lower rdiff (a register-renaming ripple): better, and first
+    check("rwsweep combinations: rdiff ranks before bdiff",
+          [x["i"] for x in rwsweep.plan_combos(rows, var, (5, 10), None, 2)[1]], [3, 2, 1])
     check("rwsweep combinations: without --asm-vs only code-neutral ones (none here)",
           rwsweep.plan_combos(rows, var, None, None, 2)[2], [])
     # output names that differ only in case (macOS: one directory)

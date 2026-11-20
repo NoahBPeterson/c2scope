@@ -711,6 +711,7 @@ def one(r, out_dir=None):
             res["result"] = "no original listing"
             return res
         res["bdiff"] = tsweep.bdiff(a, b)
+        res["rdiff"] = tsweep.rdiff(a, b)
         res["n_orig"], res["n_emit"] = len(b), len(a)
         res["result"] = "ok"
         return res

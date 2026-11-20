@@ -348,14 +348,14 @@ def main():
         r = build("c_" + "_".join("%03d" % i for i in ids), [sites[i] for i in ids])
         gap = r.gap(A, B, a.k)
         code = tsweep.bdiff(r.instrs, base.instrs)
-        rd = tsweep.bdiff(r.instrs, orig) if orig else None
+        rd = (tsweep.rdiff(r.instrs, orig), tsweep.bdiff(r.instrs, orig)) if orig else None
         print("  %-24s predicted gap %+d  real %+d  code vs base %d%s" % (
             "+".join("s%03d" % i for i in ids), pred, gap, code,
-            "" if rd is None else "  vs original: bdiff %d regdiff %d" % (rd, tsweep.regdiff(r.instrs, orig))))
+            "" if rd is None else "  vs original: rdiff %d bdiff %d regdiff %d" % (rd + (tsweep.regdiff(r.instrs, orig),))))
         if rd is not None and (best is None or rd < best[0]):
             best = (rd, ids)
     if best:
-        print("best: %s (bdiff %d) -> %s" % ("+".join("s%03d" % i for i in best[1]), best[0],
+        print("best: %s (rdiff %d, bdiff %d) -> %s" % ("+".join("s%03d" % i for i in best[1]), best[0][0], best[0][1],
                                                os.path.join(out, "c_" + "_".join("%03d" % i for i in best[1]))))
     for i in sorted({i for c in combos[:a.verify] for i in c[2]}):
         fn, s, e, expr = sites[i]

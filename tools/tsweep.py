@@ -6,7 +6,7 @@ usage: tsweep.py <template.cpp> --func SUBSTR [--metric EXPR] [--show EXPR]... [
 
 The template uses sweep.py's syntax: alternatives written `{{first<|>second<|>third}}`. Every combination is
 compiled with the traced c2 (tools/c2trace.py) and scored by EXPR, a Python expression; lower is better (default
-`bdiff`, which needs --asm-vs; --asm-func defaults to --func). Use it
+`(rdiff, bdiff)`, which needs --asm-vs; --asm-func defaults to --func; a tuple compares element by element). Use it
 when the byte diff is a poor guide, i.e. when the fix is "make X outrank Y" or "get the cursor to eax at pick 7"
 and every intermediate step looks like no progress in bytes. Names available in EXPR (and --show):
 
@@ -27,6 +27,11 @@ and every intermediate step looks like no progress in bytes. Names available in 
                      counted (a substitution 2, an insertion 1; only a displacement/immediate or a jump's target
                      wrong: 1); relocated addresses, call targets and alignment padding are masked
                      (docs/c2/tracer.md, `bdiff`)
+  rdiff              bdiff up to register choice, frame-slot choice and scheduling moves: a register or local
+                     slot is bound per value and only a read that disagrees with the binding counts; a moved
+                     instruction 1; incoming arguments, displacements, immediates, the order of a callee-saved
+                     save and base/index order still count. 0 = the original's code up to allocation and order
+                     (a renaming ripple after one changed instruction no longer makes every later line count)
   regdiff            the same alignment over mnemonic + registers only (blind to displacements and immediates);
                      posdiff: the positional count over the common length
   hinge(x, t)        max(0, x - t): 0 once x <= t (e.g. hinge(prio('this',2), 79))
@@ -499,6 +504,182 @@ def _bparts(ours, orig):
     return dict(n=n + fields + jumps + shifts, fields=fields, jumps=jumps, shifts=shifts, moved=moved)
 
 
+# rdiff: bdiff's keys with register allocation and scheduling factored out. The registers of the general families
+# (eax..ebp and their parts; esp stays literal) are replaced by their width in the alignment key, so a renamed
+# register no longer unmatches an instruction; register agreement is then checked per value: at an aligned pair that
+# writes a new value (mov/lea/movzx/movsx/pop/setcc into a full register, xor r,r) the two registers are bound to
+# each other, and a later read that disagrees with the binding counts 1. A call ends ecx/edx and binds eax to eax.
+_RFAM = {n: f for f, names in dict(a="eax ax al ah", c="ecx cx cl ch", d="edx dx dl dh", b="ebx bx bl bh",
+                                   si="esi si", di="edi di", bp="ebp bp").items() for n in names.split()}
+_RREG = re.compile(r"\b(e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp)\b")
+_RPURE = {"mov", "lea", "movzx", "movsx", "pop"}
+_RSTORE = {"mov", "fstp", "fst", "fistp", "fist", "movss", "movsd", "movq", "movd", "movaps", "movups"}
+_RNUM = re.compile(r"[+-]?(?:0x[0-9a-f]+|\d+)\b")
+_RSLOT = re.compile(r"\[(esp|ebp)([+-]\d+)?\]")
+
+
+def _rview(keys):
+    """Per instruction: (alignment key, register written as a new value, registers read, slot stored, slots read).
+    A frame slot is named by its offset from the entry esp (pushes, pops and esp adjustments since entry counted;
+    a callee's own stack cleanup is not, which both sides share at an aligned call) or from ebp when ebp holds the
+    frame; in the key a local is `[slot]`, an incoming argument `[arg+N]` (not renamed)."""
+    frame = any(k[:3] == ("mov", "ebp", "esp") for k in keys[:8])
+    out, depth, written = [], 0, set()
+    for k in keys:
+        slots = []
+
+        def sub(m):
+            base, d = m.group(1), int(m.group(2) or 0)
+            if base == "ebp" and not frame:
+                return m.group(0)
+            name = ("b", d) if base == "ebp" else ("s", d - depth)
+            if name[1] > 0:                             # an incoming argument: fixed by the calling convention
+                return "[arg%+d]" % (d if base == "ebp" else d - depth + 4)
+            slots.append(name)
+            return "[slot]"
+        ops = [_RSLOT.sub(sub, o) for o in k[1:]]
+        mn = k[0]
+        shape = (mn,) + tuple(_RREG.sub(lambda m: "r8" if m.group(1)[-1] in "lh" else "r16" if len(m.group(1)) == 2
+                                        else "r", o) if not (frame and o == "ebp") else o for o in ops)
+        regs = [[_RFAM[r] for r in _RREG.findall(o) if not (frame and r == "ebp")] for o in ops]
+        for q, o in enumerate(ops):                     # [r1+r2+D]: base and index unscaled commute
+            if len(regs[q]) == 2 and "*" not in o and "[" in o:
+                regs[q] = [tuple(regs[q])]
+        wreg = None
+        m = _RREG.fullmatch(ops[0].strip()) if ops else None
+        if m and not (frame and m.group(1) == "ebp"):
+            r = m.group(1)
+            if (mn in _RPURE and (len(r) == 3 or mn in ("movzx", "movsx"))) or mn.startswith("set"):
+                wreg = _RFAM[r]
+            elif mn in ("xor", "sub") and len(ops) == 2 and ops[0].strip() == ops[1].strip():
+                wreg, regs = _RFAM[r], []
+        rregs = [x for o in (regs[1:] if wreg else regs) for x in o]
+        if mn == "push" and rregs and rregs[0] in ("b", "si", "di", "bp") and rregs[0] not in written:
+            rregs, shape = [], ("push", "save " + k[1])    # saving a callee-saved register: not a value; c2's
+            #                                             order is fixed, so another order is a difference
+        if m and mn not in ("push", "cmp", "test"):
+            written.add(_RFAM[m.group(1)])
+        wslot = None
+        if slots and ops and "[slot]" in ops[0] and mn in _RSTORE and not (len(ops) > 1 and "[slot]" in ops[1]):
+            wslot, slots = slots[0], slots[1:]
+        out.append((shape, wreg, rregs, wslot, slots))
+        if mn == "push":
+            depth += 4
+        elif mn == "pop":
+            depth -= 4
+        elif mn in ("sub", "add") and len(k) == 3 and k[1] == "esp" and re.fullmatch(r"0x[0-9a-f]+|\d+", k[2]):
+            depth += (1 if mn == "sub" else -1) * int(k[2], 0)
+    return out
+
+
+def rdiff(ours, orig):
+    """bdiff up to register renaming and scheduling (the comment above _rshape): unmatched instructions 1 per side,
+    an instruction the scheduler moved (an unmatched pair of one key within 8 positions) 1, a pair differing only in
+    a displacement or immediate 1, a read of a register that disagrees with the value binding 1. 0: the original's
+    instruction stream up to register choice and the order of independent instructions."""
+    if getattr(ours, "decoded", None) is None and isinstance(ours, Instrs):
+        return regdiff(ours, orig)
+    return _rparts(ours, orig)["n"]
+
+
+def _rparts(ours, orig, win=8, why=None):
+    """rdiff and its parts: unmatched, moved, fields, reads (register and frame-slot reads that disagree with the
+    value binding), renamed (aligned value definitions in another register or slot: not part of n). `why`, a list,
+    gets (ours index, original index, ours name, original name, ours bound to, original bound to) per counted read."""
+    va0 = getattr(orig, "va0", None)
+    return _rscore(_bside(ours, va0)[0], _bside(orig, va0)[0], win, why)
+
+
+def _rscore(ka, kb, win=8, why=None):
+    """_rparts on two sides' bdiff keys (bkeys)."""
+    best = None
+    for keyed in (False, True):         # aligned register-blind, and as bdiff aligns (difflib's greedy blocks can
+        w = [] if why is not None else None             # land worse either way): the lower score
+        r = _rparts1(ka, kb, win, w, keyed)
+        if best is None or r["n"] < best[0]["n"]:
+            best = r, w
+    if why is not None:
+        why.extend(best[1])
+    return best[0]
+
+
+def _rparts1(ka, kb, win, why, keyed):
+    import bisect
+    va, vb = _rview(ka), _rview(kb)
+    sa, sb = [x[0] for x in va], [x[0] for x in vb]
+    al_a, al_b = ([_bshape(x) for x in ka], [_bshape(x) for x in kb]) if keyed else (sa, sb)
+    blocks = [m for m in difflib.SequenceMatcher(None, al_a, al_b, autojunk=False).get_matching_blocks() if m.size]
+    if not blocks:
+        return dict(n=len(sa) + len(sb), unmatched=len(sa) + len(sb), moved=0, fields=0, reads=0, order=0, renamed=0)
+    last = blocks[-1]
+    amap = {m.a + k: m.b + k for m in blocks for k in range(m.size)}
+    aligned_fields = sum(1 for i, j in amap.items() if sa[i] != sb[j])  # bdiff's alignment: another displacement
+    keys = sorted(amap)
+    ua = [i for i in range(last.a + last.size) if i not in amap]   # our lines past the last match: EH funclets
+    taken = set(amap.values())
+    ub = [j for j in range(len(sb)) if j not in taken]
+
+    def near(i):                                    # where our unmatched i sits on the original's side
+        p = bisect.bisect_left(keys, i)
+        return amap[keys[p - 1]] if p else 0
+
+    def pair(same):
+        n = 0
+        for i in list(ua):
+            p = near(i)
+            j = next((j for j in ub if abs(j - p) <= win and same(sa[i], sb[j])), None)
+            if j is not None:
+                ua.remove(i); ub.remove(j); amap[i] = j; n += 1
+        return n
+    moved = pair(lambda x, y: x == y)
+    fields = aligned_fields + pair(lambda x, y: len(x) == len(y) and x[0] == y[0] and
+                                   all(_RNUM.sub("#", p) == _RNUM.sub("#", q) for p, q in zip(x[1:], y[1:])))
+    fw, bw = {}, {}
+
+    def bind(x, y):
+        if x in fw:
+            bw.pop(fw[x], None)
+        if y in bw:
+            fw.pop(bw[y], None)
+        fw[x], bw[y] = y, x
+
+    def drop(x):
+        bw.pop(fw.pop(x, None), None)
+        fw.pop(bw.pop(x, None), None)
+    reads = renamed = order = 0
+    for i in sorted(amap, key=amap.get):
+        (ka, wa, ra, sa_w, sa_r), (kb, wb, rb, sb_w, sb_r) = va[i], vb[amap[i]]
+        pairs = []
+        for x, y in zip(ra, rb):
+            if isinstance(x, tuple) and isinstance(y, tuple):
+                if fw.get(x[0]) != y[0] and (fw.get(x[0]) == y[1] or fw.get(x[1]) == y[0]):
+                    y = (y[1], y[0])
+                    order += 1                          # the same address, base and index swapped: IL order
+                pairs += zip(x, y)
+            elif not isinstance(x, tuple) and not isinstance(y, tuple):
+                pairs.append((x, y))
+            else:
+                pairs += zip(x if isinstance(x, tuple) else (x,), y if isinstance(y, tuple) else (y,))
+        for x, y in pairs + list(zip(sa_r, sb_r)):
+            if fw.get(x) == y or (x == y and x not in fw and y not in bw):
+                fw.setdefault(x, y); bw.setdefault(y, x)
+                continue
+            reads += 1
+            if why is not None:
+                why.append((i, amap[i], x, y, fw.get(x), bw.get(y)))
+            bind(x, y)
+        for x, y in ((wa, wb), (sa_w, sb_w)):
+            if x is not None and y is not None:
+                renamed += x != y
+                bind(x, y)
+        if ka[0] == "call" and kb[0] == "call":
+            drop("c"); drop("d")
+            bind("a", "a")
+    unmatched = len(ua) + len(ub)
+    return dict(n=unmatched + moved + fields + reads + order, unmatched=unmatched, moved=moved, fields=fields,
+                reads=reads, order=order, renamed=renamed)
+
+
 def posdiff(ours, orig):
     """Positional difference over the common length (the old regdiff)."""
     return sum(1 for x, y in zip(cs_text(ours), orig) if _key(x) != _key(y))
@@ -529,6 +710,7 @@ class Ctx:
                 ours = listing_instrs(asm, asm_func)
                 self.ns["regdiff"] = regdiff(ours, orig)
                 self.ns["bdiff"] = bdiff(ours, orig)
+                self.ns["rdiff"] = rdiff(ours, orig)
                 self.ns["posdiff"] = posdiff(ours, orig)
             self.lst = listing_offsets(asm, asm_func) if asm_func else {}
         self.ns.update(prio=self.prio, reg=self.reg, pops=self.pops, cur=self.cur, sreg=self.sreg, rot=self.rot,
@@ -600,7 +782,7 @@ def main():
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("template")
     ap.add_argument("--func", required=True)
-    ap.add_argument("--metric", default="bdiff")
+    ap.add_argument("--metric", default="(rdiff, bdiff)")
     ap.add_argument("--show", action="append", default=[])
     ap.add_argument("--asm-vs", help="the original function's disassembly ('VA mnemonic operands' lines)")
     ap.add_argument("--asm-func", help="the function in our listing (for bdiff/regdiff/ins/dst; default --func)")
@@ -612,8 +794,8 @@ def main():
     exprs = [a.metric] + a.show
     need_regs = any(re.search(r"\b(prio|reg|pops)\(", e) for e in exprs)
     need_scratch = any(re.search(r"\b(cur|sreg|rot|off|gone|sat|ins|dst)\(", e) for e in exprs)
-    if re.search(r"\b(bdiff|regdiff|posdiff)\b", " ".join(exprs)) and not a.asm_vs:
-        sys.exit("bdiff/regdiff need --asm-vs (the original's disassembly); give --metric for a trace-only score")
+    if re.search(r"\b(bdiff|rdiff|regdiff|posdiff)\b", " ".join(exprs)) and not a.asm_vs:
+        sys.exit("bdiff/rdiff/regdiff need --asm-vs (the original's disassembly); give --metric for a trace-only score")
     orig = orig_instrs(a.asm_vs) if a.asm_vs else None
 
     text = open(a.template).read()
@@ -670,7 +852,7 @@ def main():
               " | ".join("%d:%s" % (i, spots[i][c].strip().replace("\n", " ")[:40]) for i, c in enumerate(combo))))
     if bad:
         print("%d variants unscored, e.g. %s: %s" % (len(bad), os.path.basename(bad[0][0][0]), bad[0][1]))
-    if ok and ok[0][0] == 0:
+    if ok and (ok[0][0] == 0 or (isinstance(ok[0][0], tuple) and not any(ok[0][0]))):
         print("METRIC 0: %s" % ok[0][1][0])
 
 

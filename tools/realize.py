@@ -31,7 +31,8 @@ edit     EDIT is one abstract edit in the syntax `rasim need` / `rasim want` pri
          it and the side effects listed after `also:`; `no`, with what it did instead), the code cost (`code`:
          aligned diff of the listings with registers masked, operands kept: 0 = code-neutral; `bag`: the same as a
          multiset without frame displacements: 0 = the same instructions in another order; `regs`: the diff with
-         registers), the registers of --want-regs, and with --asm-vs the bdiff against the original.
+         registers), the registers of --want-regs, and with --asm-vs the rdiff (the ranking: tsweep.rdiff) and the
+         bdiff (0 = the match) against the original.
          Several EDITs are realised one by one and then together. --list prints the candidates and stops.
          `ref:V:B` / `extend:V:B` for a V that is never modified (this, a read-only parameter) has one code-neutral
          form on 14.00 / 15.00: `if ((int)V & 1) S; else S;` around an assignment S of the block (eqif; merged
@@ -1051,7 +1052,10 @@ class Ctx:
         except Exception:
             return []
 
-    def regdiff(self, f):       # the score against the original: tsweep.bdiff (byte-faithful; the old name kept)
+    def regdiff(self, f):       # the score against the original, the sort key: tsweep.rdiff (the old name kept)
+        return tsweep.rdiff(self.scored(f), self.orig) if self.orig is not None else None
+
+    def bdiff(self, f):         # byte-faithful: 0 is the match (hit), printed beside the score
         return tsweep.bdiff(self.scored(f), self.orig) if self.orig is not None else None
 
     def oldreg(self, f):        # the earlier score (aligned mnemonics + registers), printed alongside
@@ -2350,7 +2354,7 @@ def measure(c, cands, want, tag0):
         except (Exception, SystemExit) as e:
             return dict(k=k, err=str(e)[-160:], fam=fam, desc=desc)
         d = Delta(c.base, f)
-        r = dict(k=k, fam=fam, desc=desc, d=d, f=f, path=path, regs=c.regs_ok(f), rd=c.regdiff(f))
+        r = dict(k=k, fam=fam, desc=desc, d=d, f=f, path=path, regs=c.regs_ok(f), rd=c.regdiff(f), bd=c.bdiff(f))
         if want["kind"] == "load":
             r["v"], r["side"] = ("yes" if d.code else "no"), []
             r["note"] = "load-reuse lever: the instructions changed by %d (it is meant to); the score decides" % d.code \
@@ -2421,7 +2425,7 @@ def show(c, r, n=None):
     if r["regs"] is not None:
         extra += "  wanted registers: %s" % ("YES" if r["regs"] else "no")
     if r["rd"] is not None:
-        extra += "  bdiff %d" % r["rd"]
+        extra += "  rdiff %d bdiff %s" % (r["rd"], r.get("bd"))
         if r.get("f") is not None:
             extra += " (regdiff %s)" % c.oldreg(r["f"])
     print("  %-5s %-9s code %d bag %d regs %d  %s%s" % (r["v"], r["fam"], d.code, d.bag, d.ident, r["desc"][:90], extra))
@@ -2441,14 +2445,14 @@ def show(c, r, n=None):
 
 
 def hit(c, r):
-    if r["rd"] is not None:
-        return r["rd"] == 0
+    if r.get("bd") is not None:
+        return r["bd"] == 0
     return bool(r["regs"]) and r["d"].bag == 0
 
 
 def cmd_edit(c, a):
     print("%s: %d blocks, %d instructions%s" % (c.func, len(c.base.blocks), len(c.base.code),
-                                               "" if c.orig is None else ", bdiff %d (regdiff %d)" % (c.regdiff(c.base), c.oldreg(c.base))))
+                                               "" if c.orig is None else ", rdiff %d, bdiff %d (regdiff %d)" % (c.regdiff(c.base), c.bdiff(c.base), c.oldreg(c.base))))
     per = []
     for n, e in enumerate(a.edits):
         w = parse_edit(e)
@@ -2637,7 +2641,7 @@ def build_combo(c, rs, tag, st):
         return None
     st["ncomp"] += 1
     r = dict(k=0, fam="+".join(x["fam"] for x in rs), desc=" + ".join(x["desc"][:50] for x in rs), d=Delta(c.base, f),
-             f=f, path=path, regs=c.regs_ok(f), rd=c.regdiff(f), v="-", side=[], edits=eds, tail="".join(x["tail"] for x in rs))
+             f=f, path=path, regs=c.regs_ok(f), rd=c.regdiff(f), bd=c.bdiff(f), v="-", side=[], edits=eds, tail="".join(x["tail"] for x in rs))
     _note_closest(st, r)
     return r
 
@@ -2845,7 +2849,7 @@ def cmd_pipeline(c, a):
     for v, r in wants.items():
         c.wantregs.setdefault(v, r)
     print("%s: %d blocks, %d instructions%s; wanted: %s; %d answers read" % (
-        c.func, len(c.base.blocks), len(c.base.code), "" if c.orig is None else ", bdiff %d (regdiff %d)" % (c.regdiff(c.base), c.oldreg(c.base)),
+        c.func, len(c.base.blocks), len(c.base.code), "" if c.orig is None else ", rdiff %d, bdiff %d (regdiff %d)" % (c.regdiff(c.base), c.bdiff(c.base), c.oldreg(c.base)),
         " ".join("%s=%s" % kv for kv in c.wantregs.items()) or "(none: give --want-regs or --asm-vs)", len(answers)))
     st = dict(ncomp=0, closest=None, done=set(), pool=[])
     tried, nocon, seen = 0, [], set()
@@ -2998,7 +3002,7 @@ def cmd_pipeline(c, a):
                 continue
             ncomp += 1
             r = dict(k=0, fam=f, desc="%d code-neutral %s rewrites together: %s" % (len(pick), f, "; ".join(x["desc"][:40] for x in pick[:4])),
-                     d=Delta(c.base, fn), f=fn, path=path, regs=c.regs_ok(fn), rd=c.regdiff(fn), v="-", side=[])
+                     d=Delta(c.base, fn), f=fn, path=path, regs=c.regs_ok(fn), rd=c.regdiff(fn), bd=c.bdiff(fn), v="-", side=[])
             show(c, r)
             if hit(c, r):
                 print("FOUND by %d %s rewrites together after %d answers, %d compiles: %s" % (len(pick), f, tried, ncomp, os.path.relpath(path, ROOT)))

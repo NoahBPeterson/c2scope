@@ -779,6 +779,34 @@ bytes. The names available are listed in the script's docstring:
   score without it on both measures (63/65 and 65/66). The older full-key bdiff, on those listings: 61/65 and
   64/66. Without code bytes in the listing it falls back to regdiff. Python:
   `tsweep.bdiff(ours, orig)` with `ours = listing_instrs(..)`, `orig = orig_instrs(..)` (or another listing);
+- `rdiff` (since 2026-11-20 the ranking key, before bdiff: the default `--metric` is `(rdiff, bdiff)`): bdiff **up to
+  register allocation and scheduling**. bdiff's keys include the registers, so one changed instruction that moves
+  the allocator's choices makes every later instruction count (Mount & Blade 0x4db660, `f184 |= 1`: bdiff 9 -> 48,
+  of which 40 are other registers for the same values; 0x51ee80: bdiff 14 for code identical up to an eax/ecx/edx
+  exchange, where the register-keyed alignment also paired the wrong calls). Definition, on bdiff's keys:
+  - the alignment key has each general register replaced by its width (`r`, `r16`, `r8`; esp stays), each local
+    frame slot (`[esp+N]` named by its offset from the entry esp, counting pushes, pops and esp adjustments since
+    entry; `[ebp-N]` when `mov ebp, esp` is in the prologue) by `[slot]`, an incoming argument by `[arg+N]` (not
+    renamed: the calling convention fixes it), and a push of a callee-saved register not yet written by
+    `save REG` (c2's save order is fixed, so another order is a difference);
+  - registers and slots are bound **per value**: where an aligned pair defines a new value (`mov`, `lea`, `movzx`,
+    `movsx`, `pop`, `setcc` into a full register, `xor r, r`; a store to a slot), the two sides' names are bound to
+    each other; a later read that disagrees with the binding counts 1. A call ends ecx and edx and binds eax to
+    eax. An unscaled `[r1+r2+D]` is matched in the order that agrees with the bindings, and 1 is counted when that
+    needs the swap (the order comes from the IL's operands, a source lever, not from allocation);
+  - count: unmatched instructions 1 per side (our trailing EH funclets ignored, as bdiff), an unmatched pair of one
+    key within 8 positions 1 (moved by the scheduler), a pair differing only in a displacement or immediate 1,
+    each disagreeing read 1, each swapped base/index 1. Computed on two alignments (register-blind, and bdiff's)
+    and the lower is taken: difflib's longest-block-first matching can land worse on either.
+  `tsweep._rparts(ours, orig)` gives the parts (`unmatched`, `moved`, `fields`, `reads`, `order`, and `renamed`:
+  aligned value definitions in another register or slot, not counted; `why=[]` collects the counted reads). 0 =
+  the original's code up to register and slot choice and the order of independent instructions; a match is still
+  bdiff 0. Measured (2026-11-20) on the 130 near-miss rows of the model F seeding (61 Mount & Blade, 13.10; 69
+  Spore, 15.00): median bdiff 10.5, rdiff 4; mean 26.4 and 19.9. rdiff is above bdiff on 1 row (x87 operands in
+  another order, by one), and 0 with bdiff > 0 on 5, each checked by hand: an exchange of registers (0x46bc70,
+  0x51ee80, Spore 0x74fea0, 0xcf0cf0) or an /Od frame laid out 4 bytes apart (Spore 0x437990, bdiff 15).
+  0x4db660 `|= 1` is rdiff 7 against the draft's 2: our 13.10 compile splits the OR into `mov`/`or`/`mov`, which
+  the original does not, so the variant is not yet closer in code; bdiff said 48 against 9 for a renaming;
 - `regdiff`: an **aligned** difference against a `VA mnemonic operands` disassembly of the original: instructions
   (mnemonic plus registers) left unmatched by a sequence alignment, both sides counted, our trailing EH funclets
   ignored. `posdiff` is the old positional count. Use `regdiff`: one inserted instruction shifts every later line
@@ -1554,8 +1582,8 @@ finds no sites, as the rule predicts.
 `tools/rwsweep.py tu.cpp --func DECORATED [--asm-vs orig.s] [--want 'A>B' --pass K] [--families ...] [--vars v,w]`
 does not assume a rule. It enumerates mechanical, meaning-preserving rewrites of the target's own body, compiles
 each once with the regs trace, and reports per variant: `shape` (aligned diff against the baseline with registers
-masked; 0 = code-neutral), `regs` (the same with registers), `bdiff` against the original (the sort key) and
-`regdiff`, and the change of the `--want` gap. Its baseline numbers are tsweep's: before 2026-11-12 rwsweep had its
+masked; 0 = code-neutral), `regs` (the same with registers), `rdiff` against the original (the sort key; ties by
+`bdiff`), `bdiff` and `regdiff`, and the change of the `--want` gap. Its baseline numbers are tsweep's: before 2026-11-12 rwsweep had its
 own alignment that did not merge runs of padding, so its regdiff was higher by the number of extra pad
 instructions (1 to 10 on the benchmark drafts). Code-neutral variants that help are then combined and verified. Families:
 
