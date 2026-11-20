@@ -2,7 +2,7 @@
 """Effect mining: the inverse of the codegen models, measured.  Doc: docs/c2/effectmine.md
 
 usage: effectmine.py mine  <tu.cpp> --func F [--asm-vs ORIG.s] [--want EFFECT ..] [--max-compiles 400]
-                           [--features regs,scratch,slots,keys,sched,loads] [--classes RE] [--skip RE] [--eager]
+                           [--features regs,scratch,slots,keys,sched,loads,frontend] [--classes RE] [--skip RE] [--eager]
                            [--eager-feats F,..] [--focus LO-HI,..]
                            [--pairs 16] [--depth 2 --depth-beam 4 --depth-compiles 60] [--jobs 24]
                            [--keep-variants 12] [--list] [--fresh] [-- <cl args>]
@@ -61,7 +61,7 @@ EFFECT (--want), as the models print them:
   load:LOC:N                N loads of LOC in the final code (loadcse location, e.g. [_this+16])
   bdiff                     fewer bytes against --asm-vs
 MUTATION CLASSES: `effectmine.py mine ... --list` prints every generated instance with its class. Families: rwsweep's
-  (wrap, alias, swap, split, touch, cflow, paren, guard, const, unalias), realize's constructs (copy, uncopy,
+  (wrap, alias, swap, split, touch, cflow, paren, guard, const, unalias, subst), realize's constructs (copy, uncopy,
   headdup, headhoist, taildup, tailhoist, eqif, eqif2, uneqif, helperbind), and this tool's own: decl.<kind>.<where>
   (N dummy declarations of a kind, before the function or at the top of the unit), deffn (N dummy function
   definitions before it), move (the function moved before the previous definition / to the end of the unit),
@@ -85,8 +85,8 @@ DBDIR = os.environ.get("EFFECTMINE_DIR") or os.path.join(ROOT, "work", "effectmi
 DB = os.path.join(DBDIR, "effects.jsonl")
 TEXTS = os.path.join(DBDIR, "texts")
 RUNS = os.path.join(DBDIR, "runs")
-FEATURES = ("regs", "scratch", "slots", "keys", "sched", "loads")
-MODEL_OF = {"scratch": "S", "slots": "L", "keys": "K", "sched": "Q", "loads": "M"}
+FEATURES = ("regs", "scratch", "slots", "keys", "sched", "loads", "frontend")
+MODEL_OF = {"scratch": "S", "slots": "L", "keys": "K", "sched": "Q", "loads": "M", "frontend": "F"}
 
 
 # ---------------------------------------------------------------- no wine: traced compiles go to the compile server
@@ -864,7 +864,7 @@ def gen_realize(c):
 
 
 def gen_rwsweep(c):
-    fams = ["wrap", "alias", "swap", "split", "touch", "cflow", "paren", "guard", "const", "unalias", "byval"]
+    fams = ["wrap", "alias", "swap", "split", "touch", "cflow", "paren", "guard", "const", "unalias", "byval", "subst"]
     for fam in [f for f in fams if f in rwsweep.FAMILIES]:
         try:
             for f, desc, edits in rwsweep.FAMILIES[fam](c.B):
@@ -1152,6 +1152,9 @@ def etype(model, s):
         return "K." + {"key": "moved"}.get(k, k)
     if model == "Q":
         return "Q." + {"sched": "flip"}.get(k, k)
+    if model == "F":                       # fe:SHAPE:+n -> F.fe:OPCODE+ (the opcode with a branch's condition)
+        op = s.split(":", 1)[1].rsplit(":", 1)[0].split("(")[0]
+        return "F.%s:%s%s" % (k, op, "+" if s.rsplit(":", 1)[1].startswith("+") else "-")
     if model == "M":
         if k == "load":
             a, b = s.rsplit(":", 1)[1].split(">")
@@ -1190,12 +1193,26 @@ def rec_types(rec, base_bdo):
     for m in "RSLKQM":
         for s in rec["eff"].get(m, []):
             ts.add(etype(m, s))
+    ts.update(f_types(rec["eff"].get("F", [])))
     return sorted(ts)
+
+
+def f_types(eff):
+    """Model F types by the net count per stage and opcode: `F.fe:OPADD-` only when the reader IL has fewer OPADD
+    tuples; a change of operand kinds alone (`hs_id(this)`: `OPADD(T<-V,C)` -> `OPADD(T<-T,C)`) is `F.fe:kind`."""
+    net, ts = collections.Counter(), set()
+    for s in eff:
+        st, _, b = s.partition(":")
+        sh, _, c = b.rpartition(":")
+        net[(st, sh.split("(", 1)[0])] += int(c)
+    for (st, op), n in net.items():
+        ts.add("F.%s:%s%s" % (st, op, "+" if n > 0 else "-") if n else "F.%s:kind" % st)
+    return ts
 
 
 def is_null(rec):
     return bool(rec.get("ok") and rec["code"].get("ident") == 0 and not rec["code"].get("bytes") and
-                not any(rec["eff"].get(m) for m in "RSLKQM"))
+                not any(rec["eff"].get(m) for m in "RSLKQMF"))
 
 
 # ---------------------------------------------------------------- a reference compile (the base, or a helper control)
@@ -1288,7 +1305,8 @@ def class_stats(db, build=None, exclude_func=None, by=None):
         if is_null(r):
             s["null"] += 1
         neutral = r["code"].get("code") == 0
-        for t in r.get("types", []):
+        types = [t for t in r.get("types", []) if not t.startswith("F.")] + sorted(f_types(r["eff"].get("F", [])))
+        for t in types:                    # F types recomputed: records written before f_types() typed renames
             s["types"][t] += 1
             if neutral:
                 s["neutral"][t] += 1
@@ -1373,6 +1391,9 @@ class Miner:
             return sched_regions(path, self.func, self.cl, keep=os.path.join(d, "sched"))
         if feat == "loads":
             return load_report(path, self.func, self.cl, keep=os.path.join(d, "loads"))
+        if feat == "frontend":
+            import feshape
+            return feshape.collect(path, self.func, self.cl, keep=os.path.join(d, "frontend"))
         raise ValueError(feat)
 
     def bdo(self, fn):
@@ -1470,6 +1491,9 @@ class Miner:
                     rec["eff"][m] = sched_effects(base_f, var_f)
                 elif feat == "loads":
                     rec["eff"][m] = load_effects(base_f, var_f)
+                elif feat == "frontend":
+                    import feshape
+                    rec["eff"][m] = feshape.effects(base_f, var_f)
             except Exception as e:
                 rec.setdefault("ferr", {})[feat] = "compare: " + str(e)[:200]
 
@@ -1556,6 +1580,9 @@ def parse_want(s):
     m = re.fullmatch(r"sched:(.+?)>(.+)", s)
     if m:
         return dict(m="Q", kind="order", x=m.group(1).strip(), y=m.group(2).strip(), text=s, feat="sched")
+    m = re.fullmatch(r"(fe|fi):(.+):([+-]\d+)", s)
+    if m:
+        return dict(m="F", kind=m.group(1), x=m.group(2), n=int(m.group(3)), text=s, feat="frontend")
     m = re.fullmatch(r"load:(.+):(\d+)", s)
     if m:
         return dict(m="M", kind="load", x=m.group(1), n=int(m.group(2)), text=s, feat="loads")
@@ -1592,6 +1619,8 @@ def want_type(w, miner=None):
         return "Q.flip"
     if w["m"] == "M":
         return "M.load"
+    if w["m"] == "F":
+        return "F.%s:%s%s" % (k, w["x"].split("(")[0], "+" if w["n"] > 0 else "-")
     return "?"
 
 
@@ -1666,6 +1695,10 @@ def want_hit(w, rec, miner):
             if mm and w["x"] in mm.group(1) and w["y"] in mm.group(2):
                 return True, s
         return False, ""
+    if m == "F":
+        import feshape                     # the shape AND its opcode's net count (a kind change is no removal)
+        s = feshape.hit(eff.get("F", []), w["text"])
+        return bool(s), s or ""
     if m == "M":
         for s in eff.get("M", []):
             mm = re.match(r"load:(.+):(\S+)>(\S+)$", s)
@@ -1975,7 +2008,7 @@ def deep_search(M, recs, wants, wl, stats, a):
     edit cannot: an edit that is only possible after another (a declaration hoisted, then a test on it)."""
     names = want_names(wants, M)
 
-    models = {w["m"] for w in wants if w["m"] != "C"} or set("RSLKQM")
+    models = {w["m"] for w in wants if w["m"] != "C"} or set("RSLKQMF")
 
     def mention(r):        # a change in a wanted model that names a wanted variable or element
         return sum(1 for m in models for e in r["eff"].get(m, []) for n in names
@@ -1983,7 +2016,7 @@ def deep_search(M, recs, wants, wl, stats, a):
     ok = [r for r in recs if r.get("ok") and not r.get("null") and r["code"].get("code") == 0 and r.get("edits")
           and not r["cls"].startswith(("pair", "chain", "decl", "deffn", "move")) and r.get("base_edits") is None]
     ok.sort(key=lambda r: (-mention(r), -(M.base_bdo - r["code"]["bdo"]) if r["code"].get("bdo") is not None and
-                           M.base_bdo is not None else 0, len(sum((r["eff"].get(m, []) for m in "RSLKQM"), []))))
+                           M.base_bdo is not None else 0, len(sum((r["eff"].get(m, []) for m in "RSLKQMF"), []))))
     beams = ok[:a.depth_beam]
     if not beams:
         return []
@@ -2153,12 +2186,13 @@ def cmd_table(a):
     st = class_stats(db, build=a.build, by=a.by)
     rows = [(c, s) for c, s in st.items() if s["n"] >= a.min_n and (not a.cls or re.search(a.cls, c))]
     types = TYPE_ORDER
-    if a.type:
-        types = [t for t in TYPE_ORDER if re.search(a.type, t)] or [a.type]
+    seen = collections.Counter()
+    for _c, s in rows:
+        seen.update(s["types"])
+    if a.type:                             # F types are open-ended (one per opcode): the most frequent seen ones
+        dyn = [t for t, _n in seen.most_common() if t not in TYPE_ORDER and re.search(a.type, t)][:8]
+        types = [t for t in TYPE_ORDER if re.search(a.type, t)] + dyn or [a.type]
     elif not a.all_types:
-        seen = collections.Counter()
-        for _c, s in rows:
-            seen.update(s["types"])
         types = [t for t in TYPE_ORDER if seen.get(t)]
     nf = len({r.get("fkey") for r in db})
     print("effect database: %d records, %d functions (source+build+flags)%s" % (len(db), nf,

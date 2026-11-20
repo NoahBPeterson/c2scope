@@ -3,7 +3,7 @@
 Back end `c2.dll` of cl 14.00.50727.762 (VS2005 SP1); section 7 covers 13.10.3077, 13.10.3052 and 15.00.30729.1. Tool:
 `tools/symkeys.py` (tracer.md, `symkeys`). Probes: `work/scratch/symkeys/` (`p1.cpp`, `c1.cpp`..`c4.cpp`,
 `tu_a.cpp`/`tu_b.cpp`), regression file `tests/data/symkeys.cpp`. **[C]** = read in the code at the address given or
-seen in a traced compile of the named probe; **[I]** = inferred. il_sym.md describes the symbol records themselves;
+seen in a traced compile of the named probe; **[I]** = inferred; **[M]** = measured: a probe in `tests/data/rules/RX_*.cpp` decides it on all four builds (checks in `tests/probes/misc.py`). il_sym.md describes the symbol records themselves;
 this page is about the number.
 
 ## 0. Rules for matching
@@ -51,7 +51,7 @@ this page is about the number.
 | `SymCmpSym` 0x10bf00b0 | order of registers/temps (kinds 1, 3) by key; same-size memory symbols by offset, then FE key | il_sym.md section 6 [C] |
 | `EnumerateSymbols` / `CreateGlobregs` (globregs.obj) | GLOBREG web numbers are given in pool order, i.e. key order (regalloc_cost.md section 2) | [C] there; so **the GLOBREG record numbers of webs follow SYM keys**; split pieces then come from the LIFO record list (regalloc.md 3.6) |
 | bit vectors (live sets, `_HshTmps`, frame/global key sets) | indexing only, no order | [C] |
-| frame slot order | slots are sorted by GS level and `1000*uses/size`; the seed is the colour creation order, which may follow key order | frame.md [I] |
+| frame slot order | nothing: slots are sorted by GS level and `1000*uses/size` (T > 128 or /GS), else kept in colour creation order, which is the element list order (size, uses, first to reach the count in the instruction stream; slots.md rules 2, 7). **Correction**: not key order. `o_args` (`use2(&a, &b)`, keys a < b, b pushed first) and `o_hoist` (b's second use in a loop before a's) put b's slot first | [M: `tests/data/rules/RX_slotseed.cpp`, `symkeys.py keys` and `slots`, all four builds] |
 
 ## 2. Where the keys come from: the allocation stream
 

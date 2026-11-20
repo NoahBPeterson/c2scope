@@ -36,6 +36,15 @@ Families (all keep the meaning of the program):
   unalias  a reference or pointer alias of a member chain (`T& r = p->m;`, `T* q = &p->m;`, `T*& pf = flags;`)
           removed, its uses spelled as the chain: such an alias, used twice or more, is a variable c2 does not
           copy-propagate, so its reads never share a load with the chain's own reads (docs/c2/loadcse.md R2, R3)
+  cmp     an if / while condition that is one relational compare: `b > a` for `a < b` (same meaning) and
+          `!(a >= b)` (same for integers; for floats it differs only when an operand is NaN, so check the hit
+          against the original's NaN behaviour): on x87 it decides the load order, the compare form and the branch
+  subst   `T v = E;` read once afterwards with no call, store or loop in between: the declaration removed and the
+          read spelled `((T)(E))` (scalar or pointer T); one variable and one front-end assignment fewer
+  repair  (not in the default set; --families repair) rewrites that CHANGE the meaning, for a draft whose
+          statement differs from the original's (icount `structure`): a statement or an early `if (..) return;`
+          removed, `L = C` as `L |= C` / `L &= C` (and back), `<` <-> `<=` / `>` <-> `>=` in a condition, a local's
+          signedness flipped, `X = --N` as `X = N - 1`. Each hit is a hypothesis about the original's source
   recompute  (not in the default set; --families recompute) `V = E;` with E made of literals and pure math calls
           (`dq = sqrt(13.0 / 8.0);`) is written again before a later statement that uses V after a call: the same
           value, computed once as before, but V is then one live range per call-free stretch instead of one
@@ -635,6 +644,44 @@ def gen_cflow(B):
                        [(a, z, "rw_top%d: if (%s) { %s goto rw_top%d; }" % (i, cond, body, i))])
 
 
+CMP_MIRROR = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
+CMP_NEG = {"<": ">=", ">": "<=", "<=": ">", ">=": "<"}
+
+
+def gen_cmp(B):
+    """An if / while condition that is one relational compare `A op B` (nothing else at its top level): written
+    `B op' A` (mirrored; the same meaning) and `!(A neg B)` (negated; the same for integers, for floats it differs
+    when an operand is NaN). On x87 the spelling decides which operand is loaded first, the compare form and the
+    branch: Spore 00c22a80 (`if (fDist < fCap)` -> `!(fDist >= fCap)`) on 15.00."""
+    n = len(B.toks)
+    for i in range(1, n - 1):
+        if B.toks[i][0] not in ("if", "while") or B.toks[i + 1][0] != "(":
+            continue
+        pc = _pclose(B, i + 1)
+        if B.toks[i][0] == "while" and pc + 1 < n and B.toks[pc + 1][0] == ";":
+            continue                                       # the tail of a do-while: fine too, but keep it simple
+        ops, d = [], 0
+        for q in range(i + 2, pc):
+            t = B.toks[q][0]
+            d += t in ("(", "[") or -(t in (")", "]"))
+            if d == 0 and t in ("<", ">", "<=", ">=", "==", "!=", "&&", "||", "?", ",", "=", "<<", ">>"):
+                ops.append((q, t))
+        if len(ops) != 1 or ops[0][1] not in CMP_MIRROR:
+            continue
+        q, op = ops[0]
+        if any(B.toks[k][0] in ("<", ">") and B.toks[k - 1][0] in ("static_cast", "const_cast", "reinterpret_cast")
+               for k in range(i + 2, pc)):
+            continue
+        a, b = _txt(B, i + 2, q), _txt(B, q + 1, pc)
+        line = B.text.count("\n", B.b, B.toks[i][1])
+        s, z = B.toks[i + 2][1], B.toks[pc - 1][2]
+        yield ("cmp", "%s at body line %d: `%s %s %s`" % (B.toks[i][0], line, b.strip(), CMP_MIRROR[op], a.strip()),
+               [(s, z, "%s %s %s" % (b.strip(), CMP_MIRROR[op], a.strip()))])
+        yield ("cmp", "%s at body line %d: `!(%s %s %s)` (floats: differs for NaN)" % (
+            B.toks[i][0], line, a.strip(), CMP_NEG[op], b.strip()),
+               [(s, z, "!(%s %s %s)" % (a.strip(), CMP_NEG[op], b.strip()))])
+
+
 def _fully_wrapped(B, i, j):
     return B.toks[i][0] == "(" and _pclose(B, i) == j - 1
 
@@ -982,7 +1029,159 @@ def gen_unalias(B):
             "ref" if kind == "&" else "ptr", kind, name, amp, chain, line, len(uses)), edits)
 
 
-FAMILIES = {"const": gen_const, "guard": gen_guard, "paren": gen_paren, "cflow": gen_cflow, "touch": gen_touch, "wrap": gen_wrap, "alias": gen_alias, "swap": gen_swap, "split": gen_split, "reread": gen_reread, "recompute": gen_recompute, "unalias": gen_unalias, "byval": gen_byval}
+SCALAR = set("bool char short int long unsigned signed float double __int64 size_t intptr_t uintptr_t BOOL BYTE WORD "
+             "DWORD UINT INT LONG ULONG USHORT uint8_t uint16_t uint32_t int8_t int16_t int32_t uint int8 uint8 int16 "
+             "uint16 int32 uint32".split())
+
+
+def gen_subst(B):
+    """`T v = E;` whose v is read exactly once afterwards, in the same block or a nested non-loop block, with no call,
+    store, step or loop between the declaration and the read: the declaration removed and the read spelled
+    `((T)(E))`. Same value (nothing E reads can change in between; T a scalar or pointer, so the cast is the
+    declaration's conversion), one variable and one OPASSIGN fewer in the front end's IL (effectmine model F: the
+    `structure` extras of a draft's single-use locals, Mount & Blade 00532de0, Spore 00d9eb70)."""
+    for k in range(len(B.starts)):
+        st = _stmt(B, k)
+        if not st:
+            continue
+        i, j = st
+        m = DECL.match(B.text, B.toks[i][1])
+        if not m or m.group(3) != "=" or m.end() > B.e:
+            continue
+        ty, v = m.group(1).strip(), m.group(2)
+        if "&" in ty or v not in B.vars or B.vars[v][1] < 0 or "static" in ty or "volatile" in ty:
+            continue
+        if not ("*" in ty or ty.replace("const", "").split()[0] in SCALAR):
+            continue
+        eq = next(q for q in range(i, j) if B.toks[q][1] >= m.end() - 1)
+        expr = [B.toks[q][0] for q in range(eq + 1, j - 1)]
+        if not expr or any(t in ASSIGN or t in ("++", "--", ",", "new", "delete", "throw") for t in expr):
+            continue
+        if any(re.match(r"[A-Za-z_]\w*$", t) and t not in KEYWORDS and t not in NOCALL and q + 1 < len(expr) and
+               expr[q + 1] == "(" for q, t in enumerate(expr)):
+            continue                                 # a call in E: evaluating it later is not the same
+        uses = B.uses.get(v, [])
+        if len(uses) != 1 or uses[0] < j or B.written(uses[0], uses[0] + 1):
+            continue
+        u = uses[0]
+        b = B.block[i]
+        q = B.block[u]                               # the read: in the declaration's block or nested in it
+        while q != b and q > b:
+            q = B.block[q]
+        if q != b or u > B.close.get(b, len(B.toks)):
+            continue
+        between = [B.toks[q][0] for q in range(j, u)]
+        if any(t in ASSIGN or t in ("++", "--", "for", "while", "do", "goto", "case", "default", "asm", "__asm", "_asm")
+               for t in between):
+            continue
+        if any(re.match(r"[A-Za-z_]\w*$", t) and t not in KEYWORDS and t not in NOCALL and q + 1 < len(between) and
+               between[q + 1] == "(" for q, t in enumerate(between)):
+            continue
+        e = B.src(eq + 1, j - 1)
+        line = B.text.count("\n", B.b, B.toks[i][1])
+        yield ("subst", "%s %s = %s substituted into its one use at body line %d" % (ty, v, e[:30], line),
+               [(B.toks[i][1], B.toks[j - 1][2], ""), (B.toks[u][1], B.toks[u][2], "((%s)(%s))" % (ty, e))])
+
+
+CMP_EDGE = {"<": "<=", "<=": "<", ">": ">=", ">=": ">"}
+
+
+def gen_repair(B):
+    """Meaning-CHANGING rewrites, for a draft whose statement differs from the original's (icount `structure`; Mount &
+    Blade and Spore rows: `= 1` where the original ORs, an early return it lacks, a compare off by one, a value of
+    the other signedness). Not in the default set (--families repair); a hit is a hypothesis about the original's
+    source, to be checked against what the function must do. Kinds:
+      repair.drop    a simple statement, or an `if (..) return ..;` / `if (..) break;` without braces, removed
+      repair.rmw     `L = C;` (C a literal) as `L |= C;` and `L &= C;`; `L op= C;` (| & ^) as `L = C;`
+      repair.edge    an if / while condition that is one relational compare, `<` <-> `<=`, `>` <-> `>=`
+      repair.sign    a local declared `int` / `long` / `short` / `char` as `unsigned ..`, or `unsigned ..` as signed
+      repair.step    `X = --N;` / `X = ++N;` as `X = N - 1;` / `X = N + 1;` (N unchanged), and `X = N--;` as
+                     `X = N;`"""
+    n = len(B.toks)
+    for k in range(len(B.starts)):
+        i = B.starts[k]
+        if B.toks[i][0] == "if" and i + 1 < n and B.toks[i + 1][0] == "(":
+            pc = _pclose(B, i + 1)
+            if pc + 1 < n and B.toks[pc + 1][0] in ("return", "break", "continue"):
+                j = next((q for q in range(pc + 1, n) if B.toks[q][0] in (";", "{", "}")), None)
+                if j is not None and B.toks[j][0] == ";" and not (j + 1 < n and B.toks[j + 1][0] == "else"):
+                    yield ("repair.drop", "`%s` removed at body line %d" % (B.src(i, j + 1)[:50],
+                                                                          B.text.count("\n", B.b, B.toks[i][1])),
+                           [(B.toks[i][1], B.toks[j][2], "")])
+            continue
+        st = _stmt(B, k)
+        if not st:
+            continue
+        i, j = st
+        line = B.text.count("\n", B.b, B.toks[i][1])
+        txt = B.src(i, j)
+        m = DECL.match(B.text, B.toks[i][1])
+        if m and m.end() <= B.e and m.group(2) in B.vars and B.vars[m.group(2)][1] >= 0:
+            ty = m.group(1)
+            u = re.match(r"\s*(const\s+)?unsigned(\s+(int|long|short|char))?\s*$", ty)
+            w = re.match(r"\s*(const\s+)?(signed\s+)?(int|long|short|char)\s*$", ty)
+            new = ((u.group(1) or "") + (u.group(3) or "int") + " ") if u else \
+                ((w.group(1) or "") + "unsigned " + w.group(3) + " ") if w else None
+            if new:
+                yield ("repair.sign", "`%s %s` as `%s %s` at body line %d" % (ty.strip(), m.group(2), new.strip(),
+                                                                              m.group(2), line),
+                       [(m.start(1), m.end(1), new)])
+            r = [B.toks[q][0] for q in range(i, j - 1) if B.toks[q][1] >= m.end()]
+            if len(r) == 2 and r[0] in ("++", "--") and re.match(r"[A-Za-z_]\w*$", r[1]):
+                yield ("repair.step", "`%s = %s%s` as `%s = %s %s 1` at body line %d" % (
+                    m.group(2), r[0], r[1], m.group(2), r[1], r[0][0], line),
+                       [(m.end(), B.toks[j - 2][2], " %s %s 1" % (r[1], r[0][0]))])
+            if len(r) == 2 and r[1] in ("++", "--") and re.match(r"[A-Za-z_]\w*$", r[0]):
+                yield ("repair.step", "`%s = %s%s` as `%s = %s` at body line %d" % (m.group(2), r[0], r[1], m.group(2),
+                                                                                    r[0], line),
+                       [(m.end(), B.toks[j - 2][2], " " + r[0])])
+            continue                                 # a declaration is never dropped (its name is used later)
+        toks = [B.toks[q][0] for q in range(i, j)]
+        if not any(t in ("(", "=") or t in ASSIGN or t in ("++", "--") for t in toks):
+            continue
+        yield ("repair.drop", "`%s` removed at body line %d" % (txt[:50], line), [(B.toks[i][1], B.toks[j - 1][2], "")])
+        eq = next((q for q, t in enumerate(toks) if t in ASSIGN and B.paren[i + q] == B.paren[i]), None)
+        if eq is None or eq == 0:
+            continue
+        lhs, rhs = B.src(i, i + eq), B.src(i + eq + 1, j - 1)
+        lit = re.fullmatch(r"\(?\s*-?(0x[0-9a-fA-F]+|\d+)[uUlL]*\s*\)?", rhs.strip())
+        if lit and toks[eq] == "=":
+            for op in ("|=", "&="):
+                yield ("repair.rmw", "`%s = %s` as `%s %s %s` at body line %d" % (lhs[:30], rhs, lhs[:30], op, rhs,
+                                                                                    line),
+                       [(B.toks[i][1], B.toks[j - 1][2], "%s %s %s;" % (lhs, op, rhs))])
+        elif lit and toks[eq] in ("|=", "&=", "^="):
+            yield ("repair.rmw", "`%s %s %s` as `%s = %s` at body line %d" % (lhs[:30], toks[eq], rhs, lhs[:30], rhs,
+                                                                            line),
+                   [(B.toks[i][1], B.toks[j - 1][2], "%s = %s;" % (lhs, rhs))])
+        r = toks[eq + 1:-1]
+        if toks[eq] == "=" and len(r) == 2 and r[0] in ("++", "--") and re.match(r"[A-Za-z_]\w*$", r[1]):
+            yield ("repair.step", "`%s = %s%s` as `%s = %s %s 1` at body line %d" % (
+                lhs[:30], r[0], r[1], lhs[:30], r[1], r[0][0], line),
+                   [(B.toks[i][1], B.toks[j - 1][2], "%s = %s %s 1;" % (lhs, r[1], r[0][0]))])
+        if toks[eq] == "=" and len(r) == 2 and r[1] in ("++", "--") and re.match(r"[A-Za-z_]\w*$", r[0]):
+            yield ("repair.step", "`%s = %s%s` as `%s = %s` at body line %d" % (lhs[:30], r[0], r[1], lhs[:30], r[0],
+                                                                                line),
+                   [(B.toks[i][1], B.toks[j - 1][2], "%s = %s;" % (lhs, r[0]))])
+    for i in range(1, n - 1):
+        if B.toks[i][0] not in ("if", "while") or B.toks[i + 1][0] != "(":
+            continue
+        pc = _pclose(B, i + 1)
+        ops, d = [], 0
+        for q in range(i + 2, pc):
+            t = B.toks[q][0]
+            d += t in ("(", "[") or -(t in (")", "]"))
+            if d == 0 and t in ("<", ">", "<=", ">=", "==", "!=", "&&", "||", "?", ",", "=", "<<", ">>"):
+                ops.append((q, t))
+        if len(ops) != 1 or ops[0][1] not in CMP_EDGE:
+            continue
+        q, op = ops[0]
+        yield ("repair.edge", "%s at body line %d: `%s` as `%s`" % (B.toks[i][0], B.text.count("\n", B.b, B.toks[i][1]),
+                                                                    op, CMP_EDGE[op]),
+               [(B.toks[q][1], B.toks[q][2], CMP_EDGE[op])])
+
+
+FAMILIES = {"const": gen_const, "guard": gen_guard, "paren": gen_paren, "cflow": gen_cflow, "touch": gen_touch, "wrap": gen_wrap, "alias": gen_alias, "swap": gen_swap, "split": gen_split, "reread": gen_reread, "recompute": gen_recompute, "cmp": gen_cmp, "unalias": gen_unalias, "byval": gen_byval, "subst": gen_subst, "repair": gen_repair}
 
 
 def explicit_this(text, fn, cls):
@@ -1007,6 +1206,10 @@ def body_of(text, func):
     m = re.match(r"\?(\w+?)@@Y", func)
     if m or not func.startswith("?"):
         name = m.group(1) if m else func
+        if not m and re.match(r"_[A-Za-z_]\w*(@\d+)?$", func):      # an extern "C" symbol: `_T2_FindSID`, `_f@8`
+            names = {fn[0] for fn in helpersweep.functions(text)}
+            c = re.sub(r"@\d+$", "", func)[1:]
+            name = c if c in names or func not in names else func
         for fn in helpersweep.functions(text):
             if fn[0] == name:
                 return fn
@@ -1106,7 +1309,7 @@ def main():
     ap.add_argument("--asm-vs")
     ap.add_argument("--want", help="A>B: A must be coloured before B")
     ap.add_argument("--pass", dest="k", type=int, default=2)
-    ap.add_argument("--families", default="wrap,alias,swap,split,reread,touch,cflow,paren,guard,const,unalias,byval")
+    ap.add_argument("--families", default="wrap,alias,swap,split,reread,touch,cflow,cmp,paren,guard,const,unalias,byval,subst")
     ap.add_argument("--vars", help="comma-separated: only rewrites that mention one of these variables")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--max-combo", type=int, default=2)
@@ -1151,7 +1354,7 @@ def main():
             print("  v%04d %-6s %s" % (i, v[0], v[1]))
         return
     # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory
-    out = os.path.join(ROOT, "work", "rwsweep", tsweep.out_name(a.tu))
+    out = os.path.join(ROOT, "work", "rwsweep", tsweep.out_name(a.tu, a.func))
     if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory
         out += "@" + c2trace.c2build.name()
     shutil.rmtree(out, ignore_errors=True)

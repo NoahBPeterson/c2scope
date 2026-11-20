@@ -3,8 +3,9 @@
 Back end `c2.dll` of cl 14.00.50727.762. Modules covered: `sym.obj`, `p2symtab.obj`, `type.obj`, `hash.obj`,
 `addr.obj`. C declarations are in `src/c2/il_sym.h`. They compile under cl and all of their size asserts hold.
 
-Each claim is tagged **[C]** (CONFIRMED: read in the code at the given address, or tested by a compile) or
-**[I]** (INFERRED). Addresses are VAs in `Bin/c2.dll`. Functions are `__fastcall` unless noted, and many
+Each claim is tagged **[C]** (CONFIRMED: read in the code at the given address, or tested by a compile),
+**[M]** (MEASURED on all four builds by a probe in `tests/data/rules/RE_*.cpp`, checked by
+`tests/probes/frontend.py`) or **[I]** (INFERRED). Addresses are VAs in `Bin/c2.dll`. Functions are `__fastcall` unless noted, and many
 internal ones take arguments in eax/esi/edi because of LTCG.
 
 ## 0. The rules that matter for matching
@@ -32,7 +33,8 @@ internal ones take arguments in eax/esi/edi because of LTCG.
    them, not where they are declared.** The path is `RdrOpName` 0x10bd0030 → `TupMakeUserAddr` 0x10bf4e80 →
    `SymMakeUserVar` 0x10bef7b0. Locals and parameters share the frame pool. [C] Compile test: at /O2 the
    frame order of three address-taken arrays follows the order of first use and ignores the order of
-   declaration (`t7.c`). [C] Whether that order comes from the key or from tuple order is [I].
+   declaration (`t7.c`). [C] Whether that order comes from the key or from tuple order is [I]: the key order is
+   the first-reference order (section 5.2), so no source spelling separates the two.
 6. Temporaries made by the reader take keys in source (IL) order, before any made by the optimizer.
    Adding one call result anywhere in the function (before or after the loop) moved a temporary created by
    the loop optimizer up by exactly one key (`t5.c`: fc, fe). Adding a user local that needs no temporary
@@ -244,7 +246,8 @@ prolog/epilog, EH, GS cookie, OpenMP, inliner. [C] The SSRs themselves were all 
 (`RdrGetTuples` 0x10bce2a0). [C] So key order among user variables is the order of their **first reference
 in the IL tuple stream** (plus prolog-generated references), within the frame pool (locals and params
 together) or the global pool. [C] for the mechanism. The exact place of params in that order (does the entry
-code touch them before the body?) is [I].
+code touch them before the body?) is [I]: parameters have fixed frame slots, so their keys do not show in a
+listing.
 
 ### 5.3 Equivalences (field and overlay views)
 
@@ -357,7 +360,12 @@ key**, and set its frameKeys bit. `RdrUnextract` 0x10bd2da0 makes block temps; o
 **Front-end keys versus source order.** The IL keys are written by c1, so their order is c1's numbering,
 which is not analysed here. c2 compares them only in the last tie-break of SymCmpSym. [C] The /Od frame
 order of `t7.c` (z, x, y for declarations x, y, z) shows that the debug build orders locals by
-something other than first use. [C] Whether that is FE key order or bucket order is [I].
+something other than first use. [C] **It depends on the names, so it is not FE key (declaration) order:** with
+the same body and declaration order, locals `x, y, z` are laid out `y, x, z` from `-8` down and `a, b, c` are
+`a, b, c`; declared `z, y, x` they give `x, y, z`; first use does not matter at /Od (`x, y, z` used `z, y, x`
+still gives `y, x, z`); `q1..q5` gives `q3 q2 q5 q4 q1`, `m k w d p` gives `p w k d m`. Identical on all four
+builds. Renaming a local can therefore move its /Od slot. Which hash or bucket order produces this was not
+worked out. [M: tests/data/rules/RE_odframe.cpp fa..ff with /Od; tests/probes/frontend.py]
 
 ## 9. Experiments
 

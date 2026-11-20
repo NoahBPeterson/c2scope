@@ -28,6 +28,8 @@
   "gnew": "512582c8",
   "regname": "51040080",
   "opname": "5103eb78",
+  "ehop": "326",
+  "ulabop": "34b",
   "fename": "1"
  },
  "functions": {
@@ -562,7 +564,7 @@
    "51063410=ebx,ebx>0x1c,esi>0x10>0x1c,esi,esi>4,esi>0x1c,ebx>0x10",
    "510637ca=ebx,ebx>0x1c,esi>0x1c,esi,esi>4,esi>0x1c,ebx>0x10"
   ],
-  "il_spec": "=g51258400>0>0>4$,g51258400>0>8>0>0x1c%",
+  "il_spec": "=g51258400>0>0>4$,g51258400>0>8>0>0x1c%+",
   "il_default": [
    "@dop2_PreLowerGlobalOpts@4",
    "@dop2_Codegen@4",

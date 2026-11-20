@@ -7,7 +7,7 @@ the displacement rewrite of rule 8). It is meant for matching: given a draft, pr
 pushes, compares and stack adjustments the compiler will emit, and know which source change can move them.
 
 **[C]** = CONFIRMED (read in the code, and/or shown by a compile or trace; each claim says which). **[I]** =
-INFERRED. Probes: `work/scratch/sched/` (`s*.cpp`, `q.cpp`, `c.cpp`, `w.cpp`, `v.cpp`, predictions in `*.pred`
+INFERRED. **[M]** = measured: a probe in `tests/data/rules/RX_*.cpp` decides it on all four builds (checks in `tests/probes/misc.py`). Probes: `work/scratch/sched/` (`s*.cpp`, `q.cpp`, `c.cpp`, `w.cpp`, `v.cpp`, predictions in `*.pred`
 written before compiling). Tool: `uv run tools/c2sched.py <src> --func SUBSTR [--all] [--verify [-v]] -- <cl args>`
 prints, per region, the DAG numbers of every instruction (lex, height, successors, flags, priority) and the order
 it issued them in; `--verify` checks rules 2-5 against every region of the compile.
@@ -30,7 +30,10 @@ model 13,795/13,798 picks (section 9).
    - `/Od`: never scheduled. `__try/__except`: not scheduled (seh.cpp).
    - C++ EH: a function with only a destructor local is scheduled under `/EHsc` and `/EHa`; a function with
      `try/catch` is scheduled under `/EHsc` and `/EHs` but **not under `/EHa`** (tc.cpp). So 0x100000 is
-     "has a C++ try under async EH" **[I]**.
+     "has a C++ try under async EH" (c1's SSR+0x50 bit 9, il_pipeline.md 2) **[M: `tests/data/rules/RX_ehsched.cpp`,
+     `@Schedule@8` reached or not, all four builds alike]**: under `/EHa` `catch (...)`, `catch (int)` and a try
+     whose body has no call are all unscheduled; a function that calls a (not inlined) function with a try, and a
+     destructor-only function, are scheduled; under `/EHs` and `/EHsc` all of them are.
    - `/O1` and `/O2` both schedule. `_Speed` only changes which dependencies may be broken (rule 8) and an x87
      check (`SchmdBadForFPSch`).
 2. **Regions.** Scheduling starts after `OPPROLOGEND` and walks to `OPEXIT`. `SchBlockTail` 0x10c725c0 cuts a
@@ -45,7 +48,11 @@ model 13,795/13,798 picks (section 9).
    `OPSPADJUST`, `OPHARDINTRIN`, pragmas (an `OPUSERLABEL` only if it is an annotation), TUPLIST, and a store to the
    EH registration record (`_GEH_rec`) in a function with FUNC+0xac & 0x140000, or to `_SEH_rec` under SEH. The
    state store of a destructor-only function under `/EHsc` is *not* a barrier (a9, rule 10); under `/EHa` it
-   behaves like one, consistent with the 0x140000 condition **[I]**. So **nothing crosses a call**: argument setup stays between the previous call and its
+   behaves like one **[M: `RX_ehsched.cpp` `e_dtor`, all four builds: the `__$EHRec$ = 0` store after the
+   constructor call sinks below the next loads under `/EHsc` and `/EHs`, stays above them under `/EHa`]**. In the
+   `/EHa` DAG the state stores carry the calls' memory operands (`mov s4 pas9:8000 <- 0 pas9:8000 pas23:8000` on
+   14.00/15.00, pas8/pas16 on 13.10), the `/EHsc` ones none (`c2sched.py --all`) **[C trace]**; whether a
+   register-only instruction may still cross it was not probed. So **nothing crosses a call**: argument setup stays between the previous call and its
    call, and the code after a call stays after it. **[C code, every probe]**
 4. **Dependencies (DAG edges)** **[C code; latencies from 13,798 edges, section 9]**. Edge types: 1 true (read
    after write), 2 anti (write after read), 4 output (write after write), 0x40 memory, 0x2000 volatile, 0x80000

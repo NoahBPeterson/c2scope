@@ -374,7 +374,7 @@ Example (`work/scratch/ilx/ilx_eh.cpp`, `g2`, at `@MscRVO@4`; cut):
 | `sN=L<tuple>` | a CODEADDR leaf (kind 4) whose symbol's +0x33 is a LABEL tuple: branch target, jump-table `_data` entry. The value is the tuple address an `L` line prints | CONFIRMED: `TupMakeBranch` builds the leaf from `label+0x24`, `TupMakeLabel` 10bf4bc2 stores the back pointer |
 | `sN=<name>` | any other CODEADDR leaf: the symbol's name pointer at sym+4 (these leaves hold the front-end symbol, so the name is at `[sym+4]`, not `[[sym+0]+4]`). Call and tail-jump targets, `&f`, `__ehhandler$f` | CONFIRMED (trace) |
 | `sN=&` / `dN=&` | the operand is a DATAADDR (kind 3) or EA (kind 5) leaf: the address of what is printed. Without the note the same text is the value (kind 2 SYM, kind 6 INDIR) | CONFIRMED (trace: `int *p = &x` is `_p <- _x ; s0=&`, `h(y)` for an array `y` is `OPARG <- _y ; s0=&`, every `lea`) |
-| `sN=1.5` | FCONST leaf (kind 9): the 80-bit x87 value at leaf +0x18, converted to a double by the DLL (`%.9g` for a 4-byte operand, else `%.17g`). c2il.py shortens it to the shortest text that reads back the same, and adds `(0.1f)` when the value is exactly that float (a float literal used in double arithmetic) | CONFIRMED: `TupMakeFloatConst` 10bf1dc9 copies 3 dwords; 1.5, 0.1, 2.0 and 0.1f print right (`ilx_ops.cpp` f1, f2) |
+| `sN=1.5` | FCONST leaf (kind 9): the 80-bit x87 value at leaf +0x18 (13.10: +0x16, `set fcoff`), converted to a double by the DLL (`%.17g`). c2il.py shortens it to the shortest text that reads back the same, and adds `(0.1f)` when the value is exactly that float (a float literal used in double arithmetic) | CONFIRMED: `TupMakeFloatConst` 10bf1dc9 copies 3 dwords; 1.5, 0.1, 2.0 and 0.1f print right (`ilx_ops.cpp` f1, f2) |
 | `intrin=159` | u16 at tuple +0x30 of `OPINTRINSIC` (159 `_rotl`, 167 `strlen` seen) | CONFIRMED (storage: il_tuple.md §6.3; the two numbers: trace) |
 | `default=L<tuple> cases=N` and `C <switch> <low> <high> L<tuple>` | SWITCH +0x30 default LABEL tuple, +0x34 list of CASE nodes {+0xc low, +0x10 high, +0x14 LABEL tuple}; values are in the selector's units after the reader's normalisation (`case 1:` with a preceding `OPSUB t,1` prints 0) | CONFIRMED: `TupMakeCaseListNext` 10bf2350; `case 2: case 3:` prints one line `1 2`, which settles that +0xc/+0x10 is a range and not a 64-bit value (`ilx_cc.c` c3) |
 | `L <tuple> $out` | LABEL tuple (+0x24 symbol) with the symbol's name when it has one: user labels, `__catch$f$0`, `__unwindfunclet$f$2` | CONFIRMED (trace) |
@@ -417,8 +417,13 @@ $ uv run tools/c2trace.py il work/scratch/ilx/ilx_cc.c --func c3 --diff @MscRVO@
 A function compiled several times at a pass (inline expansions, funclets) is diffed occurrence by occurrence
 when the counts agree, otherwise last against last, with a line saying so.
 
-**Other c2 builds.** The extended dump is used only when the build table's `il_spec` ends in `%+`; the 13.10 and
-15.00 tables end in `%` and keep the plain dump. To port it, check these in that build and add what differs to
+**Other c2 builds.** The extended dump is used when the build table's `il_spec` ends in `%+`: all four builds
+(13.10 and 15.00 since 2026-11-19). Their `dll` sections set what differs from 14.00: the EH and user-label opcode
+numbers (`ehop`/`ulabop`: 13.10 2ad/2d0, 15.00 326/34b, read from each build's `_TupOpcodeName`) and on 13.10
+the FCONST payload offset (`fcoff 16`; the 80-bit value at leaf +0x16, seen in the leaf's words). Checked on
+`work/scratch/ilx/*` (20 functions at `@dop2_PreLowerGlobalOpts@4` and `@Color@4`): 15.00's notes equal
+14.00's line for line; on 13.10 the only differences are its own IL (no OPLEAVE tuples, another `catch (...)` flag
+word, one EH state attached later). To port it to another build, check these and add what differs to
 the table's `dll` section (`set` directives; defaults are the 14.00 values): `ext` (0x30: the per-kind word
 after the operand lists: QUESTION cc, INTRINSIC number, SWITCH default with the case list at ext+4, EH record
 pointer), `labtup` (0x33: label symbol → LABEL tuple), `brcc` (0x0a: BRANCH cc nibble); the existing `blk` is
@@ -1453,6 +1458,16 @@ Blade 0x524420 gave `t728 WANTS ebp` and `base mixed` besides the sum's `t814 WA
 `note:` line saying that the original's result sits in the other operand's register (the IL's operand order:
 symkeys.py), not a register choice (tests/data/twoaddr.c). Every non-ok integer row also gets a `from:` line: Color
 (a globreg: `rasim want`), a scratch pick or a Riscify call (`rasim scratch ... want:`), or the phase of a `?` temp.
+
+**Address order and issue order are not register votes.** An address with the same registers in the other
+base/index order (`[edx + edi + 0x30]` against our `[edi + edx + 0x30]`) is the address's operand order (which
+value is the base: the CSE temp of the address, M&B PartyWindow::frame_update), and two nearby instructions (at
+most four aligned pairs apart, other instructions between them allowed) that the original issues the other way
+round are a scheduling difference: the alignment pairs them by shape, so each looked like a register swap. regmap
+counts the first kind as agreeing and pairs the second crosswise, and reports each on a `# base/index order` /
+`# issue order` line. In the Mount & Blade split-round triage (2026-11-19, 66 rows) these were two of the seven
+late-round candidates: Skin::read 0x4e7b30 and read_mesh 0x41d6f0 now agree everywhere, cell_grid::walk 0x437290
+keeps one scratch WANTS (tests: run_tests.py rasim_tests, `regmap: base/index order ...`).
 **[C]**
 
 **Every register class is covered**, on 14.00, 13.10 and 15.00 (the final IL names all of them):
@@ -1550,11 +1565,14 @@ instructions (1 to 10 on the benchmark drafts). Code-neutral variants that help 
 | `alias` | `T a = V;` or `T& a = V;` at a statement boundary, later uses in the block renamed |
 | `touch` | a do-nothing use of V at a statement boundary (`(void)V;`, empty inline helper, `if (V) { }`, `__assume`, `V = V;`) |
 | `cflow` | if/else arms swapped under a negated condition; `while` as `for(;;)`+break, `for(;c;)`, if+do-while or a goto loop; the statement after an if copied into both arms |
+| `cmp` | an if / while condition that is one relational compare: `b > a` for `a < b`, and `!(a >= b)` (floats: differs for NaN; check the hit). On x87 it picks the load order, compare form and branch (Spore 00c22a80) |
 | `paren` | redundant parentheses around a right-hand side, return value, call argument, additive term or left prefix (`(a + b) + c`) |
 | `guard` | `delete p; p = 0;` <-> `if (p) { delete p; p = 0; }` |
 | `swap` | two adjacent independent statements exchanged |
 | `split` | `T x = e;` as `T x; x = e;` |
 | `reread` | a use of X after `X = p->m;` spelled `(p->m)` again (check by eye: only safe if nothing stores there in between) |
+| `subst` | `T v = E;` (scalar or pointer T) read once afterwards in the same block, with no call, store, step or loop in between: the declaration removed and the read spelled `((T)(E))`. One variable and one front-end assignment fewer; c2's copy propagation usually removes such a local anyway, so an unchanged result shows the extra comes from E itself (effectmine.md §7) |
+| `repair` | (not in the default set) rewrites that CHANGE the meaning, for a draft whose statement differs from the original's (icount `structure`): a simple statement or an early `if (..) return;` removed, `L = C` as `L |= C` / `L &= C` and back, `<` <-> `<=` / `>` <-> `>=` in a condition, a local's signedness flipped, `X = --N` as `X = N - 1`, `X = N--` as `X = N`. A hit is a hypothesis about the original's source: check it against what the function must do |
 | `recompute` | (not in the default set) `V = E;` with E made of literals and pure math calls (`dq = sqrt(13.0 / 8.0);`) written again before a later statement that uses V after a call: same value, still computed once, but V is one live range per call-free stretch instead of one across the calls (x87.md §10) |
 | `const` | a `char`/`short` store of −1.. or 128.. through the type of the other signedness (same byte, another constant candidate); `for (T i = K; ..)` with the init hoisted over 1 to 3 statements, split off, or sunk back (immcand.md §3) |
 

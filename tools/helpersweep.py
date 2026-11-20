@@ -292,7 +292,7 @@ def main():
     sites = sorted(set(sites), key=lambda x: x[1])
     print("%d helpers used by the target, %d rewrite sites" % (len(helpers), len(sites)), flush=True)
     # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory
-    out = os.path.join(ROOT, "work", "helpersweep", tsweep.out_name(a.tu))
+    out = os.path.join(ROOT, "work", "helpersweep", tsweep.out_name(a.tu, a.func))
     if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory
         out += "@" + c2trace.c2build.name()
     shutil.rmtree(out, ignore_errors=True)

@@ -7,7 +7,8 @@ multiplies the priority of every other value referenced in that block (regalloc.
 constants become candidates, in which blocks they are referenced, and what in the source changes that.
 
 Tags: **[C]** read in the code at the address given (14.00.50727.762 unless a 13.10.3077 address is named) or
-seen in a trace; **[I]** inferred. Every rule below was probed on 13.10.3077, 14.00 and 15.00.30729; the probe
+seen in a trace; **[I]** inferred; **[M]** measured with `tests/data/rules/RF_immcand.cpp` on all four builds
+(14.00, 15.00, 13.10.3077, 13.10.3052; checks in `tests/probes/frame.py`, read from `regs --export`). Every rule below was probed on 13.10.3077, 14.00 and 15.00.30729; the probe
 sources and the recorded outputs are in `work/scratch/immcand/` (`a1 a2 b1 c1 d1 e1 .c`, `out_<probe>_<build>.txt`;
 `pb.py` prints, per function, every block's P, the immediates referenced `K(cost)` or live through `K~`, and a
 hash of the encoded bytes). Where a build behaves differently it is said.
@@ -121,14 +122,17 @@ immediate (kind 0xd), its `fl5 & 0x10` is clear (seen once in the function), and
   it is dropped after costing, but **it was in P**;
 - two or more uses anywhere: every use is a candidate operand.
 
-That the field at `BLOCK+0x16c` means "in a loop" is **[I]** from the probes; the test itself is **[C]**.
+That the field at `BLOCK+0x16c` means "in a loop" is **[M]**: a once-only 1000 is a candidate inside a `for`, a
+`while`, a `do`-`while`, a backward-`goto` loop, the inner loop of a nest and an `if` arm inside a loop, and not
+after a loop or with no loop (`RF_immcand.cpp` l_*); at /O1 none of the loop forms makes it one. Same on all four
+builds. The test itself is **[C]**.
 
 ### 2.4 The region, and where the load is placed
 
 The dataflow is the one used for memory variables (`ReachingOccurGenKill`, `GrgPropagateSetsBackwards` 10b57fd0,
 `GrgPropagateSetsForwards` 10b57da0, then the per-block sets are intersected in `Globregs`). Nothing kills a
 constant, so the result is: the candidate is "in a register" at a point when some path from an earlier use
-reaches the point **and** a use follows it. **[I for this reading of the sets; C for every probe below]**
+reaches the point **and** a use follows it. **[I for this reading of the sets; C for every probe below; M for dnest]**
 
 `Enterloads` 10b588e0 then walks each block; a candidate operand met while the candidate is not in the block's
 "in register" set gets an `OPENTERLOAD K` inserted before that instruction (`CmdInsertEnter`, 10b58c06). **[C]**
@@ -138,8 +142,11 @@ predecessor that does not have a candidate which B expects in a register, the ca
 edge (an "airlock" block). Instead, for an **immediate, unconditionally** (the kind-0xd test at 10b58358 skips
 `CanExtendLiveness` 10b58365), the load is inserted in the block `GrgFindNearestDominator` 10b5c0c0 returns (10b582e1), at
 `GetEnterInsertPoint` 10b58500 (10b58435; before the block's ending branch; `CmdInsertEnter` 10b58442), and the candidate is made live from there
-(`DoExtendLiveness`). **[C for the pass and the unconditional case; I that the dominator is taken over B's
-predecessors]**
+(`DoExtendLiveness`). **[C for the pass and the unconditional case; M for the dominator]** For a forward edge the
+nearest common dominator of B's predecessors is B's immediate dominator, so "over B's predecessors" and "B's
+idom" are the same block. `RF_immcand.cpp` dnest (`if (a) { h(); if (b) g(K); } h(); g(K);`) rules out one load
+per predecessor that lacks K: K is referenced in block 1 (the `if (a)` test: the load), the arm and the join, and
+only live through block 2 (the `if (b)` test, itself a predecessor without K) on all four builds.
 
 Probes (`b1.c`, K = 1000; block numbers as `regs --why` prints them; identical placement on the three builds,
 except that 14.00 and 15.00 also show the loop increment's `1` as a candidate where 13.10 uses `inc`):
@@ -165,10 +172,14 @@ in the first loop and again later. The eleven constants used only in that loop a
 - A once-only use outside loops: at `ReachingOccurGenKill` (2.3).
 - `Enterloads` can undo a candidate operand (`UndoRegCandidate` 10b597e0, called at 10b58afa, 10b58d3e,
   10b59189; for kind 0xd it calls `GrgChangeRegToImmed` 10b599b0, which puts the constant back). **[C code]**
-  b9 and u15 (the same constant once in each arm, or in two exits) end with no candidate at all **[C trace]**;
-  that this is the path that removes them is **[I]**.
+  b9 and u15 (the same constant once in each arm, or in two exits) end with no candidate at all **[C trace]**,
+  and this is the path that removes them **[C trace, all four builds]**: in b9 (`RF_immcand.cpp`) Enterloads calls
+  `UndoRegCandidate` (14.00 from 10b59189) and each of the two uses goes back through `GrgChangeRegToImmed` on
+  the kind-0xd symbol, before `CreateGlobregs`; in b8 nothing is put back there (15.00 and 13.10 put b8's 1000
+  back later, after CreateGlobregs).
 - `CreateGlobregs` 10b5abe0 (test at 10b5ac15) removes the globreg of every immediate symbol whose candidate
-  record has `+0x14 < 1`. **[C for the test; I for what the counter counts: lifetimes that survived]**
+  record has `+0x14 < 1`. **[C for the test; I for what the counter counts: lifetimes that survived; an internal
+  counter, not decidable from a listing]**
 
 A candidate that survives these is in P of every block that references it, whether or not it is ever coloured.
 After costing, `Color` spills or defers almost all of them (benefit ≤ 0: a load costs 1, a use saves 0 or 1).
@@ -272,6 +283,9 @@ where it stands.
   1077f00c, `CreateGlobregs` 1077ff3b; not read).
 - The forward/backward set propagation was not read line by line; the region rule of 2.4 is the reading that fits
   all probes.
-- /O1: `_Speed` == 0 makes every once-only constant a non-candidate even in loops (the code at 10b57827); not
-  probed.
-- 64-bit constants: only the low dword is compared at 10b56731; not probed.
+- /O1: `_Speed` == 0 makes every once-only constant a non-candidate even in loops (the code at 10b57827): holds
+  on all four builds (`RF_immcand.cpp` l_for, l_while, l_do, l_goto at /O1) **[M]**.
+- 64-bit constants: only the low dword is compared at 10b56731, but on x86 no 64-bit constant reaches Globregs: a
+  `long long` store is two dword stores by then, and each half is its own 32-bit value. The high half 7 of
+  `0x0000000700000005` shares one candidate with a separate `= 7` (k64d); halves 5 and 6 used once are not
+  candidates (k64c) **[M, all four builds]**.

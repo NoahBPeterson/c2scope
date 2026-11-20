@@ -88,9 +88,27 @@ under wine. The compile takes 1 to 5 s on the server, plus about 1 s of analysis
 | `made-by:lower:*`, `lower:*` | instruction selection: Lower, AddrModes, Mul2Shift, Opeq, LoFinalLower, MdmInsertEntryExit | isel.md |
 | `riscify`, `riscify-undo`, `made-by:riscify-undo` | 13.10: a memory operand split off into a load, or a split put back after Schedule | regalloc.md §6.6, `scratch` R rows |
 | `peephole:*` | Peeps, MscClean, LateGlobalOptimize, MdmSuperHack | |
-| `x87:*` | fld / fxch / fstp shape | `c2x87.py`, x87.md |
+| `x87:*` | fld / fxch / fstp shape | `c2x87.py`, x87.md; a `flags:` line under the report (below) first; for an x87 compare: the operand order and the form (`a < b`, `b > a`, `!(a >= b)`: `rwsweep --families cmp`; Spore 00c22a80) |
 | `loop:*` | rotation, unrolling, strength reduction, landing pads, test replacement | opt.md §8 |
 | `structure`, `structure:inline` | front-end IL: no pass made or removed it | draft structure: a statement, temporary or branch the original's source has or lacks |
+
+An EXTRA `structure` instruction born in the reader IL also gets a `front end:` line: its tuple shape and the
+mutation classes that removed that shape elsewhere, from effectmine's model F (effectmine.md section 7; a removal
+counts only when that opcode's tuples drop, not when an operand changes kind). Measured on 24 Mount & Blade and
+Spore rows, most such extras are a statement whose meaning differs from the original's (`= 1` where it ORs, an
+extra early return): read the original at that line before mutating. Branch-sense extras (`OPBRANCH[..]`) are the
+one kind the generic mutations remove (`cflow.swaparms`, `cflow.emptythen`, `cmpflip`).
+
+A `lift` block after the runs (docs/c2/lift.md) shows the original's code lifted to our IL at Lower's entry, the
+differences at our source lines (`line 280 ours st, original rmw.or`); only when the rules give back at least 80% of
+our own code. It needs no compile more.
+
+A `flags:` line after the runs names a compiler-flag cause the IL cannot show. One so far: ours rounds a float
+through its home (`fstp m`, then `fld m` within three instructions) more often than the original, and the compile
+has no `/fp:fast`. /fp:precise stores and reloads every float assignment; /fp:fast keeps the value on the stack
+(the original then has `fst m` with the value still in ST(0), or no store at all). Spore 00d38780 (15.00): the
+slice was built without /fp:fast; with it (and the returns in the original's order) the function matches. Not on
+13.10, which has no /fp switch. Probe `fp` (`#pragma float_control(precise, off)` on the X_orig side).
 
 A run takes the most frequent informative class among its instructions (`structure` only when nothing else
 applies). `--json` keeps every instruction's class, tuple, birth, history and reason.
@@ -103,12 +121,13 @@ the count difference and the class.
 | probe | construct | 14.00 | 15.00 | 13.10.3077 / 3052 |
 |---|---|---|---|---|
 | cse | `p->q` read three times, against `Q*& r = p->q` used twice | -1 CSE | -1 CSE | -1 CSE |
-| alias | the reverse | +1 kept:alias (R3) | +1 kept:path (plain dump: no branch targets) | +1 kept:alias |
+| alias | the reverse | +1 kept:alias (R3) | +1 kept:alias (kept:path before 15.00 had the extended dump) | +1 kept:alias |
 | kill | `p->q->m = 0` between two reads of `p->a`, against `p->b = 0` | +2 kept:kill (+ the p->q load, structure) | +2 kept:kill | +2 kept:kill |
 | range | a struct copy's field tested twice, against the outer test through the pointer | 0 (both folded) | 0 | -5 folded:range-check (+ callee-saved esi) |
 | dead | `p->a = 1; p->a = 2;` with nothing read between | -1 DeadStores | -1 | -1 |
 | tail | equal arm tails | -8 merged:FgDoLateFlowOpts (twins from FgTryTailMerge) | -8 | -8 |
 | stmt | a statement the original has | -1 structure | -1 | -1 |
+| fp | `f` rounded through its home (/fp:precise), against precise semantics off | +6, `flags:` /fp:fast | +6, `flags:` /fp:fast | 0, no hint |
 
 Rule probes (tests/data/rules, rules_misc_tests; opt.md §8.1 items 5 and 6):
 
@@ -210,7 +229,7 @@ go to other removed tuples, which is equally noise). The `loop (unroll)` line of
   removed. The tool cannot see that the original's front end produced other tuples; that is inferred.
 - **Tuples made and freed between two snapshots** (FgEarlyTailDup's copies that a merge removes again) are not
   seen. `--fine` narrows GlobalOptimize down to one block.
-- **Plain IL dump (13.10, 15.00).** There are no branch targets, so loadcse pairs reads in stream order, and the
-  15.00 `alias` probe says `kept:path` where 14.00 says `kept:alias`.
+- **Branch targets on every build.** 13.10 and 15.00 use the extended dump too since 2026-11-19 (tracer.md "Other
+  c2 builds"), so loadcse pairs reads by dominators everywhere; before, the 15.00 `alias` probe said `kept:path`.
 - **Verdicts without a pass behind them.** `regalloc:spill` and `regalloc:callee-saved` for missing instructions
   are heuristics: a stack load or store, or a push or pop, with nothing removed at that place.

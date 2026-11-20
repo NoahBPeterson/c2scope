@@ -5,7 +5,8 @@ written so that you can work out which register a value gets from the source of 
 
 Every claim cites a VA and function name. **[C]** means CONFIRMED: read in the code, or tested by a compile, or
 both. Tests used `tools/msvc.py` listings and `tools/c2trace.py` traces (docs/c2/tracer.md), with probe sources in
-`work/scratch/glass_regcolor_p/`. **[I]** means INFERRED.
+`work/scratch/glass_regcolor_p/`. **[M]** means MEASURED: decided by a probe in `tests/data/rules/RA_*` on
+13.10.3077, 13.10.3052, 14.00 and 15.00, checked by `tests/probes/regalloc.py`. **[I]** means INFERRED.
 
 Read docs/c2/il.md first. It covers BLOCK, TUPLE and the pipeline. Register allocation is phases 5b and 5c there.
 
@@ -105,7 +106,8 @@ c2 register numbers come from `_RegName` 10cec7b8: 1 eax, 2 ecx, 3 edx, 4 ebx, 5
 - regAvail starts with every register at 1 except esp.
 - ebx is cleared when `MdmWillUseEbxConservative` (10c58980) returns nonzero.
 - ebp is cleared when FUNC+0xac & 0x20000000, or when FUNC+0xac & 0x40 is clear. 0x40 is the FPO / no-frame-pointer
-  bit **[I]**.
+  bit **[I for the bit; M for the effect: with /Oy- no avail set holds ebp, so of four call-crossing values the
+  lowest is left without a register (tests/data/rules/RA_lastreg.cpp /DINTC /Oy-, all four builds)]**.
 - `CmdGetNumIntRegs` returns the count and sets or clears the ebx bit (0x10) in `AvailPhysRegs[0]`.
 - Color calls it only when class 0 is reached, after `MdmDetermineDoubleAlignAndFpo` (10b0d119; the call is at 10b0d120). So whether
   ebp is a colour is decided just before the integer pass. **[C]**
@@ -223,7 +225,12 @@ Spillcosts walks blocks in block-list order (FUNC+8). In each block it walks ins
 - **Pressure** P_B = the number of distinct globregs of this class referenced in B. This counts the ones that died
   in B, the live-out ones referenced in B, and immediate-candidate globregs (traced: an extra globreg of sym kind
   0xd, the constant of `cmp gx,0`, was counted) (10b113cf..10b11484).
-  Which constants are candidates and which blocks reference them: docs/c2/immcand.md.
+  Which constants are candidates and which blocks reference them: docs/c2/immcand.md. In short: a constant
+  used once outside loops is no web; used twice anywhere it is a web and counts in P of each block that uses it;
+  used once inside a loop it is costed like a variable (it counts in P of the loop block and the preheader) but
+  never popped. Probe tests/data/rules/RA_immweb.cpp: `1000` once / twice / once in a loop gives 0 / 1 / 0
+  rows in `regs`, and `p[i] > 1000` gives the loop counter the same priority as `p[i] > k` with k a parameter
+  (37 on 14.00 and 15.00, 32 on 13.10; same P in every block). **[C trace, all four builds]**
 - **At the end of B** (10b11484..10b114e8):
   - Every globreg referenced in B gets `prio += blkcost·(P_B·w)`, then `blkcost = 0`.
   - Every globreg live through B but not referenced in it gets `prio -= P_B·w`. Under PGO it gets `prio -= w`.
@@ -260,13 +267,17 @@ while the globreg itself is being coloured.
 1. **Initial avail** = `AvailPhysRegs[class]`, copied in `GrgNewGlobreg` 10b5b7b0. **[C]**
 2. **Calls.** For an operand of kind 0xb (the register-kill set that a call or OPKILLREGS carries),
    `avail -= kills` for every globreg live at that point (10b1137e..10b11396). This is why call-crossing values
-   lose eax, ecx and edx. If the callee is visible in the same TU, the kill set can be smaller **[I]**: see
-   `MscRecordInterProcRegInfo` in il_pipeline, and the M&B 6.3 / vs2005 "callers see a same-TU callee's
-   register use" levers.
+   lose eax, ecx and edx. If the callee is compiled in the same TU, the kill set is only the registers it writes
+   (`MscRecordInterProcRegInfo` / `LoAddCallScratchRegs`, ltcg.md 3), also in a plain /O2 compile without /GL,
+   and also when the callee is defined *after* the caller (c2 compiles bottom-up). Probe
+   tests/data/rules/RA_callee.cpp: a callee that writes only eax leaves `x` in ecx across the call; a declared-only
+   callee sends it to esi. Same on all four builds. **[C ltcg.md 3; M RA_callee]** This is the M&B 6.3 / vs2005
+   "callers see a same-TU callee's register use" lever.
 3. **Fixed registers.** At a def of a physical register (an operand of kind 1 whose register is in AvailPhysRegs),
    that register is cleared from the avail set of every live globreg. The exception is the source of a
    `mov phys, gr`-class copy: that copy records a preference instead (10b10b8b..10b10bdb, 10b10dd5 ff). At each
-   def of a globreg, `avail -= ` the registers live there (`SbvMinus` 10b11093). **[C op; I operand set]**
+   def of a globreg, `avail -= ` the registers live there (`SbvMinus` 10b11093). **[C op; I operand set: `rasim check` takes each web's avail set from the trace when it
+is queued, so the subtraction is not replayed; open question 2]**
 4. **Globreg–globreg interference** is found by `InsertSplitPoints` 10b13460, which walks the blocks of the
    current range. **[C structure, I precise rule]**
    - At each def of the current globreg, it ORs into `nbrs` the set of globregs live there.
@@ -323,8 +334,9 @@ Probe `tests/data/tieorder.c` (`uv run tools/c2trace.py regs tests/data/tieorder
 | `tf_xblk` | x87 | b 12/23, a 12/11, c 12/8 (13.10: no tie, FPColor's priorities are 6, 5, 5: a 5/11 before c 5/8) | the same across blocks |
 | `tf_blk` with `/arch:SSE2` | XMM | the two tied values: 30/16 then 30/13 → xmm1, xmm2 | the same for class 6 |
 
-The XMM class has no cross-block tie in this probe (its copies give the values different reference counts); the
-rule there rests on the shared code and the in-block tie. **[C code; I for an XMM cross-block trace]**
+The XMM class has no cross-block tie in this probe (its copies give the values different reference counts).
+`tests/data/rules/RA_xmmtie.c` (`/arch:SSE2`) has one: `c` in the entry block and `b` after the `if`, both 28;
+`b` (defOrd 23) pops before `c` (defOrd 8) on all four builds. **[C trace, RA_xmmtie]**
 
 **defOrd** (+0x44) is written by `RewriteAsGlobregs` 10b5ae50:
 
@@ -521,8 +533,9 @@ make them:
    live in (after the label). **[C]**
 5. **`ForceNoAirlocks` 10b1b280**: every enterload (0x295) of the web whose operand has bit 0x80 (an airlock
    load) is deleted and a split point is put at the top of each neighbouring block (BLOCK+0xc list) where the
-   web is live in. **[C code; which side the list is, I]**
-6. `InitialSplitPoints` 10b0ded0, before the first Spillcosts. Not read. **[I: loop boundaries]**
+   web is live in. **[C code]** The list is the successors (3.6.11 item 1).
+6. `InitialSplitPoints` 10b0ded0, before the first Spillcosts. Not read. **[I: loop boundaries; not hooked by
+   `regs`, so a source probe shows only the pieces, not who cut them]**
 
 #### 3.6.6 The split round (`Color` 10b0d270..10b0d330) **[C]**
 
@@ -688,8 +701,8 @@ in all three builds (14.00 / 15.00 / 13.10.3077 addresses):
    15.00 the split-round callers were read and the rest are I]**
 3. **A split round** (`ColProcessSplitGlobregs` 10b11b20 / 510640b0 / 1078b2aa): the parents are linked in
    ascending number (SbvNext over the split set, appended), handed to NewLiveRanges 32 at a time in that order,
-   each parent's pieces taken one after another (one per connected region; their order within one parent, the
-   reverse of the regions' creation order, is I); then RewriteSplitGlobregs walks the blocks forward and takes a
+   each parent's pieces taken one after another (one per connected region; within one parent the newest region
+   first, 3.6.11 item 5 **[C]**); then RewriteSplitGlobregs walks the blocks forward and takes a
    record for each use (and def) of a parent that no piece reaches; **only then** are the parents retired, in the same ascending order. So
    a round's pieces never reuse its own parents' numbers; the next round's do, newest first: the next round's
    first parent takes the previous round's highest parent number. **[C code; trace: parents ascending in every
@@ -716,12 +729,22 @@ and what is on the free list when the round runs.
   with the same statements give the same numbers (splitnum s3, s4). A declarator with an initializer mentions
   the declared variable before its initializer (`int x = a[0] + 1`: x before a, s1); an assignment mentions the
   right-hand side first (`x = a[0] + 1;`: a before x, s4); the parameters came together at the first use of
-  one of them (s1, s4) **[C for these probes; I as a general rule]**. A dead mention counts: `(void)y;` or
+  one of them (s1, s4) **[C for these probes]**. **Not a general rule for parameters** (probe
+  tests/data/rules/RA_recnum.cpp, `regs --export`, `so` events of pass 1, free list empty, the same on all four
+  builds): with locals defined from calls (`int x = g(0); int y = g(1);`) and the parameters used only after
+  them, the parameters still get 1 and 2, before x and y; and their order is neither first use nor the
+  signature: `n_late(a, b)` gives a b, `n_sig(b, a)` b a, `n_ab` (first statement `int x = g(b)`) b a, `n_ba`
+  (first statement `v(b)`) a b, `n_aa` (`int x = g(a)`) b a, `n_expr` (`int x = b + 1`) and `n_glob`
+  (`int x = gx + 1`) b a, `n_vb` (`int x = g(0); v(b);`) a b.
+  Their SYM keys were the same in these variants (`symkeys.py keys`: b 1, a 2), so the key order does not decide
+  it either. **[M; the rule CreateGlobregs follows for parameters is I, not read]** For locals the
+  first-mention order held in every probe. A dead mention counts: `(void)y;` or
   `if (0) y = 0;` before `x = ...` gives y the lower number (s6, s7), so the order is fixed before dead code
   goes **[C]** (by the front end's symbol order **[I]**). A value defined by a call result (`int a = g(1)`) may
   not keep its first-mention number: in t5.c (port1310/p) `a` has 4 although it is mentioned first, and the
   Color-entry free list holds 1 and 3, i.e. records retired before Color (by SubsumeGlobregs merging the call
-  temporary into the variable, **I**). Temporaries the optimizer makes (tNNN) came after the named ones in every probe here. Any
+  temporary into the variable, **I**). Not every call-defined local: in RA_recnum `int x = g(0); int y = g(1);`
+  kept 3 and 4 with an empty free list at Color's entry (next number 5) on all four builds. Temporaries the optimizer makes (tNNN) came after the named ones in every probe here. Any
   extra candidate mentioned earlier shifts everything after it by one, which reorders nothing; reordering two
   first mentions swaps two numbers.
 - *Earlier rounds.* One more record freed late in an earlier round (one more spilled web, one more split
@@ -774,8 +797,8 @@ other `mov esi,[params+16]`: the dword's load goes straight into the variable. W
    - an instruction whose destination points-at set (`pas` operand) may write the candidate takes it out of L, and
      `GrgKillerTuple` 10b5bfe0 empties L (tuples of kind 0x15 or opcode 0x2c1 and a table above it; which IL
      instructions those are was not identified);
-   - at the end of the block, every candidate still in M and not in BLOCK+0x4c (`SbvMinus` at 10b5915b; that +0x4c
-     is the live-out set is **I**, consistent with probe fe) is undone: `UndoRegCandidate` puts the memory operand
+   - at the end of the block, every candidate still in M and not in BLOCK+0x4c (`SbvMinus` at 10b5915b; +0x4c is
+     the live-out SBV, as ColProcessSplitGlobregs uses it, 3.6.11 item 2 **[C]**; consistent with probe fe) is undone: `UndoRegCandidate` puts the memory operand
      back, so its single reference reads memory.
    So **a stretch (from the reload to the next write of the memory or the block end) with exactly one reference has
    no reload web**: `mov t <- s12` stays a load into t's register. With two or more references the reload is a web
@@ -1028,7 +1051,7 @@ preference is for that colour).
 | 10b10c31 | `mov G, S`, S a physical register (use side) | in every pass |
 | 10b10d9c | `lea S, [G + ..]`, S a coloured globreg (def side, base of the address) | in every pass |
 | 10b10e68 | `mov S, G`, S a coloured globreg (def side) | only while G is new (`fl5 & 1`, 10b10e25) |
-| 10b11238 | `mov S, G`, S a physical register (def side) | only while G is new (10b11208), and one of: the operand has `+0x15 & 0x10` (last use **[I]**), its symbol is its own base (`sym+8 == sym`), or `NoOverlappingEnregisterableSyms` 10b1bb90 returns nonzero |
+| 10b11238 | `mov S, G`, S a physical register (def side) | only while G is new (10b11208), and one of: the operand has `+0x15 & 0x10` (last use: the flag of 3.6.11 and 6.1 **[C]**), its symbol is its own base (`sym+8 == sym`), or `NoOverlappingEnregisterableSyms` 10b1bb90 returns nonzero |
 
 Typical sources: `mov gr, eax` after a call, `mov eax, gr` before `ret`, arguments arriving in or leaving through
 ecx/edx (thiscall, fastcall).
@@ -1055,7 +1078,12 @@ meantime becomes a preference even if 4.3 did not make it one (in that same pass
   gets ecx at −1.
 - A value strongly avoids a neighbour's last remaining register: +100·benefit. **[C trace]** 0x00e0a0b0: `t332`
   sees ebp:800 because two neighbours have only ebp left (`mid`, benefit 2, and `p4`, benefit 6); `dst` sees
-  ebp:600 for `p4` alone.
+  ebp:600 for `p4` alone. **[M]** tests/data/rules/RA_lastreg.cpp: a `char` live across calls (avail {ebx},
+  benefit 6) makes every earlier call-crossing value see ebx:600, so the third of them takes **ebp** instead of
+  ebx and the char gets bl; with the value an `int` (`/DINTC`) the third takes ebx and the int ebp. With
+  `/DINTC /Oy-` (no ebp) ebx is the int's last register once esi and edi are taken, so the third value sees
+  ebx:600 too, but ebx is all it has: it takes ebx and the int lives in memory. The term only steers a choice
+  among registers the value has; it never makes a value give up its last one. All four builds.
 - `rasim need SNAP reg:V=R` prints these terms per register under each target (`ebx:400 = +400 ebx is the last
   register left to imm0 (the constant 0) (benefit 4; 100 x benefit), its only register from the start: a byte value
   ...`). M&B 0x4ea290: every value coloured while the immediate candidate `0` (23 references, benefit 4, fl5 & 0x80:
@@ -1074,11 +1102,13 @@ meantime becomes a preference even if 4.3 did not make it one (in that same pass
 - **Def side** (10b13939..10b139bb): X is defined by a copy `mov X, Y`. If Y is coloured it goes on a new-def list
   instead (`ColGetNewDefList`, used by `FlagAsNotReallyLastUse*`). If Y is uncoloured it is added only when it is
   not in the set at `[esp+0x9c]` (the set that is ORed into `nbrs` right after, so the globregs live there **[I]**),
-  or the operand has `+0x15 & 0x10` (last use **[I]**). A copy with `TUPLE+0xa & 0xfff == 1` is skipped when either
+  or the operand has `+0x15 & 0x10` (last use, 3.6.11 **[C]**). A copy with `TUPLE+0xa & 0xfff == 1` is skipped when either
   operand's symbol has `+0x24 & 1` (10b1394f..10b13971; meaning not identified).
 
 So for one copy the relation depends on which side is coloured first: the destination always becomes a partner of
-the source; the source becomes a partner of the destination only if it dies at the copy **[I for "dies"]**. Traces agree: of 13
+the source; the source becomes a partner of the destination only if it dies at the copy **[I for "dies": the last-use flag is C, but the other way in, "not in the set at
+[esp+0x9c]", is not read; not isolated by a probe, because a copy whose source lives on without interfering with
+the destination is removed by copy propagation before Globregs]**. Traces agree: of 13
 globregs listed as an uncoloured partner and coloured later, 1 listed the first one back; in 0x00c7e9a0 `local31`
 lists the already coloured `values`, while `values` (coloured first) had not listed `local31`. **[C]**
 
@@ -1092,7 +1122,8 @@ web has a PREF whose register is still in its avail set, the avail set becomes t
 count; the list is scanned from its head and replaced only by a strictly higher count), benefit becomes 1, and
 SpillOrDefer puts the web back at the **head** of `_SortedGlobregs` (10b0d6a9), so it is popped again at once and
 coloured. One exception is not decoded: `nrefs == 3` with a `lastDef` whose opcode has bit 0x40 in table 10ce1e60
-and whose dst operand has `+0x10 == 0` (10b1b4d3..10b1b4ff) **[I]**. `regs` shows this as a `spill/defer` pop followed by a pop of the same globreg
+and whose dst operand has `+0x10 == 0` (10b1b4d3..10b1b4ff) **[I: the opcode table's bit 0x40 is not decoded;
+seen once, no source probe made]**. `regs` shows this as a `spill/defer` pop followed by a pop of the same globreg
 with a single candidate. Seen once: b250.c pop 3513/3514, an immediate with esi:1 and avail eax ecx edx esi edi
 ebx, coloured esi.
 
@@ -1104,7 +1135,8 @@ ebx, coloured esi.
    `CreateGlobregs` makes one per lifetime.
 2. Split the function into blocks at branch targets and conditional jumps. Calls do not end a block. Give each
    block w = 2^(loop depth) (/O1: 1) and P = the number of distinct globregs referenced in it. Count every
-   globreg, including values that are not live across a call, loop counters, and immediates used more than once.
+   globreg, including values that are not live across a call, loop counters, and immediates used more than once
+   (an immediate used once inside a loop also counts in P, in the loop block and the preheader, 3.2).
 3. prio = Σ 2·refs_B·P_B·w_B − Σ_{live-through, unreferenced} P_B·w_B.
 4. Sort by prio descending. Break ties by defOrd: within a block the earlier def wins; across blocks the later
    block wins.
@@ -1181,7 +1213,8 @@ while the temp is live, or when r is defined bare or clobbered by a call while t
 is live across a call conflicts with eax, ecx and edx**, so it can only be placed by first fit in esi/edi/ebx/ebp
 (or spilled); temps that the rotation serves are exactly those that live between two calls. Not covered by the
 table: a temp defined after a bare physreg's def and still live after that physreg's last use gets no conflict
-with it **[I, from the code; no case seen]**.
+with it **[I, from the code; no case seen: the IL has no source spelling that defines a temp between a bare
+physreg's def and its last use, and none was found]**.
 
 The same walk sets the temp's **preferred register** (`tmp+0x30`), a register symbol or 0:
 - at the temp's def: the instruction is a copy (opcodes 1, 0x11f, 0x1fd, 0x17f, 0x181, 0x125, 0x189) from a
@@ -1434,15 +1467,15 @@ Agreement there is evidence that the algorithm family is the same, and a disagre
 | Lever | Explanation |
 |---|---|
 | M&B 7, "Callee-saved register order", rule 1 (order esi, edi, ebx, ebp; reference-count priority; ties to first defined) | `_IntRegOrder` minus the call kills (2.1, 3.3); prio = 2·refs·P in one block (3.2); defOrd tie-break (3.4). "Ties to first defined" holds **within a block** only. |
-| rule 2 (what counts: `x += y` is 2; `x = q(x)` is a new web; naming a call result adds its copy) | each def and use costs 2 (3.2); one GLOBREG per lifetime (`CreateGlobregs`); the `mov v, eax` after a call is a def reference, and a bare call result is a tmpreg, which is not a globreg **[I for the last part]** |
+| rule 2 (what counts: `x += y` is 2; `x = q(x)` is a new web; naming a call result adds its copy) | each def and use costs 2 (3.2); one GLOBREG per lifetime (`CreateGlobregs`); the `mov v, eax` after a call is a def reference, and a bare call result is a tmpreg, which is not a globreg **[C trace: tests/data/rules/RA_callres.cpp `g(a) - g(b)` has 0 globregs, `int r = g(a); r - g(b)` has 1 (r); the code is the same, the tmpreg kept across the call takes esi by first fit (6.2); all four builds]** |
 | rule 3 (a use under an `if` is worth about 1/2 or 1/3, boundaries a little above the exact fractions) | the P_B factor and the live-through penalty (3.2). Thresholds are exact for this c2 (section 5); the fractions approximate P_arm / P_main |
 | rule 4 (in a switch, each case's values take the free registers in priority order) | webs dead in a case don't occupy its registers; each case's webs are coloured by prio among what is left |
 | rule 5 (the 70 KB interpreter depends on function-wide state, and removing cases changes it non-monotonically) | prio is a sum over **all** blocks: long-lived webs pay −P_B·w_B in every case they pass through unused, P_B depends on every other web in B, and with more than 4 call-crossing webs, deferral and splitting start (3.5) |
 | M&B 6.1 ("whole-function, keyed by internal ids") | whole-function: yes. "Ids": the key is prio, then defOrd (an instruction ordinal); the globreg id breaks only full ties |
 | M&B 6.4 / 6.5 (scratch rotation; a chain from the first temporary; one extra temporary rotates later code) | `_NextIntPos` round robin over eax, ecx, edx, one cursor per function in IL order (section 6) |
-| M&B 6.3, 6.5 "Callee visibility", vs2005 "Callers see a same-TU callee's register use" | call kill sets subtract from avail (3.3.2); a visible callee's smaller kill set leaves eax, ecx or edx available across the call **[I mechanism]** |
+| M&B 6.3, 6.5 "Callee visibility", vs2005 "Callers see a same-TU callee's register use" | call kill sets subtract from avail (3.3.2); a same-TU callee's kill set is the registers it writes (ltcg.md 3), so eax, ecx or edx can stay available across the call, without /GL and whether the callee is defined before or after the caller **[C ltcg.md 3; M tests/data/rules/RA_callee.cpp]** |
 | M&B 7 "naming a global's re-read raises its priority" | the named local is a globreg with more references, while a re-read is a fresh load into a tmpreg |
-| vs2005 "Declaration order of locals moved registers" (`strqlen`) | declaration order itself is not an input. Moving a declaration with an initializer moves the def, which changes defOrd and the block it is in **[I]** |
+| vs2005 "Declaration order of locals moved registers" (`strqlen`) | declaration order itself is not an input. Moving a declaration with an initializer moves the def, which changes defOrd and the block it is in **[C trace, M: tests/data/rules/RA_declorder.cpp, two tied call results: `int x, y;` and `int y, x;` give the same pops and registers; `int y = g(..); int x = g(..);` swaps them (d_ix: x defOrd 18, y 13; d_iy: y 17, x 13); all four builds]** |
 
 ### Contradicted or refined
 

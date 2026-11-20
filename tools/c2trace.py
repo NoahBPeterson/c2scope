@@ -308,7 +308,7 @@ static void dumpil(DWORD t, int max) {
  * Layout (`set`): ext = per-kind word after the operand lists (QUESTION cc, SWITCH default, EH record; cases at
  * ext+4), labtup = label SSR -> its LABEL tuple, brcc = BRANCH condition-code nibble, ehop / ulabop = the
  * opcode numbers of OPPUSHSTATE and OPUSERLABEL. */
-static int LEXT = 0x30, LLABT = 0x33, LBRCC = 0x0a;
+static int LEXT = 0x30, LLABT = 0x33, LBRCC = 0x0a, LFC = 0x18, FCDBG = 0;
 static DWORD OPEH = 0x2db, OPULAB = 0x300;   /* opcode numbers: OPPUSHSTATE (.. OPSETSTATE = +9), OPUSERLABEL */
 static int xdepth;
 static const char *ccname[17] = { "0", "e", "ne", "l", "g", "le", "ge", "b", "a", "be", "ae", "s", "ns", "p", "np", "o", "no" };
@@ -322,12 +322,13 @@ static int ssrname(DWORD s, const char *pre) {   /* front-end symbol (CODEADDR l
     return 0;
 }
 static DWORD labtup(DWORD s) { DWORD l = s ? rd(s + LLABT) : 0; return l && rb(l + 8) == 27 ? l : 0; }
-static void xfconst(DWORD l) {         /* FCONST leaf: 80-bit x87 value at +0x18 */
-    DWORD w[3]; double d;
-    if (!readd(l + 0x18, &w[0]) || !readd(l + 0x1c, &w[1]) || !readd(l + 0x20, &w[2])) { out("?"); return; }
+static void xfconst(DWORD l) {         /* FCONST leaf: 80-bit x87 value at +LFC (`set fcoff`; 14.00: 0x18) */
+    DWORD w[3]; double d; int i;
+    if (FCDBG) { out("raw["); for (i = 0; i < 12; i++) out(i ? " %x" : "%x", rd(l + 4 * i)); out("]"); }
+    if (!readd(l + LFC, &w[0]) || !readd(l + LFC + 4, &w[1]) || !readd(l + LFC + 8, &w[2])) { out("?"); return; }
     __asm fld tbyte ptr w
     __asm fstp qword ptr d
-    out((rd(l + 8) >> 16 & 0xfff) == 4 ? "%.9g" : "%.17g", d);
+    out("%.17g", d);                  /* exact double; c2il.py prints the shortest spelling (and the f form) */
 }
 static int xehinfo(DWORD e) {          /* 1 if e looks like an ehinfo (kind byte 1..15, small state) */
     DWORD k = e ? rd(e + 0x10) & 0xff : 0;
@@ -686,6 +687,8 @@ static void setvar(const char *nm, DWORD v) {
     else if (!strcmp(nm, "mem")) LMEM = (int)v;
     else if (!strcmp(nm, "ext")) LEXT = (int)v;
     else if (!strcmp(nm, "labtup")) LLABT = (int)v;
+    else if (!strcmp(nm, "fcoff")) LFC = (int)v;
+    else if (!strcmp(nm, "fcdbg")) FCDBG = (int)v;
     else if (!strcmp(nm, "brcc")) LBRCC = (int)v;
     else if (!strcmp(nm, "ehop")) OPEH = v;
     else if (!strcmp(nm, "ulabop")) OPULAB = v;

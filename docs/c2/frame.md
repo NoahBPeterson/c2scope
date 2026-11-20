@@ -5,7 +5,8 @@ which ones share a slot, where the /GS cookie goes, and which parameters get a `
 `stack.obj` (`@StkStackAlloc@4` 0x10be8640 and below) plus the /GS code in `misc.obj` (`MscGS*`) and `mdmisc.obj`.
 
 Every claim is tagged **[C]** (read in the code at the cited address, or seen in a traced/probed compile) or
-**[I]** (inferred). "Probe" means a small function compiled with `tools/msvc.py /O2 /FAsc` (sources and listings in
+**[I]** (inferred) or **[M]** (measured with a probe unit `tests/data/rules/RF_*.cpp` on all four builds, 14.00,
+15.00, 13.10.3077 and 13.10.3052; checks in `tests/probes/frame.py`). "Probe" means a small function compiled with `tools/msvc.py /O2 /FAsc` (sources and listings in
 `work/scratch/glass_frame_gs/`, `glass_frame_pk/`, `glass_frame_cl/`, traces in `glass_frame_tr/`).
 "Trace" means `tools/c2trace.py` with hooks at the addresses named.
 
@@ -51,6 +52,9 @@ Read with `docs/c2/il.md` and `src/c2/il.h` (SYM, SSR, FUNC, TUPLE, BLOCK layout
      argument (OPARG/OPMBARG) in a block that dominates the exit (`MdmFlagUnsafeForStackPackParams` 0x10c5ad30);
    - after packing, the slot total of locals not in param homes is < 112 bytes. At 112 or more, all of it is
      undone and redone without param homes.
+
+   13.10 (both builds) differs in the first condition: a /GS function still puts a local in a dead param home
+   (`RF_parhome.cpp` buf: `_x$ = 8`, 14.00/15.00 `_x$ = -16`) [M].
 10. **/O1 only:** FPO is dropped for an EBP frame when the function has more than 4 frame operands (no locals) or
     more than 1 (with locals). [C] `WorthitFPO` 0x10c56260, called from `StackPacking` 0x10be8bf8 only when
     `_Speed == 0`; probe F4/F5/L1/L2 under `/O1`.
@@ -95,7 +99,12 @@ MdmInsertEntryExit();
    - otherwise (/Od): `StkAllocateLocals` 0x10be88e0. This allocates in first-reference order in the tuple stream,
      and temporaries are released at each `OPUSERSTATEMENT` (0x303) and reused (`_Alloc_local` reset to the
      statement start, maximum kept) [C 0x10be8955]. Under /Od the automatics are allocated by
-     `AllocateAutomatics` 0x10becf60 in `_LocalSyms` order [I: not traced].
+     `AllocateAutomatics` 0x10becf60 in `_LocalSyms` order, downward from ebp, each with its own slot (disjoint
+     block locals don't share). That order is **neither declaration order nor first use: it follows the names**
+     (`RF_odorder.cpp`: `y w z x` and `x z w y` declared, `z x w y` first used, give `w x y z` and `w y x z` from
+     ebp-4 down; 16 one-letter names in three shuffled declaration orders keep one fixed order except among
+     `c d r`, whose relative order follows the declarations: a hash table) [M, same on all four builds; the hash
+     itself was not read].
 3. `EhFuncletStackAlloc` when `FUNC.flags & 0x40000`.
 
 `StkInitAllocation` 0x10becc50 (called from `Init` 0x10be8e10 and from the /Od path) [C]:
@@ -126,8 +135,8 @@ returns the new `_Alloc_local`, so the frame grows downward and each call return
 `MdmGSBufferCandidate(FUNC, ssr)` 0x10c511f0 [C]:
 
 ```
-if (FUNC.entry.flags50 & 0x200000)              // a per-function strict mode [I: #pragma strict_gs_check]
-    return (ssr.flags & 0x2100) == 0x2100;
+if (FUNC.entry.flags50 & 0x200000)              // #pragma strict_gs_check(on) [M]
+    return (ssr.flags & 0x2100) == 0x2100;      // any address-taken local [M; bit names not read]
 return ( ((ssr.attr & 0x40000) && ssr.elemSize(+0x63) <= 2)   // array of 1- or 2-byte elements [I names]
          || (ssr.flags & 0x4000000) )                         // aggregate containing such an array [I]
        && ssr.size > 4;
@@ -138,7 +147,12 @@ otherwise `1 + (ssr.flags & 0x4000000 != 0)`, so 2 for a buffer-holding aggregat
 
 Probes [C]: `char b[4]` gives no cookie; `char b[5]` and `short b[3]` give one; `int b[2]` gives none. A
 `struct { char b[16]; }` local gets a cookie, and `struct { int a; int b[8]; }` does not
-(`glass_frame_gs/b.c`: Q4, Q5, Qs3, Qi2, P_struct, P_structint).
+(`glass_frame_gs/b.c`: Q4, Q5, Qs3, Qi2, P_struct, P_structint). The same six on all four builds (13.10 with `/GS`):
+`RF_gsbuf.cpp` q_* [M].
+
+Under `#pragma strict_gs_check(on)` an `int x[4]` and even an address-taken `int x` get a cookie; a function with
+no address-taken local gets none (`RF_gsbuf.cpp` strict_*) [M, 14.00 and 15.00]. 13.10 does not know the pragma
+(C4068) and gives no cookie. Note that 13.10 has /GS off by default; every 13.10 GS row here is with `/GS`.
 
 ### 2.2 Making the cookie
 
@@ -147,7 +161,9 @@ the SSR is class 1 (data), has sclass 1 (auto) or 3 (param), /GS is on, `FUNC+0x
 `entry.flags & 0x480 == 0` and the SSR is a GS buffer, it calls `MscMakeArrayPad` 0x10b9c480. That makes a
 4-byte int local named `__$ArrayPad`, sets `SYM.fl6 |= 4` (never packed), `FUNC.flags |= 2` and
 `FUNC+0x5c = ssr` [C]. A by-value struct parameter that holds a buffer therefore also gets a cookie (sclass 3)
-[C code; I not probed].
+[C code]. Measured (`RF_gsbuf.cpp` sp_buf, sp_bufread: `struct { char b[8]; int n; }` by value) [M]: 14.00 and
+15.00 give it a cookie **and** a `_s$GSCopy$` of the whole struct below the cookie, even when the buffer is only
+read; 13.10 (with `/GS`) gives neither.
 
 ---
 
@@ -156,7 +172,8 @@ the SSR is class 1 (data), has sclass 1 (auto) or 3 (param), /GS is on, `FUNC+0x
 **Where:** entirely in c2. `dop2_InitialOptsAndSetup` 0x10c06890 calls `MscGSShadowPtrParams(FUNC)` 0x10b9b620
 right after `Inline()` and before the global optimizer, when `_Module+0x44c & 0x20000` [C 0x10c06083]. c1xx only
 supplies the type bits it reads. The only string `GSCopy` in all of Bin/ is in c2.dll at 0x10cf9e14, used by
-`MscGSMakeProtectedCopy` 0x10b9baa0 [C, `rg -a`].
+`MscGSMakeProtectedCopy` 0x10b9baa0 [C, `rg -a`]. 13.10's c2.dll (3077 and 3052) has no `GSCopy` string and
+makes no copies: no `$GSCopy$` in any `RF_gsbuf.cpp` function under `/GS` [M].
 
 ### 3.1 Data
 
@@ -198,7 +215,8 @@ set starts as {itself}.
 
 Probe [C]: an `int` parameter that is later cast to a pointer and passed on also gets a copy (`IntCast`:
 `_n$GSCopy$`), while one only passed as `int` does not (`IntPlain`). So pointer-ness comes from any pointer-typed
-SYM in the parameter's equivalence chain [I for the exact chain rule].
+SYM in the parameter's equivalence chain [I for the exact chain rule: a copy kept in a register leaves no trace
+in the listing, so deciding it needs a trace of `MscGSMakeProtectedCopy`].
 
 ### 3.4 One forward pass: `MscGSVisitAllAppearancesFwd` 0x10b9bf70 + `MscGSMarkParamCands` 0x10b9c250
 
@@ -219,8 +237,16 @@ The pass visits every instruction once, in tuple-stream order. It recurses into 
    - a call (`TK_CALL`): the target operand (a function pointer variable), plus argument *i* (0-based) when
      `MscGSCallArgIsVulnerable(call, i)`;
    - an intrinsic (`TK_INTRINSIC`) whose descriptor has flags `0xc800`: every source;
-   - any operand naming a by-value struct param (basetype 6, `ssr.flags & 0x40000000` [I: "contains pointers"]):
-     marked if `ssr.flags & 0x4000000`, or if any member of its chain has `fl6 & 8`.
+   - any operand naming a by-value struct param (basetype 6, `ssr.flags & 0x40000000`): marked if
+     `ssr.flags & 0x4000000`, or if any member of its chain has `fl6 & 8`. **`0x40000000` is not "the declared
+     type has a pointer member"** (the earlier guess): `struct SI { int a, n; }` gets `_s$GSCopy$` when `s.a` is
+     cast to a pointer and stored through (cp_int), and `struct SP { int* p; int n; }` gets none when only `s.n`
+     is read (cp_ptrnouse). What decides is the member used: any use of a pointer member (written through, read
+     through into a global, passed to a call) gives the whole struct a copy (cp_ptr, cp_ptrread, cp_ptrpass), a
+     use of an int member alone does not (cp_intplain). Unlike a pointer param (B3_loadglob), **a read through a
+     struct's pointer member counts** (`RF_gsbuf.cpp`) [M, 14.00 and 15.00; 13.10 makes no copies]. In those
+     probes the copy shows as a dead store `mov _s$GSCopy$[esp+N], eax` of the first member, in a slot shared
+     with the buffer `_b$` (same offset); the uses read the parameter home.
 4. After the pass (`MscGSPropagateVulnerable` 0x10b9ba60): **P is vulnerable iff `P.derived ∩ vulnerable ≠ ∅`.**
    Then a basetype-6 param without `0x40000000`, and the varargs last formal, are reset to 0.
 
@@ -280,7 +306,7 @@ original's `limit_batch_files` (0x406082) loads `[cx+0x20]` and stores through t
 **any caller passing `cx` to it must shadow `cx`** [C for the rule and the original's bytes].
 
 The original compile() holds `cx` in ebx from 0x407db6 to the end and never reloads `[ebp+0x7ac]`. That fits a
-copy living in ebx throughout [I]. Ours copies it into ebx too, spills ebx in the loop and reloads from
+copy living in ebx throughout [I: the original's IL cannot be observed]. Ours copies it into ebx too, spills ebx in the loop and reloads from
 `_cx$GSCopy$` at +0xa8. A spilled non-copied param would reload from its home and need no extra slot, which
 explains our extra 4 bytes (0x828 vs 0x824) [C our listing]. **The lever to look for is what takes ebx in our loop
 (register pressure or priority), not anything that removes the copy.** That also explains why "a local copy of the
@@ -397,9 +423,21 @@ The stack packer never sees C scopes. It sees (a) PAS membership on memory and c
   address-taken (`fl5 & 2`), **size > 16**, and a membership bit at `ssr+0x5f`. It then sets
   `FUNC.flags |= 0x4000000`.
 - `MscRemoveAcyclicScopeEntryKills` 0x10ba2540 deletes those kills again in blocks with `BLOCK+0x16c == 0` (not in
-  a loop [I]).
+  a loop [M]).
 - So only large address-taken block locals inside loops get a lifetime start at each scope entry. Everywhere else
   the forward "defined" set does that job.
+
+Measured (`RF_scopekill.cpp`: `{ B a; ext(&a); } { B b; ext(&b); }`, B an int struct or array of N bytes) [M]:
+
+| N | in a loop, 14.00 / 15.00 | in a loop, 13.10 (both) | not in a loop (all four) |
+|---|---|---|---|
+| 4 .. 16 | two slots (one may be a dead param home) | two slots | one slot |
+| 20, 24, 32, 64 | **one slot** | two slots | one slot |
+
+So in a loop the first local stays live around the back edge unless the kill restarts it, and the kill exists
+only above 16 bytes. 13.10 never shares them in a loop. For a decomp: two same-size block-scoped buffers in a
+loop body that share a slot are > 16 bytes on 14.00/15.00; a 16-byte pair never shares there. (Aside: two
+8-byte address-taken locals in a loop also make the frame 8-aligned, `and esp, -8`; one does not, `RF_align.cpp`.)
 
 What decides whether an address-taken local stays live after its scope is the PAS of later operations, and that
 PAS is computed in interf.obj (`ItfRepairScopes` 0x10b74320 records each local's scope at `SYM+0x34`) [I]. Observed
@@ -420,7 +458,8 @@ number of params, forced to 0 if `FUNC.flags & 0x100` (alloca/setjmp-like intrin
 
 Then for every non-param element E in list order, try each param color c in order:
 - skip c if `E.size > c.size`, or if the function has a cookie (`/GS && FUNC+0x5c`) or GS copies
-  (`FUNC.flags & 1`). So **a function with a /GS buffer never reuses a param home** (H1 with and without `/GS-`);
+  (`FUNC.flags & 1`). So **a function with a /GS buffer never reuses a param home** (H1 with and without `/GS-`;
+  13.10 does reuse one, rule 9 [M]);
 - skip c on a conflict;
 - otherwise E joins c (`members += E; interf |= LiveOnDef[E]; uses += E.uses`) and E is done.
 
@@ -524,7 +563,17 @@ weighted by its uses, prorated when it straddles the window, `StkColorWeightForE
 over no adjustment (15 more in some SEH /Os cases). In a GS function a second candidate puts ebp so that the GS
 buffer colors and the next one fit the window: `min(gsBytes − _Alloc_local + 0x80, T − _Alloc_local − 0x80)`
 rounded to 4. `FUNC+0x4c = _EbpAdj`, and `FixOffsetsForEbpAdj` 0x10bec220 rebiases every frame offset. cl.exe's
-`compile()` (`lea ebp, [esp−0x7a8]`) is this second case [I].
+`compile()` (`lea ebp, [esp−0x7a8]`) is this second case [M by analogy]: in `RF_ebpadj.cpp` (`/O1 /GS`) the
+function with a 400-byte char buffer and three hot ints gets `lea ebp, [esp-288]` with a 416-byte frame
+(13.10: 284 / 412), i.e. ebp = lowest slot + 0x80, so the ints below the buffer get disp8 and the cookie
+`ebp+284`; `compile()`'s 0x828 frame gives 0x828 − 0x80 = 0x7a8 the same way. The same function with an `int`
+array (no GS buffer: the hot ints are already next to ebp) and one with T ≤ 128 get plain `mov ebp, esp` [M, all
+four builds]. The first candidate, measured without /GS (`RA_ebpadj.cpp`, `RA_ebpadj2.cpp`, /O1; regalloc
+agent 2026-11-19): N = 0x78 − 4·(int parameters), so the last parameter sits at `[ebp+0x7c]`: 120 / 116 / 100 for
+0 / 1 / 5 parameters, none at 20; `entry+0x44` acts as the parameter area's size [M for the formula, I for the
+field]. With /GS: a 200-byte buffer gives 108; 512 and 4000 give N = T − 0x80; a 600-byte buffer plus a 400-byte
+int array gives 736, which leaves the scalar just below the buffer at `[ebp+0x80]`, one past disp8 reach (disp32).
+13.10 makes no adjustment for the 512 and 4000 cases (it puts two scalars in parameter homes) [M, all four builds].
 
 ---
 
@@ -578,12 +627,17 @@ M&B `docs/codegen.md` §7 and vs2005 `docs/codegen.md` §2.
 - "A spilled variable keeps one slot for all its webs": elements are base SYMs. Several webs of one variable are
   one element with one slot. Separate variables are separate elements and may or may not share.
 - "Dead references don't count; folded references add no use; use counts are taken before tails are duplicated":
-  counts come from the final post-RA instruction stream. Tail duplication happens later in this phase order [I].
+  counts come from the final post-RA instruction stream. Tail duplication happens later in this phase order [I: not
+  probed; it needs the counts traced against the final listing].
 - "An output dword local must be `uint32_t`, not a 12-byte struct" (size decides the run and the 2× rule);
   "a dword flag must be `int`, not `bool`": a bool/char element is 1-byte aligned and can't share with a 4-byte
   slot (4 > 2·1).
 - `16-byte alignment, and esp,-16`: `FUNC+0x48` caps and raises slot alignment (`allotemp`, `colorElemental`).
-  `StkSetStackAlignment` 0x10bed0a0 sets it [I: not read in detail].
+  `StkSetStackAlignment` 0x10bed0a0 sets it [I: not read in detail]. The effect is measured (`RF_align.cpp`,
+  same on all four builds) [M]: with a `__declspec(align(16))` local (`and esp, -16`) a `double` beside a 12-byte
+  struct lands at -40 (8-aligned); without it at -20 (4-aligned). A single address-taken double in a loop does not
+  raise the alignment; two 8-byte locals (doubles or int pairs) in a loop give `and esp, -8`; the same two outside
+  a loop do not.
 - A 16-byte-aligned local also changes **other** functions: on 14.00 and 15.00 one such function anywhere in the
   unit (or /arch:SSE2) sets the module flag `_FHasMustAlign`, and then no `static` helper gets a register parameter
   in ebx; on 13.10 only the callees of the aligned-local function lose it (f3decomp R850, ltcg.md 2.5) **[C, M]**.
@@ -594,8 +648,9 @@ M&B `docs/codegen.md` §7 and vs2005 `docs/codegen.md` §2.
 - vs2005 "**Stack-slot order in a big function follows the declaration order of hoisted locals**"
   (`handlematch`): declaration order is not an input to the packer [C]. What hoisting changes is liveness
   (scope-entry kills, 4.4) and therefore the colors. Declaration order can still matter indirectly through the
-  register allocator, whose SYM keys follow `getsym` order and decide which variables spill [I]. Expect that
-  permuting the hoisted declarations among themselves is neutral; test before relying on it.
+  register allocator, whose SYM keys follow `getsym` order and decide which variables spill [I]. Permuting
+  hoisted declarations among themselves is neutral in the probes: `RF_declorder.cpp`, three orders of eight
+  spilling ints in a loop and of four address-taken locals of mixed size, identical code on all four builds [M].
 - M&B "escape is interprocedural: a callee defined in the TU lets the temporaries pack": with a local that is read
   after the call, a visible `static __declspec(noinline)` callee did **not** let two block locals share (R3).
   Interprocedural escape may matter only for locals with no later direct reference (as in M&B's `$T` probe), or

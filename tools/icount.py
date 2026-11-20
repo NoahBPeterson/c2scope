@@ -217,7 +217,14 @@ def run(src, func, cl, fine=False, keep=None):
                      "not compiling under wine (--allow-local does)")
         return r
     c2trace.run_remote = guarded
-    kd = keep or os.path.join(c2trace.ROOT, "work", "icount", "k", tsweep.out_name(src))
+    if keep:
+        kd = keep
+    else:   # one directory per run: two runs on one source (other builds, other lanes) must not share it
+        import atexit, shutil, tempfile
+        base = os.path.join(c2trace.ROOT, "work", "icount", "k")
+        os.makedirs(base, exist_ok=True)
+        kd = tempfile.mkdtemp(prefix=tsweep.out_name(src) + "-", dir=base)
+        atexit.register(shutil.rmtree, kd, True)
     try:
         img, hk, rc, out, log = c2trace.run_trace(src, texts, cl, keep=kd, quiet=True, func=func)
     finally:
@@ -679,6 +686,11 @@ class Analysis:
         r["born_as"] = norm(i0)
         ch = self.hist.changes(t, self.final_idx)
         r["history"] = ["%s: %s" % (self.snaps[c].label, new) for c, _, new in ch[-6:]]
+        if b == 0 or s0.name == "Inline":
+            import feshape
+            sh = feshape.shape(i0["text"])
+            if sh:
+                r["fe"] = "%s:%s:-1" % ("fe" if s0.name == "MscRVO" or b == 0 else "fi", sh)
         if b == 0:
             origin = ("front end" if s0.name in ("MscRVO", "Inline") else "first dump (%s)" % s0.label)
             cls = "structure"
@@ -1370,6 +1382,12 @@ def show(rep):
                         print("           history: %s" % h[:200])
             if it.get("why"):
                 print("           why: %s" % it["why"])
+            if it.get("fe") and it.get("verdict", "").startswith("structure"):
+                import feshape
+                found = feshape.lookup(it["fe"])
+                print("           front end: `%s`; removed elsewhere by %s (effectmine mine --want '%s')" % (
+                    it["fe"].rsplit(":", 1)[0], ", ".join("%s %d/%d" % x for x in found) if found else
+                    "no measured mutation yet", it["fe"]))
         if r.get("lever"):
             print("   lever: %s" % r["lever"])
         for c in r.get("cands", []):
@@ -1377,8 +1395,72 @@ def show(rep):
     if rep.get("moved"):
         print("\nmoved (an extra and a missing instruction of the same shape: order, not count): " + "; ".join(
             "%s @%s" % (t, "%x" % w if w is not None else "?") for m in rep["moved"] for t, w in zip(m["ins"], m["where"])))
+    for h in rep.get("hints", []):
+        print("\nflags: " + h)
+    lv = rep.get("lift")
+    if lv and lv.get("error"):
+        print("\nlift: not run (%s)" % lv["error"])
+    elif lv:
+        if lv["self"] < 0.8:
+            print("\nlift: the rules give back only %d%% of our own code here (below 80%%): the original's IL is not "
+                  "shown; `lift.py --show` lists what they miss" % (100 * lv["self"]))
+        else:
+            print("\nlift (the original's code lifted to our IL at Lower's entry; docs/c2/lift.md): %s" % (
+                "%d difference(s)" % lv["n"] if lv["n"] else "no difference the rules can see"))
+            for l in lv["text"].splitlines()[2:]:
+                print("  " + l)
     print("\nverdict classes (runs): " + ", ".join("%s %d" % kv for kv in sorted(rep["classes"].items(),
                                                                                   key=lambda kv: -kv[1])))
+
+
+FP_MEM = re.compile(r"^(fstp|fld) ((?:dword|qword) ptr \[.*\])$")
+
+
+def lift_view(snaps, asm, a):
+    """lift.py on this compile's own data (no compile more): our IL at Lower's entry, our listing, the original's code
+    lifted to the same tokens; the differences at our tuples' source lines (docs/c2/lift.md)."""
+    import io, contextlib, lift
+    low = next((s for s in snaps if s.name == "Lower"), None)
+    if low is None or not a.orig or a.orig.startswith("listing:"):
+        return None
+    func = a.asm_func or a.func
+    code = tsweep.listing_cs_offsets(asm, func)
+    srcl = lift.listing_lines(asm, func)
+    offs = sorted(code)
+    try:
+        src_lines = open(a.src, errors="replace").read().splitlines()
+    except OSError:
+        src_lines = None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r = lift.report(low.lines, [code[o] for o in offs], [srcl.get(o) for o in offs], lift.read_orig(a.orig),
+                        False, src_lines)
+    return dict(self=r["self"], orig=r.get("orig"), text=buf.getvalue(), n=len(r.get("diffs", [])))
+
+
+def fp_hints(an, cl):
+    """Flag-level causes the IL cannot show. /fp:precise rounds every float assignment through its home: `fstp m`
+    and `fld m` of the same slot, where /fp:fast keeps the value on the stack and stores a copy (`fst m`)."""
+    if any(c.lower().startswith(("/fp:fast", "-fp:fast")) for c in cl) or build_key().startswith("13.10"):
+        return []                                   # 13.10 has no /fp switch
+    def trips(ins):
+        out = []
+        for i, s in enumerate(ins):
+            m = FP_MEM.match(s)
+            if m and m.group(1) == "fstp":
+                for t in ins[i + 1:i + 4]:
+                    n = FP_MEM.match(t)
+                    if n and n.group(1) == "fld" and n.group(2) == m.group(2):
+                        out.append((s, t))
+                        break
+        return out
+    ours = trips([an.cs_a(k) for k in range(an.main_end)])
+    if len(ours) <= len(trips([an.cs_b(k) for k in range(len(an.kb))])):
+        return []
+    return ["ours `%s` ... `%s` rounds the value through its home; the original has %s such round trip%s and keeps "
+            "the value on the x87 stack (a copy stored with `fst`, or none). /fp:precise rounds every float assignment "
+            "that way and /fp:fast does not: try /fp:fast (Spore 00d38780; docs/c2/x87.md section 2)"
+            % (ours[0] + ("fewer" if len(ours) > 1 else "no", "s" if len(ours) > 1 else ""))]
 
 
 def main(argv=None):
@@ -1413,6 +1495,11 @@ def main(argv=None):
     an = Analysis(a.func, snaps, asm, a.orig, a.asm_func)
     an.merges = merges if isinstance(merges, list) else []
     rep = report(an, a.show_il)
+    rep["hints"] = fp_hints(an, cl)
+    try:
+        rep["lift"] = lift_view(snaps, asm, a)
+    except Exception as e:                            # a second opinion: never the reason a report fails
+        rep["lift"] = dict(error=str(e)[:200])
     show(rep)
     if a.json:
         json.dump(rep, open(a.json, "w"), indent=1)

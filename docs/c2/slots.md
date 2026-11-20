@@ -5,7 +5,7 @@ support (14.00.50727.762 default, 13.10.3077, 13.10.3052, 15.00.30729.1). `docs/
 14.00 reading of the same code in detail (data layout, liveness, conflicts, param homes, /GS levels); this file
 adds the other three builds, the tool (`c2trace.py slots`, code `tools/c2slots.py`), the replay model and how it was
 validated. Rules carry **[C]** (read in the code at the cited address, or seen in a traced or probed compile) or
-**[I]** (inferred).
+**[I]** (inferred) or **[M]** (measured: a probe in `tests/data/rules/RX_*.cpp`, checked on all four builds by `tests/probes/misc.py`).
 
 ## 1. The rule (all four builds unless a build is named)
 
@@ -63,8 +63,14 @@ Consequences seen in real code (M&B, 13.10.3077, from their probes; each is a ru
   scope) fixed five interpreter cases. (Rules 2, 5.)
 - `else if (a || b) { X }` written as two identical arms: the duplicate arm is merged after packing but counted
   before, so the slot's key and the sort order change (PartyScreen::setup_party). (Rules 3, 7.)
-- A temporary bound to `const float&` packs differently from a named local whose address escapes (inferred: the
-  temporary's conflict set differs). [I]
+- A temporary bound to `const float&` packs differently from a named local whose address escapes: the named local
+  is live over its whole scope (a function-scope one conflicts with the earlier parameters and with every other
+  escaping local of that scope), the temporary only over its full-expression, so `use(a * b); use(a + b);` gives the
+  second temporary `a`'s parameter home and the two named `float t, u` get two new slots. **Correction**: it is the
+  scope, not the temporary: the same named locals each in its own `{ }` block pack exactly like the temporaries.
+  Passing the named local to a `const float&` parameter instead of a pointer changes nothing. All four builds alike
+  [M: `tests/data/rules/RX_cfref.cpp` s_temp, s_named, s_named_ref, s_block; `slots` trace on 14.00 and 13.10.3077
+  shows the conflicts]
 - Frames with T <= 128 and no GS keep creation order (frame.md 4.7). (Rule 7.)
 
 ## 2. Probe addresses per build (hooks key `slots`)

@@ -8,7 +8,8 @@ values exist at `Color` entry: which copies are gone, which expressions share a 
 induction variables are.
 
 **Tags.** **[C]** = CONFIRMED: shown by a probe compile (the probe is named) or read in the code (the address
-is given). **[I]** = INFERRED. Addresses are c2.dll VAs. All probes are in `work/scratch/opt/` and were compiled
+is given). **[M]** = MEASURED on all four builds (14.00, 15.00, 13.10.3077, 13.10.3052) by a probe in
+`tests/data/rules/RO_*.cpp`, checked by `tests/probes/opt.py`. **[I]** = INFERRED. Addresses are c2.dll VAs. All probes are in `work/scratch/opt/` and were compiled
 `/TP /O2` unless a rule says otherwise; `NAME.il` holds the IL of every function of `NAME.cpp` at `@MscRVO@4`
 (c1xx's output), `@GrgIdentifyCandidates@4` (after GlobalOptimize) and `@Color@4`.
 
@@ -50,6 +51,7 @@ Read docs/c2/il_pipeline.md §5.3 to §5.4 (pass order), docs/c2/il_tuple.md (op
    `p->m = ..` kills `p->arr[i]`. **[C]**
    **A pointer that is null-tested and then dereferenced is often loaded twice** (`cmp [mem],0; je; mov reg,[mem]`)
    although nothing kills it: the test and the dereference read it with different IL types (§4 rule 8). **[C]**
+   14.00 and 15.00 only; 13.10 ends with one load (`MdmSuperHack`, §4 rule 8). **[M]**
 6. **`p->next->m = 1; p->next->n = 2;` loads `p->next` twice; with `P* q = p->next;` it is loaded once** (§5
    rule 6). Reading it twice without a store in between gives one load in both spellings. **[C]**
 7. **Dead stores**: a scalar's dead definition is removed across the whole function; a store through a pointer
@@ -80,11 +82,14 @@ Read docs/c2/il_pipeline.md §5.3 to §5.4 (pass order), docs/c2/il_tuple.md (op
     constant trip count otherwise, and by 4 with a remainder loop for float loops of unknown trip count. A float
     loop whose constant trip count has no divisor is unrolled by 8 with a remainder loop. Integer loops with
     unknown trip count, or with a constant trip count above 10 that has no divisor from 6 to 2, are not unrolled
-    (§8.7). **[C]**
+    (§8.7). **[C]** **15.00 differs**: an integer reduction of unknown trip count (`s += a[i]`) is unrolled by 2
+    with two accumulators (port-1500.md; **[M]** tests/data/rules/RO_amode.cpp `am_load`, `am_two`).
 13. **/O1 and /O2 produce the same IL here except for unrolling** (§10). **[C]** (131 probe functions compared.)
 14. **The same constant used twice in instructions that also carry a displacement goes into a register**
     (`xor ecx,ecx; mov [eax+4],ecx; mov [eax+8],ecx`); `mov [eax], imm`, `push imm` and `op reg, imm` never
-    cause it; across a call it takes four uses (§7 rule 5). **[C]**
+    cause it; across a call it takes four uses (§7 rule 5). **[C]** Decided by `Color` (benefit = uses with a
+    displacement - 1) and `CmdPostspill` (a callee-saved register is given back below benefit 3), the same on all
+    four builds. **[C trace][M]**
 
 ---
 
@@ -157,11 +162,21 @@ show its result.
    h(1))` with `t == a` becomes `h(1) + a*2`. This is why a repeated sum is not a common subexpression (§4 rule
    3). A product, quotient or load inside the chain stays one operand. **[C]** (c3 `ce21`: at `@MscRVO@4` the
    second `a + b` is one tuple, at `@GlobalOptimize@4` it is `t64 + a` then `+ b`; c1 `cs01`; c2 `cq02`; (re-verified, C++ game flags: `cs2`). Code:
-   `OptLeftWeightTree` 10bb64b0 **[I]** that this is the function.)
+   `OptLeftWeightTree` 10bb64b0 **[I]** that this is the function: traced, it is entered once or twice per sum in
+   each OptFuncExpr and returns its argument, so a trace of its calls cannot show the reordering.)
+   **[M]** `h(a + b) + (a + b)` is `lea; call; add eax, a; add eax, b` and `h(a * b) + (a * b)` has one `imul`
+   on all four builds (tests/data/rules/RO_flatten.cpp `sum_twice`, `mul_twice`).
 3. **Common factors are pulled out**: `a*3 + a*5` → `a*8`; `a*4 + b*4` → `(a + b)*4`; `x + x` → `x*2`
    (also for loads: `p->m + p->m` → `[p]*2`, one load); `(a & b) + ((a & b) << 3)` → `(a & b)*9`;
    `a[i]*k + k*3` → `(a[i] + 3)*k`. **[C]** (k1 `k24`, `k27`; c1 `cs03`; c3 `ce27`, `ce24`; l1 `lp04`. Code:
-   `OptDistrib` 10bb0bf0, factor.obj `Factoring` 10b251b0 **[I]** for which of the two does each case. (re-verified, C++ game flags: `kf2`, `kf3`, `xx1`, `xx2`.)
+   `OptDistrib` 10bb0bf0, factor.obj `Factoring` 10b251b0.) (re-verified, C++ game flags: `kf2`, `kf3`, `xx1`, `xx2`.)
+   **Which function: Factoring. [C trace]** With `--exit` on both (14.00, RO_flatten.cpp), in the first
+   OptFuncExpr `Factoring` returns a different tree than it was given for `a*3 + a*5`, `a*4 + b*4`, `p[1] + p[1]`
+   and `(a & b) + ((a & b) << 3)`, and returns its argument for sums without a common factor (`sum_twice`).
+   `OptDistrib` returns 0 in all of them except once in `fac_and` (first pass) and once in `fac_common` (second
+   OptFuncExpr, after GlobalOptimize); what it changes there is not decided **[I]**. **[M]** The four results
+   (`a*8`, `(a + b)*4`, one load of `p[1]`, `lea [x+x*8]`) on all four builds; 13.10 writes the powers of two as
+   `shl` (§7 rule 6).
 4. `x << n` is rewritten as `x * 2^n` (`OptShlToMul` 10bb4950); the shift comes back in `Mul2Shift`. **[C]**
    (c3 `ce22`: `OPSHL` and `OPMUL _a 4` in the same function.) (not re-verified)
 5. Because of 3, **`x + x` of a memory value reads memory once** even though a load is otherwise re-read
@@ -219,9 +234,15 @@ reads it.
    Unaffected by EH: copies of a variable (rule 1), reverse copy propagation (rule 3), constant propagation
    (`ehc6`), CSE of expressions and loads (`cs1_e`, `ehc7`: one load, two variables), dead code (`ehd1`), all
    of §5, §6 and §8. The final instructions are usually the same; what changes is that the value is a `Color`
-   candidate (frontend.md describes the consequences for registers). Mechanism **[I]**: GlobalOptimize's SSA
-   pass for EH functions (`SsaDeriveEHWriteThroughScalars`, §12) presumably marks these definitions as
-   write-through, which makes `GoptSingleUseCopyPropLegal` refuse them; not traced.
+   candidate (frontend.md describes the consequences for registers). **[M]** on all four builds
+   (tests/data/rules/RO_ehsu.cpp, `/EHsc`: `_t` is in the IL at `@Color@4` in `su_eh`, gone in `su_ctl` and in
+   `su_after`, where the destructor scope closes before the definition). **Mechanism, corrected [C trace]**: the
+   earlier guess (`SsaDeriveEHWriteThroughScalars` marks the definitions write-through and
+   `GoptSingleUseCopyPropLegal` refuses them) is wrong. Under `/EHsc` `SsaDeriveEHWriteThroughScalars` is not
+   entered at all (14.00), and `GoptSingleUseCopyPropLegal` is never called for `t` in `su_eh`, while it is called
+   once (and returns 1) in `su_ctl` and `su_after`; the same counts on 15.00 (5109db30), 13.10.3077 (107aa742) and
+   13.10.3052 (107b326a). So `t` drops out earlier, in `GoptSingleUseCopyProp`'s own candidate walk (before the
+   legality test); which test there removes it is **[I]**.
 5. **A local used twice stays a variable**, initialised from the expression: `int t = a + b; return h(t) + t;`
    keeps `_t` (and, unlike the spelled-twice form, computes the sum once). **[C]** (c2 `cq06`, `cq10`; c3
    `ce15`.) (re-verified, C++ game flags: `tw1`, `cs10`)
@@ -278,7 +299,8 @@ unless `GoptCantCse` 10b518f0 objects (side effects) or the tuple is marked too 
    flags the tuple instead of deleting it, and invariant code motion copies it instead of moving it): `OPPAREN`;
    a float-to-wider-float `OPCONVERT`; a float `OPLOAD` unless /arch:SSE2 (or /arch:SSE for 4-byte floats);
    conversions of symbols with flag 0x1000000. **[C]** (code) The member-address case of the table is observed
-   (**[C]** c5 `sg09`); which code marks plain `OPADD ptr, const` is **[I]** (not in this function).
+   (**[C]** c5 `sg09`); which code marks plain `OPADD ptr, const` is **[I]** (not in this function; not traced:
+   the mark is a tuple byte that no source spelling isolates).
 5. **A compare repeated on a path where its outcome is known is removed** together with its branch
    (`GoptRemoveRedundantCmp` 10b517a0; compares are handled in sweep 1 too, through `_GoptDoRCE`). **[C]**
    (code; no probe isolates it from branch folding.) (not re-verified)
@@ -306,7 +328,15 @@ unless `GoptCantCse` 10b518f0 objects (side effects) or the tuple is marked too 
    | an `int` member tested and used (`if (p->m) return p->m + 1;`): same type both times | one load | `q1` to `q5`, `g7` |
 
    Why the single-dereference cases are joined after all is **[I]** (in `g9` both loads carry the same hash temp
-   after sweep 1; the zero arm then has an assertion `t130 <- 0`); the table is what was observed. For a
+   after sweep 1; the zero arm then has an assertion `t130 <- 0`); the table is what was observed. **Where it is
+   decided [C trace]**: in `HshBuildTable` itself. At `@GdfInsertArtificialAssigns@4` (just after it) the
+   dereference in tests/data/rules/RO_nulltest.cpp `nt_once` already has the test's number (`t130:2004` and
+   `t130:1004`), while in `nt_twice` both dereferences are `t133`; why the numbering differs stays **[I]**.
+   **Per build [M]** (RO_nulltest.cpp, loads of `c->one`: twice / once / named local / two blocks): 14.00 and
+   15.00 `2 1 1 1`; **13.10.3077 and 13.10.3052 `1 1 1 1`**. 13.10's IL is the same (two loads through `Color`), but
+   its compare is emitted as `mov ecx, [eax+144]; test ecx, ecx` and `MdmSuperHack` deletes the reload into the same
+   register (IL at `@MscClean@4` against `@MdmSuperHack@4`) **[C trace]**. So on 13.10 a `cmp [mem],0` / reload pair
+   does not come from this shape. For a
    decompiler: `cmp [mem],0` followed by a reload of the same pointer does not prove a store, a call or a
    `volatile` in between, and a named local for the pointer always gives one load. Fallout 3 0x00ad1250 and
    0x0044ec70 show the two-load form (§13).
@@ -320,7 +350,8 @@ hash compare) and when `x op= y` becomes one instruction: docs/c2/loadcse.md, wi
 
 The kill rules come from the alias ("points-at") sets built by interf.obj (`ItfBuildInterference` 10b73430) and
 are applied through the hash table's kill lists (`HshUpdateKillVectors` 10b60210, `GoptUpdateAvail` 10b53f60).
-The table is **[C]** by probe; the mechanism is **[I]**.
+The table is **[C]** by probe; the mechanism is **[I]** (from the function names; the kill lists were not traced,
+and the §12 `cq16` trace shows the points-at index also decides which operands are one value).
 
 | between two reads of ... | ... there is | reload? | probe |
 |---|---|---|---|
@@ -358,7 +389,9 @@ Further rules:
    `sg01` to `sg06`.) (re-verified, C++ game flags: `sf1`, `sf2`, `sf4`, `sf5`)
 2. One shape is not forwarded: `int* q = &p->n; *q = 1; return p->n;` stores and reloads (`mov [eax+4],1; mov
    eax,[eax+4]`). `*q` on both sides, or `p->n` on both sides, is forwarded. **[C]** (c2 `cq16`; c5 `sg03`,
-   `sg01`.) Why is open (§12). (re-verified, C++ game flags, all four contexts: `sf3`)
+   `sg01`.) Why: §12 `cq16`. (re-verified, C++ game flags, all four contexts: `sf3`) **[M]** on all four builds,
+   with more spellings (tests/data/rules/RO_fwd.cpp): reloaded also for `int& r = p->n; r = 1; return p->n;` and
+   `int* q = (int*)((char*)p + 4)`; forwarded for `P* r = p; r->n = 1; return p->n;` and `q = &p->m` (offset 0).
 3. **A store that writes the value already there is removed**: `p->m = v; p->m = v;` keeps one store; `p->m =
    p->m;` and `g = g;` disappear. Across a call the second store stays. **[C]** (c3 `ce08`, `ce09`; d1 `ds25`,
    `ds26`. Code: `GoptIsRedundantStore` 10b513a0, called from `GoptCommonSubExpression` for `OPASSIGN`.) (re-verified, C++ game flags:
@@ -380,8 +413,11 @@ Further rules:
 Mechanism: `GdfRemoveDeadStores` 10b36920 walks blocks backwards with live/dead sets (`GdfInstrLiveDead`
 10b36da0); stores through pointers are tracked in a per-block list (`GdfUpdateDeadIndirList` 10b38190,
 `GdfMarkNonDeadIndirs` 10b38140). It runs after every phase that can create dead code (table in §1). Rules are
-**[C]** by probe; that the indirect-store list is per block is **[C]** by probe 6 and **[I]** from the function
-names.
+**[C]** by probe; that the indirect-store list is per block is **[C]** by probe 6 and **[M]** on all four builds
+by tests/data/rules/RO_deadst.cpp `ds_blk`: `p->m = 1; if (c) q->n = 5; p->m = 2;` keeps both stores to `p->m`,
+while the same three stores in one block (`ds_other`) keep one; the store through `q` is not a read in either
+case, so only the block boundary keeps the first store. `ds_same`, `ds_read`, `ds_arms` reproduce rules 4 and 6
+on all four builds.
 
 1. **Scalars: a definition never read is removed, across branches and loops.** `x = a*3; x = a*5` keeps the
    second; a definition overwritten on all paths goes even with a call in one arm (the call stays). **[C]** (d1
@@ -424,8 +460,9 @@ names.
    `GdfInsertAssertions` 10b35240 inserts the facts, `GoptCopyPropagation`/`GoptConstantFold` 10b53290 use them. (re-verified, C++ game flags:
    `kf4`, `ke5`, `keb`.)
 2. **No value-range reasoning in these probes**: `if (a > 10) { if (a > 5) ...` keeps the inner compare.
-   **[C]** (k1 `k18`; (re-verified, C++ game flags: `krg`.) `GoptRangeCmpFold` 10b53b40 exists and is called for compares in sweep 1; what it folds
-   is open (§12).
+   **[C]** (k1 `k18`; (re-verified, C++ game flags: `krg`.) **[M]** on all four builds, identical listings
+   (tests/data/rules/RO_range.cpp: `if (a > 10) { if (a > 5) ..` and `if (a > 10) return a > 5;` keep both compares;
+   `a == 5` folds `a*2` to 10; `a == b` leaves `a - b`). `GoptRangeCmpFold` 10b53b40 is the range-check fold (§12).
 3. **No merge of constants at a join**: `x = 5; if (c) x = 7; return x*2;` keeps `x` as a variable. **[C]**
    (k1 `k14`; (re-verified, C++ game flags: `kj1`.)
 4. **Branches on known conditions are deleted** with their dead arm (`GoptConstantFoldCompareBlk` 10b55460,
@@ -456,8 +493,23 @@ names.
    an earlier `cmp [mem], 0` puts a later run of zero stores "across a call" if a call lies between: `void
    clr3(int c) { if (c) { fr(data); data = 0; cap = 0; n = 0; } }` keeps three `mov [esi+N], 0`, while the same
    three stores right after a call with no earlier use of 0 use `xor eax,eax` (verify v_h.cpp `clr3` against `clr`,
-   `clr4`). **[C]** The thresholds are the outcome of `Color`'s cost for immediate candidates, not of a counter
-   here **[I]**. The member-function variants behave like the plain ones.
+   `clr4`). **[C]** The member-function variants behave like the plain ones.
+   **Where the thresholds come from [C trace; M on all four builds]** (tests/data/rules/RO_imm.cpp; `regs` and a
+   hook in `CmdPostspill`). Two steps, neither in the optimizer:
+   - `Color`: the candidate's benefit is the number of its uses that carry a displacement, minus 1 (the load).
+     `regs`: `im_ab` (offsets 0, 4) benefit 0, `im_nd` (no displacement, 3 uses) -1, both spill/defer; `im_bc`
+     (offsets 4, 8) 1, coloured ecx. Benefit <= 0 is not coloured (regalloc.md 3.6).
+   - `CmdPostspill` (14.00 10c25a90, called at the end of `RegSimpleAssignBody`): for each register of
+     `_IntRegOrder` it spills the register (`SpillReg`, the constant goes back into every instruction) when the
+     word at its register record +0x38 is <= 2. Traced (hook at 10c25abf; 15.00 511fb331, 13.10.3077 1078535d,
+     13.10.3052 10786e7d, same values on all four): eax, ecx, edx and a register holding a variable show 0x1000000;
+     edi holding the constant shows 2 in `im_call3` (3 uses, benefit 2: spilled, listing has three immediates
+     although `Color` gave it edi) and 3 in `im_call4` (4 uses, benefit 3: kept, `mov edi, K`). That the word is
+     the benefit of what the register holds is **[I]** (equal in both probes). So a callee-saved register is kept
+     for a constant only at benefit 3, i.e. four uses with a displacement; a scratch register needs benefit 1.
+   - All rows of RO_imm.cpp (`bc`, `ab`, no displacement, `abc`, memory `add`, `push`, 3 and 4 uses across a call)
+     give the same register/immediate choice on all four builds. **13.10 differs in one detail:** of two
+     memory-destination adds it emits the first as `mov edx, [eax+4]; add edx, ecx; mov [eax+4], edx`.
    **EH state stores count as uses. [C]** In a function with an EH frame the state updates `mov [__$EHRec+8], N`
    (N = 0, 1, 2, ... and -1) are stores of a constant with a displacement and belong to the same candidate as
    the user's own stores of that value: with two stores of -1 before the final state update the listing is `or
@@ -476,7 +528,7 @@ names.
 
    | K | /O2 code |
    |---|---|
-   | 2, 4, 8 | `add eax,eax` once, twice, three times |
+   | 2, 4, 8 | `add eax,eax` once, twice, three times (13.10.3077 and 13.10.3052: `shl eax,1/2/3` **[M]** RO_flatten.cpp) |
    | 3, 5, 9 | `lea eax,[eax+eax*2/4/8]` |
    | 6, 10, 18, 12, 20, 36, 24, 40, 72 | the `lea`, then 1 to 3 `add eax,eax` |
    | 7, 14, 28 | `lea eax,[ecx*8]; sub eax,ecx`, then 0 to 2 `add eax,eax` |
@@ -508,7 +560,9 @@ names.
 
    The kept forms of a constant size are inline moves in the final code too (`mov [eax], ecx; mov [eax+4], ecx`),
    with `test eax, eax` scheduled among the stores and the `je` after them. A constant-size `memcpy` written at the
-   site is a block assignment before c2's first pass (front end or reader [I]); inside an inline helper the size is a parameter when the
+   site is a block assignment before c2's first pass (front end or reader [I]: `RdrMemcpy` 10bd7bf0 is not entered
+   for `memcpy(c, src, sizeof(R))`, `memcpy(c, src, n)` or `*c = *src`, traced unfiltered on
+   tests/data/rules/RO_memcpy.cpp, which points at the front end; c1xx's IL was not read); inside an inline helper the size is a parameter when the
    helper is read, so the intrinsic survives inlining and is only expanded after the assertions. In an original,
    a null test that survives stores through the same pointer means one of the kept forms (icount `folded:nonnull`).
    Applied: F3 0x00422420 (icount.md section 4).
@@ -609,7 +663,11 @@ What the stages do to `s += a[i]` and to `a[i] = b[i]` (**[C]**, `lstage.sh l1 l
    turned back into `[base + i*scale]` **if every use of it can absorb that** (a memory operand, or an add of a
    constant which becomes a displacement). If one use cannot (for example the add of the variable `b - a`), the
    pointer stays (`LoptUndoOplea` 10b48a10 path). **[C]** for the multiplier test and the all-uses loop (read at
-   10b47b74..10b47f09); the exact use rules are **[I]**. Observed **[C]**: the fold happens only when one access is at
+   10b47b74..10b47f09); the exact use rules are **[I]** (§12). Observed per use **[M]** on all four builds
+   (tests/data/rules/RO_amode.cpp, one array, pointer `(i*4) + a`): a load (`s += a[i]`) and a store
+   (`a[i] = i`) fold to `[a+i*4]`; the address used as a value (`out[i] = &a[i]`) or compared with a variable
+   (`&a[i] == e`) keeps a moving pointer and a down-counter (`cmp ecx, esi` on the pointer; for `out[i] = &a[i]`
+   the `out` pointer moves and `a` is `lea [diff+ptr]`). Observed **[C]**: the fold happens only when one access is at
    displacement 0 from a base variable, i.e. the pointer's start value is the plain base (`a[i]`, `a[i] + a[i+1]`,
    `p->pad[i] + p->arr[i]` with `pad` at offset 0, a global array). When every access has a non-zero
    displacement the start value is `base + d`, the pointer stays and `i` becomes a down-counter (verify `iv13b`,
@@ -735,7 +793,7 @@ Probes, **[C]**:
 | call in the body, trip 4 | not unrolled | l3 `ur11`; (re-verified, C++ game flags: `ucall`, `pc1`) |
 | 3×3 nest | inner unrolled completely, outer loop stays | l3 `ur15`; (re-verified, C++ game flags: `unest`) |
 | `do { } while (i < 4)` | **not unrolled**; the same loop written `while`/`for` is | l3 `ur17`, `ur18`; (re-verified, C++ game flags: `udo`, `uwh`) |
-| `int` loops, unknown `n` | not unrolled | l1 `lp01`; l3 `ur14`; (re-verified, C++ game flags: `uin`, `iv1`) |
+| `int` loops, unknown `n` | not unrolled (15.00: a reduction `s += a[i]` is unrolled by 2, two accumulators, **[M]** RO_amode.cpp) | l1 `lp01`; l3 `ur14`; (re-verified, C++ game flags: `uin`, `iv1`) |
 | `float` sum or `a[i] = b[i]*2.0f`, unknown `n` | by 4: guard `n < 4`, main loop with count `((n-4)>>2)+1`, then a remainder loop | l3 `ur12`, `ur13`; (re-verified, C++ game flags: `ufn`) |
 | `r[i] = d[i] * k`, trip 3 (`float`, `double`, global / parameter / member scale, `this->v[i]`), also `for (n = 3; n > 0; --n) *r++ = *d++ * k` | complete, on 13.10.3077, 13.10.3052, 14.00, 15.00 alike | tests/data/rules/R1100_unroll3.cpp |
 | the same loop with exit test `i != 3`, or a pointer end test `r < e` with no integer counter | **not unrolled** (all four builds) | R1100_unroll3.cpp `u_ne`, `u_end` |
@@ -760,8 +818,12 @@ note that "a constant-count loop over 3 floats is not unrolled" came from such a
    re-verified.)
 3. **/fp:strict: no float CSE at all.** `GoptCommonSubExpression` 10b515e0 returns at once for float-typed
    tuples when bit 7 of the function's option word (FUNC+0x1c) is set; under /fp:strict `(a*b) + hf(a*b)`
-   multiplies twice. **[C]** (code and f1fpstrict `cf02`, `cf08`; that bit 7 is the /fp:strict (fenv) bit is
-   **[I]** from this probe.) (not re-verified)
+   multiplies twice. **[C]** (code and f1fpstrict `cf02`, `cf08`.) **Bit 7 is /fp:strict [C trace]**: hook
+   `@GoptCommonSubExpression@12=g10d123ac>0>0x1c` (`_CurFunc`+0x1c) on tests/data/rules/RO_fpstrict.cpp (`CCACHE=0`)
+   reads 0xa01804 under /fp:precise, 0xa11880 under /fp:strict, 0xa00804 under /fp:fast; only /fp:strict sets
+   0x80. **[M]** `(a*b) + hf(a*b)`: one `fmul` and a double temp (`fst QWORD PTR tv`) under /fp:precise, two `fmul`
+   under /fp:strict, one `fmul` and a float temp under /fp:fast, on 14.00 and 15.00. **13.10 has no `/fp:` switch**
+   (D4002, ignored): one `fmul` and a float temp in all three compiles (13.10 computes floats as floats).
 4. /fp:fast: no promotion to double in the IL; the shared product is a float temp (`fst DWORD PTR tv`).
    **[C]** (f1fpfast `cf02`, compiled with `CCACHE=0`, see §12.) (not re-verified)
 5. A double across a call is reloaded like any memory value. **[C]** (c3 `cf04`; (re-verified, C++ game flags: `fl5`.)
@@ -822,7 +884,9 @@ sub-pass.
     test mode and once to rewrite; a use that is an `OPCMP` against a region constant goes through
     `LoptCompareFoldable` 10b48a50, an add of the pointer and a 4-byte value through `LoptFoldToEa` 10b48c40.
     One failing use undoes the candidate (`LoptUndoOplea`). The conditions inside those three helpers were
-    not read. **[C calls, I details]**
+    not read. **[C calls, I details]** What they decide, seen from source (**[M]** RO_amode.cpp, §8.4 step 3): a
+    memory operand absorbs the pointer; a use of the address itself (stored, or compared with a non-constant)
+    does not.
 - **l2 `iv19`: settled.** `LoptFindCandidates` 10b3c730 (mode 1, the strength-reduction search) rejects a
   multiply `t = i * c` when `i` or the destination temp `t` is in `_GoptLoopHoisted` (10d0d7ac; the two
   `SbvTestBit` calls at 10b3c996 and 10b3c9ae, both must be 0 before `LoptAddCandidate`). `_GoptLoopHoisted`
@@ -843,7 +907,8 @@ sub-pass.
     met, and the loop gets a pointer `+= 12`, when the body does not use the element the test loads (`sr9`:
     `add edx,12; cmp [edx],0`), or when the data test sits at the top of the body behind a counted bottom
     test (`i < n && q[i].a`, `if (!q[i].a) break;` under `i < n`: `sr2`, `sr6`). **[C compiles]**
-  - Why the top computation counts as hoistable (which clause of §8.2) was not traced. **[I]**
+  - Why the top computation counts as hoistable (which clause of §8.2) was not traced. **[I]** (needs a trace
+    inside `GoptInvariantCodeMotion`; no source spelling separates the clauses.)
 - **Integer loops of unknown trip count: settled.** The rejecting test is in `LurUnrollDoLoop` 10b95bf0:
   modulo (remainder-loop) unrolling is entered only if `_LurUnrollModuloDoLoops` (10d11384) is set, the cached
   amount is non-zero (`cmp [ebp+0x10],0` at 10b95d4f) **and the loop's count of floating-point operations is
@@ -875,8 +940,11 @@ sub-pass.
     offset 0 (f4: c1xx emits `q = p`, a plain copy, and `q` is replaced by `p` before the sets are computed).
   - For matching: `mov [reg+d], x` directly followed by a reload of `[reg+d]` means the source reached the
     location through two different pointer spellings (a named alias or reference for one, the member
-    expression for the other). Why `q` gets a set different from `p`'s is **[I]** (it is a variable assigned
-    an address expression; `p` is a parameter).
+    expression for the other). Which spellings get a set of their own, **[M]** on all four builds
+    (tests/data/rules/RO_fwd.cpp): a pointer or reference initialised with the base **plus a non-zero offset**
+    (`&p->n`, `int& r = p->n`, `(int*)((char*)p + 4)`) is reloaded against `p->n`; a plain copy (`P* r = p`,
+    `&p->m` at offset 0) is propagated before the sets are computed and forwards. Why `ComputePointsAtSets` gives
+    such a variable its own set is **[I]** (not traced).
 - **`GoptRangeCmpFold` 10b53b40: settled; it is the range-check fold** `lo <= x && x <= hi` →
   `(unsigned)(x - lo) <= hi - lo`. It is called from `GoptOptimizeInstr` 10b4ffb0 for every `OPCMP` in sweep 1
   only (`_GoptDoCSE == 0` and not inside the loop phase), after constant folding. Conditions, all read in
@@ -909,19 +977,22 @@ sub-pass.
 - **`WpaRangeGlobopt` 10c03330** (between `SsaOptimize` and sweep 1): for each `OPCMP` against a constant whose
   other operand has an SSA definition it records a value range (`WpaGenRangeFromAssume`, `WpaSetRange`). What
   uses the ranges without LTCG was not read; it changed nothing in k1 `k18` or in the probes above. **[I]**
+  **[M]** Nothing range-based is folded on any of the four builds (tests/data/rules/RO_range.cpp, §7 rule 2).
 - **`GoptCanonicalize` 10b4a920 (7 KB) and `GoptCleanUp` 10b54570** are described from dumps only.
 - **hash.obj kill lists**: `HshCleanupTypedKillVectors` 10b60120 and `HshCleanupFPKillVectors` 10b5fe50 suggest
   typed kills exist in some mode; the probes show none for int/float in native code.
 - **EH functions.** For SEH functions and C++ EH functions without `-EHs` semantics, GlobalOptimize first runs an
   SSA pass that marks "write-through" scalars (`SsaDeriveEHWriteThroughScalars`). The verification pass probed
-  `/EHsc` functions: §3 rule 4a is the one rule that changes. That this pass is the cause is **[I]**; SEH
-  (`__try`) and `/EHa` are not probed.
+  `/EHsc` functions: §3 rule 4a is the one rule that changes. **This pass is not the cause [C trace]**: it is not
+  entered for the `/EHsc` probe of rule 4a (RO_ehsu.cpp), and the local is dropped before
+  `GoptSingleUseCopyPropLegal` is asked (§3 rule 4a). SEH (`__try`) and `/EHa` are not probed.
 - **Inlined code**: the verification pass ran every rule through a `__forceinline` helper inlined into an EH
   function (`*_i` variants); all behaved like the same body written in place (`*_e`). inline.md covers what the
   inliner leaves.
-- **Null test and dereference (§4 rule 8)**: why the single-dereference cases end up as one load is not traced.
-- **Immediate candidates (§7 rule 5)**: the thresholds are observed; the cost computation is in regalloc_cost.md's
-  territory and was not traced for these probes.
+- **Null test and dereference (§4 rule 8)**: decided in `HshBuildTable`'s numbering (traced); why it numbers the
+  single-dereference case like the test is not read. 13.10 joins the loads later (`MdmSuperHack`).
+- **Immediate candidates (§7 rule 5)**: settled: `Color`'s benefit (uses with a displacement minus 1) and
+  `CmdPostspill`'s limit (a register with value <= 2 is spilled) give the 2-use and the 4-use thresholds (traced).
 - **Loops larger than 100 blocks**, functions with 10000 or more blocks (several sub-passes are skipped), LTCG
   and PGO are not probed.
 - **Tool issue found**: `tools/ccache.py` treats `/fp:...` as an output option (`/Fp`, compared without case),

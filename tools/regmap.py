@@ -15,6 +15,11 @@ original's votes, and a verdict:
   WANTS r   the votes say r (majority)
   mixed     votes for several registers: a split range, or the alignment is off there
 
+Two kinds of difference are not counted as register votes and are reported on their own `#` lines: an address
+with the same registers in the other base/index order (`[edx + edi]` against our `[edi + edx]`: the address's
+operand order), and two nearby instructions (at most four aligned pairs apart) that the original issues the other
+way round (scheduling); the latter are paired crosswise, so their registers are compared with each other.
+
 Every register class the final IL names is covered: integer rows first (the format `rasim want` reads), then XMM
 (Color class 6), MMX, and x87. For x87 the "register" is the stack position ST(i) the value has at each aligned
 instruction (the final IL writes `ST(2)=var`), so a row says whether the original's stack has the value at the same
@@ -146,6 +151,51 @@ def align(ours, orig):
     return pairs
 
 
+MEM = re.compile(r"\[([^\]]*)\]")
+
+
+def addr_order(a_ops, b_ops, rb):
+    """The original's register list with each memory operand's registers put in our order when the two name the same
+    registers in another order (`[edx + edi + 0x30]` against our `[edi + edx + 0x30]`): which value is the base and
+    which the index is the IL's operand order (the CSE temp of the address), not a register choice. Returns
+    (rb, registers whose vote was an order difference)."""
+    ma, mb = MEM.findall(a_ops.lower()), MEM.findall(b_ops.lower())
+    if len(ma) != len(mb) or not ma:
+        return rb, []
+    out, flipped = list(rb), []
+    for x, y in zip(ma, mb):
+        ra = [wide(r) for r in REG.findall(x)]
+        ry = [wide(r) for r in REG.findall(y)]
+        if ra == ry or sorted(ra) != sorted(ry):
+            continue
+        # position of this operand's registers in the whole list: the registers before the bracket
+        pre = len(REG.findall(b_ops.lower()[:b_ops.lower().index("[" + y + "]")]))
+        out[pre:pre + len(ry)] = ra
+        flipped += [r for r, s in zip(ra, ry) if r != s]
+    return out, flipped
+
+
+def reorder(pairs, ours, orig, swapped, window=4):
+    """Two aligned pairs at most `window` pairs apart whose instructions are each other's (ours i = orig j2 and ours
+    i2 = orig j, the same text with registers; other instructions, e.g. x87 ones, may sit between them): the same
+    two instructions issued in the other order, a scheduling difference. Paired crosswise so that their registers
+    vote as equal; each such pair is recorded in `swapped`."""
+    pairs = list(pairs)
+    used = set()
+    for k in range(len(pairs)):
+        i, j = pairs[k]
+        if k in used or ours[i] == orig[j]:
+            continue
+        for k2 in range(k + 1, min(len(pairs), k + 1 + window)):
+            i2, j2 = pairs[k2]
+            if k2 not in used and ours[i2] != orig[j2] and ours[i] == orig[j2] and ours[i2] == orig[j]:
+                pairs[k], pairs[k2] = (i, j2), (i2, j)
+                used.update((k, k2))
+                swapped.append(i)
+                break
+    return pairs
+
+
 def analyse(final, asm, asm_func, orig):
     """Votes per (variable, register class): a name can be an int value in one place and an XMM value in another
     (inlined locals), and the classes never compete for a register."""
@@ -163,7 +213,8 @@ def analyse(final, asm, asm_func, orig):
     where = collections.defaultdict(list)
     agree = collections.Counter()
     order = collections.Counter()           # result votes on a commutative op with the same operands, other order
-    for i, j in align(ours, orig):
+    notes = dict(addr=collections.Counter(), swapped=[])
+    for i, j in reorder(align(ours, orig), ours, orig, notes["swapped"]):
         o = offs[i]
         if o not in ops:
             continue
@@ -171,6 +222,11 @@ def analyse(final, asm, asm_func, orig):
         rb = [wide(r) for r in REG.findall(orig[j][1])]
         if len(ra) != len(rb):
             continue
+        rb, flipped = addr_order(ours[i][1], orig[j][1], rb)
+        for r in flipped:
+            for reg, var in ops[o]:
+                if reg == r:
+                    notes["addr"][var] += 1
         comm = ours[i][0] in COMMUTATIVE and shape(ours[i]) == ours[i][0] + " R,R" and shape(orig[j]) == orig[j][0] + " R,R"
         for reg, var in ops[o]:
             key = (var, rclass(reg))
@@ -192,7 +248,7 @@ def analyse(final, asm, asm_func, orig):
                         break                   # `add eax=t2 <- eax=t1 ebp`: one vote per role, not per position
             if hit or key[1] != "x87":      # an x87 operand the listing leaves implicit (ST(0)) is not a sighting
                 have[key][reg] += 1
-    return have, votes, where, agree, order
+    return have, votes, where, agree, order, notes
 
 
 def sources(log, func, nhooks):
@@ -229,7 +285,7 @@ def sources(log, func, nhooks):
     return out, final
 
 
-def report(have, votes, where, agree, show_all, src=None, order=None):
+def report(have, votes, where, agree, show_all, src=None, order=None, notes=None):
     """A vote disagrees when the original's register differs from ours at that same instruction (so a name
     shared by several inlined locals, or a split range, is judged instruction by instruction). Integer rows come
     first, in the format `rasim want` reads; the other classes follow, each under a `#` header line."""
@@ -273,6 +329,14 @@ def report(have, votes, where, agree, show_all, src=None, order=None):
             print("      from: %s" % (src.get(var, "not found in the trace (an untraced phase)").replace("%s", var)))
     nok = sum(1 for r in rows if r[3] == "ok")
     print("# %d variables checked, %d agree with the original everywhere" % (len(rows), nok))
+    if notes and notes["addr"]:
+        print("# base/index order: %d votes had the same registers in another order inside an address (%s), counted as "
+              "agreeing: which value is the base is the address's operand order, not a register choice (Mount & Blade "
+              "PartyWindow::frame_update: keyed by the CSE temp of the address)" % (
+                  sum(notes["addr"].values()), " ".join("%s:%d" % kv for kv in notes["addr"].most_common(6))))
+    if notes and notes["swapped"]:
+        print("# issue order: %d pairs of nearby instructions the original issues the other way round, paired "
+              "crosswise (registers agree): scheduling, not allocation (c2sched.py, schedwant.py)" % len(notes["swapped"]))
     per = ["%s %d of %d" % (c, sum(1 for r in rows if r[4] == c and r[3] == "ok"), sum(1 for r in rows if r[4] == c))
            for c in CLASSES if any(r[4] == c for r in rows)]
     if len(per) > 1 or (per and not per[0].startswith("int")):
@@ -314,8 +378,8 @@ def main(argv):
     if not final:
         sys.exit("no final IL for %r (compile error?)\n%s" % (a.func, out[-500:]))
     asm = os.path.join(keep, os.path.splitext(os.path.basename(a.src))[0] + ".asm")
-    have, votes, where, agree, order = analyse(final, asm, a.asm_func, tsweep.orig_instrs(a.asm_vs))
-    report(have, votes, where, agree, a.all, src, order)
+    have, votes, where, agree, order, notes = analyse(final, asm, a.asm_func, tsweep.orig_instrs(a.asm_vs))
+    report(have, votes, where, agree, a.all, src, order, notes)
     return 0
 
 

@@ -43,15 +43,22 @@ from image import ROOT
 import c2trace, c2regs, c2scratch
 
 
-def out_name(path):
+def out_name(path, func=None):
     """The per-source variant directory name of tsweep, rwsweep, helpersweep and realize: `<stem>-<hash6>`, the hash
     of the source's directory, so that two agents' v3.cpp in different directories do not share (and rmtree) one
     directory. A stem with capitals also enters the hash: on a case-insensitive file system (macOS) `r2_D.cpp` and
-    `r2_d.cpp` of one directory would otherwise be one directory. All-lowercase stems keep their old names."""
+    `r2_d.cpp` of one directory would otherwise be one directory. All-lowercase stems keep their old names. Another
+    compiler build than 14.00 enters the hash too, so runs of one source on two builds do not share a directory.
+    `func` (rwsweep, helpersweep, realize: one function per run) enters the hash as well: two functions of one unit
+    swept at the same time overwrote each other's base/ and orig/ ("function not register-allocated", 2026-11-20)."""
     stem = os.path.splitext(os.path.basename(path))[0]
     key = os.path.dirname(os.path.abspath(path))
     if stem != stem.lower():
         key += "\0" + stem
+    if c2trace.c2build.table():
+        key += "\0" + c2trace.c2build.name()
+    if func:
+        key += "\0f" + func
     return stem + "-" + hashlib.md5(key.encode()).hexdigest()[:6]
 
 

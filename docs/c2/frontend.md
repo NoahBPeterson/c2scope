@@ -8,7 +8,8 @@ Method: probe functions compiled with the game's flags (`/TP /MT /GS /EHsc /Gy` 
 `c2trace.py il --func '' --at @MscRVO@4,@GrgIdentifyCandidates@4,@Color@4` (docs/c2/tracer.md). `@MscRVO@4` is
 the first hook after c2 has read the function, so its dump is c1xx's output; `@GrgIdentifyCandidates@4` is
 after GlobalOptimize, just before candidate selection; `@Color@4` is allocation. Probes: work/scratch/fe/ (p1..p9).
-**[C]** = shown by these dumps; **[I]** = inferred.
+**[C]** = shown by these dumps; **[M]** = measured on all four builds (14.00, 15.00, 13.10.3077, 13.10.3052) by a
+probe in `tests/data/rules/RE_*.cpp`, checked by `tests/probes/frontend.py`; **[I]** = inferred.
 
 ## What c1xx's IL looks like
 
@@ -30,9 +31,18 @@ after GlobalOptimize, just before candidate selection; `@Color@4` is allocation.
 - **Two reads of the same member** (f03, f04): the optimiser makes one address temporary `t = this+off` at the
   top of the function and loads through it. That temporary is an optimiser temp (no single def recorded), so it
   is a candidate, and it gives `this` an extra reference in that block. Color's FoldTooCheapDefs folds it back
-  into `[this+off]` operands, so it leaves no code. **[C]** for the IL; **[I]** that it never survives to code.
+  into `[this+off]` operands, so it leaves no code. **[C]** for the IL (`t129 = this+4` in the preheader of
+  RE_member_reads.cpp `C::loop` at @GrgIdentifyCandidates@4); **[M]** that it never survives to code: no
+  `lea reg, [this+4]` in `C::two`, `C::twocall`, `C::loop` on any build, the loads are `[esi+4]`/`[edi+4]`.
   By-value and by-reference accessors produced the same IL in this simple probe; in 0x008e7d40 they differ
-  (the f3decomp session's result), so the difference needs calls or aliasing between the reads to show. **[I]**
+  (the f3decomp session's result). **Corrected:** calls or aliasing between the reads are not what shows the
+  difference. A by-value `get()` and a by-reference `getr()` give identical code with a call between the reads, a
+  store through another pointer between them, in a loop with a call, and passed to calls (one or two arguments).
+  They differ only next to a local with a destructor: without `/EHsc` the by-value sum `a + c->get()` is formed
+  after the destructor call (`lea eax, [esi+edi]` after `call ??1E`) and the by-reference one before it; with
+  `/EHsc` that pair is identical but `hp(c->get(), c->y)` loads the two arguments in the other order. The
+  return-value variable of the bullet below is the mechanism. Same on all four builds. **[M:
+  tests/data/rules/RE_member_reads.cpp v_*/r_*, with and without /EHsc; tests/probes/frontend.py]**
 - **A member read in a loop with no call** (f05) is hoisted to the preheader as one load; `this` leaves the
   loop entirely. **[C]**
 - **With a call in the loop** (f07) the load stays in the loop (the call might write it), but the address
@@ -245,7 +255,8 @@ agrees:
   the bit set in **both** `+0x3c` and `+0x40` and clear in `+0x64`, yet the caller's call tuple neither defines
   nor uses the local (`pas15 <-` with no use set; `int x = 5; e4(&x); return x;` is `call; mov eax, 5` with the
   store deleted, callee5.cpp), as callee.md's "Escape" row says. So for a kept pointer the caller goes by
-  `+0x64`, not by the two bits. **[C trace; why the bits are set is I]**
+  `+0x64`, not by the two bits. **[C trace; why the bits are set is I]** (internal: no source spelling separates
+  the bits from `+0x64`)
 
 Why that moves the registers: priorities barely change (`this` 54, `center` 74). The longer `p0` web is still
 uncoloured when `center` is, it interferes with `center`, and esi is the last register it has left. `ChoosePhysReg`

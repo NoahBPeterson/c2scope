@@ -115,7 +115,8 @@ Spec: regalloc.md 4 and 3.3. The neighbour preference is added at 0x10b14c2c and
 Verdict: **holds.** A detail worth knowing, CONFIRMED in R2b: a fixed-register use such as the shift count in cl
 does not show up as a penalty weight. It removes ecx from the avail set of every web live across it (3.3 item 3),
 and the copy source k gets the preference instead. The "+100·benefit for a neighbour's last register" term was
-not exercised by any probe (**untested**).
+exercised since by `tests/data/rules/RA_lastreg.cpp` (regalloc.md 4.2: it steers a choice, never makes a value give
+up its last register) [M].
 
 ## 5. Scratch-register rotation
 
@@ -269,8 +270,25 @@ Verdict: **holds** (CONFIRMED).
 
 - Not exercised by these probes, but tested since: the parameter-home undo (slots.md section 5; test "slots: T >
   128 ... (undo)") and SpillOrDefer / `BetterToDefer` re-queueing (regalloc.md 3.6, `rasim check --predict`).
-  Still not targeted by any probe: ChoosePhysReg's `+100·benefit` term for a neighbour's last free register
-  (implemented in choose.rs) and the EBP adjustment.
-- The P_B accounting for immediates: whether a constant must be used two or more times in the function to become
-  a web was not isolated, only seen in R4a and R1b (INFERRED).
+- Tested since (tests/probes/regalloc.py, all four builds: 14.00, 15.00, 13.10.3077, 13.10.3052, the same result
+  on each unless said):
+  - ChoosePhysReg's `+100·benefit` term (choose.rs `NbrLast`): tests/data/rules/RA_lastreg.cpp. A `char` live
+    across calls has only ebx (benefit 6); the three earlier call-crossing values see ebx:600, so the third takes
+    ebp, not ebx, and the char gets bl. As an `int` (`/DINTC`) the third takes ebx. CONFIRMED (trace and
+    listing; regalloc.md 4.2).
+  - The EBP adjustment (frame.md 4.9): tests/data/rules/RA_ebpadj.cpp, RA_ebpadj2.cpp, /O1. Without /GS
+    (RA_ebpadj2, 40 address-taken ints): `lea ebp, [esp-N]` after `push ebp` with N = 0x78 − 4·(number of int
+    parameters), i.e. the last parameter dword lands at [ebp+0x7c]: 120, 116, 100 for 0, 1, 5 parameters; with 20
+    parameters no adjustment (the worth test). So frame.md's `entry+0x44` acts as the parameter area size here
+    (INFERRED from N). With /GS (RA_ebpadj, a char buffer of NB bytes): NB = 200 gives the same 108 (3
+    parameters); NB = 512 and 4000 give N = T − 0x80 (ebp = esp+0x80 once the frame is allocated, the scalars
+    below the buffer at [ebp-0x80..]) on 14.00 and 15.00 and **no adjustment on 13.10** (which puts two of the
+    scalars in parameter homes); NB = 600 with a 400-byte int array gives 736 on all four builds, which leaves
+    the scalar just below the buffer at [ebp+0x80], just out of disp8 reach (it gets a disp32). CONFIRMED (listings).
+- The P_B accounting for immediates: resolved by tests/data/rules/RA_immweb.cpp. A constant used once outside
+  loops is no web; used twice it is one (counted in P of the two blocks); used once inside a loop it is costed
+  and counts in P of the loop block and its preheader exactly like a parameter in its place would (same
+  priorities as `> k`), but is never popped (immcand.md 2.3). CONFIRMED (trace). Count uses after the optimizer: in
+  an arm of `if (a == 1000)` a use of `a` is a second use of 1000 (constant propagation; seen in a draft of the
+  probe, which therefore tests `a > 1000`).
 - The PAS mechanism behind section 8 (INFERRED; trace 0x10bea457 to confirm).

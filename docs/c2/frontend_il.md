@@ -9,8 +9,10 @@ so they are not worth trying; spellings that differ are listed with the differen
 Companion pages: frontend.md (what c2's early passes do to this IL before register allocation), inline.md (which
 calls c2 inlines), frame.md (stack slots), il_tuple.md (tuple format), tracer.md (`c2trace.py il`).
 
-**[C]** = confirmed: seen in an IL dump or listing of the named probe. **[I]** = inferred. A rule's tag names the
-probe file and function; all probes are in `work/scratch/feil/`.
+**[C]** = confirmed: seen in an IL dump or listing of the named probe. **[M]** = measured on all four builds
+(14.00, 15.00, 13.10.3077, 13.10.3052) by a probe in `tests/data/rules/RE_*.cpp`, checked by
+`tests/probes/frontend.py`. **[I]** = inferred. A rule's tag names the probe file and function; the older probes
+are in `work/scratch/feil/`.
 
 **Independently re-tested** (second agent, fresh probes in `work/scratch/feil/verify/`, C++ at the game flags, as free
 functions, as member functions with neighbouring code and as member functions with an EH frame): rules carrying
@@ -223,7 +225,12 @@ Probes: `cf_if.cpp`, `cf_q.cpp`, `cf_loop.cpp`, `cf_sw.cpp`, `cf_sw2.cpp`, `cf_r
    default in three source orders, and for two cases plus default, as free function, member function and member
    function with an EH frame **[C: verify/v1s.cpp p1 == p2 == p3, t1 == t2 == t3 (re-verified, C++ game flags)]**.
    Since four cases are already a jump table (rule 1.11), a compare-chain switch on dense values never depends on
-   the case order; sparse sets (rule 1.12) were not permuted **[I]**.
+   the case order. Sparse sets (rule 1.12) do not either: cases 1, 100, 1000, 5000 in three orders, and two sparse
+   cases plus default in three orders, give identical code on all four builds. A dense run inside a sparse set
+   that becomes a jump table keeps its bodies in source order (1..4 plus 1000, 5000 permuted: different code on
+   14.00/15.00). 13.10 (both builds) needs five dense values inside a sparse set for a table (four stay a `dec`
+   chain there, so that probe is order-independent on 13.10); a lone dense switch is a table from four values on
+   all builds. **[M: tests/data/rules/RE_switch_sparse.cpp p*, q*, r*; tests/probes/frontend.py]**
    `switch` against the equivalent `if / else if` chain: different IL and different code (`sub eax,1; je` against
    `cmp eax,1; jne`). **[C: cf_sw s1, s2; verify/v1s.cpp t1 against c1, IL and code, all
    three contexts (re-verified, C++ game flags)]** An `else if` chain is the same IL as the nested `else { if ... }`
@@ -312,12 +319,24 @@ Probes: `ex_order.cpp`, `ex_order2.cpp`, `ex_order3.cpp`, `ex_ops.cpp`, `ex_arit
 
    So the reordering is not limited to products and addresses: the operand that is itself a binary operation on a
    call result (multiply, shift, divide, `&`) goes first, and in the last row even `ga() - gb()` is turned round
-   once it has such a sibling. **[C for the rows; I for the wording]**
+   once it has such a sibling. **[C for the rows]**
 
-   **[I]** A product, or an operand that is used as an address, is evaluated before a plain sibling. So in a
-   target, a call order that contradicts left-to-right usually means the calls were operands of one expression;
-   to pin an order use named locals (`int a = ga(); int b = gb(); ...` keeps `ga gb gc`: ex_order3 s6) or
-   separate statements. Argument order (pushes) is never changed.
+   **Wording, measured (RE_call_order.cpp, 34 shapes, `ga() OP X` with X built on `gb()`) [M]:** on 14.00 and
+   15.00 the right operand goes first when the call result in it is wrapped in any non-additive operation:
+   `& | ^ >> << * / %`, `~`, `== <`, a narrowing cast `(char)`, a dereference `*gp()`, `gp()[2]`, `gs()->y`. It
+   stays second when the wrapping is additive: `gb() + 1`, `gb() - 1`, `-gb()`, `gb() + gc()` (`abc`),
+   `gb() - gc()` (`abc`); `gb() & gc()` gives `bca`. A complex left operand keeps its place (`ga()*2 + gb()`,
+   `(ga()&1) + gb()`, `ga()*2 + gb()*2`: `ab`); two plain calls keep IL order (`ga() - gb()`, `ga() * gb()`,
+   `ga() < gb()`). **13.10 (both builds) is different**: with the same IL (left to right, first dump
+   @FgCoalesceLabels@4) it evaluates the right operand first almost always, also for two plain calls
+   (`ga() - gb()`, `ga() * gb()`, `ga() < gb()`, `ga() + (gb() + 1)`, `-gb()`: `ba`; `ga() + (gb() + gc())`: `cba`;
+   `ga() - (gb() - gc())`: `bac`); exceptions found: `ga() + (gb() - 1)` and a complex left operand (`ab`).
+
+   So in a target, a call order that contradicts left-to-right usually means the calls were operands of one
+   expression; to pin an order use named locals (`int a = ga(); int b = gb(); ...` keeps `ga gb gc`: ex_order3
+   s6, and on all four builds RE_call_order.cpp `n_*`) or separate statements. Argument order (pushes, right to
+   left) is never changed by this; inside one argument the operand rule applies (`h2(ga(), gb() * gc())`: `bca` on
+   14.00/15.00, `cba` on 13.10). **[M: tests/data/rules/RE_call_order.cpp; tests/probes/frontend.py]**
 2.5 **Side effects embedded in an expression are pulled out of it** **[C: ex_order2]**:
    - **Assignments, compound assignments and prefix `++`/`--` are executed before the rest of the expression, in
      left-to-right order, and the expression then re-reads the variable.** `h2(g1 = ga(), gb())` is `ga; g1 = t;
@@ -569,8 +588,16 @@ Type words in snippets: `:1004` int/pointer, `:600c` a 12-byte struct ("multi-by
    (re-verified, C++ game flags)]**. The `n5` row is wrong code from the compiler, not a probe artefact: a target
    that shows a loop constructing into the return slot with no destructor call on the back edge has this shape.
 
-   **[C]** for each row; **[I]** that the criterion is "exactly one OPRET and its value is one non-static local"
-   (MscRVO was not read). For a type with a constructor but trivial copy and no destructor the copy is an
+   **[C]** for each row. **Corrected:** the criterion is not "exactly one OPRET and its value is one non-static
+   local" as seen in the tuple stream. `return (h(), r);` (RE_nrvo.cpp `n7`) and `K r(a); h(); return r;` (`n1`)
+   give the same stream at @MscRVO@4 (same tuples, same `OPARG &r` into the copy constructor, same eh flags), yet
+   `n1` is elided and `n7` is not, so the mark MscRVO tests is not printed by `il`. Source-level reading that fits
+   all 13 shapes on 14.00 and 15.00: **elided iff the function has exactly one `return` statement and it is
+   `return r;` (parentheses allowed) naming one non-static local**: `return a ? r : r;`, `return (h(), r);`,
+   `return K(r);`, two locals in disjoint scopes with one `return` each, and two `return r;` all keep the copy;
+   a `switch`, a loop with `break`, a `throw` path or a `goto` before the one return do not matter. **13.10 (both
+   builds) performs no NRVO**: the copy constructor is called in all 13 shapes. **[M: tests/data/rules/RE_nrvo.cpp
+   n1..n13, /EHsc; tests/probes/frontend.py; IL of n1, n2, n6, n7, n13 at @MscRVO@4 on 14.00]** For a type with a constructor but trivial copy and no destructor the copy is an
    `OPMBASSIGN`, and c2 removes it even with two `return r;` (oa_nrvo2 t2 builds in `[ReturnUdt]`), but not with two
    different locals (t3: both built on the stack, 3-dword copy on each path). **[C]**
 9. **Returning a temporary or a call is elided by c1xx itself** (no local exists in the IL): `return K(x);`,
@@ -798,7 +825,10 @@ guarded static vs hand-written flag (rule 34).
 - Execution order of two calls feeding one binary operator, with temporaries (oa_tmp2 t2, t2b, t2c: both
   constructors run before either call): the stream order at MscRVO is not the `/O2` execution order; rule 2.4.
 - Answered (rule 33): the 33rd dynamic static starts a second guard dword. Thread-safety is absent in this
-  compiler (no lock in the IL) **[I]**.
+  compiler: the guard is `mov eax, 1 / test BYTE PTR ?$S<n>, al / jne / or DWORD PTR ?$S<n>, eax` before the initialiser runs, with no
+  `lock`/`xchg` and no helper call besides the constructor and `_atexit` (an unwind funclet clears the bit if the
+  constructor throws). Same on all four builds; 13.10 names the atexit stub `_$E<n>` instead of `??__F`.
+  **[M: tests/data/rules/RE_static_local.cpp f1, f2; tests/probes/frontend.py]**
 - By-value struct parameters larger than 8 bytes with a destructor: who destroys when the callee is inlined
   was not probed.
 
@@ -906,9 +936,11 @@ caller that might inline it. The copies are identical.
     at the exit label, after `OPPOPSTATE`). **[C]** (ob_body `??0C@@QAE@H@Z`, `??0C@@QAE@XZ`,
     `??0C@@QAE@HH@Z`; verify/v3g.cpp: `C::C(int)` with a scrambled list and `C::C(int, int)` with the list in class
     order are one IL class, and the listing calls `??0B`, stores the vptr, then `??0M1` twice: re-verified, C++ game
-    flags.) `x(v)` in the initialiser list and `x = v;` as the first body statement differ only
-    when a class member or the vptr-dependent call order lies between them; for trailing scalars they are
-    the same stream position. **[I]**
+    flags.) `x(v)` in the initialiser list and `x = v;` as the first body statement give the same code exactly
+    when no member declared after `x` is initialised: a later class member (constructed even without an
+    initialiser) or a later scalar in the list puts its code before the body's store, so the code differs. The
+    vptr store does not count: it comes before all members either way (`virtual` class with `x(v)` against
+    `x = v;`: same code). **[M: tests/data/rules/RE_ctor_init.cpp T1..T5, all four builds; tests/probes/frontend.py]**
 11. **vptr stores come after all base constructors and before the first member.** With two polymorphic bases
     both base constructors are called first, then both vptrs are stored (`[this+0] = ??_7C@@6BA@@@`,
     `[this+8] = ??_7C@@6BB@@@`). **[C]** (ob_thunk `??0C`.) c2 may move the store past a later call's argument
@@ -1131,10 +1163,11 @@ declared, in a polymorphic class (rule 12: vptr store); `o.f()` / `(&o)->f()` th
   falling through has one `OPDTORACTION` with flags 0x21 and no `OPPOPSTATE` (`a3`, eh_states `s1`). The
   `OPPUSHSTATE` flags distinguish what was pushed: 1 a named object, 3 a temporary (`a6`; its action has 0x23),
   9 a by-value class parameter (`a9`), 0x101 a catch handler's state (`a4`, `a5`). The flag values are **[C]**
-  as observed; that they are bit sets with these meanings is **[I]**. The conditional-construction flag
+  as observed; that they are bit sets with these meanings is **[I]** (not decidable from source: no spelling
+  changes the flags without changing what is pushed). The conditional-construction flag
   (rule 6) is added after MscRVO; which pass adds it was not traced.
-- Rule 10's last sentence (initialiser list against first body statement for scalars) is inferred, not probed
-  as a pair.
+- Rule 10's last sentence (initialiser list against first body statement for scalars): probed as pairs, now
+  [M] (RE_ctor_init.cpp).
 - The null encoding of data member pointers and comparisons of 12/16-byte member pointers were not probed. The
   `/O2` listing of the unknown-inheritance call (m4) tests `ecx` on entry without loading it, so the IL (d7,
   m4) is the only evidence for that row of the table.
@@ -1188,7 +1221,8 @@ section's COMDAT selection and first symbols). Flags are the game's (`/TP /MT /G
    **[C: fn_inl at both flag sets; verify/v4c.cpp `M::mc1` (`OPMBASSIGN :6010`), `M::mc3` (`OPINTRINSIC`), `M::sl2`,
    and `M::mc1` == `M::mc2` (struct assignment) in code: re-verified, C++ game flags, `/O2` only]** A constant-size `memcpy` and a struct assignment of the same size are
    therefore the same IL at `/O2` **[C for the tuple; the struct side is `c_triv`]**. Whether the expansion is done
-   by c1xx or by c2's reader is not separable with this dump **[I]**; it does not matter for prediction.
+   by c1xx or by c2's reader is not separable with this dump **[I]** (no source probe can separate them; it
+   would take a hook inside `RdrReadProc`); it does not matter for prediction.
 4. **Unreferenced inline functions never reach c2.** An `inline` function, a `static` function, an in-class member or
    a template that nothing references has no `@MscRVO@4` event and no section in the object (`i_unused`,
    `s_unused`, `S::unused_member`, `i_tmpl_unused`). **[C: fn_inl; verify/v4b.cpp: the inline virtual `Vx::v` of a class
@@ -1269,8 +1303,16 @@ concatenates by section name (C).
     **[C: fn_ord2 /O2: `K::K, K::m1, K::m2, ia1, ia2, ib1, leaf0, leaf1, {Imp::Imp, ~Imp, Imp(const Imp&)}, leaf2,
     leaf3, late, uD, K::m3, leaf4, uE, tmpl<int>` then the deferred callers; fn_ord4: `V1::nv, V1::V1, V1::v`
     at the class but `V2::V2, V2::v` (implicit constructor) after `leaf0`, i.e. at `useV2`; fn_ord: `tmpl<int>`,
-    `tmpl<char>` after `u8`, then `$E`/`$F`]** The order of implicit members within one group was constructor,
-    destructor, copy constructor, `operator=` in both probes, not the order of use **[C for these; I as a rule]**.
+    `tmpl<char>` after `u8`, then `$E`/`$F`]** **Corrected:** the order of implicit members within one group is
+    **the order in which the using function first needs them**, and a constructed object needs its destructor at
+    once, so the destructor follows the first constructor that makes a local. Constructor, destructor, copy
+    constructor, `operator=` in fn_ord2/fn_ord4 is just their order of use there. `a = b; Imp c(b); Imp d;` gives
+    `operator=`, copy constructor, destructor, default constructor; `Imp d; Imp c(b); a = b;` gives default
+    constructor, destructor, copy constructor, `operator=`; with and without `/EHsc`, all four builds. The group sits
+    at the using function's source position (between its neighbours) and the user is deferred after its
+    neighbour, as rule 13 says. A global with a destructor defined first in the file still has its `??__E`/`??__F`
+    (13.10: `_$E1`, `_$E2`) last. **[M: tests/data/rules/RE_implicit_order.cpp, plain and /DREV;
+    tests/probes/frontend.py]**
     **Re-verified by prediction (C++ game flags): for verify/v4a.cpp (28 functions: in-class constructor with two
     virtuals, implicit constructor with a virtual, implicit members, two templates, a late `inline`, a `static`,
     a caller-before-callee pair, one global with a destructor) the order was written down from rules 11-13 before
@@ -1308,8 +1350,9 @@ concatenates by section name (C).
       still ends `??__Ega, ??__Egb, ??__Fga, ??__Fst, ??__Fgb`). The earlier wording ("reference their `$F` stubs
       and are still last") suggested they take part; reading the rule that way predicts `??__F` before the deferred
       functions, which is wrong. il_pipeline.md §4.2 has the mechanism: `CgBottomUpOrder` appends functions flagged
-      as dynamic initialisers to a separate list that is concatenated after the others. **[C: order; I: that the
-      `??__F` stubs carry the same flag]**
+      as dynamic initialisers to a separate list that is concatenated after the others. **[C: order; M on all four
+      builds: a global defined first in the file still has `??__E`/`??__F` last, RE_implicit_order.cpp; I: that the
+      `??__F` stubs carry the same flag (mechanism; the order is the same either way)]**
     - **A reference by address counts as a call edge and delays**: `int (*e4())(int) { return adr; }` with `adr`
       defined later is compiled one sweep later, after `adr`. **[C: v4b]**
     - **A function with a static local that has a destructor is deferred by one sweep**, because it takes the
@@ -1320,7 +1363,13 @@ concatenates by section name (C).
       what il_pipeline.md's algorithm gives if the edge ignored as "recursive" is the one that closes the cycle
       when the walk starts from the **last**-defined member (`c3 → c1 → c2`, back edge `c2 → c3`): `c2` then has no
       unplaced callee, `c1` waits for `c2`, `c3` for `c1`. The same reading gives (A) order for a two-cycle.
-      **[C: v4b order; I: the mechanism, `CgIdentifyRecursion` was not traced]** Self-recursion does not delay
+      **[C: v4b order]** **The reading predicts every cycle tried [M]:** the edges from cycle members into the
+      last-defined member are ignored, so the members that call it become leaves; then one sweep per link, a
+      function placed earlier in the same sweep counting as placed. Predicted and observed, identical on all four
+      builds: `c1→c2→c1` `c1 c2`; `c1→c2→c3→c1` `c2 c1 c3`; `c1→c3→c2→c1` `c1 c2 c3`; `c1→c2→c3→c4→c1`
+      `c3 c2 c1 c4`; `c1→c3→c2→c4→c1` `c2 c3 c1 c4`; a 5-cycle `c4 c3 c2 c1 c5`; `c1→{c2,c3}, c2→c3, c3→c1`
+      `c2 c1 c3` (both edges into `c3` ignored). **[M: tests/data/rules/RE_cycle.cpp /DC2../DCC;
+      tests/probes/frontend.py. `CgIdentifyRecursion` itself was not traced.]** Self-recursion does not delay
       (v4b `e2`). A chain `e1 → g1 → g2 → tsq<int>` takes one sweep per link when each callee is defined after its
       caller (`g2`, `g1`, `e1` in sweeps 2, 3, 4). **[C]**
     - In-class members that call each other: `k1() { return k2() + 1; }` declared before `k2` is compiled after
@@ -1667,9 +1716,11 @@ c2 decides, after inlining, from the markers plus what it knows about each remai
     **Checked on Fallout3.exe [C: `verify/f3x.py eh VA`, `verify/f3y.py`]:**
     - 0x00487210 (4 states, esp frame): state 0 is an object (`lea ecx,[ebp-0x24] / jmp dtor`), states 1, 2, 3 are
       three `new` expressions (funclets `mov eax,[ebp+N] / push eax / call 0x00401010`, each with parent 0).
-      Stores: `mov dword [esp+0x38], 0` first, then `mov byte .., 1` between two calls (taken to be the allocation
-      and the constructor **[I]**), `mov byte .., 0` after the second, and the same with 2 and 3: rules 7, 11, 13
-      as written.
+      Stores: `mov dword [esp+0x38], 0` first, then `mov byte .., 1` between two calls, `mov byte .., 0` after the
+      second, and the same with 2 and 3: rules 7, 11, 13 as written. The two calls are the allocation and the
+      constructor: `D x; D* p = new D(a);` compiles to `call ??0D` (x), `mov DWORD .., 0`, `call ??2@YAPAXI@Z`,
+      `mov BYTE .., 1`, `call ??0D@@QAE@H@Z`, `mov BYTE .., 0` on all four builds. **[M: tests/data/rules/RE_new_state.cpp
+      `f`, /EHsc; tests/probes/frontend.py]**
     - 0x00aa2d70 (a constructor, 4 states): state 0 `mov ecx,[ebp-0x10] / jmp` (base, through `this`), state 1 a
       member, states 2 and 3 `new` states with parent 1; first store a zero from a register, then BYTE stores 1, 2,
       1, 3; no store of -1 before the `ret 0xc` (rule 13, "dropped when it can no longer be observed").
@@ -1909,9 +1960,11 @@ direct chain; `p[i+1]` / `(p+1)[i]` / `*(p+i+1)`; `a*2` / `a<<1` / `a+a` and the
   c2 rather than on c1xx code: that the `?:` expansion (1.6) and the switch partitioning (1.12) happen in c2's
   reader. Whether intrinsic expansion (4.3) is c1xx's or the reader's is open.
 - Rule 2.4: the c2 pass that reorders calls inside an expression is bracketed (after the second `OptFuncExpr`
-  entry, before `ItfFuncInterf2`) but not read; the table of shapes is observational and the "product or address
-  operand first" summary is **[I]**.
-- Rule 1.13: independence of a compare-chain switch from case order is shown for two cases plus default only.
+  entry, before `ItfFuncInterf2`) but not read; the table of shapes is observational. The summary is now
+  measured on 34 shapes and four builds and reworded ("non-additive wrapper first"; 13.10 right operand first):
+  **[M: RE_call_order.cpp]**.
+- Rule 1.13: independence of a compare-chain switch from case order: shown for dense and sparse sets
+  (RE_switch_sparse.cpp, four builds).
 - Rule 6.5: when block-scoped locals share stack slots, and how far a block end moves loads in larger functions,
   was not explored; nor was the effect of scope pragmas on register allocation priorities (frontend.md's
   0x00a89680 has no such case).
@@ -1921,7 +1974,7 @@ direct chain; `p[i+1]` / `(p+1)[i]` / `*(p+i+1)`; `a*2` / `a<<1` / `a+a` and the
   OPBLKSTART; <substatement> OPBLKEND; Lelse: OPBLKEND`; the block around a return-value temporary closes
   between the `OPRET` and the `OPGOTO` to the exit, the function body's `OPBLKEND` comes after that `OPGOTO`. The word at pragma +0x20 is the same on a matching pair and
   non-zero exactly for blocks that declare a variable, including the block c1xx wraps around a return-value
-  temporary (`sN = a; OPDTORACTION; OPRET <- sN`). What the word points at is **[I]** (the block's symbols).
+  temporary (`sN = a; OPDTORACTION; OPRET <- sN`). What the word points at is **[I]** (the block's symbols; a tool-internal field, not probed from source).
 - Not probed in sections 1, 2 and 6: `__int64` arithmetic and shifts (helper calls), `long double`, `wchar_t`,
   compound literals, `?:` with mixed types, `switch` on `__int64`, `goto` into a scope, labels-as-values (none in
   MSVC), SEH (`__try`), `setjmp`, and RTTI (`dynamic_cast`, `typeid`).
@@ -2022,7 +2075,8 @@ out `.text`, funclets and handlers, `??__E`, `??__F` as rule 4.15 says; no jump 
   register pressure differs; item 10 above shows the direction in which such claims fail.
 - 5.14's 27 unwind-only functions with an ebp frame are unexplained. The `[I]` parts added by this pass: which
   cycle edge 4.13 ignores, that `??__F` stubs carry the dynamic-initialiser flag, the wording of 2.4's extra rows,
-  and the identification of the allocation call in 0x00487210.
+  and the identification of the allocation call in 0x00487210. All but the `??__F` flag (a mechanism with no
+  source-visible effect) are now [M] by the RE_*.cpp probes on four builds; 2.4's wording was corrected there.
 - Thresholds 3A.15 and 3A.20 were swept on `char` arrays and `int`-field structs with default alignment; structs
   with other member layouts, `/Oi-`, `/O1` and volatile or overlapping operands were not tried.
 - `/OPT:REF` in 4.15 is the linker default without `/DEBUG`; how Fallout 3 was linked is not known, and `/OPT:ICF`

@@ -7,7 +7,7 @@ regalloc_cost.md), instruction order inside a block (sched.md), block order and 
 il_fg.md), frame layout (frame.md), what c1xx hands over (frontend.md).
 
 **Tags.** **[C]** = confirmed: shown by a probe compile, and where an address is given also read in the code.
-**[R]** = read in the code, not probed. **[I]** = inferred. Addresses are c2.dll VAs.
+**[R]** = read in the code, not probed. **[I]** = inferred. **[M]** = measured: a probe in `tests/data/rules/RX_*.cpp` decides it on all four builds (checks in `tests/probes/misc.py`). Addresses are c2.dll VAs.
 
 **Probes.** All in `work/scratch/isel/`. `run.sh FILE /O2` compiles one file and prints a compact listing;
 `out/<file>.O2.fmt` / `.O1.fmt` hold one line per function. `passdiff.py FILE FUNC passA,passB,..` prints, per
@@ -542,8 +542,10 @@ A constant used several times is an immediate candidate (CmdIdentifyImmedCandida
 regalloc_cost.md) and is kept in a register when that pays. At /O2 the observed rule is: each use counts 1 if
 the other operand is a global/stack variable or a memory operand with a symbol or nonzero displacement, 0
 otherwise (CmdSubCost 10c237c0); a register is used when the sum is ≥ 2 **[C for the outcomes: five probes
-here and eight in v_int.cpp / v_int2.cpp (s_00, s_01, s_12, s_gg, s_1000, K::st2, K::st2b, K::st2c); I for the
-mechanism]**. Through `this`, two stores of one constant to members at nonzero offsets therefore already share a
+here and eight in v_int.cpp / v_int2.cpp (s_00, s_01, s_12, s_gg, s_1000, K::st2, K::st2b, K::st2c); M on all four
+builds: `tests/data/rules/RX_constreg.cpp`, 13 forms (pointer offsets 0/1/2, globals, 0, 5, 7, 1000, -1, pushes,
+`this` members, bytes, mixed pointer and globals) agree with the rule on 14.00, 15.00, 13.10.3077, 13.10.3052; I for
+the mechanism]**. Through `this`, two stores of one constant to members at nonzero offsets therefore already share a
 register (`xor eax, eax; mov [ecx+8], eax; mov [ecx+12], eax`; K::st2). Byte stores alone use a byte register:
 three `p[k] = 0` on chars give `xor cl, cl; mov BYTE PTR [eax], cl; ...` (v_int2.cpp st8) **[C]**. So it is not "three stores": `p[1] = 5; p[2] = 5;` → `mov ecx, 5` (1+1), `p[0] = 5; p[1] = 5;` → two
 immediates (0+1), two globals → register (cl.c z10). A pushed constant counts 0, so /O2 never shares a register
@@ -1169,7 +1171,8 @@ was re-tested.
 Additions found on the way: the redundant `and eax, 255` for byte 2 of a signed `*p` (4.3); `xor cl, cl` for
 byte-only constant stores and the two-member case through `this` (7.4); `char s[N] = ""` sizes (10.8); inline
 `strcat` as the source of `rep movsd` + `rep movsb` (10.9); switch tables before the EH funclets (9.7).
-Upgraded from [I] to [C]: the outcomes of the "sum ≥ 2" rule of 7.4 (mechanism still [I]); D5's sign fix.
+Upgraded from [I] to [C]: the outcomes of the "sum ≥ 2" rule of 7.4 (mechanism still [I]; outcomes [M] on all four
+builds, RX_constreg.cpp); D5's sign fix.
 
 **Cross-check against Fallout 3** (`Fallout3_1703.exe`, read-only; `verify/f3scan.py`, `f3find.py`,
 `f3imul.py`). Five sites, each predicted by the rules **[C]**:

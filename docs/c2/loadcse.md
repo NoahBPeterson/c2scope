@@ -5,7 +5,7 @@ it instead, and when `x op= y` on memory becomes one `op [m], y` instead of load
 14.00.50727.762 (default), 15.00.30729.1, 13.10.3077, 13.10.3052. Read opt.md §4 and §5 first (CSE and the kill
 table); this page is the part they did not cover: **which reads have the same value number at all**.
 
-**Tags.** **[C]** seen in the code (address given), in a trace or in a probe compile (probe named); **[I]** inferred.
+**Tags.** **[C]** seen in the code (address given), in a trace or in a probe compile (probe named); **[I]** inferred; **[M]** measured: a probe in `tests/data/rules/RX_*.cpp` decides it on all four builds (checks in `tests/probes/misc.py`).
 Probes: `work/scratch/loadcse/` (`p1.cpp` .. `p8.cpp`; `run.sh FILE` compiles with chosen builds, `lc.sh FILE FUNC`
 runs the tool), the construct table `work/scratch/loadcse/cons/cons.cpp` + `cons.py` (all four builds, counts loads,
 stores and RMWs of `[reg+92]` per function; result in `cons/table.txt`). Regression tests: `tests/data/loadcse.cpp`.
@@ -30,9 +30,12 @@ stores and RMWs of `[reg+92]` per function; result in `cons/table.txt`). Regress
    destination** (directly, or through a chain of the *same* operator: deep_opeq 10c71950). A CSE'd read of the
    location is a temp, not a memory leaf, so **any earlier reuse of the old value blocks the RMW** (M1). `(x & ~1) | 2`
    is a mixed chain and never an RMW (M6). **[C]**
-5. **13.10 forms the same RMWs in the IL but splits many of them back after allocation** (between
-   `dop2_CodegenUpdate` and `dop2_CodegenFinish`): a register source operand (`or [m], reg`), a reused result, a
-   read before it, `volatile`. 14.00/15.00 keep them (and reload the value if it is used again). **[C]**
+5. **13.10 forms the same RMWs in the IL but many come out as load / op / store**: `Riscify` (regalloc.md, 13.10
+   only) splits every RMW after allocation and `Riscify_undo` (dop2_PreEncode, after `Schedule`) puts it back only
+   when the load, op and store are still adjacent. So the split survives exactly where the scheduler moved
+   something into it: a register source loaded just before (`p->m += a`), a constant kept in a register, an
+   `add esp` after a call before it. `volatile` is never an RMW on 13.10 (Opeq does not form it). 14.00/15.00 keep
+   them (and reload the value if it is used again). **[C trace, M: `tests/data/rules/RX_rmw13.cpp`, §3]**
 6. **Fixes, by the rule** (table §4): to make a reload, read through an alias variable with two or more uses, or
    through an inline method of a sub-object that touches the member twice; to make one load, copy a loaded pointer
    into a local (`Q* q = p->q;`) or drop the reference/pointer alias (`rwsweep --families unalias`). To get
@@ -151,7 +154,8 @@ and, in opeq_tuple, requires **[C: decompile of Opeq, opeq_tuple, deep_opeq, ope
    the read a CSE temp (shared with another read: a test, an address computation, the value read into a local), it is
    not a memory leaf and nothing happens (**M1 shared-load**);
 5. on 14.00 and 15.00 a result used again (`p->m += 4; return p->m;`) still gives the RMW, followed by a reload (opeq_tuple
-   makes a new temp and re-reads it: the TupMakeTmpReg / TupReplaceDstMemOpt path; **[I]** that this path is the one); on 13.10 that is load / add / store with the register reused (cons
+   makes a new temp and re-reads it: `TupReplaceDstMemOpt` is called from opeq_tuple (return address 14.00 10c7186c,
+   15.00 511d9722) in `RX_rmw13.cpp` `r_imm_result` and not in `r_imm` **[C trace]**); on 13.10 that is load / add / store with the register reused (cons
    `C11`, `C14`) (**M2 shared-result** is reported where the temp has several uses before Opeq).
 
 | construct (cons.cpp) | 14.00 | 15.00 | 13.10 / 13.10.3052 |
@@ -170,9 +174,16 @@ and, in opeq_tuple, requires **[C: decompile of Opeq, opeq_tuple, deep_opeq, ope
 | `p->m += 4; h(p->m);` (C14) | RMW + reload | same | load/op/store |
 
 The 13.10 split **[C trace]**: on `C4` the tuple `or [t128] <- [t128] t64` is at `@Color@4` and `@dop2_CodegenUpdate@4`;
-at `@dop2_CodegenFinish@4` it is `or edx, ecx` between a new load and store (the tuple keeps its address). Which
-function inside that window does it, and its exact condition, is open **[I]**: it keeps immediate-operand RMWs with no
-other use of the location (C0, C10, C12, C9) and splits the rest seen.
+at `@dop2_CodegenFinish@4` it is `or edx, ecx` between a new load and store (the tuple keeps its address). The pass
+is `Riscify` (regalloc.md "Riscify"): `il --count` on `RX_rmw13.cpp` gives the RMW tuple at `@Riscify@4` and none at
+`@StkSetStackAlignment@4` or `@Schedule@8`, for `r_imm` (`p->m += 4` alone) as well; it is back at `@MdmSuperHack@4`
+(after `Riscify_undo`) for `r_imm`, not for `r_imm_call0_before` (`h(0); p->m += 4;`: `add esp, 4` was scheduled
+between the op and the store) **[C trace]**. **Correction**: the earlier guess "kept for immediate operands with no
+other use of the location" is only what the probes happened to show. Measured on both 13.10 builds (14.00/15.00 form
+the RMW in all of these) **[M]**: kept `p->m += 4`, `&= 0xff00`, `-= 4`, `<<= 2`, `g += 4`, `*q += 4`, `p->m += 4;
+return p->n;`, `p->m += 4; p->n += 8;`, `p->m += 4; h(0);`, a loop of `q->n = i; p->m += 4`; split `p->m += a`,
+`|= a`, `<<= a`, `g += a`, `*q += a`, `p->m += p->n`, `p->n = a; p->m += a`, `h(..); p->m += 4` (any call before it,
+also `h(0); g += 4`), `p->m += 4; q->m += 4` (4 shared in a register), `p->vm += 4` (volatile: no RMW formed).
 
 ## 4. Source constructs that flip a decision (measured on all four builds)
 
@@ -212,8 +223,9 @@ pointer as `{[_p+4]}`) it lists every read: FIRST, REUSED (deleted by sweep 2), 
 base with the alias variable's name, R4 dependent, R5 kill with the call or store, R6 path), its block, hash temp, PAS
 index and the spelling, then the number of reads at Color entry and in the final code. For each store of `X op y`
 it prints FORMED, FORMED + SPLIT after allocation (13.10), or NOT FORMED with M1..M6. Pairs use dominators when the dump
-has branch targets (the 14.00 extended dump); on 15.00 and 13.10 (plain dump, no targets) they are paired in stream
-order and the output says so, so a read in a sibling arm can be shown as R5/R6 where it is simply on another path.
+has branch targets (the extended dump, on all four builds since 2026-11-19); with a plain dump (`il --plain`, or a
+compile server with an older c2trace.dll) they are paired in stream order and the output says so, so a read in a
+sibling arm can be shown as R5/R6 where it is simply on another path.
 
 Example (14.00, p4 `c`; F3 0x006bd9c0's shape):
 
@@ -249,7 +261,6 @@ lea ecx,[ecx]`, our listing has `npad 14`, and bdiff keeps the first `jmp` as an
 
 - Why ComputePointsAtSets splits the alias class of a loaded pointer's dereferences per storing block (R2 mechanism),
   and the exceptions (p6 `c3`: a call between read and store keeps one class).
-- The 13.10 RMW split: the function in `dop2_CodegenUpdate`..`dop2_CodegenFinish` and its exact condition.
-- 15.00 and 13.10 dumps carry no branch targets, so loadcse.py pairs reads in stream order there.
+- (Settled: the 13.10 RMW split is Riscify + Riscify_undo, §3.)
 - Address-temp folding into a compare (F3 0x00ab47e0) and load folding of a single-use guard (M&B 0051d7c0) are
   allocation/lowering decisions not covered here.

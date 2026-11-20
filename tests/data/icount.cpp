@@ -42,3 +42,11 @@ void tail_orig(int a, int* p) { if (a) { h(1); p[1] = 7; p[2] = 8; } else { h(2)
 // structure: the original has a statement ours lacks
 void stmt_ours(P* p) { p->a = 1; h(0); }
 void stmt_orig(P* p) { p->a = 1; p->b = 2; h(0); }
+
+// flags hint (/fp:fast): under /fp:precise ours rounds f through its home (fstp / fld); the original, compiled with
+// precise semantics off (as /fp:fast would), keeps f on the x87 stack. No hint on 13.10 (no /fp switch).
+float fp_src();
+int fp_ours() { float f; if ((f = fp_src()) >= 0.5f) return 1; if (f >= -0.5f) return 2; return 3; }
+#pragma float_control(precise, off, push)
+int fp_orig() { float f; if ((f = fp_src()) >= 0.5f) return 1; if (f >= -0.5f) return 2; return 3; }
+#pragma float_control(pop)

@@ -39,6 +39,9 @@
   "len": "16",
   "mem": "2c",
   "fename": "1",
+  "ehop": "2ad",
+  "ulabop": "2d0",
+  "fcoff": "16",
   "fpdump": "1"
  },
  "functions": {
@@ -636,7 +639,7 @@
    "107eb98d=edi",
    "10710baf=esi,esi>0xc,esi>0x40,esi>0x24,esi>0x44,esi>0x1c,esi>0>0x1c,esi>0>4,esi>0>0>4$"
   ],
-  "il_spec": "=g10881d70>0>0>4$,g10881d70>0>8>0>0x1c%",
+  "il_spec": "=g10881d70>0>0>4$,g10881d70>0>8>0>0x1c%+",
   "il_default": [
    "@dop2_PreLowerGlobalOpts@4",
    "@dop2_Codegen@4",

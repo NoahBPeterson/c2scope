@@ -4,8 +4,9 @@ How c2.dll (cl 14.00.50727.762) decides **which web gets a register first**, **w
 **which webs it spills**. Everything was read from the code, and most of it was also checked with traced compiles
 (`tools/c2trace.py`, see [tracer.md](tracer.md)). Data layouts follow [il.md](il.md) and `src/c2/il.h`.
 
-Each rule is tagged **[C]** (CONFIRMED: read in the code, or seen in a traced or plain compile) or **[I]**
-(INFERRED). Addresses are c2.dll VAs.
+Each rule is tagged **[C]** (CONFIRMED: read in the code, or seen in a traced or plain compile), **[M]** (measured
+with a probe on all four builds: 14.00, 15.00, 13.10.3077, 13.10.3052) or **[I]** (INFERRED). Addresses are c2.dll
+VAs.
 
 Source modules: the Chow-style priority colorer is **color.obj** (`Color`, `Spillcosts`, `SpillOrDefer`,
 `OrderGlobregs`, `SubsumeGlobregs`, `RemoveSplitGlobregs`, `ChoosePhysReg`, ...). The task text puts the last three
@@ -14,7 +15,8 @@ in globregs.obj, but the PDB puts them in color.obj. **globregs.obj** finds cand
 temporaries after coloring. **fpreg.obj** maps the x87 virtual registers GF0..GF7 onto the x87 stack.
 
 Probe sources and the trace driver are in `work/scratch/glass_rcost_p1/` (`t.c` to `t7.c`, `run.sh`). Decompiles
-are in `work/scratch/glass_rcost_*.txt`.
+are in `work/scratch/glass_rcost_*.txt`. Rule probes run on all four builds are `tests/data/rules/RC_*.cpp`, checked
+by `tests/probes/regalloc_cost.py` (listings, plus `regs` traces where the deciding number is a priority).
 
 ---
 
@@ -52,9 +54,9 @@ considers only base SYMs (`sym->base == sym`, kind != 0x10) [C]:
 
 | SYM kind | Candidate? | Notes |
 |---|---|---|
-| 3 tmp | yes if `+0x14 == 0` (no single def recorded? [I]); otherwise excluded | clears `fl6 & 2` |
+| 3 tmp | yes if `+0x14 == 0` (no single def recorded? [I]: an internal field, no source form isolates it); otherwise excluded | clears `fl6 & 2` |
 | 4 auto, 5 param | yes. If `fl5 & 2` (address taken) is set it becomes an *aliased* candidate, like a global | |
-| 7, 8 global | yes, as *aliased* candidates (set `_GrgBvAliasedCands`) | these get memory loads and stores around regions [I] |
+| 7, 8 global | yes, as *aliased* candidates (set `_GrgBvAliasedCands`) | they get a load before and a store after the region [C traced][M] `RC_global.cpp`: in `gl_loop` (`G += i`, no call) `G` is a kind-7 web colored edx, loaded before the loop and stored after it; with a call in the loop (`gl_call`) its benefit is -4 and it is spilled, so `add [G], esi` stays in the loop. All four builds |
 | 10 func | only if `SSR+0x37 & 0x400` and not `& 0x4000`, and the member size is 4 | |
 | others | excluded (`__GrgExcludeSymCount++`) | |
 
@@ -69,7 +71,9 @@ function (`Globregs` 0x10b56490), or a recycled record from `_FreeGlobs`. It is 
 from `_ImmedHashTable`) whose record count `+0x14 < 1` are removed first [C].
 
 **Web numbering is therefore: SYM key order, then lifetime order inside a SYM.** This is the "internal id"
-that the empirical docs see in distant ties [C for the order; I that it is the only source].
+that the empirical docs see in distant ties [C for the order; I that it is the only source]. It does not decide
+the coloring order: `InsertInList` keys on priority and `defPos` only, and swapping two declarations moves no
+register (`RC_decl.cpp`, section 9) [M]. Whatever the web number feeds lies outside this module.
 
 ---
 
@@ -118,6 +122,8 @@ typedef struct GLOBREG {        /* "web"; GrgNewGlobreg 0x10b5b7b0 */
 } GLOBREG;
 ```
 
+The [I] field meanings above are left unprobed: they are internal flags with no isolated source-level effect.
+
 ---
 
 ## 4. Spillcosts: the priority and spill-cost formulas
@@ -146,6 +152,10 @@ Traced [C] with `t2.c`/`t3.c` at /O2:
 
 At /O1 the loop body block also has w = 1 [C, t2.c `/O1`].
 
+All four builds weight the loop body w = 2 at /O2 (`RC_loopw.cpp`, t2.c `loopw`, traced `regs --why b`) [C traced].
+13.10 makes fewer immediate candidates there (5 webs against 8), so its P values are lower: b's terms are
+`1*5*2 + 2*3*2` on 14.00/15.00 and `1*4*2 + 2*2*2` on 13.10.
+
 ### 4.2 Per-reference cost `c` [C]
 
 For an operand that is a web of the class being colored (`opnd.kind == 1`, `RegClass[ty] == k`):
@@ -170,7 +180,8 @@ For an operand that is a web of the class being colored (`opnd.kind == 1`, `RegC
 
 `fa08` (0x10d0fa08) is "ebp is allocatable", that is, the frame is FPO and esp-based. It is cleared when
 `FUNC+0xac & 0x20000000` is set or `& 0x40` is clear (`RegSimpleAssignBody` 0x10bda2a0) [C]. **So the /O1 costs are
-encoding bytes**: an esp-relative frame access needs one extra SIB byte, and an absolute address takes 6 bytes [I].
+encoding bytes**: an esp-relative frame access needs one extra SIB byte, and an absolute address takes 6 bytes [I:
+an interpretation of the constants, which are [C]; no probe can show their intent].
 
 In practice, at /O2 **every reference of an ordinary variable costs 2**. The traced `t4.c` shows +2 for each use,
 def and enterload [C].
@@ -214,8 +225,11 @@ Traced checks (all exact, [C]):
 function and goes up by one for every real instruction. Blocks are visited in block-list order, but each block is
 walked **from its last instruction back to its first**. Each def stores the counter, and later defs overwrite it,
 so the value that remains is the def visited last [C].
-- Within one block, a smaller source position gives a *larger* `defPos`.
-- With defs in several blocks, the def in the block that comes latest in the list wins [C code; not probed].
+- Within one block, a smaller source position gives a *larger* `defPos`. `RC_tie.cpp` `ti_blk`: a, b, c (prio 18 each) get
+  esi, edi, ebx in def order [C traced][M].
+- With defs in several blocks, the def in the block that comes latest in the list wins. `RC_tie.cpp` `ti_xblk`:
+  a, c (entry block) and b (after an `if`) all have prio 12; b (defPos 34) pops first and takes esi, then a (13)
+  edi, then c (9) esi again [C traced][M], all four builds.
 - Split webs copy the parent's `defPos` (`RewriteSplitGlobregs` 10b10000.c:2601) [C].
 
 ### 4.4 Where "1/2 under an if" comes from
@@ -272,7 +286,10 @@ and a colored web or physical register (Spillcosts 10b107e9..10b1085a, 10b10dd5)
 
 **Calls.** A call's clobbered physical registers are removed from the `avail` set of every web live at the call
 (Spillcosts' physreg and kind-11 operand paths). A web that lives across a call therefore takes the first free
-register of **esi, edi, ebx, ebp**. Traced in t.c, t2.c and t3.c [C].
+register of **esi, edi, ebx, ebp**. Traced in t.c, t2.c and t3.c [C]. That holds for a callee the unit does not
+define. A callee defined anywhere in the same unit (static or extern, above or below the caller) kills only the
+registers it uses: in `RC_callee.cpp` `leaf` uses only eax, and the two values live across it take **ecx and edx**
+(their cands start at ecx); with `leaf` only declared they take esi and edi [C traced][M], all four builds.
 
 ---
 
@@ -315,7 +332,8 @@ are rebuilt [C].
 - The def counts it uses (`+0x24`) are reset to 0 at the end, so they do not carry into Spillcosts.
 
 So a copy that is coalesced away adds no references, and a copy that survives adds a use of `src` and a def of
-`dst` [I for the M&B "named value counts 4" case].
+`dst`. `RC_copy.cpp` `cp` (`int b = a; a = g(a); ... u(b)`): the copy survives; a's first web has 3 refs (its def,
+the copy, the call argument) and b has 3 (the copy and two uses), prio 18 each [C traced], all four builds.
 
 ---
 
@@ -357,13 +375,18 @@ The trace of `t6.c` shows the position moving across picks (edx, then back to ea
   1. It rebuilds the flow graph and runs `PerformPreMappingPeepholes`, `BuildLiveOnEntryAndExitSets` and
      `SetGFxLifeAndDeath`, then `FgWeightFlowGraph` (no PGO).
   2. It processes blocks from a worklist (`InitializeFunctionBlockList` seeds the blocks with no predecessors
-     [I]). For each block it copies the entry stack model and runs `ProcessBlock`. `ProcessBlock` dispatches each
-     instruction through the handler table at 0x10d08fe8 (`processEgFADD`, `processFMOV_*`, `processCALL`, ...),
-     which raise sources to ST0 with `fxch` and pop dead values.
+     [I]: in source-level code only the entry block has none, so no probe separates this). For each block it
+     copies the entry stack model and runs `ProcessBlock`. `ProcessBlock` dispatches each instruction
+     through the handler table at 0x10d08fe8 (`processEgFADD`, `processFMOV_*`, `processCALL`, ...), which raise
+     sources to ST0 with `fxch` and pop dead values.
   3. `FinalizeBlock` pushes `fldz` for GFx registers that must be live on exit and are not. Then, for each
      successor whose entry layout is already fixed, `BalanceBlockWithConstraint` adds `fxch`s
      (`InsertExitToEntryAdjustments`). Otherwise it passes its exit layout on as the successor's entry layout
-     (`PropagateBlocksLiveOnExit`). So **the first block to reach a join sets the stack order there** [I].
+     (`PropagateBlocksLiveOnExit`). So **the first block to reach a join sets the stack order there**; after a
+     two-way branch that is the fall-through arm (x87.md 11). `RC_x87join.cpp` `j1`: the fall-through arm does
+     `fxch ST(1)` to store x, and that layout holds at the join; the taken arm stores y from ST0 and then gets the
+     `fxch ST(1)` on its edge [M], 14.00 and 15.00. 13.10 has no `X87MapGFxToSTx` (tools/c2x87.py): its arms use
+     `fld ST(1); fstp` and plain `fst` and need no fxch [M].
   4. `PerformPostMappingPeepholes`, then `FPPeeps` (fxch elimination, `try_fxch_peep`, ...).
 
 ---
@@ -375,21 +398,21 @@ vs2005 doc is this compiler (cl.exe is built /O1).
 
 | Lever | Explained by | Verdict |
 |---|---|---|
-| M&B 7 "callee-saved order": webs that live across a call are colored in priority order, each takes the first free of esi, edi, ebx, ebp | `InsertInList` order, `ChoosePhysReg` scan of `_RegOrders[0]` (eax, ecx and edx removed by the call), weights 0 when there are no preferences | **explained** [C] |
+| M&B 7 "callee-saved order": webs that live across a call are colored in priority order, each takes the first free of esi, edi, ebx, ebp | `InsertInList` order, `ChoosePhysReg` scan of `_RegOrders[0]` (eax, ecx and edx removed by the call), weights 0 when there are no preferences | **explained** [C], for calls to functions the unit does not define (a callee defined in the unit leaves ecx and edx free, section 5) |
 | "priority = reference count, defs included" | priority = `2 * refs * P` in a single block, and P is the same for every web there | **explained** [C]; holds only within one block |
-| "ties go to the web defined first" | `defPos` descending, counted backwards inside a block | **explained** [C]; across blocks the def in the later block wins (code) |
+| "ties go to the web defined first" | `defPos` descending, counted backwards inside a block | **explained** [C]; across blocks the def in the later block wins [C traced][M] (`RC_tie.cpp`, section 4.3) |
 | "under one if ~1/2, two levels ~1/3, `a && b` 1/3, else arm 1/2, boundaries a little above the exact fractions" | weight per reference is `P_b * w_b`; unreferenced live-through blocks subtract `P_b * w_b` | **explained as a pressure ratio** [C formula], not a constant. The "a little above" fits the def cost and live-through terms [I] |
-| "loop bodies don't count more" | /O2: `w_b = 2^depth` [C traced]. /O1: `w_b = 1` [C traced] | **contradicted for cl 14.00 /O2** (a loop use counted `2*3*2 = 12` against `2*5 = 10` straight in `loopw`). It looks flat only because the loop block has low P. True for /O1 code (vs2005 cl.exe) |
-| "600-case switch changes none of this" / "in a switch long-lived webs are dead in other cases" | P is per block; unreferenced live-through blocks only subtract | consistent [I] |
-| "Limit: in the 70 KB interpreter the order depends on function-wide state" | priority sums over every block in the range, plus split rounds (`HandleCurrUncolorable`, `ForceSingleBlockLives`) and `ChoosePhysReg` preference and constraint weights | **explained in principle** [I] |
-| "x = q(x) starts a new web" | webs are lifetimes (`ComputeLifetimes`) | consistent [C for webs; I for this case] |
-| "naming a call result counts its copy and the coalesced two-address result" | copies that survive `SubsumeGlobregs` add a use and a def; two-address results are defs of the same web | consistent [I] |
-| "Naming a global's re-read raises its register priority" | globals are aliased candidates (kind 7/8), and a named local is a separate web with its own refs | consistent [I] |
+| "loop bodies don't count more" | /O2: `w_b = 2^depth` [C traced]. /O1: `w_b = 1` [C traced] | **contradicted for /O2 on all four builds, 13.10 included** (`RC_loopw.cpp`: a loop use counted `2*3*2 = 12` against `2*5 = 10` straight on 14.00, `2*2*2 = 8` against `2*4 = 8` on 13.10) [C traced]. It looks flat only because the loop block has low P. True for /O1 code (vs2005 cl.exe) |
+| "600-case switch changes none of this" / "in a switch long-lived webs are dead in other cases" | P is per block; unreferenced live-through blocks only subtract | consistent [I: an M&B observation, not reprobed here] |
+| "Limit: in the 70 KB interpreter the order depends on function-wide state" | priority sums over every block in the range, plus split rounds (`HandleCurrUncolorable`, `ForceSingleBlockLives`) and `ChoosePhysReg` preference and constraint weights | **explained in principle** [I: about one M&B function, not reproducible from a small probe] |
+| "x = q(x) starts a new web" | webs are lifetimes (`ComputeLifetimes`) | **holds** [C traced]: `RC_web.cpp` `nw` gives x two webs of 4 refs each, all four builds |
+| "naming a call result counts its copy and the coalesced two-address result" | copies that survive `SubsumeGlobregs` add a use and a def; two-address results are defs of the same web | **holds** [C traced], all four builds: `RC_copy.cpp` (section 6); `RC_web.cpp` `tw`: `a += g(2)` is a use and a def of a's one web (6 refs, no second web) |
+| "Naming a global's re-read raises its register priority" | globals are aliased candidates (kind 7/8), and a named local is a separate web with its own refs | **holds** [C traced][M], `RC_gname.cpp`: the global's own web in `gn0` has 1 ref (its def is the enter-load, which adds no block cost); the copy `l = G` in `gn1` adds its def in the entry block. Prio 24 -> 32 on 14.00, 60 -> 78 on 15.00 (it unrolls the loop), 20 -> 29 on 13.10; the copy pops ahead of the parameters and takes an earlier register (edi -> edx; 15.00 edx -> ecx) |
 | M&B 6.2 "commutative and SIB order keyed by ids" / distant flips | web numbers follow SYM key order (section 2); exact priority ties fall back to `defPos`, then insertion order | partly explained [I]; operand order is not in this module |
 | M&B 6.4/6.5 "scratch-register rotation is a chain from the first temporary" | regasg `_NextIntPos` rotates through eax, ecx, edx over the whole function in instruction order and is reset only at function entry | **explained** [C code]; one extra temporary shifts every later pick |
-| M&B 6.5 "callee visibility sets the global register map" | visible callees with known clobbers keep caller-saved registers in `avail` | consistent [I] |
+| M&B 6.5 "callee visibility sets the global register map" | callees defined in the unit kill only the registers they use, so caller-saved registers stay in `avail` across their calls | **holds** [C traced][M], `RC_callee.cpp`: values live across `leaf` take ecx, edx whether `leaf` is static or extern, defined above or below the caller; esi, edi when it is only declared. All four builds (section 5) |
 | M&B refinement "use counts are taken before cl duplicates tails, so a duplicated statement counts once" | 14.00 runs `FgEarlyTailDup` **before** `Globregs`, and Spillcosts scans the copied block (block number -1 in t4.c) | **contradicted for 14.00** register priorities (a duplicated tail counts in each copy) [C]. The M&B note was about stack slots, which are out of scope here |
-| vs2005 "declaration order of locals moved registers" (`strqlen`) / "declaration order sets the order of zero-initialised registers" | SYM key order gives web numbers; equal priorities are broken by def position, so the variable initialised first is colored first | consistent [I] |
+| vs2005 "declaration order of locals moved registers" (`strqlen`) / "declaration order sets the order of zero-initialised registers" | equal priorities are broken by def position, so the variable initialised first is colored first; declaration order does not enter | **declaration order: contradicted; initialisation order: holds** [C traced][M], `RC_decl.cpp`: a, b tie at prio 12 and the one defined first takes esi; swapping the declarations changes nothing, swapping the defs swaps the registers. All four builds. A declaration-order effect seen in a real function must come through a different def order or different P |
 | vs2005 /O1 code generally | `_Speed == 0`: no loop weights; costs are byte counts (esp-frame 4, ebp-frame 3, absolute 6) | [C code] |
 
 ---
@@ -402,7 +425,9 @@ vs2005 doc is this compiler (cl.exe is built /O1).
   that a live neighbour needed.
 - `CmdSetConstraints` per-instruction constraints (byte registers, shifts in ecx, div in eax and edx) and how they
   feed the `100 * spillCost` weight.
-- The `defPos` tie-break across blocks (from code; not probed). Exact `(priority, defPos)` ties are untested.
+- Exact `(priority, defPos)` ties: `defPos` is unique per def instruction, so they need two webs defined by one
+  instruction; untested. (The cross-block `defPos` tie-break is now probed, section 4.3.)
 - What `Module+0x44c & 0x8000000` means (it is set in every probe tried), and so when `FPColor` ever runs.
-- How `X87MapGFxToSTx` orders its worklist, and which join layout wins when two predecessors disagree.
-- Whether cl 13.10 really lacked loop weighting, or whether the M&B probes had low pressure in their loop blocks.
+- How `X87MapGFxToSTx` orders its worklist beyond a two-way branch (the fall-through arm's layout wins at the join,
+  section 8).
+- Settled: cl 13.10 weights loops like 14.00 (section 4.1); so the flat loops M&B saw must come from low P in their loop blocks [I].

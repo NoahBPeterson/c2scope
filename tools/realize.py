@@ -956,7 +956,7 @@ class Ctx:
                        for nm in re.findall(r"\b((?:hs|rz)_\w+)\s*\(", ln))
             and not any(re.search(r"\bstruct\s+%s\b" % nm, self.text) for nm in re.findall(r"\bstruct\s+(rz_\w+)", ln)))
         # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory
-        out = a.keep or os.path.join(ROOT, "work", "realize", tsweep.out_name(a.src))
+        out = a.keep or os.path.join(ROOT, "work", "realize", tsweep.out_name(a.src, a.func))
         if c2trace.c2build.table() and not a.keep:
             out += "@" + c2trace.c2build.name()
         shutil.rmtree(out, ignore_errors=True)

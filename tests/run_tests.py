@@ -1133,6 +1133,11 @@ def toolgap_tests():
     check("rwsweep touch: no `c = c` for a const c, no if/__assume on a struct",
           (("self", "c") in forms, ("if", "s") in forms, ("assume", "s") in forms, ("self", "x") in forms,
            ("if", "c") in forms), (False, False, False, True, True))
+    t3 = ("int f(float a, float b, int* p) { if (a < b) return 1; if (p[0] >= (int)b && a) return 2; "
+          "while (p[1] > 4) p++; return 0; }")
+    B3 = rwsweep.Body(t3, rwsweep.body_of(t3, "f"), None)
+    check("rwsweep cmp: `a < b` and `p[1] > 4` mirrored and negated; a condition with && left alone",
+          [v[2][0][2] for v in rwsweep.gen_cmp(B3)], ["b > a", "!(a >= b)", "4 < p[1]", "!(p[1] <= 4)"])
     bv = list(rwsweep.gen_byval(B))
     check("rwsweep byval: map.find(&k) through `typename M::It rz_bv_find1(M&, const A0&)` before the definition",
           (len(bv), bv[0][2][1][2] if bv else None, bv[0][2][0][2].strip() if bv else None,
@@ -1157,8 +1162,9 @@ def toolgap_tests():
     # output names that differ only in case (macOS: one directory)
     dd = tempfile.mkdtemp()
     names = [tsweep.out_name(os.path.join(dd, n)) for n in ("r2_D.cpp", "r2_d.cpp", "R2_d.cpp")]
-    check("out_name: r2_D / r2_d / R2_d differ ignoring case; lowercase keeps <stem>-<dirhash>",
-          (len({n.lower() for n in names}), names[1] == "r2_d-" + hashlib.md5(os.path.abspath(dd).encode()).hexdigest()[:6]),
+    okey = os.path.abspath(dd) + ("\0" + tsweep.c2trace.c2build.name() if tsweep.c2trace.c2build.table() else "")
+    check("out_name: r2_D / r2_d / R2_d differ ignoring case; lowercase keeps <stem>-<dirhash> (+ the build if not 14.00)",
+          (len({n.lower() for n in names}), names[1] == "r2_d-" + hashlib.md5(okey.encode()).hexdigest()[:6]),
           (3, True))
     # c2slots: an instruction scheduled into the prologue (M&B 004362e0) does not end it
     ins = [(0, "mov", "eax, dword ptr [esp + 0x18]"), (4, "sub", "esp, 8"), (7, "push", "ebx"),
@@ -1330,6 +1336,16 @@ def untraced_tests():
     check("regmap: commutative two-address op in the other order: only the sum WANTS, noted as operand order",
           (len(wants), all(w[1].startswith("WANTS") for w in wants), "commutative two-address op" in out,
            "      from: scratch pick" in out), (1, True, True, True))
+    # base/index order inside an address and two nearby instructions issued the other way round are not register votes
+    sys.path.insert(0, os.path.join(HERE, "tools"))
+    import regmap
+    rb, fl = regmap.addr_order("dword ptr [edi + edx + 0x30], eax", "dword ptr [edx + edi + 0x30], eax",
+                               ["edx", "edi", "eax"])
+    ours = [("mov", "ebx, dword ptr [esp + 0x58]"), ("fmul", "dword ptr [esp + 0x30]"), ("mov", "eax, dword ptr [esp + 0x24]")]
+    orig = [ours[2], ours[1], ours[0]]
+    check("regmap: base/index order counted as agreeing; a load pair issued the other way round paired crosswise",
+          (rb, sorted(fl), regmap.reorder([(0, 0), (1, 1), (2, 2)], ours, orig, [])), (["edi", "edx", "eax"],
+           ["edi", "edx"], [(0, 2), (1, 1), (2, 0)]))
     # 4. a reader that goes away: no panic, no traceback (status 141 / SIGPIPE)
     bad = []
     for cmd in ([rasim, "scratch", rsnap, "-v"], [rasim, "need", snap, "reg:k=esi"],
@@ -1406,15 +1422,15 @@ def icount_tests():
         if VERBOSE:
             print(r.stdout[-3000:], r.stderr[-2000:])
         j = json.load(open(js)) if os.path.exists(js) else {}
+        hints[p] = j.get("hints", [])
         return j.get("ours", 0) - j.get("orig", 0), sorted(j.get("classes", {}))
+    hints = {}
 
     old13 = BUILD.startswith("13.10")
     check("icount: one load where the original reloads: removed-by:GlobalOptimize/CSE", classes("cse"),
           (-1, ["removed-by:GlobalOptimize/CSE"]))
     dl, cl = classes("alias")
-    check("icount: a reference used twice keeps a reload: kept:alias%s" % (" (15.00, no branch targets: kept:*)"
-          if BUILD.startswith("15.00") else ""), (dl, len(cl) == 1 and cl[0].startswith("kept:alias" if not
-          BUILD.startswith("15.00") else "kept:")), (1, True))
+    check("icount: a reference used twice keeps a reload: kept:alias", (dl, cl == ["kept:alias"]), (1, True))
     dl, cl = classes("kill")
     check("icount: a store through a loaded pointer between two reads: kept:kill", (dl, "kept:kill" in cl), (2, True))
     dl, cl = classes("range")
@@ -1427,6 +1443,10 @@ def icount_tests():
     check("icount: equal tails merged (twins from the merge events): merged:FgDoLateFlowOpts",
           (dl, "merged:FgDoLateFlowOpts" in cl), (-8, True))
     check("icount: a statement the original has: structure", classes("stmt"), (-1, ["structure"]))
+    classes("fp")
+    check("icount: a float rounded through its home where the original keeps it: %s" % (
+          "no /fp hint (13.10)" if old13 else "flags hint /fp:fast"),
+          [("/fp:fast" in h) for h in hints.get("fp", [])], [] if old13 else [True])
     # the function filter: with C2TRACE_FUNC the DLL logs only while that function is compiled
     env = dict(os.environ, C2TRACE_FUNC="?dead_ours@@")
     kd = os.path.join(d, "ff")
@@ -1945,6 +1965,17 @@ def unit_tests():
 
 
 unit_tests()
+
+
+def probe_modules():
+    """tests/probes/*.py: probe checks kept in their own files (one per doc or topic), run in this module's namespace
+    so they use check(), rule_compile(), rule_proc(), rule_trace(), RKEY and the other helpers directly."""
+    import glob
+    for f in sorted(glob.glob(os.path.join(HERE, "tests", "probes", "*.py"))):
+        exec(compile(open(f).read(), f, "exec"), dict(globals(), __file__=f))
+
+
+probe_modules()
 
 print("%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

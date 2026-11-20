@@ -56,6 +56,7 @@ One compile with the `regs` hooks gives the final code and the allocation's inpu
 | K (symbol keys) | symkeys.trace / realize.key_delta_f | `keys:frame:+n` (allocations per pool class), `key:V:+d` (a named key moved), `flips:n` (pass-2 operand orders flipped) |
 | Q (scheduler) | c2sched.parse | `sched:R<k>:A > B` (instruction A now issued before B in region k), `regions:n` (regions whose input changed) |
 | M (loads) | loadcse (child process: its PAS dump changes every trace's configuration) | `load:LOC:a>b` (loads of LOC in the final code), `rmw:LOC:..>..` |
+| F (front end) | tools/feshape.py: the function's tuple shapes in the reader IL and after inlining (section 7) | `fe:SHAPE:+n` (reader IL), `fi:SHAPE:+n` (after Inline, when not already an `fe:`) |
 
 S, L, K, Q and M cost one compile each and are traced only when the regs trace changed: the IL at Color (tuple
 addresses removed: they are heap pointers that move with any declaration), an allocation-input item, or the code
@@ -286,3 +287,92 @@ unchanged instructions, frame-key adders with fixed counts) and the 13.10 declar
   out by `work/effectmine/retired.txt` (run ids). The functions were measured again.
 - **The database is small** (section 4): rates over fewer than ~10 instances, from 4 functions, are a first
   estimate. Each `mine` run adds to it; the ordering of later runs uses it.
+
+## 7. Model F: the front end, measured (`tools/feshape.py`)
+
+icount's `structure` verdict says only that our IL never had the original's tuples: the front end (c1/c1xx) wrote
+other IL. Which source construct makes which IL is not modelled; model F measures it instead, the same way as the
+other models. Per variant whose regs trace changed (one more traced compile), feshape takes the function's IL at two
+passes and counts its tuple *shapes*: the opcode, a branch's condition and the operand kinds without names or numbers
+(`OPASSIGN(V:5004<-T:5004)`, `OPBRANCH[l](<-L,T:9000)`, `OPCALL(T:5004<-F)`; kinds T temporary, V named variable,
+K immediate candidate, C literal, M memory, F function, L label, and implicit operands by name). The stages: the
+reader IL (MscRVO's entry on 14.00; Inline's entry on 15.00 and 13.10, which have no hookable MscRVO; both are
+before same-unit callees are expanded) and the IL after inlining (FgSimpleFoldCmps' entry). The effect strings are
+the multiset changes, `fe:SHAPE:+n` / `fi:SHAPE:+n`. Their effect types count per stage and opcode, net:
+`F.fe:OPPAREN-` only when the reader IL has fewer OPPAREN tuples; a change of operand kinds alone is `F.fe:kind`
+(`hs_id(this)` turns `OPADD(T<-V,C)` into `OPADD(T<-T,C)`: one shape less, one more, no tuple fewer). The same rule
+decides a `--want 'fe:SHAPE:-n'` and icount's lookup (`feshape.hit`): the exact shape must drop by n *and* the
+opcode's net count with it. Without it, 20 of the 24 mined rows below "found" their removal through such renames.
+`effectmine.py table --type '^F\.'` lists the most frequent F types (they are open-ended, one per opcode).
+
+```sh
+uv run tools/feshape.py tu.cpp --func F [--stage reader|inlined] -- FLAGS     # a function's shapes, counted
+uv run tools/effectmine.py mine tu.cpp --func F --want 'fe:OPPAREN(T:5004<-V:5004):-1' -- FLAGS
+```
+
+**icount uses it.** An EXTRA instruction with a `structure` verdict whose tuple was born in the reader IL (or at
+Inline) gets a `front end:` line: its shape, the `--want` string that asks effectmine for a mutation removing it, and
+the classes of the database whose variants removed that shape elsewhere (`hits/measured`), or "no measured mutation
+yet". A MISSING instruction has no tuple of ours, so no shape: the original's IL is not observable.
+
+**First measurement** (tests/data/fe/fe_cond.cpp, probes in tests/probes/feshape.py): `if ((f = g()) >= 0.5f)`
+against `f = g(); if (f >= 0.5f)` adds `OPPAREN` of `f` in the reader IL and the compare reads the temporary, on all
+four builds (14.00/15.00: `OPCONVERT(T:5008<-T:5004)` for `<-V:5004`; 13.10: `OPCMP(T:8000<-T:4004,C:4004)` for
+`<-V:4004`, its front end compares floats as floats, x87.md). On Spore 0x00d38780 a 40-compile mine with this want
+found `alias.ref` (a reference to `f`) as the one class that removes the `OPPAREN` (an exact-shape match, made
+before the net-count rule above; not re-checked under it).
+
+**What the front-end probes say** (tests/data/rules/RE_*, frontend_il.md; 2026-11-19), the starting points of a
+model from source construct to reader IL:
+- The reader IL is strictly left to right, one tuple per operator, on every build; every call-order difference
+  (frontend_il.md 2.4) is c2's, and 13.10 reorders the same IL differently from 14.00/15.00. A model can walk the
+  expression tree left to right and leave reordering to a build-dependent c2 stage.
+- c1xx keeps facts outside the tuple stream that later passes read: `h(); return r;` and `return (h(), r);` dump
+  the same tuples, yet NRVO elides only the first (frontend_il.md 3A.8). Model F cannot see such attributes.
+- Emission order is a dependency order: implicit members in order of first need (a constructed object's destructor
+  at once), dynamic-initialiser cycles cut at the edge into the last-defined member; both predicted exactly from
+  source (frontend_il.md 4.11, 4.13).
+- Constructor IL follows the class layout, not the initialiser list; a body assignment equals the list form iff
+  no later-declared member is initialised (frontend_il.md 3B.10).
+- A local with a destructor wraps the return value in a temporary (`sN = a; OPDTORACTION; OPRET <- sN`): where
+  by-value and by-reference accessors diverge (frontend.md).
+- The reader's switch partitioning is build-dependent (13.10 needs 5 dense values inside a sparse set for a table,
+  14.00/15.00 need 4), and at /Od local slot order depends on the names (il_sym.md 8).
+
+**Seeding run** (2026-11-20). 130 near-miss rows (61 Mount & Blade, 13.10; 69 Spore slices, 15.00, one small-diff
+row per slice) through icount: 29 have `structure` extras whose tuple has a shape. 24 of them mined (the rest:
+the function defined in a header, or /Od slices with no register allocation), 200 traced compiles each, every
+variant with model F traced: 2,142 records with F data, 1,157 with a front-end change, over 47 functions in the
+database. Measured:
+- **The catalogue does not remove front-end tuples.** Its classes were built to move allocation without changing
+  code, and that is what they do: the wrap / wrapx / alias classes change operand kinds (`F.fe:kind` in 60-85% of
+  their variants) or add tuples (helper calls, declarations); the only classes that remove one are branch-sense
+  changes: `cflow.swaparms` (`OPBRANCH[ge]-` 30%), `cflow.emptythen` (`OPBRANCH[ne]-`/`[e]-` 39%), `cmpflip`
+  (`OPBRANCH[ge]-` 52%). Under the net-count rule two rows have a real removal (Mount & Blade 0x4e8720 by
+  `cflow.emptythen`, Spore 0x8bdf80 by `cflow.swaparms` / `cmpflip`), and in neither did it lower the bdiff.
+- **Most `structure` extras are meaning, not spelling.** By source line: `((UiA*)row[2])->f184 = 1` where the
+  original ORs (`or [eax+0x184],1`), `*g |= 1` against a plain store, `p->mRef = --n`, an extra `if (!src) return;`,
+  an extra compare in `if (rank >= cap)`, `(char*)this + 0x20` passed where the original passes something else.
+  A meaning-preserving mutation cannot reach these; the draft's statement is different. So the verdict is mostly a
+  pointer to re-read the original at that line, not a lever.
+- **Single-use locals are not the cause.** `rwsweep --families subst` (new: `T v = E;` read once, no call / store
+  / loop between, substituted as `((T)(E))`) on Mount & Blade 0x532de0 (`Party* pp = ...`) and Spore 0xd9eb70
+  (`cPoolSlot* pSlot = &mpBegin[nSlot]`): the regs trace is identical, c2's copy propagation already removes such
+  a local, so the extra comes from the expression, not the variable.
+
+**Meaning-changing rewrites** (`rwsweep --families repair`, 2026-11-20; the same rows, on a 32-vCPU Linux pod under
+wine). 22 rows swept (the rest: /Od, C code, header functions, one that does not build in a sweep copy), 6-84
+variants each. Spore: 9 of 13 rows have a rewrite that lowers the bdiff; Mount & Blade: 0 of 9. Every hit but one
+is `repair.drop` (the other `repair.step`); `rmw`, `edge` and `sign` lowered nothing. Read a drop as a locator, not a
+fix: removing a statement the original has differently also removes misaligned instructions. The strongest are
+the ones with shape 1-3: Spore 0xd1f250 `p->mRef = 1;` removed 16 -> 4 (and `p->mRef = --n` as `n - 1` 16 -> 10),
+0xfc2f90 `p->mRefs = 1;` 16 -> 14 at two sites (a reference-count initialisation the original writes elsewhere or
+not at all), 0x957a60 `*g |= 1;` 9 -> 5. No row reached bdiff 0. So the original's statement is findable by
+removal, then has to be written by reading the original there; Mount & Blade's extras (branches and compares) are
+not single statements.
+
+**Limits.** Shapes drop names, so two tuples of the same kind are not told apart, and an `fe:` change says only
+that a mutation added or removed such a tuple somewhere in the function; the site is in the record's edits. The map
+is only as wide as the mutation classes (section 3): a construct no class writes (a different loop form, a helper
+the source never had) is not measured. F records accumulate with every mine run that traces `frontend` (`--features ...,frontend` or a `--want fe:`).
+
