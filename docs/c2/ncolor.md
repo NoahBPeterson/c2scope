@@ -600,3 +600,193 @@ before and after. Ties are broken by the lifetime index (exported), as NColColPr
 Open: a value copied into another lifetime that the trace shows in the same register over the same tuples
 (coalesced copies: NColSubsumption / NColCombineLifetimes, not modelled), the boundary rules of 4.3 step 3,
 split regions (NColBestCoverage), xmm candidates, and computing the availability and liveness without a trace.
+
+---------------------------------------------------------------------------------------------------
+
+## 10. cl 17.00 x64: the source levers (realize, rwsweep, helpersweep), 2026-11-21
+
+`tools/realize.py`, `tools/rwsweep.py` and `tools/helpersweep.py` switch to NColor when the build table says
+`"arch": "x64"` and has the `ncol` hooks (`ncolsim.is_x64()`; nothing is keyed on a build name). On the four x86
+builds their code paths are unchanged. Under x64 every variant is compiled with the hooks of `c2ncol.py --export`
+plus the IL at NColor's entry (`ncolsim.trace_hooks`: the `B` lines number the blocks as NColBlockInfo does, the
+line words give block -> source line), one compile at a time (wine), and read with the helpers of ncolsim.py:
+
+| helper | what it does |
+|---|---|
+| `NRun(src, func, cl, keep)` | one traced compile: export record, listing, block -> source lines |
+| `run_delta(a, b)` | what changed in NColor's inputs between two runs, as edits: `+app:V:B:N` / `-app:V:B:N` (appearances per block), `index:V=K` (lifetime-index order of named candidates), `live:B:+K` (candidates live in block B); flags: block count changed (no edits then), ranges moved, new / gone candidates |
+| `predict(f, edits)` | the registers after edits, from the traced start (`simulate` with the edited priorities; `before:A:B` / `index:V=K` reorder ties, `live:B:+K` changes live[b] and the maximum) |
+| `need(f, want)` | the edits that give `want = {V: reg}`: singles `+app` / `-app` (N = 1..4) of every named global in every block it is live in and `before:A:B` for equal priorities, then pairs; fewest appearances first |
+| `gap(f, A, B)` | prio(B) - prio(A) with the index tie folded in (<= 0: A is processed first, same bucket) |
+
+### 10.1 What the x86 lever classes become
+
+| x86 lever (Color) | x64 (NColor) | how it is predicted |
+|---|---|---|
+| references per block (`ref` / `unref`: Spillcosts' cost per block) | appearances per block: k of the global priority `((maxLive+4) - live) * k * 8 << 2*depth` | `+app:V:B:N` / `-app` |
+| loop weight (block weight in Spillcosts) | zone depth: `<< 2*depth` per block (an appearance in a depth-1 block is worth 4) | inside `+app` (the block's depth) |
+| P per block (`P:B:+1`, new candidates) | live[b], and maxLive: a candidate more in B lowers every global's per-appearance term there | `live:B:+K` (measured; need() does not propose it) |
+| defOrd tie-break (statement swap, declaration order) | lifetime index (NColColPriorityCompare: ties to the lower index = the earlier first reference) | `before:A:B`, `index:V=K` |
+| interference, copies, preferences | availability per register and the preference windows of copies to / from a physreg; scratch registers end at calls, so a value live across a call takes the first callee-saved register in order rbx rdi rsi rbp r14 r15 r12 r13 that its processing position leaves | the order walk of `simulate` (preferences from the traced export; a new copy partner is not modelled) |
+| equal arms (`eqif`), tail / head duplication: merged after Color | the arms are still blocks at NColor and are merged later: code-neutral, but the block structure at allocation changes | not predicted (block count differs): measured only |
+
+Locals (first and last tuple in one block) have priority nTuples - length and are processed before every global of
+their class; an edit that adds a tuple inside a local's range moves all locals alike, and the tools flag it as
+`ranges` without it mattering.
+
+### 10.2 The tools on x64
+
+- **realize.py** `edit SRC --func F EDIT..` with EDIT `+app:V:B[:N]`, `-app:V:B[:N]`, `ref:V:B` / `unref:V:B` (= one
+  appearance), `before:A:B`: the constructs are rwsweep's families plus `eqif` (`if ((__int64)(V) & 1) { S } else
+  { S }`) and `store` (`rz_keep(V);`, a store to a global: one appearance, one instruction of code), placed at the
+  statements of block B's source lines (lines of B alone first; a line shared with another block is ranked by
+  position). Each variant: verdict `exact` (the request and no other input change), `yes` (and others, listed),
+  `blocks` (block structure changed), `no`; `pred(req)`: the registers ncolsim predicts for the request = traced
+  (exact variants only); `pred(meas)`: the registers predicted from what the variant measurably did = traced.
+  `--from-ncol --want-regs v=reg` (`--from-rasim` is read the same on x64): `need`'s answers, each unit edit
+  through its constructs, then the realisations of an answer's units combined, stopping at a code-neutral variant
+  with the wanted registers (FOUND; any variant compiled on the way counts, also one that changed blocks).
+  `store` is used by `edit` and, with `--with-store`, by the pipeline (a diagnosis: never code-neutral).
+  `measure BASE VARIANT --func F`: the inputs moved, registers, priorities, whether ncolsim explains them.
+  `pairs` is not ported.
+- **rwsweep.py**: the same families and variants; every single compiled; per single the measured edits, the
+  flags, whether ncolsim's registers from those edits are the traced ones (`predicted ok / MISS`); combinations of
+  the code-neutral singles predicted by adding their edits and simulating, ranked by `--want-regs` (new option) and
+  then by the predicted gap of `--want A>B`, the best `--verify` compiled and compared with the prediction.
+- **helpersweep.py**: its `hs_bind` sites, measured the same way (`rwsweep.sweep_x64`); `--want A>B` is NColor's
+  order, `--want-regs` ranks combinations.
+
+### 10.3 Measured (tests/data/ncol_levers/levers.cpp, /O2 /EHsc)
+
+Benchmarks: `swap1` (p and s across calls with equal priorities: p first by lifetime index, rdi; wanted s=rdi),
+`swap2` (the T16 swap: the pointer temporary p has more appearances in block 1, takes rbx; wanted s=rbx), `loop1`
+(an induction pointer in a loop, t only outside it; wanted t=rsi), `four` (four values across calls; wanted u=rsi,
+one place up), `hsw` (an EH frame, an inline helper taking member addresses; wanted k=rdi).
+
+**The model on realised edits** (`rz_keep` stores: realize `edit` for `+app:V:B:1` of every named global and
+block, one store each, 36 compiles): 25 realised the request exactly, and for all **25 of 25** the registers
+ncolsim predicted for the request are the traced ones (11 of them with a register change of a named value, up to
+four registers moved at once in `four`: `u:rbp->rdi v:rdi->rsi x:rsi->r14 w:r14->r15`). Predicted from what each
+variant measurably did: **36 of 36**. The other 11 put the store in another block than asked (a line shared by two
+blocks) or moved a local's range too. (One earlier run of the same compiles lost a variant to a trace value c2ncol
+could not parse, `?`: the tools report such a variant as failed.)
+
+**need**: the wanted change of each benchmark has answers (`swap2` s=rbx: `+app:s:2:1` first; one appearance
+more in block 1 is not enough there, two are: block 1 has live 11 of maxLive 11, so its per-appearance term is
+(15 - 11) * 8 = 32 against 88 in block 2). `loop1` t=rdi has none (rdi is held by a local), t=rsi has 10.
+
+**Code-neutral realisations** (`realize --from-ncol`, `rwsweep`, `helpersweep`):
+
+| benchmark, wanted | realize --from-ncol | rwsweep (families without touch / repair / recompute / byval) | helpersweep |
+|---|---|---|---|
+| swap1 s=rdi | FOUND: the declarations exchanged (`before:s:p`, index; predicted) | 88 singles: FOUND twice (declaration swap, predicted; a value copy of p, not predicted); 3 combinations verified, 3 of 3 as predicted | - |
+| swap2 s=rbx | FOUND: `eqif s` at `g(s);` (blocks changed, measured) | 105 singles, NOT FOUND (no code-neutral single moves an appearance); 2 of 2 combinations as predicted | - |
+| loop1 t=rsi | NOT FOUND (10 answers, 60 compiles: no construct realises `+app:t:3`) | 74 singles, NOT FOUND | - |
+| four u=rsi | FOUND: `eqif v` (blocks changed) | 237 singles, NOT FOUND; 7 of 7 combinations as predicted | - |
+| hsw k=rdi | FOUND: `eqif k` (blocks changed) | 83 singles, NOT FOUND; 8 of 8 combinations as predicted | 2 sites: one is `live:1:+1 live:3:+1` (dgap -8, predicted), NOT FOUND |
+
+rwsweep singles over the five runs: 587 compiled, 34 moved an input or a register; ncolsim's registers from their
+measured edits are the traced ones for 18 of 34, and for **5 of 5** of those whose inputs are all edits (the 16
+misses all moved a global's range or added / removed a candidate: value copies `alias val`, a declaration moved
+past a call). Combinations (code-neutral singles' edits added up): **20 of 20** verified as predicted.
+
+Findings: almost every do-nothing construct is gone before NColor at /O2, as on x86 before Color: `(void)V;`,
+empty inline helpers by value and by reference, `__assume`, `V = V;`, `hs_id` / `hs_cp` of a use, a local copy, a
+reference alias, `V + V - V` (14 forms by hand on swap1: none moved an input; of rwsweep's 587 singles, 553 moved
+nothing). An identity helper around a call result (`g(hs_id(h(p)))`) leaves one candidate live more in that
+block (`live:B:+1`, code-neutral, predicted). What reaches NColor and
+leaves the code alone is (1) the statement / declaration order (lifetime index: exactly predicted), (2) equal arms
+and duplicated tails (the arms are blocks at NColor and are merged afterwards: they flip registers code-neutrally,
+but change the block structure, so they are measured, not predicted), (3) in an EH function an inline helper's
+bound reference (`hs_bind`): one candidate more live in its blocks (`live:B:+1`, the x86 frontend.md rule holds on
+x64), predicted. An appearance edit `+app` proper has no code-neutral construct in these benchmarks: the store
+realises it with one instruction and is the diagnosis (the original references V in B).
+
+### 10.4 Not covered
+
+- Edits that change the block structure (eqif, cflow, tail duplication) are not predicted; nor are moved ranges
+  (a statement swap that lengthens a global, a use moved past a call), new copy partners and their preferences
+  (an `alias val` copy: NColSubsumption is not modelled), or a new candidate's own register.
+- need() proposes `+app` / `-app` / `before` only, not liveness or range edits; it searches singles and pairs.
+- Block -> line: from the IL's line words; a statement that shares a source line with another block (one-line
+  `if (c) { .. }`, a braceless loop body under its `for`) may land in the wrong block (the verdict says so).
+- realize `pairs`, `--from slots|scratch`, key edits (`add:frame@..`) and the load levers are x86 only here;
+  symkeys and slots have their own x64 paths (symkeys.md 10, slots.md 6).
+- Offline test: `ncol_levers_tests` (tests/run_tests.py) replays the stores' fixture
+  tests/data/ncol_levers/levers.json on any build.
+
+---------------------------------------------------------------------------------------------------
+
+## 11. Trace-free inputs (ncolsim.py ilin / ilprio / ilsim, 2026-11-21)
+
+`c2ncol.py SRC --export F.json --il -- FLAGS` adds each function's IL as NColor numbered it: the whole tuple stream
+dumped at the state probe (0x1006650f, after NColPrioritizeCandidates), with `T R` raw words of every tuple and
+leaf (`C2TRACE_ILRAW=12`: a branch's code-address leaf +0x24 is the label SYM, a LABEL tuple's +0x2c the same SYM),
+`T S` the first 11 words of every leaf's symbol (`C2TRACE_ILSYMW=11`, a new c2trace.dll setting: +0xc the root
+SYM, +0x24 size, +0x28 offset) and memory leaves' PAS; and each candidate's SYM (`sym`, the root its leaves'
+symbols point to). `ncolsim.il_inputs(f)` computes from that IL alone, `il_state(f, use)` substitutes the computed
+inputs into the export record so that `prio`, `replay` and `simulate` run on them unchanged:
+
+- **Tuple numbers** **[C, measured]**: every tuple of the stream counts (BLOCK, LABEL, pseudo and instruction
+  tuples), from 1; blocks start at BLOCK tuples, block 0 the entry. (The tuple's +0x28 is not the number:
+  NColDoLiveness keeps it in its own arrays, f650 / f654.)
+- **Candidates and appearances**: REG leaves whose register field is empty (a leaf printed `phys=sym` is already a
+  physical register: NColInitializeSyms' separate numbering), grouped by **root SYM** (a 32-bit view `t992` of
+  the 64-bit `t1224`, the byte view `s14` of `s2` are one candidate); one appearance per operand (a read-modify-write
+  appears twice, as traced).
+- **Flow graph**: a branch's target is the block of the LABEL whose +0x2c is the leaf's +0x24; fall through
+  unless the block ends in jmp / ret; a switch (no case list in the dump) goes to every labelled block no branch
+  names.
+- **Liveness and ranges** (NColBuildInfo's lists): backward liveness per block, pruned to where a definition
+  reaches; per block a segment from the block's first tuple (live in) or the first appearance to the block's last
+  tuple (live out) or the last appearance; a pure definition more than one tuple after the previous appearance
+  starts a new range (the hole is dead); a byte / word write of a wider candidate is no definition for that
+  purpose (it keeps the rest; a dword write zero-extends and counts as one); a block's segment continues the
+  previous block's only when that block falls through into it and the candidate is live across.
+- **Depth**: loop nesting from the flow graph (natural loops of back edges to a dominator, capped at 5) is
+  blockinfo +0x28 exactly; the **zone depth** +0x2c the priorities use is the same except 0 for the blocks of a
+  loop too large to be a hot zone (more than `ZONE_MAX_BLOCKS` = 100 blocks: in zlib only inflate's and
+  inflateBack's state-machine loops, 279 and 200 blocks; the next largest has 35), not for their headers, and not
+  for blocks of their inner loops (which keep the full depth).
+
+Measured, zlib (97 functions, 3189 candidates, 2431 blocks without each function's end block, whose blockinfo the
+state probe reads past the array):
+
+| input from the IL | as traced |
+|---|---|
+| tuple numbering (nTuples) and the block of every tuple | 97 of 97 functions |
+| appearances | 3133 of 3189 candidates |
+| ranges | 3155 of 3189 |
+| loop depth / zone depth per block | 2431 / 2431 of 2431 |
+| live count per block (f69c) | not reproduced: about one block in three |
+
+**Priorities** from the IL's appearances, ranges, blocks and zone depth (live counts as traced): **3182 of 3189**,
+more than from the traced inputs (3159): the IL's lists are those at prioritization, the traced ones are read when
+each candidate is processed, after coalescing grew some ranges and with an appearance listed twice for one tuple.
+With the IL's live counts too: 2180. **Register choice** on the IL's inputs (availability as traced): replay 2567
+of 2669 integer candidates (2585 from the traced inputs), 21 of 21 xmm; sim 2520 of 2690 (2549). Of the 18
+replay cases lost, 15 have exactly their traced ranges (13 are crc32's unrolled `c$1`..`c$7`): what moves them is
+the availability left by earlier candidates whose IL ranges differ **[I]**.
+Fixtures (tests/data/ncol/il: c1, c2, sum; `ncolsim_il_tests`): appearances 63 / ranges 62 of 65, priorities 62
+(64 traced), replay 53 of 54 and 9 of 9, sim 61 of 63 (as from the traced inputs).
+
+**The live count** (`f69c[b]`, the `live` of the priority formula) **[C in part]**: NColBuildInfo's backward walk
+starts each block's count at `SbvCount` of the live-out set (0x100d77fc), adds one each time a lifetime's bit is
+newly set in the live set during the walk (0x100d7cb4, 0x100d7da5), and stores it when it reaches the block's BLOCK
+tuple (0x100d761f; max in f698). The bit vector numbers more than the candidates: the lifetimes already in a
+physical register (NColInitializeSyms' nPhys numbering) are in it, and a block's empty `op577` pseudo-tuples raise
+the count too; no rule tried (candidates and tied lifetimes touching the block, live-out plus births with either
+operand order, with or without the flags temporaries and the op577 tuples) reproduces more than 44% of the traced
+counts, so `live` / maxLive stay read from the trace (`IL_USE` leaves them out; `ilprio+live` measures them).
+
+**Still read from the trace**: the live counts and maxLive; the initial availability lists of rax..r15 and the
+fxmm banks (`state.avail`, what is free when before allocation: fixed-register operands, calls, the incoming
+arguments); the preference windows of copies to / from a physreg (f6a0) and each region's preference list, the
+useable and anti-preference sets, the tied register and the lifetime index; the candidate order's buckets (the
+traced order). Availability without a trace (what is free at each point given earlier choices) needs those initial
+lists from the IL: the tied lifetimes `il_inputs` already computes (`tied`: ranges of operands with a preassigned
+register) plus the call clobber sets are the obvious input, not yet compared with `state.avail`.
+
+Commands: `ncolsim.py ilin EXPORT..` (the inputs against the trace), `ilprio` / `ilprio+live`, `ilsim` (replay
+and sim on the IL's inputs); `prio`, `replay`, `sim` and `whatif` are unchanged (an `--il` export also
+carries everything they read).

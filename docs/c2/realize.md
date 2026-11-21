@@ -764,3 +764,12 @@ tool (00bc9980), 1 benchmark improvement reproduced without the hand step (0x00a
      copy construct and the constant respelling realise exactly those;
   4. answers restricted to edits a given construct list can realise (`--only ref,extend,P`), so that the search
      depth goes to pairs of realisable edits instead of pairs with `before:`.
+
+
+## cl 17.00 x64
+
+On a build table with `"arch": "x64"` (cl 17.00 x86_amd64) the allocator is NColor, and realize.py, rwsweep.py and
+helpersweep.py predict with ncolsim instead of rasim / c2regs: the edits are `+app:V:B[:N]` / `-app:V:B[:N]`
+(appearances per block), `before:A:B` (lifetime index, the tie-break), measured `live:B:+K`; `realize.py edit` and
+`--from-ncol --want-regs`, rwsweep and helpersweep with `--want-regs`. The lever classes, the measured numbers and
+what is not covered are in docs/c2/ncolor.md section 10 (shared by the three tools).

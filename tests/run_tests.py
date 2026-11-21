@@ -933,6 +933,114 @@ def sched17_tests():
           got, (60, 61))
 
 
+def ncol_levers_tests():
+    """The x64 source levers (realize / rwsweep / helpersweep on NColor, docs/c2/ncolor.md 10) from exports, no compile:
+    tests/data/ncol_levers/levers.json holds the traced base run of each function of levers.cpp and its variants
+    (`rz_keep(V);` stores, one appearance each: work of the measurement in ncolor.md 10). What each variant moved is read
+    as whatif edits (ncolsim.run_delta), and ncolsim's registers for them are compared with the traced ones; for the
+    variants that realised the requested edit exactly, the registers predicted for the request itself."""
+    import json, ncolsim as N
+    d = json.load(open(os.path.join(HERE, "tests", "data", "ncol_levers", "levers.json")))
+    fx = {f["func"]: f for f in d["functions"]}
+    same = lambda p, g: all(p[k] == g.get(k, p[k]) for k in p if N.named(k))
+    ok = n = rq = rqn = moved = 0
+    for f in d["functions"]:
+        for v in f["variants"]:
+            dl = N.run_delta(f["base"], v["run"])
+            if dl["blocks"]:
+                continue
+            got = N.regs_of(v["run"])
+            n += 1
+            ok += same(N.predict(f["base"], dl["edits"]), got)
+            if v["verdict"] == "exact":
+                rqn += 1
+                rq += same(N.predict(f["base"], [v["request"]]), got)
+                moved += any(got[k] != N.regs_of(f["base"]).get(k) for k in got if N.named(k))
+    check("ncol levers: registers predicted from each variant's measured edits = traced", (ok, n), NCOL_LEVERS[0])
+    check("ncol levers: exact realisations, registers predicted for the request = traced (of them with a register "
+          "change)", (rq, rqn, moved), NCOL_LEVERS[1])
+    b1, b2 = fx["swap1"]["base"], fx["swap2"]["base"]
+    check("ncol levers: swap1 is a priority tie broken by the lifetime index (p before s)",
+          (N.traced_prio(b1, "p") == N.traced_prio(b1, "s"), N.gap(b1, "p", "s"), N.gap(b1, "s", "p")), (True, 0, 1))
+    check("ncol levers: need s=rdi in swap1 answers with the order edit before:s:p among the singles",
+          ["before:s:p"] in [e for e, _g, _s in N.need(b1, {"s": "rdi"}, limit=20)], True)
+    ans = N.need(b2, {"s": "rbx"})
+    check("ncol levers: need s=rbx in swap2 (the T16 swap): one appearance more in block 2 first, p gives rbx up",
+          (ans[0][0], ans[0][1]["s"], ans[0][1]["p"]), (["+app:s:2:1"], "rbx", "rdi"))
+    check("ncol levers: in block 1 (live 11 of 11) s needs two appearances, one is not enough",
+          (N.predict(b2, ["+app:s:1:1"])["s"], N.predict(b2, ["+app:s:1:2"])["s"]), ("rdi", "rbx"))
+    b4 = fx["four"]["base"]
+    check("ncol levers: before:A:B and index:V=K reorder a tie; live:B:+K moves every global's priority (four: 8 more "
+          "live in block 1 make u's block-2 and -3 appearances count more than x's in block 1)",
+          (N.predict(b1, ["before:s:p"])["s"], N.predict(b1, ["index:s=1"])["s"], N.predict(b4, [])["u"],
+           N.predict(b4, ["live:1:+8"])["u"]), ("rdi", "rdi", "rbp", "rsi"))
+
+
+NCOL_LEVERS = ((36, 36), (25, 25, 11))
+
+
+def ncolsim_il_tests():
+    """tools/ncolsim.py's trace-free inputs (docs/c2/ncolor.md 11): NColor's tuple numbering, blocks, appearances,
+    ranges and zone depth computed from the IL of `c2ncol.py --export --il` (tests/data/ncol/il/*.json: c1, c2, sum)
+    against the traced ones, and the priorities / register choices on them. No compile."""
+    import glob, io, contextlib, ncolsim as N
+    fns = N.load(sorted(glob.glob(os.path.join(HERE, "tests", "data", "ncol", "il", "*.json"))))
+    with contextlib.redirect_stdout(io.StringIO()):
+        c = N.cmd_ilin(fns, 0)
+        pr = N.cmd_ilprio(fns)
+    check("ncolsim il: tuple numbering / block of every tuple as NColDoLiveness", (c["ntup same"], c["blk same"],
+          c["functions"]), (4, 4, 4))
+    check("ncolsim il: appearances / ranges from the IL (of 65 candidates)", (c["apps same"], c["ranges same"]),
+          (63, 62))
+    check("ncolsim il: zone depth per block / live count per block (of 65; the live count is not reproduced)",
+          (c["depth same"], c["live same"], c["blocks"]), (62, 50, 65))
+    check("ncolsim il: priorities on the IL's inputs (live as traced) / on the traced inputs", pr, (62, 64, 65))
+    b = io.StringIO()
+    with contextlib.redirect_stdout(b):
+        N.cmd_ilsim(fns, 0)
+    out = b.getvalue()
+    check("ncolsim il: replay and sim on the IL's inputs (availability as traced)",
+          [ln.split(":")[1].split("single")[0].strip() for ln in out.splitlines()[1:]], ["53 of 54", "9 of 9", "61 of 63"])
+    t = N.il_parse(["B 10", "I 20 mov 1 0 | k$1:1004 <- r8d=t130:1004", "R 20 0 0 13b 1010c 1004 0 0 0 1 0 0",
+                    "R 21 0 0 4fb 10001 1004 0 0 40 0 30 0", "S 30 0 0 3 30 0 0 0 0 0 4 0",
+                    "R 22 0 0 4fb 10001 1004 0 0 40 0 31 0", "S 31 0 0 3 31 0 0 0 0 0 4 0"])
+    check("ncolsim il: a tuple's number, leaf kinds and roots; a preassigned register is not a candidate",
+          (t[1]["n"], t[1]["dstk"], t[1]["srck"], t[1]["dstr"], N._regleaf("r8d=t130:1004"), N._regleaf("k$1:1004")),
+          (2, [1], [1], [0x30], (None, "r8d"), ("k$1", None)))
+
+
+def sched17_predict_tests():
+    """tools/c2sched17.py --predict offline: each region's DAG, latencies, units and static priorities built from
+    its IL (tests/data/sched17/il/*.json: `c2sched17.py --il --export` of tests/data/ncol's c1 / c2 / sum and zlib's
+    adler32 compress uncompr zutil inftrees; docs/c2/sched17.md 6.x) against the traced DAG, and the schedule."""
+    import glob
+    os.environ.setdefault("C2_BUILD", "14.00")
+    import c2sched17 as S
+    if not S.have_c2_1700():
+        print("  sched17 predict: skipped (reads OpSchedInfoK8 from the 17.00 c2.dll, which is not set up here)")
+        return
+    fns = []
+    for p in sorted(glob.glob(os.path.join(HERE, "tests", "data", "sched17", "il", "*.json"))):
+        fns += S.load_export(p)
+    c, _ = S.compare_dag(fns)
+    check("sched17 predict: traced edges reproduced from the IL (+ alias facts)",
+          (c["edges both"], c["edges traced"], c["edges predicted"]), (1241, 1242, 1241))
+    check("sched17 predict: node latency, unit, height, static priority from the IL and OpSchedInfoK8",
+          (c["lat"], c["unit"], c["height"], c["static"], c["nodes"]), (565, 565, 565, 565, 565))
+    check("sched17 predict: DAG exact / issue order with the predicted DAG / with the traced DAG",
+          (c["dag exact"], c["order predicted dag"], c["order traced dag"], c["regions"]), (91, 89, 89, 92))
+    c, _ = S.compare_dag(fns, alias=False)
+    check("sched17 predict, IL only (PAS guess): edges, static priorities, issue order",
+          (c["edges both"], c["static"], c["order predicted dag"]), (1235, 557, 88))
+    # the IL leaf parser: register families, a memory leaf with base / index / PAS
+    r = S._c2_1700()["regs"]
+    check("sched17 predict: register families (eax in rax, ah at 8, cc_zf in cc)",
+          (S.reginfo(r["eax"]), S.reginfo(r["ah"]), S.reginfo(r["cc_zf"])), ((1, 32, 0), (1, 8, 8), (353, 1, 3)))
+    lf = S._leaf("[rsi=a$1:1008+rdi=n$1:1008*4+-8]@22:1004", 6, 0)
+    check("sched17 predict: memory leaf text", (lf["base"], lf["index"], lf["scale"], lf["pas"], lf["disp"]),
+          (r["rsi"], r["rdi"], 2, 0x22, "-8"))
+
+
 def symkeys17_tests():
     """symkeys on cl 17.00 x64 from an export (tests/data/symkeys17/symkeys.json: `symkeys.py export` of
     tests/data/symkeys.cpp under --c2 17.00, docs/c2/symkeys.md 10): replay without a compile, x64 spellings."""
@@ -1056,7 +1164,10 @@ bdiff_tests()
 rdiff_tests()
 judge_tests()
 ncolsim_tests()
+ncol_levers_tests()
 sched17_tests()
+sched17_predict_tests()
+ncolsim_il_tests()
 symkeys17_tests()
 
 

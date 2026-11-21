@@ -9,7 +9,10 @@ usage: realize.py edit    <tu.cpp> --func F EDIT [EDIT..] [--want-regs v=reg,..]
        realize.py --from slots|scratch <tu.cpp> --func F --asm-vs ORIG.s [--max-compiles N] [--pairs 0|1|2] [-- <cl args>]
        realize.py measure <base.cpp> <variant.cpp> --func F [--keys] [--slots] [--scratch] [-- <cl args>]
        realize.py pairs   <probes.cpp> [--keys] [--slots] [--scratch] [--only RE] [--diff] [-- <cl args>]
-   --c2 13.10 / 13.10.3052 / 15.00 as on every tool. --asm-func DECORATED: the function of our listing scored
+   --c2 13.10 / 13.10.3052 / 15.00 as on every tool. --c2 17.00 (a build table with arch x64): NColor, predicted with
+   ncolsim: edits +app:V:B[:N] / -app:V:B[:N] / ref / unref / before:A:B, `--from-ncol --want-regs v=reg`, measure
+   (docs/c2/ncolor.md 10).
+   --asm-func DECORATED: the function of our listing scored
    against --asm-vs when it is not --func itself (as tsweep's; default --func).
 
 The models answer in abstract edits; this tool goes the other way.
@@ -3033,6 +3036,435 @@ def cmd_pipeline(c, a):
     return 1
 
 
+# ---------------------------------------------------------------- cl 17.00 x64: NColor (docs/c2/ncolor.md 10)
+#
+# On x64 the abstract edits are ncolsim's whatif edits: +app:V:B[:N] / -app:V:B[:N] (appearances of V in NColor
+# block B: the priority's k), before:A:B (A's first reference before B's: the lifetime index that breaks a priority
+# tie). `ref:V:B` / `unref:V:B` are read as +app / -app of 1. The model that answers is ncolsim (need: the edits that
+# give --want-regs; predict: the registers after an edit); the constructs are rwsweep's families (they need no
+# x86 trace) at the statements of block B's source lines, plus an equal-arms if; each is compiled, traced, and its
+# measured effect compared with the request and its registers with the prediction.
+
+X64_FAMS = ("wrap", "alias", "swap", "split", "cflow", "cmp", "paren", "subst", "unalias", "touch", "const", "guard",
+            "reread")
+
+
+def x64_edit(s):
+    """An edit of the command line -> ncolsim edits (None: not an x64 edit)."""
+    f = s.split(":")
+    if s[:5] in ("+app:", "-app:") and len(f) >= 3:
+        return ["%s:%s:%s:%s" % (f[0], f[1], f[2], f[3] if len(f) > 3 else "1")]
+    if f[0] in ("ref", "unref") and len(f) >= 3 and f[2].isdigit():
+        return ["%sapp:%s:%s:1" % ("+" if f[0] == "ref" else "-", f[1].split("@p")[0].split("#")[0], f[2])]
+    if f[0] == "before" and len(f) >= 3:
+        return ["before:%s:%s" % (f[1], f[2])]
+    if s.startswith("index:") or s.startswith("prio:"):
+        return [s]
+    return None
+
+
+class X64Ctx:
+    """The source, the target's body (rwsweep.Body) and the base run (ncolsim.NRun) on cl 17.00 x64."""
+
+    def __init__(self, a, cl):
+        import rwsweep, helpersweep, ncolsim
+        self.rw, self.N, self.a, self.cl = rwsweep, ncolsim, a, cl
+        raw = open(a.src).read()
+        hdr = os.path.dirname(os.path.abspath(a.src))
+        self.text = re.sub(r'#include "([^"/][^"]*)"', lambda m: '#include "%s"' % os.path.join(hdr, m.group(1))
+                           if os.path.exists(os.path.join(hdr, m.group(1))) else m.group(0), raw)
+        self.prelude = rwsweep.prelude_for(self.text) + "".join(
+            ln + "\n" for ln in PRELUDE_RZ.splitlines()[:2] if not re.search(r"\brz_(g|keep)\b", self.text))
+        self.plines = self.prelude.count("\n")
+        out = a.keep or os.path.join(ROOT, "work", "realize", tsweep.out_name(a.src, a.func)) + "@" + c2trace.c2build.name()
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        self.out, self.n = out, 0
+        self.orig = tsweep.orig_instrs(a.asm_vs) if a.asm_vs else None
+        self.qfunc = c2trace.func_decl(a.func)
+        self.base, _ = self.build("base", [])
+        self.func = self.base.func
+        self.fn, self.cls = find_def(self.text, self.func, helpersweep, rwsweep)
+        self.B = rwsweep.Body(self.text, self.fn, self.cls)
+        self.shape0 = [rwsweep._mask(x) for x in self.base.instrs]
+        self.keys0 = [tsweep._key(x) for x in self.base.instrs]
+        self.breg = ncolsim.regs_of(self.base.f)
+        self._cons = None
+
+    def build(self, tag, edits):
+        d = os.path.join(self.out, tag)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, tag + ".cpp")
+        t = self.text
+        for s_, e_, r in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
+            t = t[:s_] + r + t[e_:]
+        open(p, "w").write(self.prelude + t)
+        return self.N.NRun(p, self.qfunc, self.cl, os.path.join(d, "r")), p
+
+    def text_lines(self, b):
+        """Block b's source lines in the text's numbering (1-based; the listing's minus the prelude)."""
+        return {L - self.plines for L in self.base.lines.get(b, [])}
+
+    def line_of(self, pos):
+        return self.text.count("\n", 0, pos) + 1
+
+    def constructs(self):
+        """Every rewrite of the families and the x64 equal-arms if: [(family, description, edits)]."""
+        if self._cons is None:
+            fams = (self.a.constructs or ",".join(X64_FAMS)).split(",")
+            out = []
+            for fam in fams:
+                if fam == "eqif":
+                    continue
+                if fam in self.rw.FAMILIES:
+                    out += list(self.rw.FAMILIES[fam](self.B))
+            if "eqif" in fams or not self.a.constructs:
+                out += list(self.eqif())
+            if "store" in fams or (not self.a.constructs and (self.a.cmd == "edit" and not (self.a.from_ncol or
+                                                                self.a.from_rasim) or self.a.with_store)):
+                out += list(self.store())
+            self._cons = out
+        return self._cons
+
+    def eqif(self):
+        """`if ((__int64)(V) & 1) { S } else { S }` around a simple statement S of the body, for a scalar or pointer
+        V assigned before it: one more appearance of V; on x86 the arms merge after Color (eqif). On x64 the arms
+        are still two blocks at NColor: the block structure changes (measured, not predicted)."""
+        B = self.B
+        for v, (ty, decl) in B.vars.items():
+            if v == "this" or ty.rstrip().endswith("&") or not ("*" in ty or
+                                   re.search(r"\b(int|long|short|char|unsigned|signed|size_t|__int64|bool)\b", ty)):
+                continue
+            for st in B.starts:
+                if decl >= st or B.toks[st][0] in KEYS_NOSTMT:
+                    continue
+                if decl >= 0 and not any(i < st for i in B.uses[v]) and not _x64_inited(B, decl):
+                    continue
+                j = st
+                while j < len(B.toks) and not (B.toks[j][0] == ";" and B.paren[j] == B.paren[st]):
+                    if B.toks[j][0] in ("{", "}"):
+                        break
+                    j += 1
+                if j >= len(B.toks) or B.toks[j][0] != ";" or self.rw.DECL.match(B.text, B.toks[st][1]):
+                    continue
+                s_, e_ = B.toks[st][1], B.toks[j][2]
+                S = B.text[s_:e_]
+                yield ("eqif", "eqif %s at line %d" % (v, self.line_of(s_)),
+                       [(s_, e_, "if ((__int64)(%s) & 1) { %s } else { %s }" % (v, S, S))])
+
+    def store(self):
+        """`rz_keep(V);` (a store of V to a global) at every statement where V is in scope and assigned: exactly one
+        appearance of V in that statement's block and nothing else at NColor when V is live there. One instruction
+        of code: a diagnosis (the original references V in that block), never a match."""
+        B = self.B
+        for v, (ty, decl) in B.vars.items():
+            if v == "this" or ty.rstrip().endswith("&") or "[" in ty:
+                continue
+            for st in B.starts:
+                if decl >= st or B.toks[st][0] in ("case", "default", "else"):
+                    continue
+                if decl >= 0 and not any(i < st for i in B.uses[v]) and not _x64_inited(B, decl):
+                    continue
+                if decl >= 0 and B.block[decl] and not (B.block[decl] < st < B.close.get(B.block[decl], 1 << 30)):
+                    continue
+                pos = B.toks[st][1]
+                yield ("store", "rz_keep(%s); at line %d" % (v, self.line_of(pos)), [(pos, pos, "rz_keep(%s); " % v)])
+
+    def mentions(self, c, names):
+        pat = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, names)))
+        return any(pat.search(r) or pat.search(self.text[s_:e_]) for s_, e_, r in c[2])
+
+    def select(self, edit):
+        """The constructs that may realise one ncolsim edit: +app / -app V B: rewrites that mention V on a source
+        line of block B; before:A:B: rewrites that mention A or B (statement order)."""
+        f = edit.split(":")
+        if f[0] in ("+app", "-app"):
+            v, b = f[1], int(f[2])
+            lines = self.text_lines(b)
+            sel = [c for c in self.constructs()
+                   if self.mentions(c, [v]) and any(self.line_of(s_) in lines for s_, _e, _r in c[2])
+                   and (c[0] not in ("eqif", "store") or re.match(r"(eqif |rz_keep\()%s\b" % re.escape(v), c[1]))]
+            # a source line shared by several blocks (`if (m) { g(u); }` on one line, a for header): lines of B alone
+            # first; on a line B shares with an earlier block the later positions, with a later block the earlier
+            share = lambda L: [k for k in self.base.lines if k != b and L in self.text_lines(k)]
+
+            def rank(c):
+                pos = min(s_ for s_, _e, _r in c[2])
+                sh = share(self.line_of(pos))
+                return (len(sh), -pos if sh and min(sh) < b else pos)
+            return sorted(sel, key=rank)
+        if f[0] == "before":
+            return [c for c in self.constructs() if c[0] in ("swap", "split", "alias", "eqif", "wrap")
+                    and self.mentions(c, f[1:3])]
+        return []
+
+    def measure(self, tag, edits):
+        r, p = self.build(tag, edits)
+        d = self.N.run_delta(self.base.f, r.f)
+        shape = adiff([self.rw._mask(x) for x in r.instrs], self.shape0)
+        regs = adiff([tsweep._key(x) for x in r.instrs], self.keys0)
+        return dict(r=r, path=p, d=d, shape=shape, regs=regs, got=self.N.regs_of(r.f),
+                    sc=(tsweep.rdiff(r.instrs, self.orig), tsweep.bdiff(r.instrs, self.orig)) if self.orig is not None else None)
+
+
+def _x64_inited(B, decl):
+    """The declaration at token decl has an initialiser (`T v = E;`): v is assigned from the next statement on."""
+    return decl + 1 < len(B.toks) and B.toks[decl + 1][0] == "="
+
+
+KEYS_NOSTMT = ("case", "default", "return", "break", "continue", "goto", "if", "while", "for", "do", "switch", "else",
+               "try", "catch", "throw")
+
+
+def x64_verdict(req, m):
+    """exact (the requested edits and no other input change), yes (them and others: `also`), blocks (the block
+    structure changed: not comparable), no."""
+    d = m["d"]
+    if d["blocks"]:
+        return "blocks", []
+    got = list(d["edits"])
+    ok = True
+    for e in req:
+        if e.startswith("before:"):
+            _k, x, y = e.split(":")[:3]
+            order = [c["name"].split("$")[0] for c in sorted(m["r"].f["cands"], key=lambda c: c.get("index", 0))]
+            ok = ok and x in order and y in order and order.index(x) < order.index(y)
+            got = [g for g in got if not g.startswith("index:")]
+        elif e in got:
+            got.remove(e)
+        else:
+            ok = False
+    if not ok:
+        return "no", got
+    also = got + ["ranges:" + ",".join(d["ranges"])] * bool(d["ranges"]) + ["live"] * d["live"] + \
+        ["new:" + v for v in d["new"]] + ["gone:" + v for v in d["gone"]]
+    return ("exact" if not also else "yes"), also
+
+
+def x64_inputs(c, m):
+    """What a variant moved in NColor's inputs, and whether ncolsim predicts its registers from that."""
+    d = m["d"]
+    if d["blocks"]:
+        return "the block structure (not predicted)"
+    pm = c.N.predict(c.base.f, d["edits"])
+    ok = all(pm[k] == m["got"].get(k, pm[k]) for k in pm if c.N.named(k))
+    return "%s (ncolsim from them: %s)" % (" ".join(d["edits"]) or "no appearance / order change",
+                                          "as traced" if ok else "differs")
+
+
+def x64_show(c, tag, desc, m, verdict, also, pred):
+    N = c.N
+    got = m["got"]
+    chg = " ".join("%s:%s->%s" % (k, c.breg[k], got[k]) for k in c.breg if N.named(k) and k in got and got[k] != c.breg[k])
+    pm = None if m["d"]["blocks"] else N.predict(c.base.f, m["d"]["edits"])
+    okreq = None if pred is None else all(pred[k] == got.get(k, pred[k]) for k in pred if N.named(k))
+    okm = None if pm is None else all(pm[k] == got.get(k, pm[k]) for k in pm if N.named(k))
+    print("  %-8s %-6s code %d regs %d%s  %-6s pred(req) %-4s pred(meas) %-4s  %s  | %s%s" % (
+        tag, verdict, m["shape"], m["regs"], "" if m["sc"] is None else "  rdiff %d bdiff %d" % m["sc"],
+        "", {True: "ok", False: "MISS", None: "-"}[okreq], {True: "ok", False: "MISS", None: "-"}[okm],
+        chg or "(registers unchanged)", desc, ("  also: " + " ".join(also)) if also else ""))
+    return okreq, okm
+
+
+def x64_cmd_edit(c, a):
+    reqs = []
+    for s in a.edits:
+        e = x64_edit(s)
+        if e is None:
+            sys.exit("realize (x64): %r is not an NColor edit (+app:V:B[:N], -app:V:B[:N], ref:V:B, unref:V:B, "
+                     "before:A:B)" % s)
+        reqs.append((s, e))
+    N = c.N
+    print("base: registers %s" % " ".join("%s=%s" % kv for kv in c.breg.items() if N.named(kv[0])))
+    print("blocks -> source lines: %s" % "  ".join("B%d:%s" % (b, ",".join(map(str, sorted(c.text_lines(b))))) for b in
+                                                  sorted(c.base.lines) if c.base.lines[b]))
+    stats = dict(n=0, exact=0, req_ok=0, req_n=0, meas_ok=0, meas_n=0)
+    for s, e in reqs:
+        pred = N.predict(c.base.f, e)
+        print("## %s  (ncolsim: %s)" % (s, " ".join("%s=%s" % (k, pred[k]) for k in pred if N.named(k) and
+                                                       pred[k] != c.breg.get(k)) or "no register change predicted"))
+        cons = []
+        for x in e:
+            cons += [k for k in c.select(x) if k not in cons]
+        if a.limit:
+            cons = cons[:a.limit]
+        if a.list:
+            for k in cons:
+                print("  %-6s %s" % (k[0], k[1]))
+            continue
+        print("  %d constructs" % len(cons))
+        for k in cons:
+            c.n += 1
+            tag = "v%04d" % c.n
+            try:
+                m = c.measure(tag, k[2])
+            except (Exception, SystemExit) as ex:
+                print("  %-8s failed: %s | %s" % (tag, str(ex)[-100:], k[1]))
+                continue
+            v, also = x64_verdict(e, m)
+            if v == "no" and not a.all_variants and m["regs"] == 0 and not m["d"]["edits"]:
+                continue
+            okreq, okm = x64_show(c, tag, "%s %s" % (k[0], k[1]), m, v, also, pred if v == "exact" else None)
+            stats["n"] += 1
+            stats["exact"] += v == "exact"
+            if okreq is not None:
+                stats["req_n"] += 1
+                stats["req_ok"] += okreq
+            if okm is not None and (m["d"]["edits"] or m["regs"]):
+                stats["meas_n"] += 1
+                stats["meas_ok"] += okm
+    if not a.list:
+        print("summary: %d variants shown, %d exact; predicted registers of the requested edit = traced on %d of %d "
+              "exact variants; of the measured edits on %d of %d variants that moved an input or a register" % (
+                  stats["n"], stats["exact"], stats["req_ok"], stats["req_n"], stats["meas_ok"], stats["meas_n"]))
+    return stats
+
+
+def x64_pipeline(c, a):
+    """--from-ncol: ncolsim.need's answers for --want-regs, each realised by the constructs of its edits (singles,
+    then the realising variants of every unit of the answer combined), until a code-neutral variant has the wanted
+    registers (FOUND)."""
+    import itertools
+    N = c.N
+    want = c.rw.parse_want_regs(a.want_regs)
+    if not want:
+        sys.exit("realize (x64): --from-ncol needs --want-regs v=reg,..")
+    print("base: registers %s; wanted %s" % (" ".join("%s=%s" % kv for kv in c.breg.items() if N.named(kv[0])),
+                                             " ".join("%s=%s" % kv for kv in want.items())))
+    answers = N.need(c.base.f, want, limit=a.max_answers)
+    if not answers:
+        print("NOT FOUND: ncolsim has no appearance / order edit (singles, pairs) that gives the wanted registers")
+        return dict(answers=0, compiled=0, found=None, pred=(0, 0))
+    for ed, got, side in answers:
+        print("  answer: %-34s predicted %s%s" % (" ".join(ed), " ".join("%s=%s" % (k, got[k]) for k in want),
+                                                 ("  side: " + " ".join("%s %s->%s" % s for s in side)) if side else ""))
+    compiled, pok, pn = 0, 0, 0
+    tried = {}
+
+    def run(tag, edits):
+        nonlocal compiled
+        key = tuple(sorted(edits))
+        if key in tried:
+            return tried[key]
+        if compiled >= a.max_compiles:
+            return None
+        compiled += 1
+        try:
+            m = c.measure(tag, edits)
+        except (Exception, SystemExit):
+            m = None
+        tried[key] = m
+        return m
+
+    def hit(m):
+        return m is not None and m["shape"] == 0 and all(m["got"].get(k) == v for k, v in want.items())
+
+    for ai, (ed, got, side) in enumerate(answers):
+        units = []                               # (edit of one appearance / one order, count)
+        for e in ed:
+            f = e.split(":")
+            units.append(("%s:%s:%s:1" % (f[0], f[1], f[2]), int(f[3])) if f[0] in ("+app", "-app") else (e, 1))
+        real = {}
+        for u, _n in units:
+            real[u] = []
+            for k in c.select(u):
+                c.n += 1
+                m = run("v%04d" % c.n, k[2])
+                if m is None:
+                    continue
+                v, also = x64_verdict([u], m)
+                if v in ("exact", "yes"):
+                    gained = 1
+                    if u[:5] in ("+app:", "-app:"):
+                        _s, var, b, _one = u.split(":")
+                        gained = sum(int(x.split(":")[3]) for x in m["d"]["edits"]
+                                     if x.split(":")[:3] == [u[:4], var, b])
+                    real[u].append((k, m, gained))
+                    if len(ed) == 1 and _n == 1:
+                        pr = N.predict(c.base.f, ed)
+                        ok = all(pr[q] == m["got"].get(q, pr[q]) for q in pr if N.named(q))
+                        pn += 1
+                        pok += ok
+                        x64_show(c, "v%04d" % c.n, "%s %s" % (k[0], k[1]), m, v, also, pr if v == "exact" else None)
+                if hit(m):
+                    print("FOUND (while realising answer %d, %s): %s %s; measured %s -> %s" % (
+                        ai, " ".join(ed), k[0], k[1], x64_inputs(c, m), m["path"]))
+                    return dict(answers=len(answers), compiled=compiled, found=m["path"], pred=(pok, pn))
+        # combine: per unit the realisations, enough of them for its count, members not overlapping
+        if all(real[u] for u, _n in units):
+            pick = []
+            for u, n in units:
+                acc, got_n = [], 0
+                for k, m, g in sorted(real[u], key=lambda x: (x[1]["shape"], -x[2])):
+                    if g <= 0 or any(c.rw.overlap(k[2], q[2]) for q in pick + acc):
+                        continue
+                    acc.append(k)
+                    got_n += g
+                    if got_n >= n:
+                        break
+                pick += acc
+            if pick and (len(pick) > 1 or len(units) > 1 or units[0][1] > 1):
+                c.n += 1
+                m = run("c%04d" % c.n, [e for k in pick for e in k[2]])
+                if m is not None:
+                    pr = N.predict(c.base.f, ed)
+                    v, also = x64_verdict(ed, m)
+                    ok = all(pr[q] == m["got"].get(q, pr[q]) for q in pr if N.named(q))
+                    pn += 1
+                    pok += ok
+                    x64_show(c, "c%04d" % c.n, " + ".join("%s %s" % (k[0], k[1]) for k in pick), m, v, also,
+                             pr if v == "exact" else None)
+                    if hit(m):
+                        print("FOUND answer %d (%s): %s; measured %s -> %s" % (
+                            ai, " ".join(ed), " + ".join(k[1] for k in pick), x64_inputs(c, m), m["path"]))
+                        return dict(answers=len(answers), compiled=compiled, found=m["path"], pred=(pok, pn))
+        else:
+            print("  answer %d: no construct realises %s" % (ai, ", ".join(u for u, _n in units if not real[u])))
+    print("NOT FOUND: %d answers, %d compiles; predictions of the realised answers: %d of %d as traced" % (
+        len(answers), compiled, pok, pn))
+    return dict(answers=len(answers), compiled=compiled, found=None, pred=(pok, pn))
+
+
+def x64_cmd_measure(a, cl):
+    import rwsweep, ncolsim as N
+    d = tempfile.mkdtemp(prefix="realize_x64_")
+    func = c2trace.func_decl(a.func)
+    ra = N.NRun(a.src, func, cl, os.path.join(d, "a"))
+    rb = N.NRun(a.edits[0], func, cl, os.path.join(d, "b"))
+    dl = N.run_delta(ra.f, rb.f)
+    print("inputs: %s%s" % (" ".join(dl["edits"]) or "(no appearance / order change)",
+                            "".join("  %s: %s" % (k, dl[k]) for k in ("blocks", "ranges", "live", "new", "gone") if dl[k])))
+    ga, gb = N.regs_of(ra.f), N.regs_of(rb.f)
+    print("registers: %s" % (" ".join("%s:%s->%s" % (k, ga[k], gb[k]) for k in ga if N.named(k) and k in gb and
+                                      ga[k] != gb[k]) or "unchanged"))
+    if not dl["blocks"]:
+        pm = N.predict(ra.f, dl["edits"])
+        bad = {k: (pm[k], gb.get(k)) for k in pm if N.named(k) and k in gb and pm[k] != gb[k]}
+        print("ncolsim from the measured edits: %s" % ("as traced" if not bad else "differs: " + " ".join(
+            "%s model %s traced %s" % (k, x, y) for k, (x, y) in bad.items())))
+    pa, pb = {N.short(c["name"]): N.traced_prio(ra.f, c["name"]) for c in ra.f["cands"]}, \
+        {N.short(c["name"]): N.traced_prio(rb.f, c["name"]) for c in rb.f["cands"]}
+    print("priorities: %s" % (" ".join("%s:%s->%s" % (k, pa[k], pb[k]) for k in pa if N.named(k) and k in pb and
+                                       pa[k] != pb[k]) or "unchanged"))
+    print("code: shape %d regs %d" % (adiff([rwsweep._mask(x) for x in ra.instrs], [rwsweep._mask(x) for x in rb.instrs]),
+                                      adiff([tsweep._key(x) for x in ra.instrs], [tsweep._key(x) for x in rb.instrs])))
+    shutil.rmtree(d, ignore_errors=True)
+    return dl
+
+
+def main_x64(a, cl):
+    if a.cmd == "measure":
+        if len(a.edits) != 1:
+            sys.exit("usage: realize.py measure BASE.cpp VARIANT.cpp --func F")
+        return x64_cmd_measure(a, cl)
+    if a.cmd == "pairs":
+        sys.exit("realize (x64): pairs is not ported (use measure, or rwsweep)")
+    c = X64Ctx(a, cl)
+    if a.from_ncol or a.from_rasim:
+        return x64_pipeline(c, a)
+    return x64_cmd_edit(c, a)
+
+
 def run(a, cl):
     c = Ctx(a, cl)
     if a.from_rasim or a.from_model:
@@ -3081,7 +3513,13 @@ def main():
                          "scratch model (rasim scratch --target scan, singles and pairs); needs --asm-vs")
     ap.add_argument("--no-callee", action="store_true", help="--from-rasim: skip the final callee-body stage")
     ap.add_argument("--constructs", help="comma-separated construct names (default: all catalogued for the edit kind)")
+    ap.add_argument("--from-ncol", action="store_true", help="x64 (cl 17.00, NColor): the pipeline with ncolsim's "
+                    "answers for --want-regs")
+    ap.add_argument("--all-variants", action="store_true", help="x64 edit: also print variants that did nothing")
     a = ap.parse_intermixed_args(argv)
+    import ncolsim
+    if ncolsim.is_x64():               # cl 17.00 x64: NColor, predicted with ncolsim (docs/c2/ncolor.md 10)
+        return main_x64(a, cl)
     if a.cmd == "measure":
         return cmd_measure(a, cl)
     if a.cmd == "pairs":

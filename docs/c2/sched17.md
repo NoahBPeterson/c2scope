@@ -534,3 +534,129 @@ only): 1125.
 Not done: breakable dependences and lea
 folding (SchmdBreakDep), DAG construction itself (memory disambiguation: the edges are read from the trace), the
 Atom path.
+
+### 6.1 Predicted DAG: the region's DAG and static priorities from its IL (`c2sched17.py --predict`, 2026-11-21)
+
+`c2sched17.py SRC --predict -- FLAGS` (or `--il --export F.json`, then `c2sched17.py F.json --predict` offline)
+logs each region's IL as DagBuildGraph creates its nodes and builds the DAG, the latencies, units, heights and
+static priorities from that IL and OpSchedInfoK8 (`predict_dag`), then schedules it (`simulate`) and compares
+everything with the trace.
+
+**Probes** (hooks 4..8 of `c2sched17.hooks(il=True)`, no table change): DagBuildGraph entry (first / tail tuple;
+head / tail merging also run it, so a region keeps the graph built last before SchSchedGraph on its thread); a
+probe at 0x100e2bfa, once per tuple node as created: opcode, the +0xc dword (kind, flags, condition code), type
+word, lexical index, (kind, +0x1c) and (+0x24, +0x28) of every source / destination leaf, the first 11 words of
+the SYM of the first three sources and two destinations, and the tuple as an IL line (`!`, with
+`C2TRACE_ILPAS=28`: memory leaves print their points-at set `@pas`); a probe at 0x100e3918 (a register-set
+destination as DagBuildGraph walks it: the sparse bit vector's chunks); `ItfPasInterf` and `ItfIsMemberOfPas`
+entry / exit (the alias facts, below). With `--il` the issue probe logs all successor edges (90, not 24) and their
+types. Two layout facts found on the way **[C]**: an ICONST leaf's value is at +0x28 (the plain dump prints +0x24,
+which is 0 on x64: `add r10, 16` prints `0:1008`); a code-address leaf's +0x24 is the label SYM, the LABEL tuple's
++0x2c the same SYM.
+
+**DagBuildGraph, as now read** (0x100e29e0 in full for the paths zlib reaches; `DagMakeControlPoint`,
+`DagChkSymDefs/Refs`, `DagChkMemrefDefs`, `DagMakeAntiOutputDeps`, `SchmdPseudoCCDef`, `ItfSymsTotalInterf`,
+`ItfPartialInterf`'s dispatch, `ItfPasInterf`, `SchmdAgiStall`, `SchmdLatencyCallbacks`, `SchmdFindCBranchDep`,
+`SchComputeStaticPriority`, `SchmdDepIsBreakable`, `SchmdFindAGI` / `SchmdFindIndir`, the head of
+`SchmdBreakDep`) **[C]**. Four lists, newest first, all cleared at a control point: register / variable
+definitions (TLS+0xda60) and uses (0xda58), memory definitions (0xda70) and references (0xda68). Per tuple, in
+order:
+
+1. Control point (tuple kinds 0xf, 0x11 branch, 0x13 switch, 0x14 unless opcode 0x58f, 0x17..0x1a label, not
+   opcode 0x577; kind 0x15; kind 0x16 unless an opcode-0x59e non-annotation): a 0x80000 edge from every node
+   since the last control point that has no successor yet, a label after a label also from that one; the lists
+   are cleared. A call (0x18; also 0x3eb, 0x4f0, 0x4f2, 0x4f3) becomes a control point *after* its operand edges,
+   before its own definitions enter the lists.
+2. Sources. A REG leaf's physical register (+0x28; none: skipped) against the definitions: same family (+0xc of
+   the register SYM) and overlapping (+0x28 offset, +0x24 size; table below) gives a **true** edge, latency
+   `max(lat, producer latency + AGI)` (0 from OPPAREN 0x517); the walk stops at a definition whose range holds
+   the use (ItfSymsTotalInterf). SchmdAgiStall: +1 when the consumer's first memory leaf (sources, then a memory
+   destination; kind 5 counts) has that exact register as index or base, or the register is rsp, the consumer a
+   push / pop and the producer not. A variable leaf (kind 2) whose SYM is a variable / temporary (kind 3..5) and
+   not address-taken (SYM +9 bit 1) is looked up by SYM in the same lists (`DagChkSymDefs`: same root, overlapping
+   offset / size; type 0x20, **latency 1**, stops at a covering definition); other variable leaves and memory
+   leaves (kind 6, and kind 11, a call's memory set) are checked against every memory definition (0x20, no stop),
+   unless the memory leaf's PAS is 2.
+3. Destinations. A register: **output** edges (type 4, latency max(lat, 0) on K8) from overlapping definitions,
+   stopping at a covering one except for the flags (family cc: never stops); **anti** edges (type 2) from every
+   overlapping use since the control point. An unnamed flags clobber (the leaf's own symbol is cc) gets no output
+   edges when a later instruction of the region writes the flags before anything reads them, with no branch or
+   non-instruction between (0x100e3624 = SchmdPseudoCCDef). A variable: 0x80 from its definitions, 0x40 from its
+   uses. Memory: 0x80 from interfering memory definitions (`DagChkMemrefDefs`), 0x40 from interfering
+   references. A register set (kind 10: a call's clobbers) defines every register of its bit vector: for an
+   extern call rcx rdx r8..r11 ymm0..15 (rax is the result operand), for a static callee in the same file only
+   what it clobbers (so an argument register can have no output edge into the call).
+4. Zero idioms (`xor` / `xorps` / `xorpd` / `vxorps` / `vxorpd` of one register with itself, `or r, -1`): only
+   the destinations' output and anti edges (`DagMakeAntiOutputDeps`, the same pseudo-flags rule).
+5. The tuple enters the lists: its register uses / definitions, a variable leaf's frame register as a use
+   (`get_local_base_reg`) and the variable itself (or, address-taken, the memory lists), its memory references /
+   definitions. A node without a predecessor gets a 0x80000 edge from the last control point. The exit node is a
+   control point. A non-instruction tuple's node latency is 0.
+
+Register SYMs (read off the live table [TLS+0x113f4] + 0x64 * number, `reginfo`) **[C]**: rax..r15 their own
+family, size 64; eax.. / ax.. / al.. in it at offset 0, sizes 32 / 16 / 8; ah..bh at offset 8; ymmN 256 with ymmNh
+(128 at 128), xmmN / dxmmN / ixmmN (128), their h (64 at 64), l and s (64 / 32 at 0), fxmmNl / s, all in ymmN; the
+flags cc (5) with cc_sozp 4, cc_soz 3, cc_so 2, cc_sf 1 at 0, cc_of at 1, cc_pf at 2, cc_zc 2 at 3, cc_zf at 3,
+cc_cf at 4.
+
+**Memory interference** (`ItfPartialInterf` 0x100ddb70) **[C]**: two memory leaves by `ItfPasInterf(pas, pas)`
+(PAS 2 meets nothing, 3 only 3, equal sets or set 1 meet, other pairs when their bit vectors [TLS+0xebf4]
+intersect, refined for derived sets >= [TLS+0xec48]); a memory set (kind 11) by its PAS at +0x24 (flagged +0x1c
+bit 8: only with another flagged one); a variable against a set by `ItfIsMemberOfPas(sym, pas)`; two variables
+by root and range. A volatile memory definition (+0x1c bit 13) meets everything. The bit vectors are the
+optimizer's alias sets and are not in the IL dump: the probe logs the answers the scheduler's own DagBuildGraph
+asked (`alias` per region: (pas, pas, answer), (sym, pas, answer)); without them (`--predict`'s "IL only" line,
+`predict_dag(region, alias=False)`) a guess fitted on zlib: set 6 meets only itself, 7 (the call / escaping set),
+10, 13, 15 meet every set but 6; two per-access sets (>= 16) meet unless both leaves are based on the same
+variable without an index; a variable is in 7, 10, 13, 15.
+
+**Breakable edges** (`SchmdDepIsBreakable`, called per successor edge in the forward pass before the node's
+priority) **[C for the cases implemented]**: neither end a control point.
+
+- True edge, producer `add r, imm` (kind 1), `sub r, imm` (3, not rsp), `inc` (0xb), `dec` (0xc, not rsp), `lea`
+  (5: the consumer's leaf has no index; 7: the register is its base, the lea's address without index or x1), the
+  consumer reaching memory through exactly that register (SchmdFindAGI: the producer's first register
+  destination; the consumer's first memory leaf, sources before destinations, by base or index; not when the
+  consumer reads the flags or names the register as its first source): breakable unless the displacement is short
+  and would become long (|d| < 0x80, |d + delta| >= 0x80). The consumer then gets the producer's true and control
+  predecessors (true ones with the broken edge's latency). If the edge is also anti / output: only for a lea whose
+  address does not use its own destination, split into a true edge of kind + 1 (6, 8: folded at issue time by
+  SchmdHasFoldableAGI) and a new plain edge with the other bits.
+- Anti edge (no output bit), consumer `add r, imm` (0x10), `sub` (0x11), `inc` (0x15), `dec` (0x16), `lea` (0x13,
+  displacement - delta within int32) moving the register the producer addresses memory through; not rsp; needs
+  favor-speed.
+
+Each marks the edge's kind (latency word bits 16..20) and counts it in the consumer's `nbreak`; a node whose
+predecessors are all breakable gets `DagMakeBackwardControlDep` (0x80000 from the nearest earlier control point).
+In the replay (`simulate(..., breaks=True)`): a node is ready when `npred == nbreak`; it waits while a producer of
+one of its anti breaks (kind >= 0x10) is unissued, ready and could issue by the next cycle; when it issues first
+its edges from unissued producers are removed (SchmdBreakDep), and a producer left without successors gets a
+control edge to the next control point (`DagMakeForwardControlDep`, called from SchmdBreakDep 0x100e6094).
+
+**Latencies** (`k8_latency`): OpSchedInfoK8 +0 as in 2.4, the callback cases of `SchmdLatencyCallbacks` read for
+lea, imul / mul, div / idiv, the 0x13d..0x157 table and the default (mov, _emov, movzx: 4 load, 3 store, 1
+register; memory = a leaf of kind 6, 3, 4 or 2, so a call or a jump to a code address counts), + 1.
+
+**Measured** (zlib 1.2.1, 12 files at /O2, 1173 regions, 8450 nodes; tests/data/ncol's four sources in brackets,
+72 regions):
+
+| | IL + alias facts | IL only (PAS guess) |
+|---|---|---|
+| traced edges reproduced (type and latency equal) | 20028 of 20043 [2507 of 2511] | 19876 of 20043 [2488 of 2511] |
+| edges predicted | 20028 [2507] | 20015 [2686] |
+| DAG exact (traced edge set) | 1158 [68] | 1073 [64] |
+| node latency, unit | 8450 / 8450 of 8450 [769 / 769] | the same |
+| height, static priority | 8450 / 8450 [769 / 769] | 8367 / 8269 [732 / 695] |
+| regions in exactly the traced issue order | **1155** [72] | 1124 [70] |
+
+The same replay from the traced DAG: 1152 [71] (as in 6), 1153 [71] with `breaks=True`. The 15 traced edges not
+predicted are all control edges SchmdBreakDep adds during scheduling (above), not edges of the built DAG; a traced
+breakable edge the traced order broke is not in the trace and is not counted against the prediction. Still read
+from the trace with `--predict`: the alias facts (the IL-only line shows their weight); every other input of the
+DAG, its latencies, units, heights and priorities comes from the IL and the DLL's tables.
+
+Not done: the Atom path; break kinds 9 (a lea folded into an index; not taken in zlib's traces) and the lea split's
+issue-time folding (SchmdHasFoldableAGI); `SchmdBreakDep`'s operand rewrites and producer removal (bit 5: never set
+by the cases above); a switch's case edges and opcode 0x51b / the CurFunc+0x58 register / int, cli, sti control
+points (not reached by zlib); `ItfStackLocIsMemberOfPas` (TLS+0xebdc never seen set). Offline test:
+`sched17_predict_tests` (tests/data/sched17/il/*.json: c1, c2, sum, adler32, compress, uncompr, zutil, inftrees).

@@ -344,9 +344,20 @@ static void oplist(DWORD l) {
     int n = 0;
     while (l && n++ < 16) { out(" "); leaf(l); l = rd(l + LNEXT); }
 }
+static int ILSYMW = 0;         /* `set ilsymw N` (env C2TRACE_ILSYMW): with ilraw, "T S <sym> <N words>" after each leaf's
+                               * T R line: the words of the leaf's symbol (leaf + lpay; "T S 0" without one) */
 static void rawlist(DWORD l) {
-    int n = 0;
-    while (ILRAW && l && n++ < 16) { rawwords(l); l = rd(l + LNEXT); }
+    int n = 0, i; DWORD s;
+    while (ILRAW && l && n++ < 16) {
+        rawwords(l);
+        if (ILSYMW) {
+            s = rd(l + LPAY);
+            out("T S %x", s);
+            for (i = 0; s && i < ILSYMW; i++) out(" %x", rd(s + 4 * i));
+            out("\n");
+        }
+        l = rd(l + LNEXT);
+    }
 }
 static void dumpil(DWORD t, int max) {
     int n = 0; char c[48];
@@ -819,6 +830,7 @@ static void setvar(const char *nm, DWORD v) {
     else if (!strcmp(nm, "skind")) SKIND = (int)v;
     else if (!strcmp(nm, "snum")) SNUM = (int)v;
     else if (!strcmp(nm, "ilraw")) ILRAW = (int)v;
+    else if (!strcmp(nm, "ilsymw")) { ILSYMW = (int)v; out("# ilsymw %x\n", ILSYMW); }
     else if (!strcmp(nm, "lmd")) LMD = (int)v;
     else if (!strcmp(nm, "ilnum")) ILNUM = (int)v;
     else if (!strcmp(nm, "lmb")) LMB = (int)v;
@@ -1260,6 +1272,10 @@ def write_cfg(cfg, img, hooks, maxn=None, exit_all=False, func=None):
         if os.environ.get("C2TRACE_ILPAS"):          # memory leaves print their PAS index (tools/loadcse.py)
             f.write("set ilpas %s\n" % (os.environ["C2TRACE_ILPAS"] if os.environ["C2TRACE_ILPAS"] != "1" else
                                         c2build.get("dll", {}).get("ilpas_off", "1c")))
+        if os.environ.get("C2TRACE_ILRAW"):          # "T R" raw words after each tuple and leaf (c2ncol.py --il)
+            f.write("set ilraw %x\n" % int(os.environ["C2TRACE_ILRAW"]))
+        if os.environ.get("C2TRACE_ILSYMW"):         # with ilraw: "T S" the words of each leaf's symbol
+            f.write("set ilsymw %x\n" % int(os.environ["C2TRACE_ILSYMW"]))
         if os.environ.get("C2TRACE_ILNUM"):          # tuple numbers after each instruction (tools/c2ncol.py)
             f.write("set ilnum %s\n" % (os.environ["C2TRACE_ILNUM"] if os.environ["C2TRACE_ILNUM"] != "1" else
                                         c2build.get("dll", {}).get("ilnum_off", "28")))

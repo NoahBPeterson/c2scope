@@ -10,6 +10,9 @@ variable behind. That variable counts in P of its block, which moves every other
 usually takes the register the address temporary had through a copy hint, so no rotation pick moves and the code
 stays the same. Outside EH frames nothing happens.
 
+On cl 17.00 x64 (arch x64) the sites are measured on NColor and combinations predicted with ncolsim instead of
+added gaps (rwsweep.sweep_x64, docs/c2/ncolor.md 10); --want-regs v=reg ranks them.
+
 Steps:
   1. find the helpers the target function uses (inline function and member bodies whose name occurs in the
      target's body, transitively);
@@ -259,6 +262,24 @@ class Run:
         return g
 
 
+def main_x64(a, cl, text, sites, A, B):
+    """helpersweep under cl 17.00 x64: the same sites, each single compiled with the NColor trace; what it moved in
+    NColor's inputs read as whatif edits, combinations predicted by ncolsim (their edits added up, then simulated)
+    instead of adding Spillcosts gaps (rwsweep.sweep_x64). --want A>B is NColor's processing order (prio(B) - prio(A),
+    ties by lifetime index); --want-regs ranks the combinations by the registers predicted."""
+    import rwsweep
+    out = os.path.join(ROOT, "work", "helpersweep", tsweep.out_name(a.tu, a.func)) + "@" + c2trace.c2build.name()
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    orig = tsweep.orig_instrs(a.asm_vs) if a.asm_vs else None
+    res = rwsweep.sweep_x64(out, lambda ids: apply_sites(text, [sites[i][1:] for i in ids]),
+                            [("bind", "%s: &%s -> &hs_bind(%s)" % (sites[i][0], sites[i][3], sites[i][3]))
+                             for i in range(len(sites))], a.func, cl, A, B, rwsweep.parse_want_regs(a.want_regs),
+                            a.max_combo, a.verify, orig, tag="s")
+    print("variants: %s/s<id>/s<id>.cpp" % out)
+    return res
+
+
 def main():
     argv = sys.argv[1:]
     cl = []
@@ -275,6 +296,7 @@ def main():
     ap.add_argument("--max-combo", type=int, default=3)
     ap.add_argument("--verify", type=int, default=6)
     ap.add_argument("--include-target", action="store_true", help="also rewrite sites in the target's own body")
+    ap.add_argument("--want-regs", help="x64 (NColor): v=reg,..: the registers wanted (combinations ranked by them)")
     a = ap.parse_args(argv)
     A, B = a.want.split(">")
     text = open(a.tu).read()
@@ -291,6 +313,8 @@ def main():
             sites.append((fn[0],) + s)
     sites = sorted(set(sites), key=lambda x: x[1])
     print("%d helpers used by the target, %d rewrite sites" % (len(helpers), len(sites)), flush=True)
+    if c2trace.c2build.get("arch") == "x64" and "ncol" in (c2trace.c2build.get("hooks") or {}):
+        return main_x64(a, cl, text, sites, A, B)     # cl 17.00 x64: NColor (docs/c2/ncolor.md 10)
     # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory
     out = os.path.join(ROOT, "work", "helpersweep", tsweep.out_name(a.tu, a.func))
     if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory

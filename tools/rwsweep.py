@@ -68,6 +68,11 @@ Measures per variant:
   regdiff  (--asm-vs) the same alignment over mnemonic + registers only (tsweep.regdiff)
   dgap     (--want A>B) change of prio(B) - prio(A); the constraint holds when the gap is <= 0
 
+cl 17.00 x64 (a build table with arch x64): every single is traced on NColor; what it moved is printed as ncolsim
+whatif edits (+app / -app per block, index order, live counts) with whether ncolsim's registers for them are the
+traced ones; combinations are predicted by simulating the added edits; --want-regs v=reg ranks them and reports
+FOUND (docs/c2/ncolor.md 10).
+
 Output: every variant that changed something, best first; then combinations of the code-neutral ones that
 helped (gaps add up, as in helpersweep), compiled and reported. Variants stay in work/rwsweep/<tu>-<dirhash>/.
 """
@@ -76,7 +81,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image import ROOT
-import c2trace, c2regs, tsweep, helpersweep
+import c2trace, c2regs, tsweep, helpersweep, ncolsim
 
 PRELUDE = ("template<class HsT> __forceinline HsT& hs_bind(HsT& x) { HsT& r = x; return r; }\n"
            "template<class HsT> __forceinline HsT hs_id(HsT x) { return x; }\n"
@@ -1301,6 +1306,203 @@ def plan_combos(rows, variants, b0, g0, max_combo):
     return good, better, [(pred, n, ids) for pred, _g, n, ids in combos]
 
 
+# ---------------------------------------------------------------- cl 17.00 x64: NColor (docs/c2/ncolor.md 10)
+
+class XRun:
+    """One traced x64 compile (ncolsim.NRun) with the measures rwsweep compares: shape (registers masked), keys."""
+
+    def __init__(self, src, func, cl, work):
+        self.r = ncolsim.NRun(src, func, cl, os.path.join(work, "r"))
+        self.f, self.instrs = self.r.f, self.r.instrs
+        self.shape = [_mask(x) for x in self.instrs]
+        self.keys = [tsweep._key(x) for x in self.instrs]
+
+
+def parse_want_regs(s):
+    """'v=rbx,w=rdi' -> {v: rbx, w: rdi} (64-bit names; ebx / bl.. are taken as their master)."""
+    out = {}
+    for x in (s or "").split(","):
+        if "=" in x:
+            v, r = x.split("=", 1)
+            out[v.strip()] = ncolsim.ALIAS.get(r.strip(), r.strip())
+    return out
+
+
+def _regchg(base, r):
+    rb, rr = ncolsim.regs_of(base.f), ncolsim.regs_of(r.f)
+    return {k: (rb[k], rr[k]) for k in rb if ncolsim.named(k) and k in rr and rb[k] != rr[k]}
+
+
+def sweep_x64(out, make, descs, func, cl, A=None, Bn=None, want=None, max_combo=2, verify=8, orig=None,
+              conflict=None, show_all=False, tag="v"):
+    """The x64 measuring loop of rwsweep and helpersweep. make(ids) -> source text of the base with the variants ids
+    applied (make([]) the base); descs[i] = (family, description). Every single is compiled (sequentially: one wine
+    compile at a time) and traced with the NColor hooks; its effect on the allocator's inputs is read as whatif edits
+    (ncolsim.run_delta: appearances per block, lifetime-index order; flags for changed blocks, ranges, liveness), and
+    the model's registers for those edits (ncolsim.predict on the base run) are checked against the traced ones.
+    Combinations of the code-neutral singles are predicted by adding up their edits and simulating, ranked by the
+    wanted registers (want) or by the predicted gap of A>B, and the best `verify` are compiled.
+    -> dict(rows, singles=(predicted right, predictable), combos=(right, compiled), found=[...])."""
+    os.makedirs(out, exist_ok=True)
+
+    def build(t, ids):
+        d = os.path.join(out, t)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, t + ".cpp")
+        open(p, "w").write(make(ids))
+        return XRun(p, func, cl, d)
+
+    sc = (lambda r: (tsweep.rdiff(r.instrs, orig), tsweep.bdiff(r.instrs, orig))) if orig is not None else (lambda r: None)
+    base = build("base", [])
+    g0 = ncolsim.gap(base.f, A, Bn) if A else None
+    breg = ncolsim.regs_of(base.f)
+    print("baseline: %d instructions, registers %s%s%s" % (
+        len(base.instrs), " ".join("%s=%s" % kv for kv in breg.items() if ncolsim.named(kv[0])),
+        "" if g0 is None else ", gap %+d (%s %s, %s %s)" % (g0, A, ncolsim.traced_prio(base.f, A), Bn,
+                                                           ncolsim.traced_prio(base.f, Bn)),
+        "" if orig is None else ", rdiff %d, bdiff %d" % sc(base)), flush=True)
+    if want:
+        miss = [k for k in want if k not in breg]
+        if miss:
+            print("  (not NColor candidates of the baseline: %s)" % ", ".join(miss))
+    rows, failed = [], 0
+    for i in range(len(descs)):
+        try:
+            r = build("%s%04d" % (tag, i), [i])
+        except (Exception, SystemExit) as e:
+            failed += 1
+            if show_all:
+                print("  %s%04d failed: %s | %s" % (tag, i, descs[i][1], str(e)[-160:]))
+            continue
+        d = ncolsim.run_delta(base.f, r.f)
+        chg = _regchg(base, r)
+        pred = None if d["blocks"] else ncolsim.predict(base.f, d["edits"])
+        got = ncolsim.regs_of(r.f)
+        ok = None if pred is None else all(pred[k] == got.get(k, pred[k]) for k in pred if ncolsim.named(k))
+        rows.append(dict(i=i, r=r, shape=adiff(r.shape, base.shape), regs=adiff(r.keys, base.keys), d=d, chg=chg,
+                         pred=pred, ok=ok, dgap=None if g0 is None or ncolsim.gap(r.f, A, Bn) is None
+                         else ncolsim.gap(r.f, A, Bn) - g0, sc=sc(r)))
+    inert = [x for x in rows if x["regs"] == 0 and not x["chg"] and not x["d"]["edits"] and not x["d"]["blocks"]
+             and not x["dgap"]]
+    print("%d measured, %d failed to compile, %d changed nothing (code, registers, NColor inputs)" % (
+        len(rows), failed, len(inert)))
+    flags = lambda d: ",".join(k for k in ("blocks", "ranges", "live", "new", "gone") if d[k]) or "-"
+    print("   id   family shape regs %s%s inputs  predicted  edits / registers / rewrite" % (
+        "rdiff bdiff " if orig is not None else "", "dgap " if A else ""))
+    shown = [x for x in rows if show_all or x not in inert]
+    shown.sort(key=lambda x: ((x["sc"] or (0, 0)), x["shape"], x["dgap"] or 0, x["i"]))
+    for x in shown:
+        fam, desc = descs[x["i"]]
+        print("  %s%04d %-6s %5d %4d %s%s %-12s %-5s  %s | %s | %s" % (
+            tag, x["i"], fam, x["shape"], x["regs"], "" if orig is None else "%5d %5d " % x["sc"],
+            "" if not A else ("%+4d " % x["dgap"] if x["dgap"] is not None else "   ? "), flags(x["d"]),
+            {True: "ok", False: "MISS", None: "-"}[x["ok"]], " ".join(x["d"]["edits"]) or "-",
+            " ".join("%s:%s->%s" % (k, a_, b_) for k, (a_, b_) in x["chg"].items()) or "-", desc))
+    pr = [x for x in rows if x["ok"] is not None and (x["d"]["edits"] or x["chg"])]
+    out_ = [x for x in pr if x["d"]["ranges"] or x["d"]["new"] or x["d"]["gone"]]
+    print("model: %d of %d singles that moved an input or a register have the predicted registers; %d of %d among "
+          "those whose inputs are all edits (no moved range, no new or gone candidate)" % (
+              sum(x["ok"] for x in pr), len(pr), sum(x["ok"] for x in pr if x not in out_), len(pr) - len(out_)))
+    nb = [x for x in rows if x["d"]["blocks"] and x["chg"]]
+    if nb:
+        print("%d singles changed the block structure at NColor (not predicted; measured only)" % len(nb))
+    found = []
+    hit = lambda regs: want and all(regs.get(k) == v for k, v in want.items())
+    for x in rows:
+        if x["shape"] == 0 and hit(ncolsim.regs_of(x["r"].f)):
+            found.append(([x["i"]], x))
+            print("FOUND %s%04d (%s): the wanted registers, code-neutral -> %s" % (
+                tag, x["i"], descs[x["i"]][1], os.path.join(out, "%s%04d" % (tag, x["i"]))))
+    # combinations: code-neutral singles whose inputs or registers moved, blocks unchanged
+    pool = [x for x in rows if x["shape"] == 0 and not x["d"]["blocks"] and (x["d"]["edits"] or x["chg"])]
+    if orig is not None:
+        b0 = sc(base)
+        pool += [x for x in rows if x["shape"] != 0 and not x["d"]["blocks"] and x["sc"] < b0 and x not in pool][:8]
+    pool = pool[:16]
+    combos = []
+    for n in range(2, max_combo + 1):
+        for c in itertools.combinations(pool, n):
+            ids = [x["i"] for x in c]
+            if conflict and any(conflict(p, q) for p, q in itertools.combinations(ids, 2)):
+                continue
+            edits = [e for x in c for e in x["d"]["edits"]]
+            try:
+                pred = ncolsim.predict(base.f, edits)
+            except SystemExit:
+                continue
+            nw = sum(pred.get(k) == v for k, v in (want or {}).items())
+            pg = None
+            if A:
+                try:
+                    p = ncolsim.edited_prio(base.f, ncolsim.whatif_edits(edits))
+                    pa = p.get(ncolsim._cand(base.f, A)["name"], ncolsim.traced_prio(base.f, A))
+                    pb = p.get(ncolsim._cand(base.f, Bn)["name"], ncolsim.traced_prio(base.f, Bn))
+                    pg = pb - pa
+                except (SystemExit, TypeError, KeyError):
+                    pg = None
+            side = sum(1 for k in pred if ncolsim.named(k) and pred[k] != breg.get(k) and k not in (want or {}))
+            combos.append((-nw, pg if pg is not None else 0, side, n, ids, edits, pred))
+    combos.sort(key=lambda c: c[:4])
+    print("%d code-neutral singles combinable; %d combinations predicted, verifying %d" % (
+        len(pool), len(combos), min(verify, len(combos))))
+    cok = cn = 0
+    for nw, pg, side, n, ids, edits, pred in combos[:verify]:
+        t = "c_" + "_".join("%04d" % i for i in ids)
+        try:
+            r = build(t, ids)
+        except (Exception, SystemExit) as e:
+            print("  %s failed: %s" % (t, str(e)[-120:]))
+            continue
+        got = ncolsim.regs_of(r.f)
+        ok = all(pred[k] == got.get(k, pred[k]) for k in pred if ncolsim.named(k))
+        cn += 1
+        cok += ok
+        print("  %-18s shape %d regs %d%s  predicted %s  traced %s  %s%s" % (
+            "+".join("%s%04d" % (tag, i) for i in ids), adiff(r.shape, base.shape), adiff(r.keys, base.keys),
+            "" if orig is None else "  rdiff %d bdiff %d" % sc(r),
+            " ".join("%s=%s" % (k, pred[k]) for k in (want or pred) if k in pred and ncolsim.named(k)),
+            " ".join("%s=%s" % (k, got.get(k)) for k in (want or pred) if k in pred and ncolsim.named(k)),
+            "ok" if ok else "MISS", "" if pg is None or not A else "  gap predicted %+d real %s" % (pg, ncolsim.gap(r.f, A, Bn))))
+        if adiff(r.shape, base.shape) == 0 and hit(got):
+            found.append((ids, r))
+            print("FOUND %s: the wanted registers, code-neutral -> %s" % (t, os.path.join(out, t)))
+    if want and not found:
+        print("NOT FOUND: no single or verified combination gives %s with the same code" % (
+            " ".join("%s=%s" % kv for kv in want.items())))
+    return dict(rows=rows, singles=(sum(x["ok"] for x in pr), len(pr)), combos=(cok, cn), found=found)
+
+
+def main_x64(a, cl, text, raw, variants, tfunc, nthis):
+    """rwsweep under cl 17.00 x64: the same families and variants, measured on NColor (sweep_x64)."""
+    A, Bn = a.want.split(">") if a.want else (None, None)
+    out = os.path.join(ROOT, "work", "rwsweep", tsweep.out_name(a.tu, a.func)) + "@" + c2trace.c2build.name()
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    orig = tsweep.orig_instrs(a.asm_vs) if a.asm_vs else None
+    if prelude_for(raw):
+        try:
+            p0 = os.path.join(out, "raw")
+            os.makedirs(p0, exist_ok=True)
+            open(os.path.join(p0, "raw.cpp"), "w").write(raw)
+            r0 = XRun(os.path.join(p0, "raw.cpp"), tfunc, cl, p0)
+            p1 = os.path.join(out, "orig")
+            os.makedirs(p1, exist_ok=True)
+            open(os.path.join(p1, "orig.cpp"), "w").write(prelude_for(raw) + raw)
+            r1 = XRun(os.path.join(p1, "orig.cpp"), tfunc, cl, p1)
+            if r0.keys != r1.keys:
+                print("WARNING: the helper prelude alone changes the code; variants are measured against the baseline "
+                      "with it", flush=True)
+        except (Exception, SystemExit) as e:
+            print("raw baseline failed: %s" % str(e)[-160:])
+    if nthis:
+        print("%d member calls given `this->`" % nthis)
+    res = sweep_x64(out, lambda ids: apply(text, [e for i in ids for e in variants[i][2]]),
+                    [(v[0], v[1]) for v in variants], tfunc, cl, A, Bn, parse_want_regs(a.want_regs), a.max_combo,
+                    a.verify, orig, conflict=lambda i, j: overlap(variants[i][2], variants[j][2]), show_all=a.all)
+    print("variants: %s/v<id>/v<id>.cpp" % out)
+    return res
+
+
 def main():
     argv = sys.argv[1:]
     cl = []
@@ -1321,6 +1523,8 @@ def main():
     ap.add_argument("--limit", type=int, help="measure only the first N variants")
     ap.add_argument("--list", action="store_true", help="print the variants and stop")
     ap.add_argument("--all", action="store_true", help="also print variants that changed nothing")
+    ap.add_argument("--want-regs", help="x64 (NColor): v=reg,..: the registers wanted; combinations are ranked by "
+                    "whether ncolsim predicts them")
     a = ap.parse_args(argv)
     A, Bn = a.want.split(">") if a.want else (None, None)
     text = open(a.tu).read()
@@ -1357,6 +1561,8 @@ def main():
         for i, v in enumerate(variants):
             print("  v%04d %-6s %s" % (i, v[0], v[1]))
         return
+    if ncolsim.is_x64():               # cl 17.00 x64: NColor, predicted with ncolsim (docs/c2/ncolor.md 10)
+        return main_x64(a, cl, text, raw, variants, tfunc, nthis)
     # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory
     out = os.path.join(ROOT, "work", "rwsweep", tsweep.out_name(a.tu, a.func))
     if c2trace.c2build.table():       # another c2 build (--c2 / C2_BUILD): its own variant directory

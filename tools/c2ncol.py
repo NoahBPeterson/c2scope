@@ -38,7 +38,8 @@ def why_specs():
     return ["ecx>0x1c*%d:4" % NAPP, "ecx>0x10*%d" % NRNG,
             "ecx>0x3c>8", "ecx>0x3c>0xc", "ecx>0x38>0x20",   # its own preference window; the tied physreg
             "ecx>4>0x44",                                     # the anti-preference set (TLS+0x119c8 / cc / d0)
-            "ecx", "tf640>0"]                                 # its record and the array: lifetime index (ties)
+            "ecx", "tf640>0",                                 # its record and the array: lifetime index (ties)
+            "ecx>4"]                                          # its SYM (--il: the root of the IL leaves' symbols)
 
 
 def hooks():
@@ -80,6 +81,7 @@ def parse_all(text):
     fns = []
     ctx = {}            # thread -> {"fn": record, "cur": candidate}
     th = 0
+    ilrec = {}          # thread -> the record whose STATE event the following T lines (--il) belong to
 
     def fn_of(t):
         c = ctx.setdefault(t, {"fn": None, "cur": None})
@@ -93,8 +95,12 @@ def parse_all(text):
         if ln.startswith("# thread "):
             th = int(ln.split()[2])
             continue
+        if ln.startswith("T ") and th in ilrec:
+            ilrec[th].setdefault("il", []).append(ln[2:])
+            continue
         if not ln.startswith("E ") or "|" not in ln:
             continue
+        ilrec.pop(th, None)
         head, _, rest = ln.partition("|")
         f = head.split()
         kind, v = int(f[3]), c2trace._split(rest)
@@ -120,6 +126,8 @@ def parse_all(text):
                     cur["anti"] = g(v[11]) if len(v) > 11 else None
                     if len(v) > 13 and g(v[12]) is not None and g(v[13]):
                         cur["index"] = (g(v[12]) - g(v[13])) // 0x5c
+                    if len(v) > 14 and g(v[14]) is not None:
+                        cur["sym"] = g(v[14])
             rec["cands"].append(cur)
             c["cur"] = cur
         elif kind == PREF and cur is not None:
@@ -148,6 +156,7 @@ def parse_all(text):
                 if len(v) >= na + 3:
                     st["anti"] = [hx(x) if x != "?" else None for x in v[na:na + 3]]
             rec["state"] = st
+            ilrec[th] = rec       # --il: the IL as NColDoLiveness numbered it follows (T lines)
         elif kind == GIVEBACK:
             rec["given"].append(unq(v[0]))
         elif kind == REWRITE:
@@ -223,6 +232,9 @@ def main(argv):
     ap.add_argument("--why", action="store_true", help="appearances per block and the priority formula per candidate")
     ap.add_argument("--export", help="JSON of every function's NColor run (candidates, liveness, initial "
                     "availability): rasim's input; --func optional (empty: all functions)")
+    ap.add_argument("--il", action="store_true", help="with --export: also the IL after prioritization, with raw "
+                    "words (T R: branch targets) and each leaf's symbol (T S: root, size, offset), for ncolsim's "
+                    "trace-free inputs (docs/c2/ncolor.md 11)")
     ap.add_argument("--keep")
     argv, cl = c2trace.split_cl(argv)
     a = ap.parse_args(argv)
@@ -236,6 +248,11 @@ def main(argv):
             st += "," + ",".join("tf65c>0>%d*%d" % (4 * r, NAVAIL) for r in AVAIL_REGS)
             st += "," + ",".join("tf6a0>0>%d*%d" % (4 * r, NAVAIL) for r in PREFWIN_REGS)  # preference windows
             st += ",t119c8>0,t119cc>0,t119d0>0"     # the anti-preference sets: r12 / rbp, r13 / all three
+            if a.il:          # the whole tuple stream (NColDoLiveness numbers every tuple from 1), raw words
+                st += ",tdccc>0>8>0>0x1c%"
+                os.environ.setdefault("C2TRACE_ILRAW", "12")
+                os.environ.setdefault("C2TRACE_ILSYMW", "11")    # each leaf's symbol: +0xc root, +0x24 / +0x28
+                os.environ.setdefault("C2TRACE_ILPAS", "28")
         hk.append(st)
         hk.append(c2build.hooks("ncol_fn", None))
         hk.append(c2build.hooks("ncol_pref", None))
