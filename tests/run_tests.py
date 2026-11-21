@@ -890,6 +890,66 @@ def rdiff_tests():
 
 
 
+def ncolsim_tests():
+    """tools/ncolsim.py on NColor traces of cl 17.00 x64 (tests/data/ncol/*.json: `c2ncol.py --export` of the .c /
+    .cpp beside them): the priority formula and the register choice of the order walk, against the trace."""
+    import glob, io, contextlib, ncolsim as N
+    fns = N.load(sorted(glob.glob(os.path.join(HERE, "tests", "data", "ncol", "*.json"))))
+    ok = n = 0
+    for f in fns:
+        for c in f["cands"]:
+            p = N.prio(c, f["state"])
+            if p is not None:
+                n += 1
+                ok += p == (c["prio"] - (1 << 32) if c["prio"] & 0x80000000 else c["prio"])
+    check("ncolsim: NColor priorities (x64) of the fixtures as traced", (ok, n), (293, 294))
+    b = io.StringIO()
+    with contextlib.redirect_stdout(b):
+        N.cmd_replay(fns, 0)
+    lines = b.getvalue().splitlines()
+    check("ncolsim: order walk register = traced register, single-region integer candidates",
+          lines[0].split(":")[1].split("single")[0].strip(), "128 of 131")
+    check("ncolsim: the same for xmm candidates (banks fxmm l / s, masters ymm)",
+          lines[1].split(":")[1].split("single")[0].strip(), "159 of 160")
+
+
+def sched17_tests():
+    """tools/c2sched17.py's replay of the x64 scheduler (cl 17.00, K8 model) on traced regions
+    (tests/data/sched17/*.json: `c2sched17.py --export` of tests/data/ncol's sources)."""
+    import glob, json
+    os.environ.setdefault("C2_BUILD", "14.00")
+    import c2sched17 as S
+    fns = []
+    for p in sorted(glob.glob(os.path.join(HERE, "tests", "data", "sched17", "*.json"))):
+        for f in json.load(open(p))["functions"]:
+            for r in f["regions"]:
+                for x in r["sel"]:
+                    x["succ"] = [tuple(e) for e in x["succ"]]
+            fns.append(f)
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        got = S.check(fns, 0)
+    check("sched17: x64 regions issued in the replay model's order (static + dynamic priority, units, fusion)",
+          got, (60, 61))
+
+
+def symkeys17_tests():
+    """symkeys on cl 17.00 x64 from an export (tests/data/symkeys17/symkeys.json: `symkeys.py export` of
+    tests/data/symkeys.cpp under --c2 17.00, docs/c2/symkeys.md 10): replay without a compile, x64 spellings."""
+    js = os.path.join(HERE, "tests", "data", "symkeys17", "symkeys.json")
+    env = dict(os.environ, C2_BUILD="17.00")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "keys", "--from", js, "--func", ""],
+                       capture_output=True, text=True, cwd=HERE, env=env)
+    rep = re.findall(r"replay: (\d+)/(\d+) keys reproduced", r.stdout)
+    check("symkeys17: every traced key of the 10 functions reproduced by the replay",
+          (len(rep), all(a == b for a, b in rep)), (10, True))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "keys", "--from", js, "--func",
+                        "kparams", "--brief"], capture_output=True, text=True, cwd=HERE, env=env)
+    m = re.search(r"^\?kparams@\S*\s+(.*?)\s+\[", r.stdout, re.M)
+    check("symkeys17: parameters in reverse, locals by first reference; two dummy globals",
+          " ".join(m.group(1).split()[1:8]) if m else "", "c:1 b:2 a:3 r:4 q:5 DummyGlobal:32 DummySafeGlobal:33")
+
+
 def judge_tests():
     """tools/judge.py on synthetic code: what instruction selection, allocation, scheduling and layout change is
     EQUIVALENT; a changed store, branch or loop body is a MISMATCH."""
@@ -995,6 +1055,9 @@ def judge_tests():
 bdiff_tests()
 rdiff_tests()
 judge_tests()
+ncolsim_tests()
+sched17_tests()
+symkeys17_tests()
 
 
 

@@ -1,13 +1,14 @@
 # c2scope: see inside the MSVC back end while it compiles
 
 Tools that look inside Microsoft's C++ back end (`c2.dll`) while it compiles your source, so that matching a
-decompiled function becomes prediction instead of guessing. Three compilers are supported:
+decompiled function becomes prediction instead of guessing. Four compilers are supported:
 
 | compiler | used by | option |
 |---|---|---|
 | VS2005 SP1, 14.00.50727.762 | Fallout 3 | default |
 | VS .NET 2003, 13.10.3077 and 13.10.3052 | Mount & Blade | `--c2 13.10`, `--c2 13.10.3052` |
 | VS2008 SP1, 15.00.30729.1 | Spore | `--c2 15.00` |
+| VS2012 Update 4, 17.00.61030 (x86_amd64: 64-bit code) | x64 targets | `--c2 17.00` |
 
 They trace c2's own decisions (which values get registers and in what order, which register each temporary gets,
 the IL at every pass, the scheduler's choices), model the register allocator well enough to answer "what source
@@ -40,7 +41,9 @@ traced toolchain and rasim, and finishes with a regression test (9 checks). If a
 to fix it; run the same command again and it continues where it stopped.
 
 For the other compilers, after the setup above: `uv run tools/c2build.py setup --c2 13.10` (or `--c2 15.00`),
-then add the same `--c2` option to any tool command. `tools/c2build.py` explains where it looks for each toolchain.
+then add the same `--c2` option to any tool command. For 17.00, stage an unpacked VS2012 first with
+`uv run tools/c2stage_vs2012.py ROOT`; the x64 back end is a different allocator (NColor), scheduler and frame
+packer, and docs/c2/port-1700.md lists which tools run there. `tools/c2build.py` explains where it looks for each toolchain.
 
 Coding agents: read `AGENTS.md` first (which tool for which symptom, and the rules that avoid wrong answers).
 

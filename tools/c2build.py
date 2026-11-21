@@ -13,7 +13,10 @@ A non-default build is described by tools/c2builds/<build>.json:
   image_base              c2.dll's preferred base (hex)
   patch                   cave_rva, text_vsize, entry_rva, iat_loadlibrarya (hex RVAs) for the entry-point cave
                           optional: file_delta (.text RVA minus file offset, hex; 0 when the image is
-                          section-aligned on disk), nsec (number of sections, default 5)
+                          section-aligned on disk), nsec (number of sections, default 5), loadlib "w" (the IAT slot
+                          is LoadLibraryW: the cave passes a UTF-16 name; cl 17.00 imports no LoadLibraryA)
+  dll_build               optional: the build whose cl compiles c2trace.dll (a cross compiler's own cl makes a DLL
+                          for its target, which its 32-bit c2.dll cannot load: 17.00 x64 uses "14.00")
   setup                   optional defaults of `setup`: {"from", "sdk", "sal"} directories relative to the repository
   dll                     c2trace.dll settings written to the trace config: regname, opname (hex VAs) and tuple /
                           symbol layout overrides (see DLL_SRC in c2trace.py, directive `set`)
@@ -44,7 +47,9 @@ DEFAULT = "14.00"
 ALIASES = {"14.00": DEFAULT, "14.00.50727.762": DEFAULT, "vs2005": DEFAULT,
            "13.10": "13.10.3077", "vc71": "13.10.3077", "3077": "13.10.3077", "3052": "13.10.3052",
            "15.00": "15.00.30729.1", "15.00.30729.01": "15.00.30729.1", "vc9sp1": "15.00.30729.1",
-           "vs2008sp1": "15.00.30729.1", "30729": "15.00.30729.1"}
+           "vs2008sp1": "15.00.30729.1", "30729": "15.00.30729.1",
+           "17.00": "17.00.61030-x64", "17.00-x64": "17.00.61030-x64", "vs2012": "17.00.61030-x64",
+           "vc11": "17.00.61030-x64", "61030": "17.00.61030-x64"}
 _cache = {}
 
 
@@ -89,6 +94,24 @@ def get(key, default=None):
     return default if t is None else t.get(key, default)
 
 
+class Unported(list):
+    """A hook list a partly ported build (table "partial": true, e.g. cl 17.00 x64) does not have: an empty list, so
+    the tools import and compile (tsweep's bdiff / rdiff need no trace); what they would have read from those events
+    is missing (a metric such as prio() then fails per variant). A note goes to stderr once per key."""
+    _said = set()
+
+    def __init__(self, key):
+        super().__init__()
+        self.key = key
+        if key not in Unported._said:
+            Unported._said.add(key)
+            sys.stderr.write("c2 %s: '%s' events are not ported to this build (docs/c2/port-1700.md); tools that "
+                             "read them have no data\n" % (name(), key))
+
+    def __getitem__(self, i):             # import-time code that builds on an element (HOOKS[0] + ",...") gets ""
+        return "" if isinstance(i, int) else Unported(self.key)
+
+
 def hooks(key, default):
     """The hook list (or spec string) `key` for the selected build; `default` is the 14.00 one."""
     t = table()
@@ -96,6 +119,8 @@ def hooks(key, default):
         return default
     h = t.get("hooks", {})
     if key not in h:
+        if t.get("partial") and default is not None and not isinstance(default, str):
+            return Unported(key)
         sys.exit("c2 %s: no '%s' hooks in the build table (not ported; see docs/c2/port-1310.md)" % (name(), key))
     return h[key]
 

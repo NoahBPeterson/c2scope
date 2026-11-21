@@ -10,7 +10,8 @@ where it would have compiled SRC. SRC (the tool's source argument) is the candid
 usage: unitcompose.py compose SPEC [CANDIDATE] [-o OUT]   write the composed unit (default: print it)
        unitcompose.py line OUT N..                         composed line N -> candidate (or header) line
        unitcompose.py extract OUT [VARIANT]                the candidate's part of OUT (or of an edited copy of it)
-SPEC is a JSON file or `f3pack:DIR` (the f3decomp pack adapter, below).
+SPEC is a JSON file, `f3pack:DIR` (the f3decomp pack adapter, below) or `PREFIX:DIR` of a local adapter module
+(tools/<name>_adapter.py defining PREFIX, OPTION and spec(DIR)).
 
 Spec (JSON; relative paths are taken against the spec's directory):
   {"parts": [PART, ..], "flags": ["/MT", ..], "func": "SYMBOL", "name": "STEM"}
@@ -19,10 +20,13 @@ Spec (JSON; relative paths are taken against the spec's directory):
     {"include": "PATH"}                     an `#include "/absolute/PATH"` line (the file ships to a compile server
                                             like any header the unit includes)
     {"inline": "PATH", "drop": [RE..]}      the file's text, without the lines a `drop` regex finds
-    {"candidate": true | "PATH", "drop": [RE..], "hoist": [RE..]}
+    {"candidate": true | "PATH", "drop": [RE..], "hoist": [RE..], "incdirs": [DIR..]}
                                             the candidate: SRC on a tool's command line (or PATH); lines found by a
                                             `hoist` regex are moved to the {"hoisted": true} part (or to the top
                                             when there is none), other lines found by a `drop` regex are removed
+                                            incdirs: a candidate line `#include "X"` becomes the absolute path
+                                            of the first DIR/X that exists (the header then ships to a compile
+                                            server; cl's own /I search would not see the server's copy)
     {"hoisted": true}                       where hoisted candidate lines go
   `drop` and `hoist` are Python regular expressions searched in each line (without its newline).
   flags: cl flags put before the ones given after `--` (so a later flag of yours wins); func: the function's symbol
@@ -31,6 +35,7 @@ Spec (JSON; relative paths are taken against the spec's directory):
 
 On any tool (taken out of sys.argv when c2trace is imported, like --c2):
   --unit SPEC | --unit f3pack:DIR | --f3pack DIR    compose; the tool runs on the composed unit
+  OPTION DIR of a local adapter (= --unit PREFIX:DIR)
   --unit-out PATH                                    where to write it (default: the --keep directory, else next
                                                      to --export, else work/units/<hash>/<stem>.unit.cpp)
 The composed unit is written with a line map (<out minus .cpp>.json). Reports that print absolute source lines
@@ -77,8 +82,29 @@ def f3pack_spec(d):
     return spec
 
 
+_ADAPTERS = None
+
+
+def adapters():
+    """Local pack adapters: every tools/*_adapter.py (defining PREFIX, OPTION and spec(DIR)); none in the release."""
+    global _ADAPTERS
+    if _ADAPTERS is None:
+        import glob, importlib.util
+        _ADAPTERS = []
+        for f in sorted(glob.glob(os.path.join(ROOT, "tools", "*_adapter.py"))):
+            sp = importlib.util.spec_from_file_location(os.path.basename(f)[:-3], f)
+            m = importlib.util.module_from_spec(sp)
+            sp.loader.exec_module(m)
+            _ADAPTERS.append(m)
+    return _ADAPTERS
+
+
 def load_spec(s):
-    """A spec from `f3pack:DIR` or a JSON file; relative part paths resolved against the file's directory."""
+    """A spec from `f3pack:DIR`, an adapter's `PREFIX:DIR` or a JSON file; relative part paths resolved against the
+    file's directory."""
+    for m in adapters():
+        if s.startswith(m.PREFIX):
+            return m.spec(s[len(m.PREFIX):])
     if s.startswith("f3pack:"):
         return f3pack_spec(s[7:])
     if os.path.isdir(s) and os.path.isfile(os.path.join(s, "pack.json")):
@@ -121,7 +147,13 @@ def compose(spec, cand=None):
     pat = lambda key, p=cp: [re.compile(r) for r in p.get(key) or []]
     drop, hoist = pat("drop"), pat("hoist")
     body, hoisted, dropped = [], [], []
+    incdirs = cp.get("incdirs") or []
     for n, ln in enumerate(_strip_last(_lines(cand)), 1):
+        mi = re.match(r'^([ \t]*#[ \t]*include[ \t]*)"([^"]+)"(.*)$', ln) if incdirs else None
+        if mi and not os.path.isabs(mi.group(2)):
+            hit = next((os.path.join(x, mi.group(2)) for x in incdirs if os.path.isfile(os.path.join(x, mi.group(2)))), None)
+            if hit:
+                ln = '%s"%s"%s' % (mi.group(1), hit.replace("\\", "/"), mi.group(3))
         if any(r.search(ln) for r in hoist):
             hoisted.append((n, ln))
         elif any(r.search(ln) for r in drop):
@@ -270,7 +302,7 @@ def take_argv(argv=None, quiet=False):
     spec_s, out, k = None, None, 1
     while k < end:
         x = a[k]
-        for opt in ("--unit", "--f3pack", "--unit-out"):
+        for opt in ("--unit", "--f3pack", "--unit-out") + tuple(m.OPTION for m in adapters()):
             if x == opt and k + 1 < end:
                 val = a[k + 1]
                 del a[k:k + 2]
@@ -289,7 +321,8 @@ def take_argv(argv=None, quiet=False):
         elif spec_s is not None:
             sys.exit("unitcompose: only one --unit / --f3pack")
         else:
-            spec_s = ("f3pack:" + val) if opt == "--f3pack" else val
+            ad = [m for m in adapters() if m.OPTION == opt]
+            spec_s = ("f3pack:" + val) if opt == "--f3pack" else (ad[0].PREFIX + val) if ad else val
     if spec_s is None:
         if out:
             sys.exit("unitcompose: --unit-out needs --unit or --f3pack")

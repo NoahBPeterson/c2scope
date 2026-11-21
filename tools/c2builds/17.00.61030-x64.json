@@ -1,0 +1,636 @@
+{
+ "version": "17.00.61030-x64",
+ "c2_sha256": "0108f8b0d13bcf2b61295faca9d4bf6c1b87ec288c7862438263a9491cb1e1fa",
+ "image_base": "10000000",
+ "patch": {
+  "cave_rva": "2e24a0",
+  "text_vsize": "2e149c",
+  "entry_rva": "1b57da",
+  "iat_loadlibrarya": "3fc70c",
+  "file_delta": "c00",
+  "nsec": 6,
+  "loadlib": "w"
+ },
+ "dll_build": "14.00",
+ "arch": "x64",
+ "partial": true,
+ "setup": {
+  "from": "work/vs2012/stage/vc",
+  "sdk": "work/vs2012/stage/sdk",
+  "sal": ""
+ },
+ "dll": {
+  "regname": "10001ff0",
+  "opname": "100226e8",
+  "opcount": "4f6",
+  "tlsidx": "10304a04",
+  "curfunctls": "dccc",
+  "lnext": "4",
+  "lop": "8",
+  "lkind": "c",
+  "lflg": "d",
+  "ldst": "34",
+  "lsrc": "30",
+  "ltyw": "10",
+  "lpay": "24",
+  "lpay2": "28",
+  "skind": "8",
+  "snum": "20",
+  "sname": "4",
+  "mem": "24",
+  "lmd": "38",
+  "lmb": "30",
+  "lmi": "34",
+  "lms": "1c",
+  "blk": "28",
+  "lline": "20",
+  "len": "24"
+ },
+ "functions": {
+  "@HandleCurrUncolorable@8": [
+   "1b9010",
+   121,
+   "pdb",
+   "?HandleCurrUncolorable@@YIPAUtagBV@@PAUtagSYM@@W4GLOBREGLASS_ENUM@@@Z"
+  ],
+  "@dop2_PreLowerGlobalOpts@4": [
+   "4ef00",
+   762,
+   "pdb",
+   "?dop2_PreLowerGlobalOpts@@YIHPAUtagFUNC@@@Z"
+  ],
+  "@dop2_Codegen@4": [
+   "971a0",
+   768,
+   "pdb",
+   "?dop2_Codegen@@YIHPAUtagFUNC@@@Z"
+  ],
+  "@dop2_CodegenUpdate@4": [
+   "92120",
+   382,
+   "pdb",
+   "?dop2_CodegenUpdate@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@RegSimpleAssignBody@4": [
+   "1e3d40",
+   252,
+   "pdb",
+   "?RegSimpleAssignBody@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@RegAssign@8": [
+   "1e2a90",
+   821,
+   "pdb-name",
+   "?RegAssign@@YIPAUtagSYM@@PAVTuple@@0@Z"
+  ],
+  "@dop2_CodegenFinish@4": [
+   "91c90",
+   260,
+   "pdb",
+   "?dop2_CodegenFinish@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_GlobalRegAlloc@4": [
+   "16a620",
+   188,
+   "pdb",
+   "?dop2_GlobalRegAlloc@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@Globregs@4": [
+   "16a6e0",
+   478,
+   "pdb",
+   "?Globregs@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@GrgIdentifyCandidates@4": [
+   "de7e0",
+   316,
+   "pdb",
+   "?GrgIdentifyCandidates@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_PostLowerPreRegAllocGlobalOpts@4": [
+   "81d70",
+   150,
+   "pdb",
+   "?dop2_PostLowerPreRegAllocGlobalOpts@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@FgEarlyTailDup@4": [
+   "16b3f0",
+   616,
+   "pdb",
+   "?FgEarlyTailDup@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@Color@4": [
+   "1b7c60",
+   839,
+   "pdb",
+   "?Color@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@Spillcosts@12": [
+   "1bbb10",
+   1935,
+   "pdb",
+   "?Spillcosts@@YIXPAUtagFUNC@@W4GLOBREGLASS_ENUM@@PAUtagBV@@@Z"
+  ],
+  "@SpillObvious@16": [
+   "1bb490",
+   220,
+   "pdb",
+   "?SpillObvious@@YIXPAUtagFUNC@@W4GLOBREGLASS_ENUM@@PAUtagBV@@2@Z"
+  ],
+  "@InsertInList@8": [
+   "1ba0a0",
+   120,
+   "pdb",
+   "?InsertInList@@YIPAUtagSYM@@PAU1@0@Z"
+  ],
+  "@ChoosePhysReg@12": [
+   "1b7110",
+   794,
+   "pdb",
+   "?ChoosePhysReg@@YIXPAUtagSYM@@W4GLOBREGLASS_ENUM@@PAUtagBV@@@Z"
+  ],
+  "@InsertSplitPoints@28": [
+   "1ba150",
+   2307,
+   "pdb",
+   "?InsertSplitPoints@@YIPAUtagBV@@PAUtagFUNC@@PAUtagSYM@@W4GLOBREGLASS_ENUM@@PAU1@33H@Z"
+  ],
+  "@OrderGlobregs@12": [
+   "1bad50",
+   216,
+   "pdb",
+   "?OrderGlobregs@@YIPAUtagBV@@PAUtagFUNC@@W4GLOBREGLASS_ENUM@@PAU1@@Z"
+  ],
+  "@Schedule@8": [
+   "bf7e0",
+   544,
+   "pdb",
+   "?Schedule@@YIXPAUtagFUNC@@H@Z"
+  ],
+  "@SpillOrDefer@12": [
+   "1bb570",
+   390,
+   "pdb",
+   "?SpillOrDefer@@YIPAUtagBV@@PAUtagSYM@@PAUtagFUNC@@W4GLOBREGLASS_ENUM@@@Z"
+  ],
+  "@InsertByBenefit@8": [
+   "1b9fd0",
+   197,
+   "pdb",
+   "?InsertByBenefit@@YIPAUtagSYM@@PAU1@0@Z"
+  ],
+  "@InsertNewGlobregs@8": [
+   "1ba120",
+   48,
+   "pdb",
+   "?InsertNewGlobregs@@YIPAUtagSYM@@PAUtagBV@@PAU1@@Z"
+  ],
+  "@FgCoalesceLabels@4": [
+   "b2c30",
+   547,
+   "pdb",
+   "?FgCoalesceLabels@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@EncEmitFunc@4": [
+   "11b9b0",
+   864,
+   "pdb",
+   "?EncEmitFunc@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@EncSetOffsets@12": [
+   "11bd10",
+   1782,
+   "pdb",
+   "?EncSetOffsets@@YIXPAUtagFUNC@@EE@Z"
+  ],
+  "@Encode@4": [
+   "c0a30",
+   1300,
+   "pdb",
+   "?Encode@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_EncodeAndRelated@4": [
+   "11b150",
+   559,
+   "pdb",
+   "?dop2_EncodeAndRelated@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_PreEncode@4": [
+   "92050",
+   201,
+   "pdb",
+   "?dop2_PreEncode@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@dop2_FinalFlowOpts@4": [
+   "486d0",
+   208,
+   "pdb",
+   "?dop2_FinalFlowOpts@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@FgCodeMotion@4": [
+   "48d90",
+   1820,
+   "pdb",
+   "?FgCodeMotion@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@SchSelectInstrs@4": [
+   "e5600",
+   842,
+   "pdb",
+   "?SchSelectInstrs@@YIHI@Z"
+  ],
+  "@SchSchedGraph@4": [
+   "e5440",
+   445,
+   "pdb",
+   "?SchSchedGraph@@YIXPAUtagDAGGRAPH@@@Z"
+  ],
+  "@SchAddToReadyList@4": [
+   "e5ea0",
+   144,
+   "pdb",
+   "?SchAddToReadyList@@YIXPAUtagDAGNODE@@@Z"
+  ],
+  "@SchComputeStaticPriority@4": [
+   "e65c0",
+   495,
+   "pdb",
+   "?SchComputeStaticPriority@@YIXPAUtagDAGGRAPH@@@Z"
+  ],
+  "@MscClean@4": [
+   "13fa90",
+   5236,
+   "pdb",
+   "?MscClean@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@RemoveSplitGlobregs@4": [
+   "1bae80",
+   58,
+   "pdb",
+   "?RemoveSplitGlobregs@@YIPAUtagSYM@@PAU1@@Z"
+  ],
+  "@dop2_PostCodegenFlowOpts@4": [
+   "91c10",
+   114,
+   "pdb",
+   "?dop2_PostCodegenFlowOpts@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@LateGlobalOptimize@16": [
+   "7bac0",
+   198,
+   "pdb",
+   "?LateGlobalOptimize@@YIXPAUtagFUNC@@HHH@Z"
+  ],
+  "@RegBuildGlobalConflict@4": [
+   "1e3400",
+   1489,
+   "pdb",
+   "?RegBuildGlobalConflict@@YIXPAUtagFUNC@@@Z"
+  ],
+  "@RegResetRegMap@4": [
+   "1e3ce0",
+   94,
+   "pdb-name",
+   "?RegResetRegMap@@YIXPAVTuple@@@Z"
+  ],
+  "@RegSpill@12": [
+   "1e3e40",
+   598,
+   "pdb-name",
+   "?RegSpill@@YIXKPAVTuple@@0@Z"
+  ],
+  "@RegFixConflict@8": [
+   "1e3b50",
+   397,
+   "pdb-name",
+   "?RegFixConflict@@YIXPAVTuple@@K@Z"
+  ],
+  "@ColRemoveGlobregFromHashTable@8": [
+   "197a70",
+   141,
+   "pdb",
+   "?ColRemoveGlobregFromHashTable@@YIXPAUtagSYM@@H@Z"
+  ],
+  "@RestrictToReg@4": [
+   "1baec0",
+   125,
+   "pdb",
+   "?RestrictToReg@@YIHPAUtagSYM@@@Z"
+  ],
+  "@ForceSingleBlockLives@4": [
+   "1b8f30",
+   63,
+   "pdb",
+   "?ForceSingleBlockLives@@YIXPAUtagSYM@@@Z"
+  ],
+  "@ForceNoAirlocks@4": [
+   "1b8e80",
+   174,
+   "pdb",
+   "?ForceNoAirlocks@@YIXPAUtagSYM@@@Z"
+  ],
+  "@BetterToDefer@4": [
+   "1b6aa0",
+   15,
+   "pdb",
+   "?BetterToDefer@@YIHPAUtagSYM@@@Z"
+  ],
+  "@FoldAwaySplitGlobreg@4": [
+   "1b6aa0",
+   15,
+   "pdb",
+   "?FoldAwaySplitGlobreg@@YIHPAUtagSYM@@@Z"
+  ],
+  "@TryToRecalc@4": [
+   "1bc990",
+   1454,
+   "pdb",
+   "?TryToRecalc@@YIXPAUtagSYM@@@Z"
+  ],
+  "@UpdateAffectedGlobregs@20": [
+   "1bcf60",
+   399,
+   "pdb",
+   "?UpdateAffectedGlobregs@@YIPAUtagBV@@PAUtagFUNC@@W4GLOBREGLASS_ENUM@@PAUtagSYM@@PAU1@3@Z"
+  ],
+  "@GrgNewGlobreg@4": [
+   "188eb0",
+   267,
+   "pdb",
+   "?GrgNewGlobreg@@YIPAUtagSYM@@PAU1@@Z"
+  ],
+  "@NewLiveRanges@4": [
+   "1baab0",
+   601,
+   "pdb",
+   "?NewLiveRanges@@YIXPAUtagSYM@@@Z"
+  ],
+  "@RewriteSplitGlobregs@12": [
+   "1bb100",
+   897,
+   "pdb",
+   "?RewriteSplitGlobregs@@YIXPAUtagFUNC@@PAUtagCOBLOCKLIST@@PAUtagBV@@@Z"
+  ],
+  "@GrgAirlockEnterloads@12": [
+   "cdf60",
+   715,
+   "pdb",
+   "?GrgAirlockEnterloads@@YIXPAUtagFUNC@@PAUtagBLOCK@@H@Z"
+  ],
+  "@NColor@4": [
+   "66390",
+   624,
+   "pdb",
+   "?NColor@@YIXPAUtagFUNC@@@Z"
+  ]
+ },
+ "probes": {},
+ "kinds": {
+  "0": "0",
+  "1": "1",
+  "2": "2",
+  "3": "3",
+  "4": "4",
+  "5": "5",
+  "6": "6",
+  "7": "7",
+  "8": "8",
+  "9": "9",
+  "a": "a",
+  "b": "b",
+  "c": "c",
+  "d": "d",
+  "e": "e",
+  "f": "f",
+  "11": "12",
+  "19": "1a",
+  "1a": "1b"
+ },
+ "opnames": {
+  "4f7": "OPICONST",
+  "4f8": "OPSCONST",
+  "4f9": "OPFCONST",
+  "4fa": "OPTEXT",
+  "4fb": "OPREG",
+  "4fc": "OPLOCAL",
+  "4fd": "OPGLOBAL",
+  "4fe": "OPBASED",
+  "4ff": "OPINDEXED",
+  "500": "OPLOCALSCALED",
+  "501": "OPSCALED",
+  "502": "OPSYMOFF",
+  "503": "OPSYMSEG",
+  "504": "OPSEGOFF",
+  "505": "OPEXTERNAL",
+  "506": "OPINTERNAL",
+  "50d": "OPARG",
+  "50e": "OPOUTARG",
+  "50f": "OPMGDCONVERT",
+  "510": "OPASSIGN",
+  "511": "OPVOLATILEASSIGN",
+  "512": "OPLOAD",
+  "513": "OPSTORE",
+  "514": "OPCONVERT",
+  "515": "OPNOT",
+  "516": "OPNEG",
+  "517": "OPPAREN",
+  "518": "OPENTERLOAD",
+  "519": "OPEXITSAVE",
+  "528": "OPRET",
+  "529": "OPPHI",
+  "52a": "OPRHO",
+  "52b": "OPINLINEARGS",
+  "52c": "OPADD",
+  "52d": "OPSUB",
+  "52e": "OPMUL",
+  "52f": "OPMULHI",
+  "530": "OPSHL",
+  "531": "OPAND",
+  "532": "OPOR",
+  "533": "OPXOR",
+  "534": "OPDIV",
+  "535": "OPREM",
+  "536": "OPDIVREM",
+  "537": "OPSHR",
+  "538": "OPRNGCHECK",
+  "539": "OPIVADD",
+  "53a": "OPIVSUB",
+  "53b": "OPIVMUL",
+  "53c": "OPIVCONVERT",
+  "53d": "OPCMP",
+  "53e": "OPEQ",
+  "53f": "OPNE",
+  "540": "OPLT",
+  "541": "OPGT",
+  "542": "OPLE",
+  "543": "OPGE",
+  "544": "OPSPADJUST",
+  "545": "OPCALL",
+  "546": "OPBRANCH",
+  "547": "OPGOTO",
+  "548": "OPCATCHRET",
+  "549": "OPFINALLYCALL",
+  "54a": "OPFINALLYRET",
+  "54b": "OPSCOPEGOTO",
+  "54c": "OPSCOPEEXITGOTO",
+  "54d": "OPONERROR",
+  "54e": "OPEXITGOTO",
+  "54f": "OPLEAVE",
+  "550": "OPSWITCH",
+  "551": "OPSCOPEEXIT",
+  "552": "OPQUESTION",
+  "553": "OPINTRINSIC",
+  "554": "OPTUPLIST",
+  "590": "OPLABEL",
+  "591": "OPBLOCK",
+  "592": "OPENTRY",
+  "593": "OPEXIT"
+ },
+ "globals": {
+  "_RegName": "10001ff0",
+  "_TupOpcodeName": "100226e8",
+  "__tls_index": "10304a04",
+  "_IntRegOrder": "100068b8",
+  "_XMMXRegOrder": "10005f94"
+ },
+ "tls": {
+  "_CurFunc": "dccc",
+  "_CurFuncSym": "dd24"
+ },
+ "hooks": {
+  "default": [
+   "@NColor@4=tdccc>0>0>4$"
+  ],
+  "il_spec": "=tdccc>0>0>4$,tdccc>0>8>0>0x1c%",
+  "il_default": [
+   "@dop2_PreLowerGlobalOpts@4",
+   "@dop2_Codegen@4",
+   "@dop2_PostLowerPreRegAllocGlobalOpts@4",
+   "@FgEarlyTailDup@4",
+   "@Globregs@4",
+   "@NColor@4",
+   "@dop2_CodegenUpdate@4",
+   "@dop2_PostCodegenFlowOpts@4",
+   "@dop2_CodegenFinish@4",
+   "@LateGlobalOptimize@16",
+   "@dop2_FinalFlowOpts@4",
+   "@FgCodeMotion@4",
+   "@FgCoalesceLabels@4",
+   "@dop2_PreEncode@4",
+   "@MscClean@4",
+   "@dop2_EncodeAndRelated@4",
+   "@EncEmitFunc@4"
+  ],
+  "ncol": [
+   "10068300=ecx>4>4>4$,ecx>4>0x20,ecx>4>8,ecx>0x48,ecx>0x40,ecx>0x44",
+   "10068751=eax>0x20~10001ff0$",
+   "10068877=s6>0x20~10001ff0$,esi>0x24,esi>0x28,esi>0x34",
+   "100ca950=ecx>0x20~10001ff0$",
+   "10066600=ecx>4>4>4$,ecx>4>0x20,ecx>4>8,ecx>8>0x1c>0x20~10001ff0$,ecx>8>0>0x1c>0x20~10001ff0$,ecx>8>0>0>0x1c>0x20~10001ff0$"
+  ],
+  "ncol_state": "1006650f=tf698>0,tf67c>0,tf69c>0#%(nblk)d,tf650>0#%(ntup)d,tf648>0#%(ninfo)d,tdd08>0",
+  "ncol_fn": "@NColor@4=tdccc>0>0>4$",
+  "ncol_pref": "100686b2=s15*16:0x20:0x38:0x34,edi>4>0x44,eax>0#4",
+  "slots": [
+   "100e1b40=tdccc>0>0>4$,s1,ecx>8,ecx>0x2c,s2",
+   "100e1bcf={SYM:ebx},ebx>4>0x1c,ebx>4>0x18",
+   "100e1c2e={LOD:edx}",
+   "100e1e89=esi,ebp>-0x18,ecx>8",
+   "100e1cf8=ebp>-8,{SYM:ebp>-0xc}",
+   "100e1d1c={LOD:edx}",
+   "10052ec0={SYM:s1},ecx>0x28,ecx>0x2c",
+   "10052eea=edi,ebx>8",
+   "10053066=edi",
+   "10053086={LOD:edx}",
+   "10052f50={LOD:edx}",
+   "1005319a=eax",
+   "10053159=eax",
+   "100e1d49=esi,ebp>-0x10",
+   null,
+   "100e1d93=edi>0x28,esi,edi>0x2c,tdccc>0>0x68,tdccc>0>0xe4,t850>0>0x396,tdd14>0,tdccc>0>0x4c",
+   "100e1dc2=esi,eax",
+   "100e1e1d=edx,edx>0x40,eax",
+   "1006c6a1=tdccc>0>0>4$,esi>0xa4,edi,eax,esi>0xb8"
+  ],
+  "symkeys": {
+   "init": "10093940",
+   "alloc": "100a8c60=ecx,tdcbc>0,a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15/xeax>0x20,eax",
+   "free": "10060f1b=esi>0x20,ebp>-1",
+   "free2": "100906bd=edi>0x20,ecx",
+   "free3": "100ab747=ecx>0x20,edx",
+   "free4": "100a9310=esi>0x20,eax",
+   "free5": "1009e087=ebx>0x20,ecx",
+   "uservar": "100a8210=ecx>4$,ecx,ecx>0x28/xeax",
+   "equiv": "1018a390=ecx,ecx>0xc,s2,ecx>0xc>0x28/xeax,eax>0,eax>0x24",
+   "splice": "100ba7b0=s3>0x30>0x24>4$,s3>0x20/xeax",
+   "read": "10126e20/xeax",
+   "opt": "100a74b0=tdccc>0>0>4$",
+   "gc": "10090610",
+   "hshwalk": "100a4b80/xeax",
+   "hshasg": "100d8d20/xeax",
+   "pool": "10093a80/xeax>4>0x20",
+   "getinl": "10094f00=ecx>4>0x30>0x24>4$,ecx>4>0x20/xeax",
+   "sort": "1016ede0=a0/xedi>8,edi>0x20,eax>0xc,eax>0x18,eax>0x24>0x20,eax>0x30>0xc,eax>0x30>0x24>0x20,eax>4>0xc,eax>4>0x18,eax>4>0x24>0x20,eax>4>0x30>0xc,eax>4>0x30>0x24>0x20,eax>0x38,eax>4>0x38",
+   "sortx": "100abf60/xeax>0x30>0x30>0xc,eax>0x30>0x30>0x24>0x20,eax>0x30>0x30>0x30>0x24>0x20,eax>0x30>0x30>0x38,eax>0x30>0x30>4>0xc,eax>0x30>0x30>4>0x24>0x20,eax>0x30>4>0x30>0xc,eax>0x30>4>0x30>0x24>0x20,eax>0x30>4>0x30>0x30>0x24>0x20,eax>0x30>4>0x30>0x38,eax>0x30>4>0x30>4>0xc,eax>0x30>4>0x30>4>0x24>0x20",
+   "sort3": "100ac148=edi>0x30>4>4>0xc,edi>0x30>4>4>0x18,edi>0x30>4>4>0x24>0x20,edi>0x30>4>4>0x30>0xc,edi>0x30>4>4>0x30>0x24>0x20,edi>0x30>4>4>0x30>0x24>0x20,edi>0x30>4>4>0x38,edi>0x30>4>4>4>0xc,edi>0x30>4>4>4>0x18,edi>0x30>4>4>4>0x24>0x20,edi>0x30>4>4>4>0x30>0x24>0x20,edi>0x30>4>4>4>4>0xc"
+  }
+ },
+ "regs_ops": {
+  "enterload": "518",
+  "last": "4f5"
+ },
+ "symkeys_sort_ret": "100ac148",
+ "symkeys_sort_disp": true,
+ "symkeys_skip": {
+  "100a8bc0": 5,
+  "100a7370": 5,
+  "100a7410": 5,
+  "100a7260": 7,
+  "100cec10": 4
+ },
+ "symkeys_free_by": "kindmap",
+ "symkeys_free_map": {
+  "3": "tmp",
+  "0": "frame",
+  "1": "frame",
+  "2": "frame",
+  "4": "frame",
+  "5": "frame",
+  "6": "glob",
+  "7": "glob",
+  "8": "glob"
+ },
+ "symkeys_free_default": "other",
+ "symkeys_kind_shift": [
+  12,
+  1
+ ],
+ "symkeys_equiv_rel": true,
+ "slots": {
+  "sbv": {
+   "bits": 64,
+   "next": 12,
+   "words": 4
+  },
+  "v13": false,
+  "sym": "{x},{x}>0x40,{x}>0x24,{x}>0x3c,{x}>8,{x}>0x20,{x}>4>4$,{x}>0x30,{x}>0,{x}>4>0x28",
+  "sorted": [
+   "ncol",
+   "T",
+   "nparams",
+   "pad",
+   "fflags",
+   "gsopt",
+   "alloc",
+   "cap"
+  ],
+  "gsbit": 1,
+  "gs_join_probe": true,
+  "tround": 16,
+  "undo": false,
+  "up": true,
+  "palign": true,
+  "capdef": 16,
+  "argarea": true
+ }
+}

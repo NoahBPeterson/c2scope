@@ -134,7 +134,8 @@ DEC_HOOKS = [
 # --pieces (regalloc.md 3.6.11): the globreg view ('^', DLL_SRC dumpg) of the whole function at the entry of every
 # ColProcessSplitGlobregs call; the tuple path is the Color hook's IL dump (CurFunc > FUNC+8 > first BB > first tuple).
 PC0 = None
-PIECE_HOOK = "@ColProcessSplitGlobregs@12=" + [x for x in HOOKS[0].partition("=")[2].split(",") if x.endswith("%")][0][:-1] + "^"
+PIECE_HOOK = None if isinstance(HOOKS, c2trace.c2build.Unported) else \
+    "@ColProcessSplitGlobregs@12=" + [x for x in HOOKS[0].partition("=")[2].split(",") if x.endswith("%")][0][:-1] + "^"
 # and the cost Spillcosts gives each reference (14.00 only; another build: its table's hooks.regs_pieces): the
 # cost, the globreg's number, the tuple; src side 10b109b7, dst side 10b10ff9 (both just before `blkcost += eax`)
 PIECE_COST_HOOKS = ["10b109b7=eax,ebp>0x1c,s17", "10b10ff9=eax,ebp>0x1c,esi"] \

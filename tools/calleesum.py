@@ -33,6 +33,16 @@ usage:
              (param names, `*[p]` = a value loaded through p, `&stack[off]`): the evidence for the table.
   -v         also list where a parameter's value was lost.
 
+x64 (PE32+, machine 0x8664): detected from the header.  One convention: parameters 1..4 in rcx, rdx, r8, r9
+(xmm0..3 for floating point), 5+ at [rsp+0x28], [rsp+0x30] ... at entry; spills into the home area [rsp+8..0x20]
+are followed like any stack slot.  Parameter numbers are positions (0 = rcx = `this` of a member).  --conv is
+ignored; --proto gives names and the count (`this` first for a non-static member, calling-convention keywords
+ignored); --nparams N is the total number of parameters.  Without either, the count is the highest parameter
+register or stack slot read before it is written (also by a direct callee it is handed to).  A call's arguments
+are the registers (and stack slots above its home area) the direct callee reads; for an indirect call or an
+unanalysable target, all four registers, an argument register not written since the entry or the last call
+reported as possibly stale.
+
 Honest limits: values are followed through registers, stack slots and pointer arithmetic; when a parameter's
 value is lost (merged with something else at a join, pushed through arithmetic the tool does not model, kept
 in a local whose address escapes) and the function also stores through pointers of unknown origin, the
@@ -55,6 +65,21 @@ GPR = ("eax", "ecx", "edx", "ebx", "ebp", "esi", "edi")
 FP_STORES = {getattr(X, "X86_INS_" + n) for n in ("FST", "FSTP", "FIST", "FISTP", "FISTTP", "FNSTCW", "FNSTSW", "FBSTP",
                                                 "FNSAVE", "FNSTENV", "FXSAVE", "STMXCSR") if hasattr(X, "X86_INS_" + n)}
 MAXDEEP = 3
+# x64 (PE32+): register families, the Microsoft x64 convention
+FULL64 = {}
+for _f, _subs in {"rax": "eax ax al ah", "rcx": "ecx cx cl ch", "rdx": "edx dx dl dh", "rbx": "ebx bx bl bh",
+                  "rsp": "esp sp spl", "rbp": "ebp bp bpl", "rsi": "esi si sil", "rdi": "edi di dil"}.items():
+    FULL64[_f] = _f
+    for _s in _subs.split():
+        FULL64[_s] = _f
+for _n in range(8, 16):
+    for _s in ("", "d", "w", "b"):
+        FULL64["r%d%s" % (_n, _s)] = "r%d" % _n
+GPR64 = ("rax", "rcx", "rdx", "rbx", "rbp", "rsi", "rdi") + tuple("r%d" % _n for _n in range(8, 16))
+CALLEE_SAVED64 = ("rbx", "rbp", "rdi", "rsi", "r12", "r13", "r14", "r15")
+CALLER_SAVED64 = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")
+ARGREGS64 = ("rcx", "rdx", "r8", "r9")
+HOME64 = 0x20                                       # home area: [rsp+8..0x20] at entry, [rsp..0x18] at a call
 
 
 class Exe:
@@ -65,9 +90,10 @@ class Exe:
         self.base = self.pe.OPTIONAL_HEADER.ImageBase
         self.size = self.pe.OPTIONAL_HEADER.SizeOfImage
         self.data = self.pe.get_memory_mapped_image()
+        self.x64 = self.pe.FILE_HEADER.Machine == 0x8664
         self.text = [(self.base + s.VirtualAddress, self.base + s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData))
                      for s in self.pe.sections if s.Characteristics & 0x20000000]
-        self.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        self.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if self.x64 else capstone.CS_MODE_32)
         self.md.detail = True
         self.cache = {}
         self.imports = {}
@@ -104,7 +130,109 @@ class Exe:
     def is_cookie_check(self, va):
         """__security_check_cookie: cmp ecx,[cookie]; jne; rep ret.  c2 adds the call after it has summarised."""
         b = self.read(va, 10)
+        if getattr(self, "x64", False):                     # cmp rcx, [rip+cookie]; jne (or bnd jne)
+            return b[:3] == b"\x48\x3b\x0d" and b[7:8] in (b"\x75", b"\xf2")
         return b[:2] == b"\x3b\x0d" and b[6:7] == b"\x75"
+
+    def is_chkstk64(self, va):
+        """x64 __chkstk: sub rsp,10h; mov [rsp],r10; mov [rsp+8],r11.  Probes, moves nothing: rax is kept."""
+        return self.read(va, 13) == b"\x48\x83\xec\x10\x4c\x89\x14\x24\x4c\x89\x5c\x24\x08"
+
+    def quick64(self, va, depth=0):
+        """x64: (parameter positions read before written, stack parameters read, a ret was reached) from a walk
+        of the function's code that follows only which argument registers were written (must-written at joins)
+        and rsp.  A direct call counts as reading the argument registers its target reads (depth 3)."""
+        key = ("q64", va)
+        if key in self.cache:
+            return self.cache[key]
+        act = self.cache.setdefault("q64active", set())
+        if depth > 3 or va in act:
+            return frozenset(), 0, False
+        act.add(va)
+        argn = {r: k for k, r in enumerate(ARGREGS64)}
+        argn.update({"xmm%d" % k: k for k in range(4)})
+        allw = frozenset(argn) | frozenset("xmm%d" % k for k in range(4, 6))
+        used, nstk, ok, n = set(), 0, False, 0
+        states, work = {va: (frozenset(), 0)}, [va]
+        while work and n < 6000:
+            a = work.pop()
+            wr, d = states[a]
+            while n < 6000:
+                n += 1
+                i = self.ins(a) if self.in_text(a) else None
+                if i is None or i.id in (X.X86_INS_INT3, X.X86_INS_HLT, X.X86_INS_UD2):
+                    break
+                if i.id in (X.X86_INS_RET, X.X86_INS_RETF):
+                    ok = True
+                    break
+                ops = i.operands
+                if i.id == X.X86_INS_CALL:
+                    if ops[0].type == X.X86_OP_IMM:
+                        u = self.quick64(ops[0].imm, depth + 1)[0]
+                        used |= {k for k in u if k < 4 and ARGREGS64[k] not in wr and "xmm%d" % k not in wr}
+                    wr = allw                                # what is read after a call is not a parameter
+                    a += i.size
+                    continue
+                succ = []
+                if i.id == X.X86_INS_JMP:
+                    if ops[0].type != X.X86_OP_IMM:         # switch or indirect tail jump: not followed
+                        break
+                    succ = [ops[0].imm]
+                else:
+                    try:
+                        rd, wrr = i.regs_access()
+                    except capstone.CsError:
+                        rd, wrr = [], []
+                    same = len(ops) == 2 and ops[0].type == ops[1].type == X.X86_OP_REG and ops[0].reg == ops[1].reg \
+                        and i.id in (X.X86_INS_XOR, X.X86_INS_SUB, X.X86_INS_SBB, X.X86_INS_PXOR, X.X86_INS_XORPS,
+                                     X.X86_INS_XORPD)
+                    same = same or (len(ops) == 2 and ops[0].type == X.X86_OP_REG and ops[1].type == X.X86_OP_IMM and
+                                    ((i.id == X.X86_INS_OR and (ops[1].imm + 1) % (1 << 8 * ops[0].size) == 0) or
+                                     (i.id == X.X86_INS_AND and ops[1].imm == 0)))
+                    if not same:
+                        for r in rd:
+                            nm = i.reg_name(r)
+                            f = FULL64.get(nm, nm)
+                            if f in argn and f not in wr:
+                                used.add(argn[f])
+                    for op in ops:
+                        if op.type == X.X86_OP_MEM and op.mem.base == X.X86_REG_RSP and not op.mem.index and \
+                                (not op.access or op.access & capstone.CS_AC_READ):
+                            off = d + op.mem.disp
+                            if off >= 8 + HOME64:
+                                nstk = max(nstk, (off - 8 - HOME64) // 8 + 1)
+                    wr = wr | {FULL64.get(i.reg_name(r), i.reg_name(r)) for r in wrr} & allw
+                    if i.id == X.X86_INS_PUSH:
+                        d -= 8
+                    elif i.id == X.X86_INS_POP:
+                        d += 8
+                    elif i.id in (X.X86_INS_ADD, X.X86_INS_SUB) and ops[0].type == X.X86_OP_REG and \
+                            ops[0].reg == X.X86_REG_RSP and ops[1].type == X.X86_OP_IMM:
+                        d += ops[1].imm if i.id == X.X86_INS_ADD else -ops[1].imm
+                    if i.group(X.X86_GRP_JUMP) and ops and ops[0].type == X.X86_OP_IMM:
+                        succ = [a + i.size, ops[0].imm]
+                    else:
+                        a += i.size
+                        continue
+                for t in succ[1:]:
+                    if t not in states:
+                        states[t] = (wr, d)
+                        work.append(t)
+                    elif not states[t][0] <= wr:
+                        states[t] = (states[t][0] & wr, states[t][1])
+                        work.append(t)
+                t = succ[0]
+                if t in states:
+                    if not states[t][0] <= wr:
+                        states[t] = (states[t][0] & wr, states[t][1])
+                        work.append(t)
+                    break
+                states[t] = (wr, d)
+                a = t
+        act.discard(va)
+        r = (frozenset(used), nstk, ok)
+        self.cache[key] = r
+        return r
 
     def quick(self, va, _seen=None):
         """(bytes popped by `ret`, reads ecx before writing it, same for edx) from a walk of the function's
@@ -160,14 +288,16 @@ class Exe:
 
 
 class State:
-    __slots__ = ("regs", "slots", "esp", "pend", "esc")
+    __slots__ = ("regs", "slots", "esp", "pend", "esc", "aw")
 
     def __init__(self):
         self.regs, self.slots, self.esp, self.pend, self.esc = {}, {}, 0, 0, frozenset()
+        self.aw = frozenset()                       # x64: argument registers / stack offsets written since a call
 
     def copy(self):
         s = State()
         s.regs, s.slots, s.esp, s.pend, s.esc = dict(self.regs), dict(self.slots), self.esp, self.pend, self.esc
+        s.aw = self.aw
         return s
 
 
@@ -216,6 +346,8 @@ class Analyzer:
             return None                                     # recursion: c2 has no summary for it yet either
         self.active.add(va)
         try:
+            if getattr(self.exe, "x64", False):
+                conv = "x64"                                # one convention; --conv / keywords do not apply
             if conv is None:
                 pop, ecx, edx = self.exe.quick(va)
                 conv = "fastcall" if (ecx and edx) else "thiscall" if ecx else "stdcall" if pop else "cdecl"
@@ -246,6 +378,12 @@ class Analyzer:
 class Func:
     def __init__(self, an, va, conv, nparams, level, regs=None):
         self.an, self.exe, self.va, self.conv, self.level = an, an.exe, va, conv, level
+        self.x64 = x64 = bool(getattr(self.exe, "x64", False))
+        self.FULL, self.GPR, self.CS = (FULL64, GPR64, CALLEE_SAVED64) if x64 else (FULL, GPR, CALLEE_SAVED)
+        self.SP, self.BP, self.AX = ("rsp", "rbp", "rax") if x64 else ("esp", "ebp", "eax")
+        self.W = 8 if x64 else 4                            # pointer / stack slot size
+        if x64:
+            regs = None
         self.regs = list(regs) if regs else None            # custom (/LTCG) register parameters, in order: ltcgstub.py
         self.s = Summary(va)
         self.s.conv = conv
@@ -256,23 +394,24 @@ class Func:
         self.homes = set()                                  # local slots a parameter was reloaded from (spill homes)
         self.guessed = set()                                # indirect calls whose stack cleanup was guessed
         self.maxarg = 0
+        self.tables = {}                                    # x64: register -> (site, switch table VA) of a table load
 
     # ---- values -------------------------------------------------------------------------------------------
     def reg(self, st, name):
-        name = FULL.get(name)
-        if name == "esp":
+        name = self.FULL.get(name)
+        if name == self.SP:
             return ("sp", st.esp)
         return st.regs.get(name)
 
     def setreg(self, st, name, v):
-        f = FULL.get(name)
+        f = self.FULL.get(name)
         if f is None:
             return
-        if f == "esp":
+        if f == self.SP:
             if v is not None and v[0] == "sp" and v[1] is not None:
                 st.esp = v[1]
             else:
-                self.warn("esp set to an untracked value")
+                self.warn("%s set to an untracked value" % self.SP)
             return
         st.regs[f] = v if name == f else None                # a write to al/ax makes eax unknown
 
@@ -284,12 +423,31 @@ class Func:
     def lose(self, v, site, why):
         if v is not None and v[0] == "p":
             self.s.lost.setdefault(v[1], set()).add("%08x %s" % (site, why))
+        elif v is not None and v[0] == "x":                 # x64: a value merged from a parameter, used here
+            for k in v[1]:
+                self.s.lost.setdefault(k, set()).add("%08x merged with another value, used here" % site)
+
+    def xuse(self, v, site):
+        """x64: a value merged from a parameter is used (dereferenced, stored, passed, returned, computed with)."""
+        if v is not None and v[0] == "x":
+            self.lose(v, site, "")
 
     def addr(self, st, ins, op):
         m = op.mem
         if m.segment in (X.X86_REG_FS, X.X86_REG_GS):
             return ("seg",)
         disp = m.disp
+        if self.x64:
+            if m.base == X.X86_REG_RIP:                     # [rip + disp]: a global
+                return ("abs", (ins.address + ins.size + disp) & 0xffffffffffffffff)
+            if not m.base and not m.index:
+                return ("abs", disp & 0xffffffffffffffff)
+            bv = self.reg(st, ins.reg_name(m.base)) if m.base else None
+            self.xuse(bv, ins.address)
+            if m.index:
+                self.xuse(self.reg(st, ins.reg_name(m.index)), ins.address)
+            if bv is not None and bv[0] == "g":             # base = an address taken with lea [rip+..] (__ImageBase)
+                return ("abs", (bv[1] + disp) & 0xffffffffffffffff)
         if not m.base and not m.index:
             return ("abs", disp & 0xffffffff)
         bv = self.reg(st, ins.reg_name(m.base)) if m.base else None
@@ -320,9 +478,9 @@ class Func:
             if a[1] is None:
                 return None
             self.direct.add(a[1])
-            if a[1] >= 4:
+            if a[1] >= (8 + HOME64 if self.x64 else 4):
                 self.maxarg = max(self.maxarg, a[1])
-            v = st.slots.get(a[1]) if size == 4 else None
+            v = st.slots.get(a[1]) if size == self.W else None
             if v is not None and v[0] == "p":
                 s.touched.add(v[1])
                 self.homes.add(a[1])
@@ -330,10 +488,10 @@ class Func:
         if k == "p":
             s.rd.setdefault(a[1], set()).add((a[2], size))
             s.touched.add(a[1])
-            return ("d", a[1], 1) if size == 4 else None
+            return ("d", a[1], 1) if size == self.W else None
         if k == "d":
             s.drd.setdefault(a[1], set()).add(site)
-            return ("d", a[1], min(a[2] + 1, MAXDEEP)) if size == 4 else None
+            return ("d", a[1], min(a[2] + 1, MAXDEEP)) if size == self.W else None
         if k == "abs":
             s.grd.setdefault(a[1], set()).add(site)
         return None
@@ -341,6 +499,7 @@ class Func:
     def escape(self, st, v, site, where):
         if v is None:
             return
+        self.xuse(v, site)
         if v[0] == "p":
             self.s.stored.setdefault(v[1], []).append((site, where))
         elif v[0] == "d":
@@ -362,10 +521,13 @@ class Func:
                     del st.slots[o]
                 return
             self.direct.add(a[1])
-            for o in (a[1] - 3, a[1] - 2, a[1] - 1, a[1] + 1, a[1] + 2, a[1] + 3):
-                if o in st.slots and (o > a[1] - 4 and o < a[1] + size):
+            W = self.W
+            for o in [o for o in range(a[1] - W + 1, a[1] + W) if o != a[1]]:
+                if o in st.slots and (o > a[1] - W and o < a[1] + size):
                     del st.slots[o]
-            if size == 4:
+            if self.x64:
+                st.aw = st.aw | {a[1] - st.esp}
+            if size == W:
                 st.slots[a[1]] = v
             else:
                 st.slots.pop(a[1], None)
@@ -387,36 +549,65 @@ class Func:
             v = self.reg(st, name)
             if v is not None and v[0] == "p":
                 self.s.touched.add(v[1])
-            return v if FULL.get(name) == name else None
+            return v if self.FULL.get(name) == name else None
         if op.type == X.X86_OP_MEM:
             return self.load(st, self.addr(st, ins, op), op.size, site)
         if op.type == X.X86_OP_IMM and op.size == 4:
             return ("c", op.imm & 0xffffffff)
+        if op.type == X.X86_OP_IMM and op.size == 8 and self.x64:
+            return ("c", op.imm & 0xffffffffffffffff)
         return None
 
     def step(self, ins, st):
         """Apply ins to st in place; return the successor addresses."""
+        if not self.x64:
+            return self.step1(ins, st)
+        ops = ins.operands
+        if ins.id in (X.X86_INS_MOV, X.X86_INS_MOVSXD) and len(ops) == 2 and ops[0].type == X.X86_OP_REG and \
+                ops[1].type == X.X86_OP_MEM and ops[1].size == 4 and ops[1].mem.index and ops[1].mem.scale == 4:
+            bv = self.reg(st, ins.reg_name(ops[1].mem.base)) if ops[1].mem.base else None
+            if bv == ("g", self.exe.base):                  # mov ecx, [__ImageBase + idx*4 + table]: a switch
+                self.tables[self.FULL.get(ins.reg_name(ops[0].reg))] = (ins.address, self.exe.base + ops[1].mem.disp)
+        if ins.id in (X.X86_INS_CALL, X.X86_INS_JMP, X.X86_INS_RET):
+            return self.step1(ins, st)
+        try:
+            wr = ins.regs_access()[1]
+        except capstone.CsError:
+            wr = []
+        out = self.step1(ins, st)
+        aw = {self.FULL.get(ins.reg_name(r)) for r in wr} & set(ARGREGS64)
+        if aw:
+            st.aw = st.aw | aw
+        return out
+
+    def step1(self, ins, st):
         s, site, ops, nxt = self.s, ins.address, ins.operands, ins.address + ins.size
         i = ins.id
         if i == X.X86_INS_PUSH:
             v = self.opval(st, ins, ops[0], site)
-            st.esp -= 4
+            st.esp -= self.W
             st.slots[st.esp] = v
-            st.pend = 0 if (v is not None and v[0] == "init" and v[1] in CALLEE_SAVED) else st.pend + 1
+            st.pend = 0 if (v is not None and v[0] == "init" and v[1] in self.CS) else st.pend + 1
             return [nxt]
         if i == X.X86_INS_POP:
             v = st.slots.pop(st.esp, None)
-            st.esp += 4
+            st.esp += self.W
             st.pend = max(st.pend - 1, 0)
             if ops[0].type == X.X86_OP_REG:
                 self.setreg(st, ins.reg_name(ops[0].reg), v)
             else:
-                self.store(st, self.addr(st, ins, ops[0]), v, 4, site)
+                self.store(st, self.addr(st, ins, ops[0]), v, self.W, site)
             return [nxt]
         if i in (X.X86_INS_MOV, X.X86_INS_MOVZX, X.X86_INS_MOVSX):
+            if self.x64 and i == X.X86_INS_MOV and ops[0].type == X.X86_OP_REG and ops[1].type == X.X86_OP_IMM \
+                    and ops[0].size in (4, 8) and self.FULL.get(ins.reg_name(ops[0].reg)) not in (None, self.SP):
+                st.regs[self.FULL[ins.reg_name(ops[0].reg)]] = ("c", ops[1].imm & ((1 << 8 * ops[0].size) - 1))
+                return [nxt]                                 # mov r32, imm zero-extends: an exact constant
             v = self.opval(st, ins, ops[1], site)
-            if i != X.X86_INS_MOV or ops[1].size != 4:
-                self.lose(self.reg(st, ins.reg_name(ops[1].reg)) if ops[1].type == X.X86_OP_REG else None, site, "narrowed")
+            if i != X.X86_INS_MOV or ops[1].size != self.W:
+                if not (self.x64 and ops[1].type == X.X86_OP_REG and ops[1].size < 8):   # x64: a 32-bit value is
+                    self.lose(self.reg(st, ins.reg_name(ops[1].reg)) if ops[1].type == X.X86_OP_REG else None,  # no address
+                              site, "narrowed")
                 v = None
             if ops[0].type == X.X86_OP_REG:
                 self.setreg(st, ins.reg_name(ops[0].reg), v)
@@ -426,18 +617,26 @@ class Func:
         if i == X.X86_INS_LEA:
             a = self.addr(st, ins, ops[1])
             v = a if (a is not None and a[0] in ("sp", "p", "d")) else None
+            if self.x64 and ops[1].mem.base == X.X86_REG_RIP and ops[0].size == 8:
+                v = ("g", a[1])                              # lea r, [rip+..]: a global's address
             for r in (ops[1].mem.base, ops[1].mem.index):
                 rv = self.reg(st, ins.reg_name(r)) if r else None
                 if rv is not None and rv[0] == "p":
                     s.touched.add(rv[1])
             self.setreg(st, ins.reg_name(ops[0].reg), v)
             return [nxt]
-        if i in (X.X86_INS_ADD, X.X86_INS_SUB) and ops[0].type == X.X86_OP_REG and FULL.get(ins.reg_name(ops[0].reg)) == ins.reg_name(ops[0].reg):
+        if i in (X.X86_INS_ADD, X.X86_INS_SUB) and ops[0].type == X.X86_OP_REG and self.FULL.get(ins.reg_name(ops[0].reg)) == ins.reg_name(ops[0].reg):
             name = ins.reg_name(ops[0].reg)
             d = self.reg(st, name)
-            if ops[1].type == X.X86_OP_IMM:
-                k = ops[1].imm if i == X.X86_INS_ADD else -ops[1].imm
-                if name == "esp":
+            self.xuse(d, site)
+            kc = None
+            if self.x64 and name == self.SP and ops[1].type == X.X86_OP_REG:     # sub rsp, rax after __chkstk
+                c = st.regs.get(self.FULL.get(ins.reg_name(ops[1].reg)))
+                kc = c[1] if (c is not None and c[0] == "c") else None
+            if ops[1].type == X.X86_OP_IMM or kc is not None:
+                k = ops[1].imm if kc is None else kc
+                k = k if i == X.X86_INS_ADD else -k
+                if name == self.SP:
                     st.esp += k
                     st.pend = max(st.pend - k // 4, 0) if k > 0 else 0
                     for o in [o for o in st.slots if o < st.esp]:
@@ -452,8 +651,8 @@ class Func:
                 st.regs[name] = d
                 return [nxt]
             v = self.opval(st, ins, ops[1], site)
-            if name == "esp":
-                self.warn("esp changed by a variable amount (alloca?)", site)
+            if name == self.SP:
+                self.warn("%s changed by a variable amount (alloca?)" % self.SP, site)
                 s.bad_stack = True
                 return [nxt]
             if d is not None and d[0] in ("sp", "p", "d"):
@@ -469,9 +668,10 @@ class Func:
                 d = None
             st.regs[name] = d
             return [nxt]
-        if i in (X.X86_INS_INC, X.X86_INS_DEC) and ops[0].type == X.X86_OP_REG and ins.reg_name(ops[0].reg) in GPR:
+        if i in (X.X86_INS_INC, X.X86_INS_DEC) and ops[0].type == X.X86_OP_REG and ins.reg_name(ops[0].reg) in self.GPR:
             name = ins.reg_name(ops[0].reg)
             d, k = st.regs.get(name), (1 if i == X.X86_INS_INC else -1)
+            self.xuse(d, site)
             if d is not None and d[0] == "sp":
                 d = ("sp", d[1] + k if d[1] is not None else None)
             elif d is not None and d[0] == "p":
@@ -487,14 +687,14 @@ class Func:
             self.setreg(st, b, va)
             return [nxt]
         if i == X.X86_INS_LEAVE:
-            b = st.regs.get("ebp")
+            b = st.regs.get(self.BP)
             if b is None or b[0] != "sp" or b[1] is None:
-                self.warn("leave with an untracked ebp", site)
+                self.warn("leave with an untracked %s" % self.BP, site)
                 s.bad_stack = True
                 return [nxt]
             st.esp = b[1]
-            st.regs["ebp"] = st.slots.pop(st.esp, None)
-            st.esp += 4
+            st.regs[self.BP] = st.slots.pop(st.esp, None)
+            st.esp += self.W
             return [nxt]
         if i == X.X86_INS_CALL:
             self.call(ins, st, False)
@@ -506,23 +706,23 @@ class Func:
             if ops[0].type == X.X86_OP_IMM:
                 t = ops[0].imm
                 if st.esp == 0 and t != self.va and (t < self.va or self.exe.read(t - 1, 1) == b"\xcc") \
-                        and all(st.regs.get(r) == ("init", r) for r in CALLEE_SAVED):
+                        and all(st.regs.get(r) == ("init", r) for r in self.CS):
                     self.call(ins, st, True)
                     return []
                 return [t]
-            tbl = self.switch(ins, st)
+            tbl = self.switch64(ins, st) if self.x64 else self.switch(ins, st)
             if tbl is not None:
                 return tbl
             if ops[0].type == X.X86_OP_MEM:
-                self.load(st, self.addr(st, ins, ops[0]), 4, site)
+                self.load(st, self.addr(st, ins, ops[0]), self.W, site)
             self.call(ins, st, True)
             return []
         if ins.group(X.X86_GRP_JUMP):                        # jcc, loop, jecxz
             return [nxt, ops[0].imm] if ops and ops[0].type == X.X86_OP_IMM else [nxt]
         if i in (X.X86_INS_INT3, X.X86_INS_HLT, X.X86_INS_UD2):
             return []
-        if i == X.X86_INS_AND and ops[0].type == X.X86_OP_REG and ins.reg_name(ops[0].reg) == "esp":
-            self.warn("stack realigned (and esp): local offsets after it are approximate", site)
+        if i == X.X86_INS_AND and ops[0].type == X.X86_OP_REG and ins.reg_name(ops[0].reg) == self.SP:
+            self.warn("stack realigned (and %s): local offsets after it are approximate" % self.SP, site)
             return [nxt]
         # generic: memory operands by access, then every written register becomes unknown
         cmov = ins.group(X.X86_GRP_CMOV)
@@ -544,26 +744,29 @@ class Func:
                 v = self.reg(st, ins.reg_name(op.reg))
                 if v is not None and v[0] == "p":
                     s.touched.add(v[1])
-                if op.access & capstone.CS_AC_READ:
+                if op.access & capstone.CS_AC_READ and not (self.x64 and op.size < 8):
                     srcv.append(v)
         rd, wr = ins.regs_access()
         compare = i in (X.X86_INS_CMP, X.X86_INS_TEST)
         for r in wr:
-            name = FULL.get(ins.reg_name(r))
-            if name in GPR:
+            name = self.FULL.get(ins.reg_name(r))
+            if name in self.GPR:
                 old = st.regs.get(name)
                 if cmov and len(srcv) and srcv[-1] == old:
                     continue
                 if old is not None and old[0] in ("p", "d") and i in (X.X86_INS_MOVSD, X.X86_INS_MOVSB, X.X86_INS_MOVSW,
                                                                     X.X86_INS_STOSD, X.X86_INS_STOSB, X.X86_INS_STOSW,
                                                                     X.X86_INS_LODSD, X.X86_INS_LODSB, X.X86_INS_CMPSB,
-                                                                    X.X86_INS_SCASB, X.X86_INS_CMPSD, X.X86_INS_SCASD):
+                                                                    X.X86_INS_SCASB, X.X86_INS_CMPSD, X.X86_INS_SCASD,
+                                                                    X.X86_INS_MOVSQ, X.X86_INS_STOSQ, X.X86_INS_LODSQ,
+                                                                    X.X86_INS_CMPSQ, X.X86_INS_SCASQ):
                     st.regs[name] = ("p", old[1], None) if old[0] == "p" else old
                     continue
                 st.regs[name] = None
         if not compare and not cmov:
             for v in srcv:
-                if v is not None and v[0] == "p" and not any(st.regs.get(r) is not None and st.regs[r][:2] == v[:2] for r in GPR) \
+                self.xuse(v, site)
+                if v is not None and v[0] == "p" and not any(st.regs.get(r) is not None and st.regs[r][:2] == v[:2] for r in self.GPR) \
                         and not any(w is not None and w[:2] == v[:2] for w in st.slots.values()):
                     self.lose(v, site, "used by `%s`" % ins.mnemonic)
         return [nxt]
@@ -585,22 +788,45 @@ class Func:
             out.append(t)
         return sorted(set(out)) if out else None
 
+    def switch64(self, ins, st):
+        """x64 `jmp reg` after `mov reg32, [__ImageBase + idx*4 + table]; add reg, __ImageBase`: the table holds
+        image-relative offsets."""
+        op = ins.operands[0]
+        if op.type != X.X86_OP_REG:
+            return None
+        t = self.tables.get(self.FULL.get(ins.reg_name(op.reg)))
+        if t is None or not (0 < ins.address - t[0] < 32):
+            return None
+        out = []
+        for k in range(1024):
+            r = self.exe.u32(t[1] + 4 * k)
+            if r is None:
+                break
+            a = self.exe.base + r
+            if not self.exe.in_text(a) or not (self.va <= a < self.va + 0x8000):
+                break
+            out.append(a)
+        return sorted(set(out)) if out else None
+
     def ret(self, ins, st):
         s = self.s
         pop = ins.operands[0].imm if ins.operands else 0
         if s.pop is None:
             s.pop = pop
         if st.esp != 0:
-            self.warn("esp is entry%+d at this ret: stack tracking failed (an indirect call's cleanup was guessed "
+            self.warn(self.SP + " is entry%+d at this ret: stack tracking failed (an indirect call's cleanup was guessed "
                       "wrong? use --pop VA=BYTES)" % st.esp, ins.address)
             s.bad_stack = True
-        v = st.regs.get("eax")
+        v = st.regs.get(self.AX)
+        self.xuse(v, ins.address)
         if v is not None and v[0] == "p":
             s.returned.add(v[1])
         elif v is not None and v[0] == "d":
             s.dpassed.setdefault(v[1], []).append((ins.address, None, "returned"))
 
     def call(self, ins, st, tail):
+        if self.x64:
+            return self.call64(ins, st, tail)
         s, site, op = self.s, ins.address, ins.operands[0]
         target = op.imm if op.type == X.X86_OP_IMM else None
         text = "%08x" % target if target is not None else ins.op_str.replace("dword ptr ", "")
@@ -701,38 +927,8 @@ class Func:
                     self.merge_inner(inner, pos, v[1], v[2], site, target)
                 elif kind != "self":
                     s.dpassed.setdefault(v[1], []).append((site, target, "passed"))
-        if inner is not None:                                 # the inner function's own effects are ours too
-            for a, sites in inner.grd.items():
-                s.grd.setdefault(a, set()).add(site)
-            for a, sites in inner.gwr.items():
-                s.gwr.setdefault(a, set()).add(site)
-            if inner.unk_rd:
-                s.unk_rd.append(site)
-            if inner.unk_wr:
-                s.unk_wr.append(site)
-            for c in inner.calls:
-                if c[3] == "unknown":
-                    s.calls.append((site, c[1], c[2] + " (via %08x)" % target, "unknown"))
-            if inner.bad_stack:
-                self.warn("callee %08x could not be analysed reliably" % target, site)
-                s.calls.append((site, target, text + " (unreliable)", "unknown"))
-        # locals whose address a callee holds may be rewritten by any call
-        if st.esc:
-            bounds = sorted(self.direct | {0})
-            for a in st.esc:
-                hi = next((b for b in bounds if b > a), a + 4)
-                for o in [o for o in st.slots if a <= o < hi]:
-                    v = st.slots[o]
-                    if v is not None and v[0] == "p":
-                        if o in self.homes:                  # stack packing: a dead spill slot reused for a local
-                            s.shared.setdefault(v[1], set()).add(site)
-                        elif kind == "unknown":
-                            s.passed.setdefault(v[1], []).append((site, target, -1, False))
-                        self.lose(v, site, "kept in a local whose address a callee has")
-                    elif v is not None and v[0] == "d" and kind == "unknown":
-                        s.dpassed.setdefault(v[1], []).append((site, target, "inside a local object"))
-                    if not (v is not None and v[0] == "init"):
-                        del st.slots[o]
+        self.inner_effects(inner, site, target, text)        # the inner function's own effects are ours too
+        self.clobber_escaped(st, site, target, kind)
         for r in ("eax", "ecx", "edx"):
             st.regs[r] = None
         if not tail:
@@ -743,6 +939,127 @@ class Func:
         elif st.esp != 0:
             self.warn("tail jump with esp at entry%+d" % st.esp, site)
             s.bad_stack = True
+
+    def call64(self, ins, st, tail):
+        """x64 call or tail jump: arguments in rcx, rdx, r8, r9 and the stack slots above the callee's home area."""
+        s, site, op = self.s, ins.address, ins.operands[0]
+        target = op.imm if op.type == X.X86_OP_IMM else None
+        text = "%08x" % target if target is not None else ins.op_str.replace("qword ptr ", "")
+        if op.type == X.X86_OP_MEM:
+            a = self.addr(st, ins, op)
+            if a is not None and a[0] == "abs" and (op.mem.base == X.X86_REG_RIP or not (op.mem.base or op.mem.index)):
+                text = self.exe.imports.get(a[1], "[%08x]" % a[1])
+        if target is not None and self.exe.is_chkstk64(target):
+            for r in ("r10", "r11"):
+                st.regs[r] = None
+            return
+        if target is not None and (self.exe.is_cookie_check(target) or target in self.an.pure):
+            s.calls.append((site, target, text, "pure"))
+            for r in CALLER_SAVED64:
+                st.regs[r] = None
+            st.aw = frozenset()
+            return
+        q = self.exe.quick64(target) if target is not None else None
+        reliable = q is not None and q[2]
+        if reliable:                                        # the registers and stack slots the target reads
+            nreg = max(q[0]) + 1 if q[0] else 0
+            nstk = q[1]
+        else:                                               # unknown: every register; the slots written since
+            nreg, nstk = 4, 0                               # the last call
+            while ((8 if tail else 0) + HOME64 + 8 * nstk) in st.aw or \
+                    (tail and (st.slots.get(8 + HOME64 + 8 * nstk) or ("?",))[0] == "p"):
+                nstk += 1
+                if nstk > 24:
+                    break
+        if tail and target is None and not reliable:
+            nstk = 24                                       # an indirect tail jump sees all incoming arguments
+        if tail and s.pop is None:
+            s.pop = 0                                       # a tail jump is an exit (ret has no pop on x64)
+        base = st.esp + (8 if tail else 0) + HOME64
+        regargs = [(ARGREGS64[k], k, st.regs.get(ARGREGS64[k])) for k in range(min(nreg, 4))]
+        args = [("stack", k, st.slots.get(base + 8 * k)) for k in range(nstk)]
+        inner = None
+        kind = "unknown"
+        if target == self.va:
+            kind = "self"
+        elif target is not None and self.an.in_tu(target) and self.level < self.an.depth:
+            inner = self.an.summarize(target, level=self.level + 1)
+            kind = "tu" if inner is not None else "self"
+        s.calls.append((site, target, text, kind))
+        for where, k, v in regargs + args:
+            pos = k if where != "stack" else 4 + k
+            weak = where != "stack" and not reliable and where not in st.aw
+            if v is None:
+                continue
+            self.xuse(v, site)
+            if v[0] == "sp" and v[1] is not None:
+                s.localargs.append((site, target, where if where != "stack" else "arg%d" % (4 + k), v[1], pos))
+                st.esc = st.esc | {v[1]}
+            elif v[0] == "p":
+                s.touched.add(v[1])
+                if inner is not None:
+                    self.merge_inner(inner, pos, v[1], 0, site, target)
+                elif kind != "self":
+                    s.passed.setdefault(v[1], []).append((site, target, pos, weak))
+            elif v[0] == "d":
+                if inner is not None:
+                    self.merge_inner(inner, pos, v[1], v[2], site, target)
+                elif kind != "self":
+                    s.dpassed.setdefault(v[1], []).append((site, target, "passed"))
+        self.inner_effects(inner, site, target, text)
+        self.clobber_escaped(st, site, target, kind)
+        for r in CALLER_SAVED64:
+            st.regs[r] = None
+        st.aw = frozenset()
+        if not tail:                                        # the callee owns its home area and stack arguments
+            for o in [o for o in st.slots if st.esp <= o < base + 8 * max(nstk, 0)]:
+                del st.slots[o]
+        elif st.esp != 0:
+            self.warn("tail jump with rsp at entry%+d" % st.esp, site)
+            s.bad_stack = True
+
+    def inner_effects(self, inner, site, target, text):
+        """The effects of a summarised (--tu) callee on globals and unknown memory are the caller's too."""
+        s = self.s
+        if inner is None:
+            return
+        for a, sites in inner.grd.items():
+            s.grd.setdefault(a, set()).add(site)
+        for a, sites in inner.gwr.items():
+            s.gwr.setdefault(a, set()).add(site)
+        if inner.unk_rd:
+            s.unk_rd.append(site)
+        if inner.unk_wr:
+            s.unk_wr.append(site)
+        for c in inner.calls:
+            if c[3] == "unknown":
+                s.calls.append((site, c[1], c[2] + " (via %08x)" % target, "unknown"))
+        if inner.bad_stack:
+            self.warn("callee %08x could not be analysed reliably" % target, site)
+            s.calls.append((site, target, text + " (unreliable)", "unknown"))
+
+    def clobber_escaped(self, st, site, target, kind):
+        """Locals whose address a callee holds may be rewritten by any call."""
+        s = self.s
+        if not st.esc:
+            return
+        bounds = sorted(self.direct | {0})
+        for a in st.esc:
+            hi = next((b for b in bounds if b > a), a + self.W)
+            for o in [o for o in st.slots if a <= o < hi]:
+                v = st.slots[o]
+                if v is not None and v[0] == "p":
+                    if o in self.homes:                  # stack packing: a dead spill slot reused for a local
+                        s.shared.setdefault(v[1], set()).add(site)
+                    elif kind == "unknown":
+                        s.passed.setdefault(v[1], []).append((site, target, -1, False))
+                    self.lose(v, site, "kept in a local whose address a callee has")
+                elif v is not None and v[0] == "d" and kind == "unknown":
+                    s.dpassed.setdefault(v[1], []).append((site, target, "inside a local object"))
+                else:
+                    self.xuse(v, site)
+                if not (v is not None and v[0] == "init"):
+                    del st.slots[o]
 
     def merge_inner(self, inner, pos, i, deep, site, target):
         s = self.s
@@ -775,6 +1092,8 @@ class Func:
         """First address after the entry's frame set-up (register saves, EH registration, /GS cookie): pushes
         up to there are not call arguments."""
         a, end = self.va, self.va
+        if self.x64:
+            return end                                      # x64 passes no argument with push
         for _ in range(24):
             i = self.exe.ins(a)
             if i is None:
@@ -816,6 +1135,14 @@ class Func:
     # ---- fixpoint -----------------------------------------------------------------------------------------
     def entry_state(self):
         st = State()
+        if self.x64:                                        # rcx rdx r8 r9 = params 0..3, [rsp+0x28+8k] = 4+k
+            for r in GPR64:
+                st.regs[r] = ("init", r)
+            for k, r in enumerate(ARGREGS64):
+                st.regs[r] = ("p", k, 0)
+            for k in range((self.want_nstack - 4) if self.want_nstack is not None else 20):
+                st.slots[8 + HOME64 + 8 * k] = ("p", 4 + k, 0)
+            return st
         for r in GPR:
             st.regs[r] = ("init", r)
         nreg = self.s.nreg
@@ -844,6 +1171,11 @@ class Func:
         if not b.esc <= a.esc:
             a.esc = a.esc | b.esc
             ch = True
+        if not b.aw <= a.aw:
+            a.aw = a.aw | b.aw
+            ch = True
+        if self.x64:
+            return self.join64(a, b, site) or ch
         for d, e in ((a.regs, b.regs), (a.slots, b.slots)):
             for k in list(d):
                 v, w = d[k], e.get(k)
@@ -862,6 +1194,30 @@ class Func:
                     self.lose(v, site, "merged with another value")
                     self.lose(w, site, "merged with another value")
                 if n != v:
+                    d[k] = n
+                    ch = True
+        return ch
+
+    def join64(self, a, b, site):
+        """x64 registers and slots: a parameter merged with another value becomes ("x", {params}), lost only
+        where that value is used (lose() at the use), so a dead copy (rcx after a call on one path) costs nothing."""
+        ch = False
+        tags = lambda v: {v[1]} if (v is not None and v[0] == "p") else set(v[1]) if (v is not None and v[0] == "x") else set()
+        for d, e in ((a.regs, b.regs), (a.slots, b.slots)):
+            for k in set(d) | set(e):
+                v, w = d.get(k), e.get(k)
+                if v == w:
+                    continue
+                if v is not None and w is not None and v[0] == w[0] == "p" and v[1] == w[1]:
+                    n = ("p", v[1], None)
+                elif v is not None and w is not None and v[0] == w[0] == "sp":
+                    n = ("sp", None)
+                elif v is not None and w is not None and v[0] == w[0] == "d" and v[1] == w[1]:
+                    n = ("d", v[1], max(v[2], w[2]))
+                else:
+                    t = tags(v) | tags(w)
+                    n = ("x", frozenset(t)) if t else None
+                if n != v and not (n is None and k not in d):
                     d[k] = n
                     ch = True
         return ch
@@ -909,7 +1265,15 @@ class Func:
         if s.pop is None:
             s.pop = 0
             self.warn("no ret reached (the function ends in a jump to code that was not followed)")
-        if self.want_nstack is not None:
+        if self.x64:                                        # count: given, or the highest position read
+            if self.want_nstack is not None:
+                n = self.want_nstack
+            else:
+                q = self.exe.quick64(self.va)
+                n = max([k + 1 for k in q[0]] + [4 + q[1] if q[1] else 0] +
+                        [4 + (self.maxarg - 8 - HOME64) // 8 + 1 if self.maxarg else 0])
+            s.nreg, s.nstack = min(n, 4), max(n - 4, 0)
+        elif self.want_nstack is not None:
             s.nstack = self.want_nstack
         elif self.conv == "cdecl":
             s.nstack = self.maxarg // 4
@@ -963,14 +1327,17 @@ def describe(s, i, verbose=False):
         notes.append("loads [p%s]" % offs(s.rd[i]))
     if s.wr.get(i):
         notes.append("stores [p%s]" % offs(s.wr[i]))
+    weaktext = " (still in its register since the entry or the last call: an argument, or a stale register)" \
+        if s.conv == "x64" else " (in ecx: `this`, or a stale register)"
     for site, target, pos, weak in s.passed.get(i, [])[:4]:
         notes.append("%s to %s at %08x%s" % ("in a local object passed" if pos < 0 else "passed",
                                               "%08x" % target if target is not None else "an indirect call", site,
-                                              " (in ecx: `this`, or a stale register)" if weak else ""))
+                                              weaktext if weak else ""))
     for site, where in s.stored.get(i, [])[:3]:
         notes.append("pointer stored to %s at %08x" % (where, site))
     if i in s.returned and s.returns is not False:
-        notes.append("returned" if s.returns else "in eax at a ret: returned, if the function returns a value")
+        notes.append("returned" if s.returns else "in %s at a ret: returned, if the function returns a value"
+                     % ("rax" if s.conv == "x64" else "eax"))
     if s.drd.get(i) or s.dwr.get(i):
         notes.append("through the loaded pointer: %s" % "+".join(
             x for x, c in (("reads", s.drd.get(i)), ("writes", s.dwr.get(i))) if c))
@@ -1016,12 +1383,15 @@ def show(v, names=None):
         return "&stack[%s]" % ("var" if v[1] is None else "%+d" % v[1])
     if v[0] == "init":
         return "entry " + v[1]
+    if v[0] == "g":
+        return "&global %08x" % v[1]
     return "0x%x" % v[1] if v[0] == "c" else "?"
 
 
 def trace(exe, s, proto, out=sys.stdout):
     """Every instruction reached, with the stack depth and what each register operand holds."""
     f, names = s.func, param_names(s, proto)
+    full, sp = f.FULL, f.SP
     for a in sorted(f.states):
         st, ins = f.states[a], exe.ins(a)
         if ins is None:
@@ -1033,17 +1403,17 @@ def trace(exe, s, proto, out=sys.stdout):
                 continue                                     # a register that is only written
             regs = [op.reg] if op.type == X.X86_OP_REG else [op.mem.base, op.mem.index] if op.type == X.X86_OP_MEM else []
             for r in regs:
-                name = FULL.get(ins.reg_name(r)) if r else None
-                v = st.regs.get(name) if name and name != "esp" else None
-                if v is not None and v[0] in ("p", "d", "sp"):
+                name = full.get(ins.reg_name(r)) if r else None
+                v = st.regs.get(name) if name and name != sp else None
+                if v is not None and v[0] in ("p", "d", "sp", "g"):
                     t = "%s=%s" % (name, show(v, names))
                     if t not in notes:
                         notes.append(t)
-            if op.type == X.X86_OP_MEM and op.mem.base and ins.reg_name(op.mem.base) == "esp" and not op.mem.index:
+            if op.type == X.X86_OP_MEM and op.mem.base and ins.reg_name(op.mem.base) == sp and not op.mem.index:
                 off = st.esp + op.mem.disp
                 v = st.slots.get(off)
-                notes.append("[esp%+d]=stack[%+d]%s" % (op.mem.disp, off, " holds " + show(v, names) if v is not None else ""))
-        out.write("%08x  esp%+-5d %-8s %-34s %s\n" % (a, st.esp, ins.mnemonic, ins.op_str[:34], "; " + ", ".join(notes) if notes else ""))
+                notes.append("[%s%+d]=stack[%+d]%s" % (sp, op.mem.disp, off, " holds " + show(v, names) if v is not None else ""))
+        out.write("%08x  %s%+-5d %-8s %-34s %s\n" % (a, sp, st.esp, ins.mnemonic, ins.op_str[:34], "; " + ", ".join(notes) if notes else ""))
 
 
 def parse_proto(proto):
@@ -1088,12 +1458,18 @@ def parse_proto(proto):
         ptr = "*" in ty or "&" in ty
         slots = 2 if (not ptr and re.search(r"\b(double|__int64|long long)\b", ty)) else 1
         out.append((ty, nm, slots))
-    return dict(ret=head or "void", name=name, cls=cls, conv=conv, params=out)
+    return dict(ret=head or "void", name=name, cls=cls, conv=conv, params=out, member=bool(cls and not static))
 
 
 def param_names(s, proto):
     """name and declared type of every summary parameter index."""
     names = {}
+    if s.conv == "x64":                                     # positions: rcx rdx r8 r9, then the stack
+        allp = ([("this", (proto["cls"] or "?") + "*")] if proto and proto.get("member") else []) + \
+            ([(nm, ty) for ty, nm, _ in proto["params"]] if proto else [])
+        for i in range(max(s.nparams(), len(allp))):
+            names[i] = allp[i] if i < len(allp) else (ARGREGS64[i] if i < 4 else "arg%d" % i, "?")
+        return names
     if proto and getattr(s, "regs", None):                  # custom register convention: the first len(regs)
         allp = ([("this", (proto["cls"] or "?") + "*")] if proto["conv"] == "thiscall" else []) + \
             [(nm, ty) for ty, nm, _ in proto["params"]]     # parameters (this first) are the registers, in order
@@ -1130,9 +1506,19 @@ def param_names(s, proto):
 def report(exe, s, proto, out=sys.stdout, verbose=False):
     names = param_names(s, proto)
     w = out.write
-    w("callee %08x  %s, %d stack parameter(s), ret %d%s\n" % (
-        s.va, s.conv, s.nstack, s.pop or 0, "  [%s]" % proto["name"] if proto else ""))
-    if proto:
+    if s.conv == "x64":
+        w("callee %08x  x64, %d parameter(s) (%d in registers, %d on the stack)%s\n" % (
+            s.va, s.nparams(), s.nreg, s.nstack, "  [%s]" % proto["name"] if proto else ""))
+    else:
+        w("callee %08x  %s, %d stack parameter(s), ret %d%s\n" % (
+            s.va, s.conv, s.nstack, s.pop or 0, "  [%s]" % proto["name"] if proto else ""))
+    if proto and s.conv == "x64":
+        q = s.func.exe.quick64(s.va) if getattr(s, "func", None) else None
+        if q is not None and q[0] and max(q[0]) + 1 > s.nparams():
+            w("  WARNING: the code reads parameter register(s) %s but --proto has %d parameter(s): check the "
+              "prototype (hidden return pointer? `this`?)\n" % (", ".join(ARGREGS64[k] for k in sorted(q[0]) if k >= s.nparams()),
+                                                                s.nparams()))
+    elif proto:
         want = sum(sl for _, _, sl in proto["params"]) - (min(2, len(proto["params"])) if proto["conv"] == "fastcall" else 0)
         if proto["conv"] != "cdecl" and want * 4 != (s.pop or 0):
             w("  WARNING: --proto has %d stack slot(s) but the code pops %d bytes: check the prototype "
@@ -1256,7 +1642,11 @@ def stub(exe, s, proto, out=sys.stdout):
     for k in ("ext", "pass", "keep", "sink", "ret"):
         if k in need:
             w(decl[k] + "\n")
-    if proto:
+    if proto and s.conv == "x64":                           # one convention: no keyword
+        sig = "%s %s(%s)" % (proto["ret"], proto["name"], ", ".join("%s %s" % (t, n) for t, n, _ in proto["params"]))
+    elif s.conv == "x64":
+        sig = "void FUN_%08x(%s)" % (s.va, ", ".join("void* %s" % names[i][0] for i in range(s.nparams())))
+    elif proto:
         conv = " __%s" % proto["conv"] if proto["conv"] in ("stdcall", "fastcall", "cdecl") and not proto["cls"] and proto["conv"] != "cdecl" else ""
         sig = "%s%s %s(%s)" % (proto["ret"], conv, proto["name"], ", ".join("%s %s" % (t, n) for t, n, _ in proto["params"]))
     else:
@@ -1278,7 +1668,10 @@ def stub(exe, s, proto, out=sys.stdout):
 def caller_mode(exe, an, va, out=sys.stdout):
     s = an.summarize(va)
     w = out.write
-    w("caller %08x  %s, ret %d\n" % (va, s.conv, s.pop or 0))
+    if s.conv == "x64":
+        w("caller %08x  x64\n" % va)
+    else:
+        w("caller %08x  %s, ret %d\n" % (va, s.conv, s.pop or 0))
     for t in s.warn:
         w("  WARNING: %s\n" % t)
     if s.bad_stack:
@@ -1299,7 +1692,8 @@ def caller_mode(exe, an, va, out=sys.stdout):
             sub = Analyzer(exe, tu=an.tu, depth=an.depth, pops=an.pops, pure=an.pure)
             inner = sub.summarize(target)
         for where, off, pos in sorted(lst, key=lambda x: x[2]):
-            t = "        %-5s = &%s[entry esp%+d]" % (where, "local" if off < 0 else "param home", off)
+            t = "        %-5s = &%s[entry %s%+d]" % (where, "local" if off < 0 else "param home",
+                                                  "rsp" if s.conv == "x64" else "esp", off)
             if inner is not None and pos < inner.nparams():
                 cls, v, _ = describe(inner, pos)
                 t += "   callee #%d: %s" % (pos, cls)
@@ -1348,6 +1742,24 @@ def main():
         ap.error("give a callee VA or --caller VA")
     va = int(a.va, 16)
     proto = parse_proto(a.proto) if a.proto else None
+    if exe.x64:
+        if a.conv:
+            print("note: --conv is ignored on x64 (one calling convention)", file=sys.stderr)
+        if proto and re.search(r"__(thiscall|stdcall|fastcall|cdecl)\b", a.proto):
+            print("note: calling-convention keywords in --proto are ignored on x64", file=sys.stderr)
+        nparams = a.nparams
+        if proto and nparams is None:
+            nparams = len(proto["params"]) + (1 if proto["member"] else 0)
+        s = an.summarize(va, None, nparams)
+        s.returns = (proto["ret"] != "void") if proto else None
+        if a.trace:
+            trace(exe, s, proto)
+            print()
+        report(exe, s, proto, verbose=a.v)
+        if not a.no_stub:
+            print()
+            stub(exe, s, proto)
+        return
     conv = a.conv or (proto["conv"] if proto else None)
     nparams = a.nparams
     if proto and nparams is None:

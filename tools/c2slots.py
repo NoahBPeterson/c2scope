@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 ROLES = ["start", "pnew", "pnew_lod", "ptry", "pjoin", "pjoin_lod", "elem", "ctry", "cjoin", "cjoin_lod",
          "cnew_lod", "gs_join", "gs_new", "done", "redo", "sorted", "col", "mem"]
+ROLES_EXTRA = ["frame"]      # optional: the frame decision (name, argument area A, F, pushed bytes, B)
 # {SYM:x}: sym, index, size, uses, kind|fl5|fl6|fl7, key, name, alignCode, ty, SSR+0x28 ($T number)     {LOD:x}: 12 nodes of the SBV at x
 SYM9 = "{x},{x}>0x3c,{x}>0x20,{x}>0x38,{x}>4,{x}>0x1c,{x}>0>4$,{x}>0x2c,{x}>0x10,{x}>0>0x28"
 # 14.00.50727.762 (addresses: docs/c2/slots.md section 2; frame.md section 4)
@@ -63,23 +64,39 @@ SBV_14 = {"bits": 64, "next": 0xc, "words": 4}       # node: base, bits lo, bits
 BUILD = {"14.00": dict(sbv=SBV_14, gs3=True, cap_note="FUNC+0x48")}
 
 
+# the packer's rules that differ per build (table key `slots`; defaults = the x86 packer of section 1 of the doc):
+# tround  T counts each colour rounded to this (x86 4, x64 16)      undo     the T >= 112 param-home undo exists
+# up      offsets ascend from Alloc_local in colour order, every member at the colour's base (x64)
+# palign  a param home also needs (home - 8) % alignment == 0 (x64)  capdef   alignment cap when FUNC's is 0
+# argarea the final frame offset is packed + the outgoing-argument area (role `frame`, x64)
+# sym     the SYM field template (SYM9)   sorted  field names of the `sorted` role   gsbit  /GS bit in its gsopt
+# gs_join_probe  the gs_join hook is a probe whose first spec is the level (x86: StkGSBufferLevel's exit eax)
+RULES = dict(tround=4, undo=True, up=False, palign=False, capdef=4, argarea=False)
+
+
 def build_info():
     import c2build
     t = c2build.table()
     if t is None:
-        return dict(name="14.00", hooks=HOOKS, sbv=SBV_14, v13=False)
+        return dict(name="14.00", hooks=HOOKS, roles=list(ROLES), sbv=SBV_14, v13=False, sym=SYM9, rules=dict(RULES))
     s = t.get("slots")
     if not s or "slots" not in t.get("hooks", {}):
         sys.exit("c2 %s: the slots probes are not ported (no hooks.slots / slots in its build table)" % c2build.name())
-    return dict(name=c2build.name(), hooks=t["hooks"]["slots"], sbv=s["sbv"], v13=s.get("v13", False))
+    allh = t["hooks"]["slots"]
+    names = ROLES + ROLES_EXTRA
+    hooks = [h for h in allh if h]                  # a null entry: the role does not exist on that build
+    roles = [names[k] for k, h in enumerate(allh) if h]
+    return dict(name=c2build.name(), hooks=hooks, roles=roles, sbv=s["sbv"], v13=s.get("v13", False),
+                sym=s.get("sym", SYM9), sorted=s.get("sorted"), gsbit=s.get("gsbit"), gs_join_probe=s.get("gs_join_probe"),
+                rules={k: s.get(k, v) for k, v in RULES.items()})
 
 
-def expand(h, sbv):
+def expand(h, sbv, sym=SYM9):
     def lod(x):
         nx = ">0x%x" % sbv["next"]
         return ",".join("%s>0%s#%d" % (x, nx * k, sbv["words"]) for k in range(12))
     h = re.sub(r"\{LOD:([^}]+)\}", lambda m: lod(m.group(1)), h)
-    return re.sub(r"\{SYM:([^}]+)\}", lambda m: SYM9.replace("{x}", m.group(1)), h)
+    return re.sub(r"\{SYM:([^}]+)\}", lambda m: sym.replace("{x}", m.group(1)), h)
 
 
 # ---------------------------------------------------------------- trace parsing
@@ -136,23 +153,33 @@ def _sym(v, k=0):
 def parse(log, info):
     """Per function: elements (by index), the final colouring run, the offsets the packer gave."""
     import c2trace
-    hooks = [expand(h, info["sbv"]) for h in info["hooks"]]
+    roles = info.get("roles") or ROLES
     funcs, F, cur, col = [], None, None, None
+    ctx, thr = {}, "0"              # c2 17.00 compiles on worker threads: "# thread N" says whose events follow
     for ln in log.splitlines():
+        if ln.startswith("# thread "):
+            ctx[thr] = (F, cur, col)
+            thr = ln.split()[2]
+            F, cur, col = ctx.get(thr, (None, None, None))
+            continue
         if "|" not in ln or ln[:2] not in ("E ", "X "):
             continue
         head, _, rest = ln.partition("|")
         f = head.split()
-        role = ROLES[int(f[3])]
+        role = roles[int(f[3])]
         v = [_val(x) for x in c2trace._split(rest)]
         regs = [int(x, 16) for x in f[4:]]
         if role == "start":
             F = dict(name=v[0], nstack=v[2], nparams=v[3], elems={}, params=[], runs=[[]], cols=[], pend={},
-                     done=None, redo=None, sorted=None)
+                     done=None, redo=None, sorted=None, frame=None)
             funcs.append(F)
             cur = col = None
             continue
         if F is None:
+            continue
+        if role == "frame":
+            if v[0] == F["name"] and F["frame"] is None:
+                F["frame"] = dict(A=s32(v[1]), F=s32(v[2]), pushed=s32(v[3]), B=s32(v[4]))
             continue
         run = F["runs"][-1]
         if role == "pnew":
@@ -195,10 +222,12 @@ def parse(log, info):
             if cur is not None:
                 cur["res"] = ("c", v[0])
         elif role in ("gs_join", "gs_new"):
-            if cur is not None and "tries" in cur and (role == "gs_new" or f[0] == "X"):
+            if cur is not None and "tries" in cur and (role == "gs_new" or f[0] == "X" or
+                                                       (v and info.get("gs_join_probe"))):
                 lvl = (regs[0] if f[0] == "X" else v[0]) & 0xff
                 cur["gs"] = lvl if not info["v13"] else 1
         elif role == "done":
+            v = v + [None] * 4
             F["done"] = dict(T=v[0], npc=v[1], ebp=v[2], joins=v[3])
             cur = None
         elif role == "redo":
@@ -206,7 +235,14 @@ def parse(log, info):
             F["runs"].append([])
             cur = None
         elif role == "sorted":
-            if info["v13"]:
+            if info.get("sorted"):                    # named fields (x64: no EBP frame, no EbpAdj)
+                d = dict(zip(info["sorted"], v))
+                F["sorted"] = dict(ncol=d.get("ncol"), T=d.get("T"), ebp=d.get("ebp") or 0, nparams=d.get("nparams"),
+                                   arraypad=d.get("pad"), fflags=d.get("fflags"), ebpadj=s32(d.get("ebpadj") or 0),
+                                   gs=bool((d.get("gsopt") or 0) & (info.get("gsbit") or 0) and d.get("pad")),
+                                   gscopies=bool((d.get("fflags") or 0) & 1), alloc=s32(d.get("alloc")),
+                                   cap=d.get("cap"), dalign=d.get("dalign"))
+            elif info["v13"]:
                 n, T, ebp, npar, pad, fflags, adj, gsopt, alloc, cap, dalign = v[:11]
                 F["sorted"] = dict(ncol=n, T=T, ebp=ebp, nparams=npar, arraypad=pad, fflags=fflags, ebpadj=s32(adj),
                                    gs=bool((gsopt or 0) & 1 and pad), gscopies=False, alloc=s32(alloc), cap=cap,
@@ -260,7 +296,7 @@ class Model:
 
     def amin(self, code, cap):
         a = (1 << (code - 1)) if code >= 1 else 0
-        c = cap or 4
+        c = cap or self.fn.get("capdef") or 4
         return a if a < c else c
 
     def run(self, order, record=False):
@@ -290,6 +326,11 @@ class Model:
                 if x["size"] > C["size"]:
                     tries.append((c, "size"))
                     continue
+                if fn.get("palign"):
+                    a = (1 << (x.get("align", 1) - 1)) if x.get("align", 1) >= 1 else 1
+                    if C["poff"] is None or abs(C["poff"] - 8) % a:
+                        tries.append((c, "align"))
+                        continue
                 if fn.get("v13"):
                     if fn.get("gs") and (x.get("fl7", 0) & 0x20 or (x["size"] > 4 and x.get("ty") != 0x4008)):
                         tries.append((c, "gs"))
@@ -313,7 +354,7 @@ class Model:
             if not done:
                 T = self._elemental(E, cols, npar, T, tries, log)
         undo = False
-        if not fn.get("ebp") and joins > 0 and T >= 0x70:
+        if fn.get("undo", True) and not fn.get("ebp") and joins > 0 and T >= 0x70:
             undo = True
             cols, npar, T = [], 0, 0
             if record:
@@ -327,12 +368,14 @@ class Model:
             self._qsort(cols, nfixed, len(cols) - 1, bool(fn.get("ebp")))
         offs, bases = {}, []
         alloc = fn.get("alloc") or 0
-        idxs = range(len(cols)) if fn.get("ebp") else range(len(cols) - 1, -1, -1)
+        idxs = range(len(cols)) if fn.get("ebp") or fn.get("up") else range(len(cols) - 1, -1, -1)
         bases = [None] * len(cols)
         for c in idxs:
             C = cols[c]
             if c < nfixed:
                 base = C["poff"]
+            elif fn.get("up"):
+                base, alloc = self._allotemp_up(alloc, C["size"], C["align"])
             else:
                 alloc = self._allotemp(alloc, C["size"], C["align"])
                 base = alloc
@@ -371,7 +414,7 @@ class Model:
             C["interf"] |= self.lod[E]
             C["uses"] += x["uses"]
             if x["size"] > C["size"]:
-                T += align4(x["size"]) - C["size"]
+                T += self._tr(x["size"]) - C["size"]
                 C["size"] = x["size"]
             if x.get("gs"):
                 C["gs"] = x["gs"]
@@ -384,7 +427,10 @@ class Model:
                          param=False))
         if log is not None:
             log[E] = dict(tries=tries, res=len(cols) - 1, new=True)
-        return T + align4(x["size"])
+        return T + self._tr(x["size"])
+
+    def _tr(self, n):
+        return roundup(n, self.fn.get("tround") or 4)
 
     def _cmp(self, p, x, d):
         if p["gs"] != x["gs"]:
@@ -405,6 +451,19 @@ class Model:
             self._qsort(a, lo, last - 1, d)
             lo = last + 1
 
+    @staticmethod
+    def _allotemp_up(alloc, size, align):
+        """x64 allotemp 0x10047e30 / align_base 0x10047e90: (base, new Alloc_local); the frame grows upward."""
+        align = align or 16                        # TLS+0x11698, the default alignment
+        size = roundup(size, align)
+        if size == 1:
+            base = alloc
+        elif size == 2 and align > 1:
+            base = (alloc + 1) & ~1
+        else:
+            base = roundup(alloc, align)
+        return base, base + size
+
     def _allotemp(self, alloc, size, align):
         fn = self.fn
         cap = fn.get("cap") or 4
@@ -424,7 +483,7 @@ class Model:
 
     def _member_off(self, C, c, nfixed, base, m):
         fn = self.fn
-        if not fn.get("ebp"):
+        if not fn.get("ebp") or fn.get("up"):
             return base
         a0 = (1 << (m.get("align", 3) - 1)) if m.get("align", 3) >= 1 else 0
         if c < nfixed:
@@ -461,6 +520,11 @@ def snapshot(F, info, lst=None):
     fn = dict(npc=(F["done"] or {}).get("npc"), ebp=S.get("ebp"), nparams=S.get("nparams"), gs=S.get("gs"),
               gscopies=S.get("gscopies"), alloc=S.get("alloc"), cap=S.get("cap"), dalign=S.get("dalign"),
               ebpadj=S.get("ebpadj"), v13=info["v13"], T=S.get("T"), ncol=S.get("ncol"))
+    rules = info.get("rules") or RULES
+    if rules != RULES:                             # x64 and later: the rules of the build table (RULES)
+        fn.update(rules)
+    if F.get("frame"):
+        fn["frame"] = F["frame"]
     obs = dict(run=[dict(idx=r["idx"], tries=r["tries"], res=r["res"], ncol=r.get("ncol")) for r in run],
                undo=F["redo"] is not None, cols=[dict(c=c["c"], base=c["base"], members=c["members"]) for c in F["cols"]],
                done=F["done"])
@@ -508,6 +572,11 @@ def infer(F, elems, S, info):
                     continue
                 if kind == "p" and gsfunc and not info["v13"]:
                     continue
+                if kind == "p" and (info.get("rules") or RULES).get("palign") and c < len(F["params"]):
+                    po = elems.get(F["params"][c], {}).get("poff")
+                    al = 1 << (x.get("align", 1) - 1) if x.get("align", 1) >= 1 else 1
+                    if po is None or abs(po - 8) % al:
+                        continue                  # refused for the home's alignment, not a conflict
                 M = members.get(c, [])
                 if any(conf(E, m) for m in M):
                     continue
@@ -582,8 +651,8 @@ def check(s, res):
 
 
 # ---------------------------------------------------------------- listing
-SYMLINE = re.compile(r"^(\S+) = (-?\d+)\s*; size = (\d+)")
-OPSYM = re.compile(r"([_$A-Za-z0-9?@]+)\[(?:esp|ebp)")
+SYMLINE = re.compile(r"^(\S+) = (-?\d+)\s*(?:; size = (\d+))?\s*$")      # x64 listings give no size
+OPSYM = re.compile(r"([_$A-Za-z0-9?@]+)\[(?:esp|ebp|rsp|rbp)")
 
 
 def listing_slots(asm, func):
@@ -601,7 +670,8 @@ def listing_slots(asm, func):
                     break
                 continue
             break
-        syms[m.group(1)] = dict(off=int(m.group(2)), size=int(m.group(3)), refs=0, line=None, lines=[])
+        syms[m.group(1)] = dict(off=int(m.group(2)), size=int(m.group(3)) if m.group(3) else None, refs=0, line=None,
+                                lines=[])
     line = None
     for ln in text[i:j].splitlines():
         m = re.match(r"^; (\d+)\s*:", ln)
@@ -621,9 +691,13 @@ def listing_slots(asm, func):
 def attach_listing(F, syms):
     """{element idx: dict(lname, loff, lsize, lrefs, line)} by name stem (or tv<key>) and final offset."""
     offs = {}
+    fr = F.get("frame")                     # x64: the listing gives [rsp+N], i.e. packed + A (homes: + F + pushed)
     for c in F["cols"]:
         for i, off in c["members"]:
             offs[i] = off
+            if fr and off is not None:
+                offs[i] = off + (fr["F"] + fr["pushed"] if c["c"] < len(F["params"]) else
+                                 (fr["A"] if fr["B"] == fr["A"] else fr["A"] - fr["B"]))
     used, out = set(), {}
     by = collections.defaultdict(list)
     for n, s in syms.items():
@@ -669,14 +743,26 @@ def report(s, res, bad, tried_max=8, out=sys.stdout):
     if res["sort"]:
         why.append("T > 128" if res["T"] > 0x80 else "GS")
     w("# %s  (c2 %s)\n" % (s["func"], s["build"]))
-    w("# %d elements (%d params), %d colours, T=%d%s, %s frame%s%s\n" % (
+    fr = fn.get("frame")
+    if fn.get("argarea"):
+        kind = "rsp frame, A=%s F=%s pushed=%s" % ((fr["A"], fr["F"], fr["pushed"]) if fr else ("?", "?", "?"))
+    else:
+        kind = "%s frame" % ("EBP" if fn.get("ebp") else "ESP")
+    w("# %d elements (%d params), %d colours, T=%d%s, %s%s%s\n" % (
         len(E), len(s["params"]), len(cols), res["T"], " sorted (%s)" % ", ".join(why) if res["sort"] else
-        " (creation order: T <= 128, no GS)", "EBP" if fn.get("ebp") else "ESP",
+        " (creation order: T <= 128, no GS)", kind,
         ", EbpAdj %d" % fn["ebpadj"] if fn.get("ebpadj") else "", ", undo: param homes dropped (T >= 112)" if res["undo"] else ""))
     w("model: %s\n" % ("reproduces the trace exactly (decisions, colour order, offsets)" if not bad else
                        "%d differences: %s" % (len(bad), "; ".join(bad[:6]))))
-    w("\n## colours, in final (sorted) order; offsets as the packer gave them\n")
-    w("%4s %4s %7s %5s %6s %8s  %s\n" % ("pos", "made", "offset", "size", "uses", "key", "members (name:packer uses/listing refs line)"))
+    fin = final_offsets(s, res)
+    if fin is not None:
+        ok, n, miss = listing_agree(s, fin)
+        w("listing: %d of %d named elements at the model's final offset (packed + A; param homes + F + pushed)%s\n"
+          % (ok, n, "; differ: " + ", ".join("%s %s/%s" % m for m in miss[:6]) if miss else ""))
+    w("\n## colours, in final (sorted) order; offsets as the packer gave them%s\n"
+      % ("; `final` = the [rsp+N] of the listing" if fin is not None else ""))
+    w("%4s %4s %7s%s %5s %6s %8s  %s\n" % ("pos", "made", "offset", " %6s" % "final" if fin is not None else "", "size",
+                                          "uses", "key", "members (name:packer uses/listing refs line)"))
     for k, C in enumerate(cols):
         key = 1000 * C["uses"] // C["size"] if C["size"] else 0
         mem = []
@@ -684,8 +770,9 @@ def report(s, res, bad, tried_max=8, out=sys.stdout):
             L = s["listing"].get(m)
             mem.append("%s:%d/%s%s" % (ename(s, m), E[m]["uses"], L["lrefs"] if L else "-",
                                        (" " + eline(s, m)) if eline(s, m) else ""))
-        w("%4d %4s %7s %5d %6d %8d  %s%s\n" % (k, ("p" if C.get("param") else "") + str(C["created"]),
-                                             res["bases"][k], C["size"], C["uses"], key,
+        w("%4d %4s %7s%s %5d %6d %8d  %s%s\n" % (k, ("p" if C.get("param") else "") + str(C["created"]),
+                                             res["bases"][k], " %6s" % fin.get(C["members"][0]) if fin is not None
+                                             else "", C["size"], C["uses"], key,
                                              ", ".join(mem[:12]), " ... +%d" % (len(mem) - 12) if len(mem) > 12 else ""))
     w("\n## elements in visiting order (size asc, uses desc, first to reach the count)\n")
     w("%4s %5s %4s %5s %5s  %-26s %-14s %s\n" % ("vis", "idx", "size", "uses", "lst", "name", "-> colour/off", "tried (newest first): reason"))
@@ -716,6 +803,40 @@ def report(s, res, bad, tried_max=8, out=sys.stdout):
         nm = ename(s, i) + ((" " + eline(s, i)) if eline(s, i) else "")
         w("%4d %5d %4d %5d %5s  %-26s %-14s %s%s\n" % (v, i, x["size"], x["uses"], L["lrefs"] if L else "-", nm[:26], dest,
                                                      tr, ("  [LOD cut at #%d%s]" % (x["lodtrunc"], ", %d inferred" % len(x["inferred"]) if x.get("inferred") else "")) if x.get("lodtrunc") not in (None, False) else ""))
+
+
+def final_offsets(s, res):
+    """x64 (`argarea`): {element: [rsp+N] at the end}, from the model's packed offsets and the frame (role `frame`):
+    MdmInsertEntryExit adds A to every local (A - B in an alloca frame, B = min(A, 0xf0)) and F + the pushed bytes to
+    the parameters and whatever shares their homes. None on builds without the frame record."""
+    fn = s["fn"]
+    fr = fn.get("frame")
+    if not fn.get("argarea") or not fr:
+        return None
+    d = fr["A"] if fr["B"] == fr["A"] else fr["A"] - fr["B"]
+    out = {}
+    for k, C in enumerate(res["cols"]):
+        for m in C["members"]:
+            if res["offs"].get(m) is not None:
+                out[m] = res["offs"][m] + (fr["F"] + fr["pushed"] if k < res["nfixed"] else d)
+    for p in s["params"]:
+        if p not in out and res["offs"].get(p) is not None:
+            out[p] = res["offs"][p] + fr["F"] + fr["pushed"]
+    return out
+
+
+def listing_agree(s, fin):
+    """(agree, compared, [(name, ours, listing)]) over the elements the listing names."""
+    ok, n, miss = 0, 0, []
+    for i, L in s["listing"].items():
+        if L.get("loff") is None or i not in fin:
+            continue
+        n += 1
+        if fin[i] == L["loff"]:
+            ok += 1
+        else:
+            miss.append((L["lname"], fin[i], L["loff"]))
+    return ok, n, miss
 
 
 # ---------------------------------------------------------------- what-if
@@ -1162,7 +1283,7 @@ def search(s, om, top=15, limit=800, out=sys.stdout):
 def trace(src, func, cl, keep=None):
     import c2trace, tempfile
     info = build_info()
-    hooks = [expand(h, info["sbv"]) for h in info["hooks"]]
+    hooks = [expand(h, info["sbv"], info.get("sym", SYM9)) for h in info["hooks"]]
     d = keep or tempfile.mkdtemp(prefix="c2slots_")
     img, hk, rc, out, log = c2trace.run_trace(src, hooks, cl, keep=d, quiet=True)
     if rc:
@@ -1220,8 +1341,13 @@ def run_one(F, info, asm, a):
     bad = check(s, res)
     s["_bad"] = bad
     if a.quiet:
-        print("# %s: %d elements, %d colours, T=%d; model: %s" % (s["func"], len(s["elems"]), len(res["cols"]), res["T"],
-              "exact" if not bad else "%d differences: %s" % (len(bad), "; ".join(bad[:4]))))
+        fin = final_offsets(s, res)
+        lst_ = ""
+        if fin is not None:
+            ok, n, miss = listing_agree(s, fin)
+            lst_ = "; listing %d/%d%s" % (ok, n, (" (" + ", ".join("%s %s/%s" % m for m in miss[:4]) + ")") if miss else "")
+        print("# %s: %d elements, %d colours, T=%d; model: %s%s" % (s["func"], len(s["elems"]), len(res["cols"]), res["T"],
+              "exact" if not bad else "%d differences: %s" % (len(bad), "; ".join(bad[:4])), lst_))
     else:
         report(s, res, bad, a.tried)
     if a.export:

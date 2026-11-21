@@ -286,6 +286,40 @@ loads (`*p`, `**p`), calls and tail jumps. Conventions: thiscall, stdcall, cdecl
 - Value parameters wider than 4 bytes are handled for `double`/`__int64` in `--proto`; a struct passed by value
   needs `--nparams`.
 
+### x64
+
+The x64 c2 (cl 17.00) has the same `ItfSummarizeFuncInterf`, so the same table and stub apply to a 64-bit
+callee. `calleesum.py` detects a PE32+ image (machine `0x8664`) and switches to capstone's 64-bit mode and the
+Microsoft x64 convention; the x86 path is unchanged (same output on selftest and a 600-function Fallout 3 sample).
+
+- **Parameters are positions**: 0..3 in `rcx`, `rdx`, `r8`, `r9` (`xmm0..3` for floating point), 4+ at
+  `[rsp+0x28]`, `[rsp+0x30]` ... at entry. A spill to the home area `[rsp+8..0x20]` is an ordinary stack slot,
+  so a reload from it is the parameter again. `ret` pops nothing; caller-saved `rax rcx rdx r8..r11` are lost at
+  a call, callee-saved `rbx rbp rdi rsi r12..r15` are kept (and must be back for a jump to count as a tail call).
+- **Count**: from `--proto` (`this` first for a non-static member; `__thiscall`/`__stdcall` keywords ignored),
+  `--nparams N` (total), or detected: the highest parameter register or stack slot read before it is written,
+  including a register handed on to a direct callee that reads it. `--conv` is ignored.
+- **Calls**: the arguments of a direct call are the registers and the stack slots above its home area that the
+  target reads (same walk). For an indirect call, an import, or a target that cannot be walked, all four
+  registers count, plus the stack slots written since the last call; a register not written since the entry or
+  the last call is noted as possibly stale (the x64 form of the x86 `ecx` note). A parameter passed on is handled
+  as on x86: the callee's summary inside `--tu`, otherwise read + written + kept.
+- **Globals**: `[rip+disp]` is the global at the computed address; `lea r, [rip+..]` gives a register that holds
+  a global's address (`__ImageBase` + index is a table). Switch tables of the form `mov ecx, [base + idx*4 + rva];
+  add rcx, base; jmp rcx` are followed. `__chkstk` (followed by `sub rsp, rax`) and `__security_check_cookie`
+  are recognised.
+- **Where x64 differs from the x86 rules**: a 32-bit read of a parameter register (`mov eax, edx`, `xor eax,
+  ecx`) is a value use, not a lost pointer, because a 32-bit value cannot address memory. A parameter merged at a
+  join with another value counts as lost only where the merged value is used (dereferenced, stored, passed,
+  returned, computed with), so a dead copy left in `rcx` on one path costs nothing.
+- **Stub**: a plain declaration without a calling-convention keyword (`void FUN_x(void* rcx, void* rdx)` without
+  `--proto`).
+- **Limits**: a struct returned by value takes a hidden pointer in `rcx` (`rdx` for a member) that shifts every
+  parameter; give `--proto` with it written out, or `--nparams`. A struct of 16 bytes or more passed by value
+  arrives as a pointer to a caller copy. A local struct whose fields are stored one by one is split into separate
+  objects at the stored offsets (as on x86), so a parameter stored into a field other than the one whose address
+  is passed is not seen as escaping. No x64 selftest binary exists yet.
+
 ---
 
 ## 6. How a decompiler agent uses this

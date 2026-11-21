@@ -23,6 +23,18 @@ import argparse, collections, difflib, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 REGS = set("eax ebx ecx edx esi edi ebp esp ax bx cx dx si di bp sp al ah bl bh cl ch dl dh".split())
+try:                              # x64 (cl 17.00, "arch": "x64" in the build table): the 64-bit names too
+    import c2build
+    X64 = c2build.get("arch") == "x64"
+except Exception:
+    X64 = False
+if X64:
+    REGS |= set("rax rbx rcx rdx rsi rdi rbp rsp sil dil bpl spl".split())
+    REGS |= {"r%d%s" % (k, w) for k in range(8, 16) for w in ("", "d", "w", "b")}
+ARGREGS = ("rcx", "rdx", "r8", "r9")       # the Win64 convention's register arguments
+_A64 = {"ecx": "rcx", "cx": "rcx", "cl": "rcx", "edx": "rdx", "dx": "rdx", "dl": "rdx", "rcx": "rcx", "rdx": "rdx",
+        "r8": "r8", "r8d": "r8", "r8w": "r8", "r8b": "r8", "r9": "r9", "r9d": "r9", "r9w": "r9", "r9b": "r9"}
+_SAVED64 = r"(?:rbx|rsi|rdi|rbp|r1[2-5])"
 COMM = {"add", "and", "or", "xor", "imul", "mul", "cmp"}
 ARITH = {"add", "sub", "and", "or", "xor", "imul", "mul", "shl", "sal", "shr", "sar", "neg", "not", "inc", "dec",
          "adc", "sbb", "idiv", "div", "cdq", "rol", "ror"}
@@ -58,7 +70,7 @@ def akind(op):
     if o in REGS or re.match(r"xmm\d$", o):
         return "R"
     if o.startswith("["):
-        if re.match(r"\[\s*esp\b", o) or (FRAME["ebp"] and re.match(r"\[\s*ebp\b", o)):
+        if re.match(r"\[\s*[er]sp\b", o) or (FRAME["ebp"] and re.match(r"\[\s*[er]bp\b", o)):
             return "R"                                         # a frame slot: a variable
         if re.match(r"\[\s*(0x[0-9a-f]+|\d+)\s*\]$", o):
             return "R"                                         # an absolute address: a global, a variable in the IL
@@ -87,7 +99,7 @@ def canon_asm(text):
         return canon_float(mn, ops, k)
     if mn in ("movs", "movsd", "movsb", "movsw", "stosd", "stos", "stosb") or mn.startswith("rep"):
         return ("copy", None)
-    if mn == "mov" or mn in ("movzx", "movsx"):
+    if mn == "mov" or mn in ("movzx", "movsx", "movsxd"):
         if k[0] == "M":
             return ("st:" + k[1], None)
         if k[1] == "M":
@@ -112,7 +124,7 @@ def canon_asm(text):
     if mn == "pop":
         return None
     if mn == "lea":                                            # `&local` for an argument: the IL's OPARG carries it;
-        if len(ops) == 2 and re.match(r"\[\s*(esp|ebp)\b", ops[1]):   # otherwise an addition
+        if len(ops) == 2 and re.match(r"\[\s*([er]sp|[er]bp)\b", ops[1]):   # otherwise an addition
             return None
         return ("add:R,R", None)
     if mn.startswith("set") or mn.startswith("cmov"):
@@ -164,6 +176,28 @@ def canon_float(mn, ops, k):
     if mn.startswith("cvt"):
         return ("f.cvt", None)
     return None                                                # fld, fxch, fnstsw, fstp st(i), movss xmm, [m]
+
+
+def prologue_epilogue64(texts):
+    """x64: the saves of callee-saved registers in their home slots (`mov qword ptr [rsp + 8], rbx` before the
+    frame is set up) and their restores (`mov rbx, qword ptr [rsp + N]` after the frame's release or before a ret),
+    push / pop of callee-saved registers, `sub rsp, N` in the prologue, `add rsp, N` before a return or tail jump."""
+    drop = set()
+    n = len(texts)
+    for j, t in enumerate(texts):
+        t = t.strip()
+        if j < 8 and re.match(r"mov qword ptr \[rsp \+ (?:8|0x10|0x18|0x20)\], %s$" % _SAVED64, t):
+            drop.add(j)
+        elif re.match(r"(push|pop) %s$" % _SAVED64, t):
+            drop.add(j)
+        elif re.match(r"sub rsp, \S+$", t) and j < 10:
+            drop.add(j)
+        elif re.match(r"add rsp, \S+$", t):
+            drop.add(j)
+        elif re.match(r"mov %s, qword ptr \[rsp \+ [^\]]+\]$" % _SAVED64, t) and any(
+                re.match(r"(ret|jmp|add rsp|pop)", texts[k].strip()) for k in range(j + 1, min(n, j + 4))):
+            drop.add(j)
+    return drop
 
 
 def prologue_epilogue(texts):
@@ -254,8 +288,9 @@ def lift_code(texts):
     """[(index, token, cc)] of a function's instructions (capstone text, in address order). A jcc right after an
     arithmetic instruction (the flags of `add eax, -1` tested, the compare with 0 removed by a peephole) gets the
     compare it stands for."""
-    FRAME["ebp"] = any(t.strip() == "mov ebp, esp" for t in texts)
-    drop = prologue_epilogue(texts)
+    FRAME["ebp"] = any(t.strip() in ("mov ebp, esp", "mov rbp, rsp") for t in texts)
+    drop = prologue_epilogue64(texts) if X64 else prologue_epilogue(texts)
+    args = {}                                                  # x64: argument register -> its last write
     rmw = contract_rmw(texts)
     out, ecx = [], None
     for i, t in enumerate(texts):
@@ -266,7 +301,20 @@ def lift_code(texts):
                 out.append((i, rmw[i], None))
             continue
         tt = t.strip()
-        if re.match(r"(mov|lea|xor) ecx, ", tt):
+        if X64:
+            m = re.match(r"(mov|lea|xor|movsxd|movzx|movsx|or) (\w+), ", tt)
+            if m and _A64.get(m.group(2)):
+                args[_A64[m.group(2)]] = i
+            if tt.startswith("call"):                          # each argument register set for the call: one OPARG
+                for r in ARGREGS:
+                    if r in args:
+                        out.append((args[r], "push", None))
+                args = {}
+            if re.match(r"mov \w+ ptr \[rsp \+ (0x2[0-9a-f]|0x[3-9a-f][0-9a-f]|0x[1-9a-f][0-9a-f]{2,})\], ", tt) and \
+                    any(texts[k].strip().startswith("call") for k in range(i + 1, min(len(texts), i + 12))):
+                out.append((i, "push", None))                  # a stack argument above the home area
+                continue
+        elif re.match(r"(mov|lea|xor) ecx, ", tt):
             ecx = i                                            # `this` (thiscall) or a fastcall argument, maybe;
         elif re.match(r"rep", tt):                             # a constant too (a global object's address)
             ecx = None                                         # a count, consumed

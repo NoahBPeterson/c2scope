@@ -69,7 +69,12 @@ def out_name(path, func=None):
 
 ALT = re.compile(r"\{\{(.*?\}*)\}\}(?!\})", re.S)   # a code `}` just before the closing `}}` stays in the alternative
 
-REG = re.compile(r"\b(e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp|e?sp|st\(\d\))\b")
+# x64 (a build table with "arch": "x64", cl 17.00 x86_amd64): the 64-bit registers, r8..r15 with their parts, the
+# low bytes sil/dil/bpl/spl; capstone decodes in 64-bit mode; frame slots are rsp-relative (docs/c2/port-1700.md)
+X64 = c2trace.c2build.get("arch") == "x64"
+_X64REG = r"r[abcd]x|r[sd]i|r[sb]p|r(?:[89]|1[0-5])[dwb]?|[sd]il|[sb]pl|"
+REG = re.compile(r"\b(" + (_X64REG if X64 else "") + r"e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp|e?sp|st\(\d\)|xmm\d+)\b"
+                 if X64 else r"\b(e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp|e?sp|st\(\d\))\b")
 
 
 def listing_offsets(path, func):
@@ -135,7 +140,7 @@ def listing_instrs(path, func):
 # 14.00 and 13.10 listings: imul (2 and 3 operand), cmpxchg, xadd, shld/shrd, bt/bsf and the x87 two-stack forms
 # (regmap.norm) keep the order; fcomip/fucomip are capstone's fcompi/fucompi (CS_MNEMONIC).
 _SWAPPED = ("test", "xchg")
-_REGOP = re.compile(r"(?:e?[abcd]x|[abcd][lh]|e?[sd]i|e?[sb]p)", re.I)
+_REGOP = re.compile(r"(?:" + (_X64REG if X64 else "") + r"e?[abcd]x|[abcd][lh]|e?[sd]i|e?[sb]p)", re.I)
 
 
 def canon_listing(mn, ops):
@@ -211,13 +216,16 @@ def _decode(off, code, mn, ops, rel=None):
         return ("npad", "", False, False)
     if _CS is None:
         import capstone
-        _CS = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        _CS = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if X64 else capstone.CS_MODE_32)
         _CS.detail = True
     ins = list(_CS.disasm(code, off))
     if len(ins) != 1 or ins[0].size != len(code):
         return ("db", code.hex(), False, False)         # data in the procedure (a jump table) or a decode failure
     imm_sym = bool(re.search(r"\bOFFSET\b", ops))
     mem_sym = False
+    if mn in ("lock", "rep", "repe", "repne", "repz", "repnz"):
+        ops = re.sub(r"^\s*\w+\s*", "", ops)            # the listing's `lock inc DWORD PTR [rax+8]`: operands after
+        #                                                 the instruction's own mnemonic
     if rel:                                             # the object's relocations, where there is one
         x = ins[0]
         imm_sym |= bool(x.imm_size and off + x.imm_offset in rel)
@@ -227,10 +235,11 @@ def _decode(off, code, mn, ops, rel=None):
         o = re.sub(r"^(?:BYTE|WORD|DWORD|QWORD|TBYTE|FWORD|XMMWORD|MMWORD|OWORD)\s+PTR\s+", "", o.strip())
         o = re.sub(r"^FLAT:", "", re.sub(r"^[cdefgs]s:", "", o))
         m = re.match(r"([\w?@$.]+)\s*(\[[^\]]*\])?", o)
-        if not m or "OFFSET" in o or re.fullmatch(r"(?:e?[a-d]x|[a-d][lh]|e?[sd]i|e?[sb]p|st|st\(\d\)|xmm\d|mm\d|"
+        if not m or "OFFSET" in o or re.fullmatch(r"(?:" + (_X64REG if X64 else "") +
+                                                    r"e?[a-d]x|[a-d][lh]|e?[sd]i|e?[sb]p|st|st\(\d\)|xmm\d+|mm\d|"
                                                     r"-?[0-9][0-9a-f]*h?)", m.group(1).lower()):
             continue
-        if m.group(2) and re.match(r"\[\s*e[sb]p\b", m.group(2)):
+        if m.group(2) and re.match(r"\[\s*[er][sb]p\b", m.group(2)):
             continue                                    # a frame variable: _x$[esp+8], the bytes have its offset
         if mem:
             mem_sym = True                              # a global, constant, import or jump table
@@ -263,9 +272,15 @@ def orig_instrs(path):
     out, va = [], []
     for ln in open(path):
         p = ln.split(None, 2)
+        if len(p) >= 2 and p[0].startswith("+0x"):     # offset form: "+0xOFF  mn  ops", jumps to "+0xOFF"
+            p[0] = p[0][1:]
+            if len(p) > 2:
+                p[2] = re.sub(r"(?<![\w\]])\+(0x[0-9a-f]+)\b", r"\1", p[2]) if p[1].startswith(("j", "loop")) else p[2]
+        elif len(p) >= 2 and not re.fullmatch(r"(?:0x)?[0-9a-fA-F]+:?", p[0]):
+            continue                                    # a header line ("FUN_<va>  (N bytes, ...)")
         if len(p) >= 2:
             out.append((p[1], p[2].strip() if len(p) > 2 else ""))
-            va.append(p[0].lower())
+            va.append(p[0].lower().rstrip(":"))
     # a long alignment pad is `jmp` over the padding (the listing's npad 5..): `jmp X; lea r, [r]; X:` is one npad,
     # also in several parts (npad 14: `jmp X; lea esp, [esp]; jmp X; lea ecx, [ecx]; X:`): a jmp followed by pad
     # instructions and further jmps, each jmp landing at or before the end X of the run, X the first jmp's target
@@ -288,6 +303,12 @@ def orig_instrs(path):
                     out[q] = ("npad", "")
     out = Instrs(out)
     out.decoded = [x + (False, False) for x in out]
+    if X64:   # a TLS variable: `mov rax, gs:[0x58]` (the TLS array) then `mov r32, OFFSET var` (SECREL in ours, the
+        #       resolved offset here): the immediate is a relocation
+        for i, (mn, ops) in enumerate(out):
+            if mn == "mov" and re.fullmatch(r"\w+, (?:0x[0-9a-f]+|\d+)", ops) and \
+                    any("gs:[0x58]" in out[k][1] for k in range(max(0, i - 4), i)):
+                out.decoded[i] = (mn, ops, True, False)
     try:
         vas = [int(v, 16) for v in va]
     except ValueError:
@@ -378,11 +399,17 @@ def _bop(o, mn, imm_sym, mem_sym, rng):
                 disp = (disp + (-_num(t) if sign == "-" else _num(t))) & 0xffffffff
             else:
                 regs.append(t.replace(" ", ""))
+        if "rip" in regs or any(re.search(r"[A-Za-z_?@$][\w?@$]*", r) and not REG.fullmatch(r) and
+                                not re.fullmatch(r"\w+\*\d", r) for r in regs):
+            regs = [r for r in regs if r != "rip" and (REG.fullmatch(r) or re.fullmatch(r"\w+\*\d", r))]
+            mem_sym = True                              # x64: rip-relative (a global), or a name the disassembler printed
         if mem_sym or not regs or rng[0] <= disp < rng[1]:
             d = "+A" if regs else "A"
         else:
             d = "%+d" % (disp - (1 << 32) if disp & 0x80000000 else disp) if disp else ""
         return "%s[%s%s]" % (m.group(1), "+".join(regs), d)
+    if mn in ("call", "jmp") and re.fullmatch(r"[A-Za-z_?@$][\w?@$:<>.]*", o) and not REG.fullmatch(o):
+        return "T"                                      # a call (or tail-jump) target printed by name
     if re.fullmatch(r"-?(?:0x[0-9a-f]+|\d+)", o):
         if mn == "call":
             return "T"                                  # a call target (relocated in ours)
@@ -512,10 +539,28 @@ def _bparts(ours, orig):
 _RFAM = {n: f for f, names in dict(a="eax ax al ah", c="ecx cx cl ch", d="edx dx dl dh", b="ebx bx bl bh",
                                    si="esi si", di="edi di", bp="ebp bp").items() for n in names.split()}
 _RREG = re.compile(r"\b(e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp)\b")
-_RPURE = {"mov", "lea", "movzx", "movsx", "pop"}
+if X64:   # x64: rax eax ax al ah, rsi esi si sil, r8 r8d r8w r8b, ...; rsp stays literal
+    _RFAM = {n: f for f, names in dict(a="rax eax ax al ah", c="rcx ecx cx cl ch", d="rdx edx dx dl dh",
+                                       b="rbx ebx bx bl bh", si="rsi esi si sil", di="rdi edi di dil",
+                                       bp="rbp ebp bp bpl").items() for n in names.split()}
+    _RFAM.update({"r%d%s" % (k, w): "r%d" % k for k in range(8, 16) for w in ("", "d", "w", "b")})
+    _RREG = re.compile(r"\b(r[abcd]x|e?[abcd]x|[abcd][lh]|r[sd]i|e?[sd]i|[sd]il|r[b]p|e?bp|bpl|r(?:[89]|1[0-5])[dwb]?)\b")
+
+
+def _rwidth(r):
+    """The width class of a general register name in the alignment key."""
+    if r[-1] in "lh" and r not in ("sil", "dil", "bpl") or r[-1] == "b" and r[0] == "r" or r in ("sil", "dil", "bpl"):
+        return "r8"
+    if len(r) == 2 or r[-1] == "w" and r[0] == "r" and r[1:-1].isdigit():
+        return "r16"
+    if X64 and (r[0] == "r" and not r[-1] in "dwb" or r[0] == "r" and r[1:].isdigit()):
+        return "r64"
+    return "r"
+_RPURE = {"mov", "lea", "movzx", "movsx", "movsxd", "pop"}
 _RSTORE = {"mov", "fstp", "fst", "fistp", "fist", "movss", "movsd", "movq", "movd", "movaps", "movups"}
 _RNUM = re.compile(r"[+-]?(?:0x[0-9a-f]+|\d+)\b")
-_RSLOT = re.compile(r"\[(esp|ebp)([+-]\d+)?\]")
+_RSLOT = re.compile(r"\[(esp|ebp|rsp|rbp)([+-]\d+)?\]")
+_SAVED = ("b", "si", "di", "bp") + (("r12", "r13", "r14", "r15") if X64 else ())   # callee-saved families
 
 
 def _rview(keys):
@@ -523,40 +568,45 @@ def _rview(keys):
     A frame slot is named by its offset from the entry esp (pushes, pops and esp adjustments since entry counted;
     a callee's own stack cleanup is not, which both sides share at an aligned call) or from ebp when ebp holds the
     frame; in the key a local is `[slot]`, an incoming argument `[arg+N]` (not renamed)."""
-    frame = any(k[:3] == ("mov", "ebp", "esp") for k in keys[:8])
+    frame = any(k[:3] in (("mov", "ebp", "esp"), ("mov", "rbp", "rsp")) for k in keys[:8])
+    fp, word = ("rbp", 8) if X64 else ("ebp", 4)
     out, depth, written = [], 0, set()
     for k in keys:
         slots = []
 
         def sub(m):
             base, d = m.group(1), int(m.group(2) or 0)
-            if base == "ebp" and not frame:
+            if base in ("ebp", "rbp") and not frame:
                 return m.group(0)
-            name = ("b", d) if base == "ebp" else ("s", d - depth)
+            name = ("b", d) if base in ("ebp", "rbp") else ("s", d - depth)
             if name[1] > 0:                             # an incoming argument: fixed by the calling convention
-                return "[arg%+d]" % (d if base == "ebp" else d - depth + 4)
+                return "[arg%+d]" % (d if base in ("ebp", "rbp") else d - depth + word)
             slots.append(name)
             return "[slot]"
         ops = [_RSLOT.sub(sub, o) for o in k[1:]]
         mn = k[0]
-        shape = (mn,) + tuple(_RREG.sub(lambda m: "r8" if m.group(1)[-1] in "lh" else "r16" if len(m.group(1)) == 2
-                                        else "r", o) if not (frame and o == "ebp") else o for o in ops)
-        regs = [[_RFAM[r] for r in _RREG.findall(o) if not (frame and r == "ebp")] for o in ops]
+        shape = (mn,) + tuple(_RREG.sub(lambda m: _rwidth(m.group(1)), o) if not (frame and o == fp) else o
+                              for o in ops)
+        regs = [[_RFAM[r] for r in _RREG.findall(o) if not (frame and r == fp)] for o in ops]
         for q, o in enumerate(ops):                     # [r1+r2+D]: base and index unscaled commute
             if len(regs[q]) == 2 and "*" not in o and "[" in o:
                 regs[q] = [tuple(regs[q])]
         wreg = None
         m = _RREG.fullmatch(ops[0].strip()) if ops else None
-        if m and not (frame and m.group(1) == "ebp"):
+        if m and not (frame and m.group(1) == fp):
             r = m.group(1)
-            if (mn in _RPURE and (len(r) == 3 or mn in ("movzx", "movsx"))) or mn.startswith("set"):
+            if (mn in _RPURE and (_rwidth(r) in ("r", "r64") or mn in ("movzx", "movsx", "movsxd"))) or \
+                    mn.startswith("set"):
                 wreg = _RFAM[r]
             elif mn in ("xor", "sub") and len(ops) == 2 and ops[0].strip() == ops[1].strip():
                 wreg, regs = _RFAM[r], []
         rregs = [x for o in (regs[1:] if wreg else regs) for x in o]
-        if mn == "push" and rregs and rregs[0] in ("b", "si", "di", "bp") and rregs[0] not in written:
+        if mn == "push" and rregs and rregs[0] in _SAVED and rregs[0] not in written:
             rregs, shape = [], ("push", "save " + k[1])    # saving a callee-saved register: not a value; c2's
             #                                             order is fixed, so another order is a difference
+        elif X64 and mn == "mov" and depth == 0 and len(ops) == 2 and "[arg" in shape[1] and rregs and \
+                rregs[0] in _SAVED and rregs[0] not in written:
+            rregs, shape, slots = [], ("mov", shape[1], "save " + k[2]), []   # x64: saved into its home slot
         if m and mn not in ("push", "cmp", "test"):
             written.add(_RFAM[m.group(1)])
         wslot = None
@@ -564,10 +614,10 @@ def _rview(keys):
             wslot, slots = slots[0], slots[1:]
         out.append((shape, wreg, rregs, wslot, slots))
         if mn == "push":
-            depth += 4
+            depth += word
         elif mn == "pop":
-            depth -= 4
-        elif mn in ("sub", "add") and len(k) == 3 and k[1] == "esp" and re.fullmatch(r"0x[0-9a-f]+|\d+", k[2]):
+            depth -= word
+        elif mn in ("sub", "add") and len(k) == 3 and k[1] in ("esp", "rsp") and re.fullmatch(r"0x[0-9a-f]+|\d+", k[2]):
             depth += (1 if mn == "sub" else -1) * int(k[2], 0)
     return out
 

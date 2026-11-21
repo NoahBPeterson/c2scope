@@ -11,7 +11,7 @@ usage: symkeys.py keys    <src> --func F [--all] [--brief] [--grep RE] [--phase 
                           [--n ..|--max N] [--depth 1|2|3] [--pool K]       (several wanted orders at once)
        symkeys.py compare <src> --func F [EDIT..] --vs VARIANT.json      (prediction vs a traced variant)
        symkeys.py export  <src> --func F --out FILE.json
-   Every command takes --from FILE.json (an export) instead of <src>: no compile.  --c2 13.10 / 15.00 as usual.
+   Every command takes --from FILE.json (an export) instead of <src>: no compile.  --c2 13.10 / 15.00 / 17.00 (x64) as usual.
 
 keys     one row per symbol in key order: key, pool class, kind, name (user variable or parameter; `base+off.ty`
          field view; `$T<fekey>` a c1xx temporary, named as in the /FAsc listing; `$tN` / `$fN` unnamed temp / frame
@@ -100,7 +100,8 @@ HOOKS = {
     # inside both "assign", any other "later" (assertions, sweeps, loops).  Optional: without them hph stays None.
     "hshwalk": "@HshBuildTable@4/xeax",
     "hshasg": "@HshEnterAssign@8/xeax",
-    # optional roles (13.10): "free2" a second chain-free loop (same specs as free), "equivp" a probe right after a
+    # optional roles (13.10): "free2" a second chain-free loop (same specs as free; 17.00 x64 has free2..free5, the
+    # copies of SymFree's loop inlined in four functions), "equivp" a probe right after a
     # member SYM is made where SymNewEquiv is inlined: new sym, base, offset.  13.10's "sort" also logs at entry
     # (a1-a10 after the return address): weight, kind, memory base key, displacement of the first two list members,
     # then each one's second-source base key, for member operands (memory leaves) and subtrees over them
@@ -115,6 +116,22 @@ FREE_BY = c2trace.c2build.get("symkeys_free_by", "headkind")
 FREE_KIND = {3: "tmp"}
 # pool classes that have no free list (14.00/15.00: hash; 13.10: also globals and others)
 NOFREE = set(c2trace.c2build.get("symkeys_nofree", ["hash"]))
+# "kindmap" (17.00 x64): the free probe logs the head's kind byte, mapped by this table (other kinds: the default)
+FREE_MAP = {int(k): v for k, v in (c2trace.c2build.get("symkeys_free_map", {}) or {}).items()}
+FREE_DEFAULT = c2trace.c2build.get("symkeys_free_default", "frame")
+# tuple kinds: [K, d] = raw kinds >= K are logged d lower than 14.00's (17.00 x64: an instruction operand is 12)
+KIND_SHIFT = c2trace.c2build.get("symkeys_kind_shift")
+# the sort exit logs the two operands' displacements after the 12 x86 values (17.00 x64)
+SORT_DISP = c2trace.c2build.get("symkeys_sort_disp", False)
+# the equiv entry's offset is absolute; a 4th value is the root's offset, subtracted (17.00 x64)
+EQUIV_REL = c2trace.c2build.get("symkeys_equiv_rel", False)
+
+
+def tkind(k):
+    """A logged tuple kind in 14.00's numbering (leaves 1-12, an instruction 13)."""
+    if KIND_SHIFT and k is not None and k >= KIND_SHIFT[0]:
+        return k + KIND_SHIFT[1]
+    return k
 
 
 def shash(sym, key):
@@ -156,7 +173,28 @@ def _str(v):
 
 
 def parse(text, hooks, img):
-    """-> [Func] in compile order."""
+    """-> [Func] in compile order.  c2 17.00 compiles each function on one of its worker threads (SymInit and the
+    symbol table are per thread): the log's `# thread N` lines say whose events follow, and each thread's events
+    are parsed on their own; functions are ordered by their SymInit."""
+    lines = text.splitlines()
+    if not any(ln.startswith("# thread ") for ln in lines):
+        return _parse(list(enumerate(lines)), img)
+    groups, head, thr = {}, [], "0"
+    for i, ln in enumerate(lines):
+        if ln.startswith("# thread "):
+            thr = ln.split()[2]
+        elif ln.startswith("# c2trace base "):
+            head.append((i, ln))
+        else:
+            groups.setdefault(thr, []).append((i, ln))
+    funcs = []
+    for t in groups:
+        funcs += _parse(head + groups[t], img)
+    funcs.sort(key=lambda f: f.order)
+    return funcs
+
+
+def _parse(lines, img):
     funcs, f = [], None
     stack = []            # open SymAlloc frames (exit order), each a dict
     uvar = []             # open SymMakeUserVar frames: (name, ssr)
@@ -181,7 +219,9 @@ def parse(text, hooks, img):
                 r = c2trace.containing(img, a[k])
                 nm = r["symbol"] if r else "%08x" % a[k]
                 m = re.match(r"\?(\w+)@@", nm)            # 15.00 C++ names: ?SymMakeTmpReg@@YI... -> SymMakeTmpReg
-                hit = names[a[k]] = (m.group(1) if m else nm, nm, "%08x" % r["va"] if r else "")
+                mc = None if m else re.match(r"\?(\w+)@(\w+)@@", nm)    # 17.00 members: ?MakeTmpBinary@Tuple@@
+                hit = names[a[k]] = (m.group(1) if m else "%s::%s" % (mc.group(2), mc.group(1)) if mc else nm, nm,
+                                     "%08x" % r["va"] if r else "")
             fn = hit[0]
             step = SKIP.get(hit[1]) or SKIP.get(hit[2]) or SKIP.get(fn)
             if not step:
@@ -189,7 +229,7 @@ def parse(text, hooks, img):
             k += step
         return fn
 
-    for ln in text.splitlines():
+    for lno, ln in lines:
         if ln.startswith("# c2trace base "):
             delta[0] = int(ln.split()[3], 16) - img.base
             continue
@@ -202,6 +242,7 @@ def parse(text, hooks, img):
         ent = hd[0] == "E"
         if hk == "init" and ent:
             f = Func()
+            f.order = lno
             funcs.append(f)
             live, bykey, stack, uvar, equiv, inl, nread = {}, {}, [], [], [], [], 0
             sorts, nopt, lastsort = [], 0, None
@@ -213,7 +254,7 @@ def parse(text, hooks, img):
         ev = f.events
         if hk == "alloc":
             if ent:
-                stack.append(dict(kind=int(v[0], 16) & 0xff, cr=creator(v[2:11]), line=int(v[1], 16) & 0xffff if v[1] != "?" else 0))
+                stack.append(dict(kind=int(v[0], 16) & 0xff, cr=creator(v[2:]), line=int(v[1], 16) & 0xffff if v[1] != "?" else 0))
             elif stack:
                 fr = stack.pop()
                 s = Sym(idx=len(ev), cls=KIND_CLASS.get(fr["kind"], "tmp"), kind=fr["kind"], key=int(v[0], 16),
@@ -230,10 +271,12 @@ def parse(text, hooks, img):
                 bykey[s.key] = s
                 ev.append(("alloc", s))
                 f.syms.append(s)
-        elif hk in ("free", "free2"):
+        elif hk in ("free", "free2", "free3", "free4", "free5"):
             k = int(v[0], 16)
             if FREE_BY == "kind":
                 cls = FREE_KIND.get(int(v[1], 16) & 0xff, "frame") if v[1] != "?" else "frame"
+            elif FREE_BY == "kindmap":
+                cls = FREE_MAP.get(int(v[1], 16) & 0xff, FREE_DEFAULT) if v[1] != "?" else FREE_DEFAULT
             else:
                 cls = FREE_CLASS.get(int(v[1], 16))
             ev.append(("free", k, cls, hd[1]))
@@ -252,7 +295,11 @@ def parse(text, hooks, img):
                     s.ssr = ssr
         elif hk == "equiv":
             if ent:
-                equiv.append((v[1], int(v[2], 16)))
+                off = int(v[2], 16)
+                if EQUIV_REL and len(v) > 3 and v[3] != "?":
+                    off = (off - int(v[3], 16)) & 0xffffffff
+                    off = off - (1 << 32) if off >= 1 << 31 else off
+                equiv.append((v[1], off))
             elif equiv:
                 equiv.pop()
                 s = live.get(v[0])
@@ -308,12 +355,19 @@ def parse(text, hooks, img):
                     kind, w, key, skind, skey = (num(x) for x in v[j:j + 5])
                     if kind is None:
                         break
-                    kind &= 0xff
+                    kind = tkind(kind & 0xff)
+                    skind = tkind(skind & 0xff) if skind is not None else None
                     leaf = key if kind in (1, 2) else None
                     sub = skey if kind == 13 and skind is not None and (skind & 0xff) in (1, 2) else None
                     ops.append(dict(kind=kind, w=w, key=leaf, dkey=sub, op=None,
                                     sym=bykey.get(leaf) if leaf is not None else None,
                                     dsym=bykey.get(sub) if sub is not None else None))
+                    if KIND_SHIFT and kind == 6 and skind in (1, 2) and skey is not None:
+                        # 17.00 x64: a memory leaf's base is at the source-list offset (+0x30), so the "first
+                        # source" fields are its base leaf (the displacement is not logged here)
+                        dv = num(v[12 + len(ops) - 1]) if SORT_DISP and len(v) > 13 else None
+                        dv = (dv - (1 << 32) if dv >= 1 << 31 else dv) if dv is not None else "?"
+                        ops[-1]["mem"] = (skey, dv, bykey.get(skey))
                     # a memory leaf (13.10's sort operands are [base+d] leaves): its base from the entry fields,
                     # matched by kind and weight (the sort is stable, so equal ones keep the entry order)
                     for q, (pw, pk, pb, pd, pb2) in enumerate(pre):
@@ -338,7 +392,8 @@ def parse(text, hooks, img):
             for kind, w, key, skind, skey, mb, md in (vals[0:7], vals[7:11] + [None, None, None]):
                 if kind is None or w is None:
                     break
-                kind &= 0xff
+                kind = tkind(kind & 0xff)
+                skind = tkind(skind & 0xff) if skind is not None else None
                 if kind not in (1, 2, 6, 7, 8, 9, 13, 3, 4, 5):
                     break
                 o = dict(kind=kind, w=w, key=key if kind in (1, 2) else None, dkey=None, op=None,
@@ -349,7 +404,7 @@ def parse(text, hooks, img):
                     o["mem"] = (mb, md, bykey.get(mb))
                 pend3.append(o)
             if vals[11] is not None and len(pend3) == 4:
-                pend3.append(dict(kind=vals[11] & 0xff, w=None, key=None, dkey=None, op=None, sym=None, dsym=None, nth=True))
+                pend3.append(dict(kind=tkind(vals[11] & 0xff), w=None, key=None, dkey=None, op=None, sym=None, dsym=None, nth=True))
             pend3 = None
         elif hk == "sortx" and not ent and lastsort is not None:
             def num(x):
@@ -358,6 +413,8 @@ def parse(text, hooks, img):
                 if o["kind"] != 13:
                     continue
                 sk, key, base, disp, sk2, key2 = (num(x) for x in v[j:j + 6])
+                sk = tkind(sk & 0xff) if sk is not None else None
+                sk2 = tkind(sk2 & 0xff) if sk2 is not None else None
                 if sk2 is not None and (sk2 & 0xff) in (1, 2) and key2 is not None:
                     o["dkey2"], o["dsym2"] = key2, bykey.get(key2)
                 elif sk2 is not None and (sk2 & 0xff) == 6 and o.get("b2") is not None:
@@ -716,6 +773,11 @@ def print_events(f):
 LEAFKIND = {1: "reg", 2: "sym", 3: "&", 4: "code", 5: "ea", 6: "mem", 7: "iconst", 8: "iconst", 9: "fconst"}
 
 
+def _disp(d):
+    """A memory operand's displacement as printed: '?' when the trace does not log it (17.00 x64 sort leaves)."""
+    return d if isinstance(d, str) else "%d" % (d or 0)
+
+
 def opdesc(o):
     w = o["w"] or 0
     t = "SU%d n%d h%04x" % (w >> 24, (w >> 16) & 0xff, w & 0xffff)
@@ -729,8 +791,8 @@ def opdesc(o):
         d, m = o["dsym"], o.get("mem")
         if m:
             b = m[2]
-            what = "([%s+%d] ..)" % ("%s key %d" % (label(b), b.key) if b is not None and (b.cls != "tmp" or b.phase == "opt") else
-                                     "t%d" % m[0], m[1] or 0)
+            what = "([%s+%s] ..)" % ("%s key %d" % (label(b), b.key) if b is not None and (b.cls != "tmp" or b.phase == "opt") else
+                                     "t%d" % m[0], _disp(m[1]))
         else:
             what = "(%s ..)" % ("%s key %d" % (label(d), d.key) if d is not None and (d.cls != "tmp" or d.phase == "opt") else
                                 "t%d" % o["dkey"] if o["dkey"] is not None else "?")
@@ -740,8 +802,8 @@ def opdesc(o):
     elif o["kind"] == 6 and o.get("mem"):
         m = o["mem"]
         b = m[2]
-        what = "[%s+%d]" % ("%s key %d" % (label(b), b.key) if b is not None and (b.cls != "tmp" or b.phase == "opt") else "t%d" % m[0],
-                            m[1] or 0)
+        what = "[%s+%s]" % ("%s key %d" % (label(b), b.key) if b is not None and (b.cls != "tmp" or b.phase == "opt") else "t%d" % m[0],
+                            _disp(m[1]))
     else:
         what = LEAFKIND.get(o["kind"], "kind%d" % o["kind"])
     return "%-46s %s" % (what, t)
