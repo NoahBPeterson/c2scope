@@ -112,6 +112,16 @@ def short(text):
     return "%-7s %s" % (op.split()[0], ops.strip())
 
 
+# _SchmdHWT: the static-priority row, shifts per field (B, height, nsucc, C, -, L, x87 store; negative = right
+# shift). 14.00 / 15.00 / 13.10: (23, 10, 10, -1, -2, 15, 0) = (ht + ns) << 10 | L << 15 | B << 23 (+1 for an x87
+# store), sched.md rule 3. A build table may give its own as `sched_hwt` (13.00.9044: port-1300.md).
+HWT = tuple(c2trace.c2build.get("sched_hwt") or (23, 10, 10, -1, -2, 15, 0))
+
+
+def _sh(x, n):
+    return x << n if n >= 0 else x >> -n
+
+
 def verify(funcs, verbose=False):
     """Check sched.md rules 5 (height), 6 (static priority) and 7 (selection) against every scheduled region."""
     np_ = nbad_p = nsel = nbad_sel = nbad_noest = 0
@@ -122,10 +132,11 @@ def verify(funcs, verbose=False):
             for t, n in N.items():
                 if not t:
                     continue
-                L, B = n["fl"] >> 2 & 1, n["fl"] >> 1 & 1
-                want = ((n["ht"] + n["ns"]) << 10) + (L << 15) + (B << 23)
+                fl = n["fl"]
+                want = (_sh(fl >> 1 & 1, HWT[0]) + _sh(n["ht"], HWT[1]) + _sh(n["ns"], HWT[2]) + _sh(fl & 1, HWT[3])
+                        + _sh(fl >> 2 & 1, HWT[5]))
                 np_ += 1
-                if n["prio"] not in (want, want + 1):
+                if n["prio"] not in (want, want + (1 << HWT[6])):
                     nbad_p += 1
                     if verbose:
                         print("PRIO %s r%d lex %d: %x want %x  %s" % (name, k, n["lex"], n["prio"], want,
@@ -201,6 +212,120 @@ def op_cost(op):
 
 
 def simulate_check(funcs, verbose=False):
+    if c2trace.c2build.get("sched_model") == "p5":
+        return simulate_p5(funcs, verbose)
+    return simulate_p6(funcs, verbose)
+
+
+def _p5_pairable(f, s):
+    """SchmdPairable (13.00.9044 0x1075f2ee): may s issue in the V pipe next to f (issued first this cycle)?
+    Pairing class = OpSchedInfo column 3: 0 UV, 0x100 U only, 0x200 V only, 0x300 not pairable; an x87 first
+    instruction (type class 4) pairs only when its class is 0x102 and s is fxch (op 0x5f)."""
+    if f["x"][0] >> 16 & 0xf000 == 0x4000:
+        return op_cost(f["op"])[2] == 0x102 and s["op"] == 0x5f
+    return op_cost(f["op"])[2] in (0, 0x100) and op_cost(s["op"])[2] in (0, 0x200)
+
+
+def simulate_p5(funcs, verbose=False):
+    """Table key sched_model "p5" (13.00.9044; port-1300.md): SchSelectInstrs 0x10715a7c with the Pentium unit
+    model. Each cycle fills up to 2 issue slots; for each slot the ready list is walked in (prio desc, lex asc)
+    order and the first node that passes these tests is taken (the walk stops at the region's exit node):
+      unit    SchmdGetFuncUnit 0x1075f249: an fdiv (op 0x46) waits while the last fdiv's 2-cycle flag is set;
+              slot 0 needs units u and u+1 free (busy < 1; u = node +0x3a, 0 here), slot 1 needs SchmdPairable with
+              slot 0's node and gets unit u+1
+      AGI     SchmdCauseAGI 0x10715ce0: a node with an unissued predecessor over an address edge (edge +0x16 & 0x1f
+              >= 0x10) whose est <= cycle + 1 waits
+      x87     SchmdBadForFPSch 0x10715d3e (/Ot): right after an fxch an integer node waits while an x87 node is ready
+              with est <= cycle + 1 (and unit 2 busy <= 1)
+      est     est <= cycle + max(busy[unit], 0)
+    An issue adds the op's cost (column 2) to busy[unit]; every cycle subtracts 1 from every unit."""
+    n = bad = 0
+    for name, pre, post, regions in funcs:
+        for k, r in enumerate(regions):
+            N = r["nodes"]
+            preds = {}
+            for a, b, lat, typ, plat, eb in r["edges"]:
+                preds.setdefault(b, []).append((a, eb & 0x1f))
+            busy, fdiv = [0, 0, 0, 0], 0
+            ready, issued, last, lastc = [], set(), None, None
+            for e in r["events"]:
+                if e[0] == "add":
+                    ready.append(e[1])
+                    continue
+                if e[0] == "sel":
+                    if lastc is not None:
+                        for c in range(lastc, e[1]):
+                            busy = [b - 1 for b in busy]
+                            fdiv -= 1
+                    cyc = lastc = e[1]
+                    snap = [x for x in ready if x not in issued]
+                    continue
+                first, units = None, []
+                for j, t in enumerate(x for x in e[2] if x):
+                    # slot 0 walks the list as the cycle began; an issue adds its successors at once (slot 1 sees them)
+                    pool = sorted(snap if j == 0 else (x for x in ready if x not in issued),
+                                  key=lambda x: (-N[x]["prio"], N[x]["lex"]))
+
+                    def unit(x):
+                        X = N[x]
+                        if X["op"] == 0x46 and fdiv > 0:
+                            return None
+                        u = X["unit"] & 0xffff
+                        if u >= 4:
+                            return 0 if all(b < 1 for b in busy) else None
+                        if j == 0:
+                            return u if busy[u] < 1 and busy[u + 1] < 1 else None
+                        return u + 1 if _p5_pairable(N[first], X) else None
+
+                    def agi(x):
+                        return any(ty >= 0x10 and p in N and p not in issued and N[p]["est"] <= cyc + 1
+                                   for p, ty in preds.get(x, ()))
+
+                    def badfp(x):
+                        if last is None or not (N[last]["op"] == 0x5f or
+                                                (N[last]["op"] == 0x263 and N[last]["x"][2] == 0x5f)):
+                            return False
+                        if not (1 << (N[x]["x"][0] >> 28) & 0xe):
+                            return False
+                        return busy[2] <= 1 and any(N[y]["x"][0] >> 16 & 0xf000 == 0x4000 and N[y]["est"] <= cyc + 1
+                                                    for y in pool if y)
+
+                    best = None
+                    for x in pool:
+                        if not x:
+                            break                           # the exit node ends the walk
+                        u = unit(x)
+                        if not N[x]["np"] and any(p in N and p and p not in issued for p, ty in preds.get(x, ())):
+                            continue      # added by this cycle's later slot (all its preds issue first); np > 0 at
+                                          # the add = only breakable preds left (SchmdBreakDep folds them)
+                        if u is None or agi(x) or badfp(x) or N[x]["est"] > cyc + max(busy[u], 0):
+                            continue
+                        best = x
+                        break
+                    n += 1
+                    if best != t:
+                        bad += 1
+                        if verbose:
+                            print("SIM  %s r%d cyc %d slot %d: issued lex %d (prio %x), model says %s" % (
+                                name, k, cyc, j, N[t]["lex"], N[t]["prio"],
+                                "lex %d (prio %x)" % (N[best]["lex"], N[best]["prio"]) if best else "nothing"))
+                    u = unit(t)
+                    u = (0 if j == 0 else 1) if u is None else u
+                    if j == 0:
+                        first = t
+                    issued.add(t)
+                    units.append((t, u))
+                for t, u in units:
+                    if 0 < N[t]["op"] < 0x246:
+                        busy[u] = max(busy[u], 0) + op_cost(N[t]["op"])[1]
+                        if N[t]["op"] == 0x46:
+                            fdiv = 2
+                    last = t
+                issued.update(e[2])
+    return n - bad, n
+
+
+def simulate_p6(funcs, verbose=False):
     """Replay each region's picks with SchSelectInstrs' unit model: 4 units, each takes one instruction per
     cycle while its busy counter is below 3; an issue adds the op's cost to its unit's counter, every cycle
     subtracts 1; a node is eligible once its est <= cycle + max(busy, 0). Units >= 4 mean 'any' (unit 0)."""

@@ -267,10 +267,11 @@ static DWORD rd(DWORD a) { DWORD w = 0; readd(a, &w); return w; }
 #define MAXFF 4
 static char ffilt[MAXFF][256]; static int nffilt; static DWORD CURFUNC = 0x10d123ac;
 static DWORD CURFUNCTLS;       /* `set curfunctls <off>`: _CurFunc is at this offset of the TLS block (cl 17.00) */
+static int CFNAME = 4;         /* `set cfname <off>`: the name pointer's offset in [FUNC+0] (13.00.9044: 0x18) */
 static int infunc(void) {
     char nm[1024]; DWORD f, s, n; int i, m = 0;
     if (!nffilt) return 1;
-    if (!readd(CURFUNCTLS ? tlsblock() + CURFUNCTLS : CURFUNC + delta, &f) || !f || !readd(f, &s) || !s || !readd(s + 4, &n) || !n) return 0;
+    if (!readd(CURFUNCTLS ? tlsblock() + CURFUNCTLS : CURFUNC + delta, &f) || !f || !readd(f, &s) || !s || !readd(s + CFNAME, &n) || !n) return 0;
     while (m < (int)sizeof nm - 1 && readd(n + m, &f) && (nm[m] = (char)f) != 0) m++;
     nm[m] = 0;
     for (i = 0; i < nffilt; i++) if (!strstr(nm, ffilt[i])) return 0;
@@ -282,6 +283,8 @@ static int infunc(void) {
  * "T R <addr> <N words>" line after each tuple and leaf: the raw words a new layout is read from. */
 static int LNEXT = 0, LOP = 4, LKIND = 8, LFLG = 9, LLINE = 0x14, LSRC = 0x28, LDST = 0x2c, LTYW = 0x0a;
 static int LPAY = 0x18, LPAY2 = 0x1c, SNAME = 0, SKIND = 4, SNUM = 0x1c, ILRAW = 0;
+static int LICON = -1, SNSTR = 4;   /* `set licon` ICONST value offset (-1: lpay), `set snstr` name pointer in the name
+                                    * record (13.00.9044: 0x18 and 0x18) */
 static int LMD = -1, LMB = -1, LMI = -1, LMS = 0x14;
 static int ILNUM = 0;          /* `set ilnum <off>` (env C2TRACE_ILNUM): "T N <tuple> <word at +off>" after each T I line */  /* memory leaf disp / base / index (-1: LMEM+4/+8/+12), scale byte */
 static BYTE kmap[256]; static int kmapset;
@@ -299,7 +302,7 @@ static void symname(DWORD x) {
     k = rb(x + SKIND);
     if (k == 1) { rstr(rd(REGNAME + delta + 4 * rd(x + SNUM)), c, sizeof c); out("%s", c); return; }
     if (k == 2) { out("^"); x = rd(x + SNAME); if (!x) { out("?"); return; } k = rb(x + SKIND); }
-    if (rd(x + SNAME) && rstr(rd(rd(x + SNAME) + 4), c, sizeof c)) out("%s", c);
+    if (rd(x + SNAME) && rstr(rd(rd(x + SNAME) + SNSTR), c, sizeof c)) out("%s", c);
     else out("%c%d", k == 3 ? 't' : k == 0xd ? 'k' : 's', rd(x + SNUM));
 }
 static int FENAME = 0;         /* `set fename 1` (13.10): CODEADDR leaves print the front-end symbol's name at sym+4 */
@@ -324,7 +327,7 @@ static void leaf(DWORD l) {
             symname(a); break;
     case 4: if (FENAME && cdname(rd(l + LPAY))) break;  /* fall through */
     case 2: case 3: symname(rd(l + LPAY)); break;
-    case 7: out("%d", rd(l + LPAY)); break;
+    case 7: out("%d", rd(l + (LICON < 0 ? LPAY : LICON))); break;
     case 9: out("fconst"); break;
     case 5: case 6:
         out("[");
@@ -816,6 +819,9 @@ static void setvar(const char *nm, DWORD v) {
     else if (!strcmp(nm, "gspl")) GSPL = (int)v;
     else if (!strcmp(nm, "curfunc")) CURFUNC = v;
     else if (!strcmp(nm, "curfunctls")) CURFUNCTLS = v;
+    else if (!strcmp(nm, "cfname")) CFNAME = (int)v;
+    else if (!strcmp(nm, "licon")) LICON = (int)v;
+    else if (!strcmp(nm, "snstr")) SNSTR = (int)v;
     else if (!strcmp(nm, "lnext")) LNEXT = (int)v;
     else if (!strcmp(nm, "lop")) LOP = (int)v;
     else if (!strcmp(nm, "lkind")) LKIND = (int)v;

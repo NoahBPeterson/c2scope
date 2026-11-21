@@ -1,7 +1,7 @@
 [project]
 name = "c2scope"
 version = "0.1.0"
-description = "Tracer, register-allocation model and search tools for MSVC c2.dll (13.10, 14.00, 15.00, 17.00 x64)"
+description = "Tracer, register-allocation model and search tools for MSVC c2.dll (13.00.9044, 13.10, 14.00, 15.00, 17.00 x64)"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [

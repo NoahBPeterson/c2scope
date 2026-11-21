@@ -64,6 +64,16 @@ def etype(t):
     return "+".join(n for b, n in ETYPE.items() if t & b) or "%x" % t
 
 
+def _sh(x, n):
+    return x << n if n >= 0 else x >> -n
+
+
+def _prio(ht, ns, fl):
+    """Static priority with the build's _SchmdHWT row (c2sched.HWT; 14.00's: (ht + ns) << 10 | L << 15 | B << 23)."""
+    w = c2sched.HWT
+    return _sh(fl >> 1 & 1, w[0]) + _sh(ht, w[1]) + _sh(ns, w[2]) + _sh(fl & 1, w[3]) + _sh(fl >> 2 & 1, w[5])
+
+
 class Region:
     def __init__(self, r, txt):
         self.N = {t: dict(n) for t, n in r["nodes"].items() if t}
@@ -95,7 +105,7 @@ class Region:
         prio = {}
         for t, n in N.items():
             ns = len(succ.get(t, ())) + (nsd or {}).get(t, 0)
-            prio[t] = ((h(t) + ns) << 10) + (n["fl"] >> 2 & 1) * (1 << 15) + (n["fl"] >> 1 & 1) * (1 << 23)
+            prio[t] = _prio(h(t), ns, n["fl"])
         done, out = set(), []
         while len(out) < len(N):
             ready = [t for t in N if t not in done and pred.get(t, set()) <= done]

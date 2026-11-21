@@ -246,6 +246,8 @@ def match(refp, namesp, tgtp, outp):
         rk[key(f)].append(e)
     for e, f in tf.items():
         tk[key(f)].append(e)
+    log = lambda *x: sys.stderr.write("c2port match: " + " ".join(str(y) for y in x) + "\n")
+    log("explored %d reference / %d target functions" % (len(rf), len(tf)))
     m, how = {}, {}                      # ref entry -> target entry
     for k, es in rk.items():
         if len(es) == 1 and len(tk.get(k, ())) == 1 and sum(rf[es[0]][0].values()) >= 8:
@@ -259,25 +261,40 @@ def match(refp, namesp, tgtp, outp):
     for e, f in tf.items():
         for c in f[1]:
             callers_t[c].add(e)
-    changed = True
+    log("sig: %d" % len(m))
+    seen = {}                            # (e, side) -> the unmatched sets last examined: same sets, same outcome
+    changed, rounds = True, 0
     while changed:
         changed = False
+        rounds += 1
         for e in list(m):
-            for rset, tset in ((set(rf[e][1]), set(tf[m[e]][1])), (callers_r[e], callers_t[m[e]])):
+            for side, (rset, tset) in enumerate(((set(rf[e][1]), set(tf[m[e]][1])), (callers_r[e], callers_t[m[e]]))):
                 ru = [x for x in rset if x not in m and x in rf]
                 tu = [x for x in tset if x not in used and x in tf]
                 if not ru or not tu:
                     continue
+                sig_ = (frozenset(ru), frozenset(tu))
+                if seen.get((e, side)) == sig_:
+                    continue
+                seen[(e, side)] = sig_
                 sc = sorted(((sim(rf[a][0], tf[b][0]), a, b) for a in ru for b in tu), reverse=True)
+                by_a, by_b = collections.defaultdict(list), collections.defaultdict(list)   # each sorted descending
+                for s2, a2, b2 in sc:
+                    by_a[a2].append((s2, b2))
+                    by_b[b2].append((s2, a2))
                 for s, a, b in sc:
                     if a in m or b in used:
                         continue
-                    rival = max([s2 for s2, a2, b2 in sc if (a2 == a) != (b2 == b) and a2 not in m and b2 not in used] or [0])
+                    # the best other pair sharing exactly one side, both still free (same as scanning sc)
+                    r1 = next((s2 for s2, b2 in by_a[a] if b2 != b and b2 not in used), 0)
+                    r2 = next((s2 for s2, a2 in by_b[b] if a2 != a and a2 not in m), 0)
+                    rival = max(r1, r2)
                     if s >= 0.5 and s - rival >= 0.1 or (len(ru) == 1 and len(tu) == 1 and s >= 0.3):
                         m[a] = b
                         used.add(b)
                         how[a] = ("calls", s)
                         changed = True
+        log("calls round %d: %d matched" % (rounds, len(m)))
     # leftovers among named functions: global best similarity
     left_t = [b for b in tf if b not in used and sum(tf[b][0].values()) >= 12]
     for a in sorted(fnames):

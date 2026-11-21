@@ -96,6 +96,10 @@ HOOKS_X = [
 ]
 
 
+# table key scratch_avail_all: the build keeps no regAvail[] (13.00.9044, port-1300.md); its HOOKS_X entry 1 puts a
+# placeholder in that field and every integer register counts as available
+AVAIL_ALL = bool(c2trace.c2build.table() is not None and c2trace.c2build.get("scratch_avail_all"))
+
 _IMGBASE = 0x10B00000
 
 # Where a temp of the final code got its register when it is neither a RegAssign pick nor a Color pop (`origins`):
@@ -223,6 +227,8 @@ def parse_segments(log, funcpat, cbase=None, obase=None, oroles=()):
                         pref="", instr=v[2], text=None, rot=False, reg=None)
             if len(v) > 10:                                  # HOOKS_X
                 rm, av = _words(v[8]) or [], _words(v[9]) or []
+                if AVAIL_ALL:                                # a build without regAvail (13.00.9044): all int regs
+                    av = [0] + [1] * 8
                 busy = {}
                 for r, w in enumerate(rm):
                     if w and r in RNAME and r:

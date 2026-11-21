@@ -11,6 +11,20 @@ DATA = os.path.join(HERE, "tests", "data", "eh_helpers.cpp")
 FLAGS = ["--", "/TP", "/MT", "/GS", "/EHsc", "/Gy"]
 VERBOSE = "-v" in sys.argv
 results = []
+sys.path.insert(0, os.path.join(HERE, "tools"))
+import c2build as _c2b
+# what a build cannot run (table key `lacks`: feature -> reason; 13.00.9044, the VC6 front end: docs/c2/port-1300.md);
+# a test that needs one prints a skip line instead (not counted)
+LACKS = dict((_c2b.get("lacks") or {}) if _c2b.table() is not None else {})
+
+
+def lacking(*feats):
+    """The first of feats this build lacks (its reason), or None."""
+    return next((LACKS[f] for f in feats if f in LACKS), None)
+
+
+def skip(name, why):
+    print("  %-58s skipped (%s)" % (name, why), flush=True)
 
 
 def tool(*args):
@@ -111,48 +125,54 @@ got = tuple(m.group(1) == m.group(2) for m in re.finditer(r"^rule \d.*: (\d+) of
 check("sched --verify: height, static priority and selection rules all match", got[-3:] if len(got) >= 3 else got, (True, True, True))
 
 FP = os.path.join(HERE, "tests", "data", "fpclasses.c")
-out = tool("regs", FP, "--all-classes", "--", "/arch:SSE2")
-fx, _, hx = out.partition("\n_h ")
-check("regs --all-classes: XMM values coloured in class 6 (4 pops)", len(re.findall(r"\bxmm\d\s.*\[class 6\]", fx)), 4)
-check("regs --all-classes: x87 values reported (Color's x87 class, FPColor on 13.10)", len(re.findall(r"\[x87", hx)) >= 5, True)
+if lacking("sse2"):
+    skip("regs --all-classes: XMM and x87 values (fpclasses.c)", lacking("sse2"))
+else:
+    out = tool("regs", FP, "--all-classes", "--", "/arch:SSE2")
+    fx, _, hx = out.partition("\n_h ")
+    check("regs --all-classes: XMM values coloured in class 6 (4 pops)", len(re.findall(r"\bxmm\d\s.*\[class 6\]", fx)), 4)
+    check("regs --all-classes: x87 values reported (Color's x87 class, FPColor on 13.10)", len(re.findall(r"\[x87", hx)) >= 5, True)
 
-out = script("c2ltcg.py", "regs", os.path.join(HERE, "tests", "data", "ltcg_a.c"), "--with", os.path.join(HERE, "tests", "data", "ltcg_b.c"))
-m = re.search(r"^_helper\s+\((\d+) globregs", out, re.M)
-check("ltcg: Color traced inside link.exe (/GL + /LTCG), helper has 7 values", int(m.group(1)) if m else None, 7)
+if lacking("ltcg"):
+    skip('ltcg: Color in link.exe, kill sets, custom convention, regmap (7 checks)', lacking("ltcg"))
+else:
+    out = script("c2ltcg.py", "regs", os.path.join(HERE, "tests", "data", "ltcg_a.c"), "--with", os.path.join(HERE, "tests", "data", "ltcg_b.c"))
+    m = re.search(r"^_helper\s+\((\d+) globregs", out, re.M)
+    check("ltcg: Color traced inside link.exe (/GL + /LTCG), helper has 7 values", int(m.group(1)) if m else None, 7)
 
-# LTCG rules (docs/c2/ltcg.md): kill sets and the custom convention, in a two-object probe; listing from the image
-KA, KB = (os.path.join(HERE, "tests", "data", f) for f in ("ltcg_kill_a.c", "ltcg_kill_b.c"))
-kdir = tempfile.mkdtemp()
-out = script("c2ltcg.py", "asm", KA, "--with", KB, "--out", kdir)
-
-
-def lproc(name):
-    m = re.search(r"^%s\tPROC NEAR\n(.*?)^%s\tENDP" % (re.escape(name), re.escape(name)), out, re.M | re.S)
-    rows = [re.sub(r"\t; .*$", "", l).split("\t") for l in m.group(1).splitlines()] if m else []
-    return [(r[-2].strip() + " " + r[-1].strip()).strip() for r in rows if len(r) >= 4]
+    # LTCG rules (docs/c2/ltcg.md): kill sets and the custom convention, in a two-object probe; listing from the image
+    KA, KB = (os.path.join(HERE, "tests", "data", f) for f in ("ltcg_kill_a.c", "ltcg_kill_b.c"))
+    kdir = tempfile.mkdtemp()
+    out = script("c2ltcg.py", "asm", KA, "--with", KB, "--out", kdir)
 
 
-check("ltcg asm: k_eax, reached only from /GL code, takes its argument in eax (custom convention)",
-      lproc("_k_eax")[:1], ["lea eax, [eax + eax*4]"])
-check("ltcg asm: k_std, exported, keeps the standard convention (argument on the stack)",
-      lproc("_k_std")[:1], ["mov eax, dword ptr [esp + 4]"])
-check("ltcg kill set: a stays in edx across k_eax / k_std (they write only eax), in esi across k_ext",
-      tuple(any(l == "mov dword ptr [ecx + 8], %s" % r for l in lproc(f)) for f, r in
-            (("_c_eax", "edx"), ("_c_std", "edx"), ("_c_ext", "esi"))), (True, True, True))
-out = script("c2ltcg.py", "regs", KA, "--with", KB, "--func", "_c_")
-cands = {}
-for blk in out.split("\n\n"):
-    m = re.search(r"^\s+\d+\s+a\s+param\s+(?:-?\d+\s+){4}\S+\s+(.*)$", blk, re.M)
-    n = re.search(r"^(_c_\w+)\s+\(", blk, re.M)
-    if m and n:
-        cands[n.group(1)] = m.group(1)
-check("ltcg regs: edx is a candidate for a in c_eax (kill set {eax}), not in c_ext (no body: all killed)",
-      ("edx:" in cands.get("_c_eax", ""), "edx:" in cands.get("_c_ext", "x edx:")), (True, False))
-out = script("c2ltcg.py", "regmap", KA, "--with", KB, "--func", "_c_std", "--asm-vs", os.path.join(kdir, "_c_std.s"),
-             "--asm-func", "_c_std")
-m = re.search(r"# (\d+) variables checked, (\d+) agree", out)
-check("ltcg regmap: the image listing aligns with our own build's disassembly (all variables agree)",
-      bool(m) and m.group(1) == m.group(2) and int(m.group(1)) >= 3, True)
+    def lproc(name):
+        m = re.search(r"^%s\tPROC NEAR\n(.*?)^%s\tENDP" % (re.escape(name), re.escape(name)), out, re.M | re.S)
+        rows = [re.sub(r"\t; .*$", "", l).split("\t") for l in m.group(1).splitlines()] if m else []
+        return [(r[-2].strip() + " " + r[-1].strip()).strip() for r in rows if len(r) >= 4]
+
+
+    check("ltcg asm: k_eax, reached only from /GL code, takes its argument in eax (custom convention)",
+          lproc("_k_eax")[:1], ["lea eax, [eax + eax*4]"])
+    check("ltcg asm: k_std, exported, keeps the standard convention (argument on the stack)",
+          lproc("_k_std")[:1], ["mov eax, dword ptr [esp + 4]"])
+    check("ltcg kill set: a stays in edx across k_eax / k_std (they write only eax), in esi across k_ext",
+          tuple(any(l == "mov dword ptr [ecx + 8], %s" % r for l in lproc(f)) for f, r in
+                (("_c_eax", "edx"), ("_c_std", "edx"), ("_c_ext", "esi"))), (True, True, True))
+    out = script("c2ltcg.py", "regs", KA, "--with", KB, "--func", "_c_")
+    cands = {}
+    for blk in out.split("\n\n"):
+        m = re.search(r"^\s+\d+\s+a\s+param\s+(?:-?\d+\s+){4}\S+\s+(.*)$", blk, re.M)
+        n = re.search(r"^(_c_\w+)\s+\(", blk, re.M)
+        if m and n:
+            cands[n.group(1)] = m.group(1)
+    check("ltcg regs: edx is a candidate for a in c_eax (kill set {eax}), not in c_ext (no body: all killed)",
+          ("edx:" in cands.get("_c_eax", ""), "edx:" in cands.get("_c_ext", "x edx:")), (True, False))
+    out = script("c2ltcg.py", "regmap", KA, "--with", KB, "--func", "_c_std", "--asm-vs", os.path.join(kdir, "_c_std.s"),
+                 "--asm-func", "_c_std")
+    m = re.search(r"# (\d+) variables checked, (\d+) agree", out)
+    check("ltcg regmap: the image listing aligns with our own build's disassembly (all variables agree)",
+          bool(m) and m.group(1) == m.group(2) and int(m.group(1)) >= 3, True)
 
 # combined what-ifs (tracer.md "Combined what-ifs"): a source-level edit carried through priority, order and register
 r = subprocess.run([rasim, "check", snap], capture_output=True, text=True).stdout
@@ -172,9 +192,12 @@ var = os.path.join(os.path.dirname(snap), "eh_var.cpp")
 open(var, "w").write(open(DATA).read().replace("void eA(H* h, int k) { BODY(incA) }",
                                                "void eA(H* h, int k) { use(k, k, k); BODY(incA) }"))
 out = tool("regs", var, "--func", "?eA@@", *FLAGS)
-real = dict(re.findall(r"^\s+\d+\s+(\S+)\s+\S+\s+-?\d+\s+-?\d+\s+\d+\s+\d+\s+(e[a-ds][xip])\s", out, re.M))
+rrows = re.findall(r"^\s+\d+\s+(\S+)\s+\S+\s+-?\d+\s+-?\d+\s+\d+\s+\d+\s+(e[a-ds][xip])\s", out, re.M)
+real = dict(rrows)
+# two globregs of one temp (13.00.9044: t162 twice) are one dict key; rasim names them t162@p2 / t162@p4
+samerows = sorted((re.sub(r"@p\d+$", "", k), v) for k, v in pred.items()) == sorted(rrows)
 check("combined what-if vs a real compile: ref:k:1:6 gives the 6 registers of eA with use(k, k, k) added (k esi, h edi)",
-      (pred == real, pred.get("k"), pred.get("h"), len(real)), (True, "esi", "edi", 6))
+      (pred == real or samerows, pred.get("k"), pred.get("h"), len(rrows)), (True, "esi", "edi", 6))
 # need/want's fast path (differences from the unedited run, Model::run_diff; single source edits from Uni::quick;
 # tracer.md "Speed of `need reg:`") prints exactly what the reference path prints (RASIM_REF=1: a full state copy and
 # run per candidate). RASIM_QCHECK=1 also checks every quick edit against the overlay path (it aborts on a difference).
@@ -208,13 +231,14 @@ int f3(unsigned char *p, int n, int k) { unsigned char a=p[0],b=p[1],c=p[2],d=p[
     m = re.search(r"^\s+all\s+\d+\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)", r, re.M)
     check("rasim check --predict: 9 rounds of byte-register code: list head, branch, spill/defer, register, no-reg sets, "
           "cut sets, split rounds, SpillObvious", m.groups() if m else None,
+          ("34/34", "34/34", "24/24", "10/10", "2/2", "3/3", "5/5", "46/46") if BUILD.startswith("13.00") else
           ("34/34", "34/34", "24/24", "10/10", "4/4", "4/4", "8/8", "44/44" if BUILD.startswith("13.10") else "45/45"))
     m = re.search(r"state: (\d+) places", r)
     check("rasim check --predict: the model's records never differ from c2's", m.group(1) if m else None, "0")
     m = re.search(r"record numbers .*?: (\d+) of (\d+) records .*\n.*ascending number: (\S+); enterloads at one place in "
                   r"ascending piece number: (\S+)", r)
     check("rasim check --predict: every piece's record number (LIFO free list), parent order, reload order (f3)",
-          m.groups() if m else None, ("28", "28", "3/3", "4/4"))
+          m.groups() if m else None, ("26", "26", "1/1", "2/2") if BUILD.startswith("13.00") else ("28", "28", "3/3", "4/4"))
     # the reload order after a loop follows the record numbers, which a dead mention of y moves (regalloc.md 3.6.9)
     SN = os.path.join(HERE, "tests", "data", "splitnum.c")
     order = {}
@@ -234,24 +258,30 @@ int f3(unsigned char *p, int n, int k) { unsigned char a=p[0],b=p[1],c=p[2],d=p[
           (order["_f4"], order["_f6"], order["_f4rasim"], order["_f6rasim"]),
           ("xy", "yx", ("9", "9", "1/1"), ("9", "9", "1/1")))
     # split pieces modelled from the round's IL (regalloc.md 3.6.11, tracer.md "rasim pieces"): f4's two rounds
-    ps = os.path.join(os.path.dirname(snap), "pieces_f4.json")
-    out = tool("regs", SN, "--func", "_f4", "--pieces", "--export", ps)
-    r = subprocess.run([rasim, "pieces", ps], capture_output=True, text=True).stdout
-    m = re.search(r"piece sequence (\S+); blocks walked (\S+); per-block terms (\S+); .*pieces exact (\S+)", r)
-    check("rasim pieces (f4): records, blocks, terms of every piece, from the round's IL",
-          m.groups() if m else None, ("2/2", "2/2", "8/9", "8/9") if BUILD.startswith("13.10") else ("2/2", "2/2", "9/9", "9/9"))
-    r = subprocess.run([rasim, "pieces", ps, "--chain"], capture_output=True, text=True).stdout
-    m2 = re.search(r"piece sequence (\S+); .*pieces exact (\S+)", r)
-    r = subprocess.run([rasim, "check", ps, "--predict", "--pieces"], capture_output=True, text=True).stdout
-    m3 = re.search(r"pieces: (\d+) of the (\d+) records", r)
-    check("rasim pieces --chain and check --predict --pieces (f4): the same from the first round, 8 of 8 records",
-          (m2.groups() if m2 else None, m3.groups() if m3 else None),
-          (("2/2", "8/9" if BUILD.startswith("13.10") else "9/9"), ("8", "8")))
+    if lacking("pieces"):
+        skip("rasim pieces (f4) and --chain / --predict --pieces", lacking("pieces"))
+    else:
+        ps = os.path.join(os.path.dirname(snap), "pieces_f4.json")
+        out = tool("regs", SN, "--func", "_f4", "--pieces", "--export", ps)
+        r = subprocess.run([rasim, "pieces", ps], capture_output=True, text=True).stdout
+        m = re.search(r"piece sequence (\S+); blocks walked (\S+); per-block terms (\S+); .*pieces exact (\S+)", r)
+        check("rasim pieces (f4): records, blocks, terms of every piece, from the round's IL",
+              m.groups() if m else None, ("2/2", "2/2", "8/9", "8/9") if BUILD.startswith("13.10") else ("2/2", "2/2", "9/9", "9/9"))
+        r = subprocess.run([rasim, "pieces", ps, "--chain"], capture_output=True, text=True).stdout
+        m2 = re.search(r"piece sequence (\S+); .*pieces exact (\S+)", r)
+        r = subprocess.run([rasim, "check", ps, "--predict", "--pieces"], capture_output=True, text=True).stdout
+        m3 = re.search(r"pieces: (\d+) of the (\d+) records", r)
+        check("rasim pieces --chain and check --predict --pieces (f4): the same from the first round, 8 of 8 records",
+              (m2.groups() if m2 else None, m3.groups() if m3 else None),
+              (("2/2", "8/9" if BUILD.startswith("13.10") else "9/9"), ("8", "8")))
 
 # immediate candidates (docs/c2/immcand.md) and the --func forms (tracer.md)
 IMM = os.path.join(HERE, "tests", "data", "immcand.c")
 out = tool("regs", IMM, "--func", "k1", "--block", "1")
-check("regs: an immediate candidate shows its constant", len(re.findall(r"imm0 .*= -1 \(const, 1 bytes\)", out)) >= 2, True)
+if lacking("regs_imm"):
+    skip("regs: an immediate candidate shows its constant", lacking("regs_imm"))
+else:
+    check("regs: an immediate candidate shows its constant", len(re.findall(r"imm0 .*= -1 \(const, 1 bytes\)", out)) >= 2, True)
 m1 = re.search(r"^\s+\d+\s+x\s+\S+\s+(-?\d+)", out, re.M)
 out = tool("regs", IMM, "--func", "k2", "--block", "1")
 m2 = re.search(r"^\s+\d+\s+x\s+\S+\s+(-?\d+)", out, re.M)
@@ -270,7 +300,8 @@ check("regs: equal priorities pop the larger def first in the int, x87 and XMM c
       (all(ties), len(ties) >= 10), (True, True))
 
 kd = tempfile.mkdtemp()
-tool("regs", FP, "--keep", kd, "--", "/arch:SSE2")
+if not lacking("sse2"):
+    tool("regs", FP, "--keep", kd, "--", "/arch:SSE2")
 got = {}
 
 
@@ -283,14 +314,17 @@ def orig_from_listing(asm, func, path):
     return path
 
 
-for fn_ in ("_f", "_h"):
-    orig = orig_from_listing(os.path.join(kd, "fpclasses.asm"), fn_, os.path.join(kd, fn_ + ".s"))   # every row agrees
-    out = tool("regmap", FP, "--func", fn_, "--asm-vs", orig, "--asm-func", fn_, "--all", "--", "/arch:SSE2")
-    m = re.search(r"^# by class: (.*)$", out, re.M)
-    got[fn_] = dict((c, (int(a), int(b))) for c, a, b in re.findall(r"(\w+) (\d+) of (\d+)", m.group(1))) if m else {}
-xm, st = got["_f"].get("xmm", (0, -1)), got["_h"].get("x87", (0, -1))
-check("regmap: XMM rows (f) and x87 stack-position rows (h), all agreeing with the same code",
-      (xm[0] == xm[1] and xm[1] >= 4, st[0] == st[1] and st[1] >= 4), (True, True))
+if lacking("sse2"):
+    skip("regmap: XMM rows (f) and x87 stack-position rows (h)", lacking("sse2"))
+else:
+    for fn_ in ("_f", "_h"):
+        orig = orig_from_listing(os.path.join(kd, "fpclasses.asm"), fn_, os.path.join(kd, fn_ + ".s"))   # every row agrees
+        out = tool("regmap", FP, "--func", fn_, "--asm-vs", orig, "--asm-func", fn_, "--all", "--", "/arch:SSE2")
+        m = re.search(r"^# by class: (.*)$", out, re.M)
+        got[fn_] = dict((c, (int(a), int(b))) for c, a, b in re.findall(r"(\w+) (\d+) of (\d+)", m.group(1))) if m else {}
+    xm, st = got["_f"].get("xmm", (0, -1)), got["_h"].get("x87", (0, -1))
+    check("regmap: XMM rows (f) and x87 stack-position rows (h), all agreeing with the same code",
+          (xm[0] == xm[1] and xm[1] >= 4, st[0] == st[1] and st[1] >= 4), (True, True))
 
 
 def testorder_tests():
@@ -316,14 +350,17 @@ def testorder_tests():
 
 testorder_tests()
 
-fsnap = os.path.join(kd, "f.json")
-tool("regs", FP, "--func", "_f", "--export", fsnap, "--", "/arch:SSE2")
-r = subprocess.run([rasim, "need", fsnap, "s>t"], capture_output=True, text=True)
-check("rasim need 's>t' without --pass answers in the XMM pass the two are costed in",
-      ("(XMM class) chosen" in r.stdout, bool(re.search(r"^s \(\d+, def \d+\) before t \(", r.stdout, re.M))), (True, True))
-r = subprocess.run([rasim, "need", fsnap, "s>n"], capture_output=True, text=True)
-check("rasim need 's>n' (XMM against int) says the classes differ instead of answering",
-      "different register classes" in r.stdout + r.stderr, True)
+if lacking("sse2"):
+    skip("rasim need 's>t' / 's>n' in the XMM pass (fpclasses.c)", lacking("sse2"))
+else:
+    fsnap = os.path.join(kd, "f.json")
+    tool("regs", FP, "--func", "_f", "--export", fsnap, "--", "/arch:SSE2")
+    r = subprocess.run([rasim, "need", fsnap, "s>t"], capture_output=True, text=True)
+    check("rasim need 's>t' without --pass answers in the XMM pass the two are costed in",
+          ("(XMM class) chosen" in r.stdout, bool(re.search(r"^s \(\d+, def \d+\) before t \(", r.stdout, re.M))), (True, True))
+    r = subprocess.run([rasim, "need", fsnap, "s>n"], capture_output=True, text=True)
+    check("rasim need 's>n' (XMM against int) says the classes differ instead of answering",
+          "different register classes" in r.stdout + r.stderr, True)
 
 # symbol keys (docs/c2/symkeys.md, tools/symkeys.py), on every c2 build: the assignment rules, the exact replay of the
 # allocator and a what-if prediction checked against a real compile
@@ -557,6 +594,8 @@ def x87stack_tests():
 if BUILD.startswith("13.10"):
     fpcolor_tests()
     fpcheck_tests()
+elif lacking("x87view"):
+    skip("x87 stack after Color (x87stack.cpp: kill sets, airlocks, rounding, need stack:)", lacking("x87view"))
 else:
     x87stack_tests()
 
@@ -629,7 +668,10 @@ def realize_tests():
           bool(re.search(r"^\s+yes\s+eqif\s+code 0 bag 0 regs \d+\s+`if \(\(int\)this & 1\) s \^= k;", r.stdout, re.M)), True)
 
 
-realize_tests()
+if lacking("noinline"):
+    skip("realize pairs/edit on realize.cpp (11 checks)", lacking("noinline"))
+else:
+    realize_tests()
 
 
 def realize2_tests():
@@ -656,17 +698,21 @@ def realize2_tests():
             cur["more"] += ln.strip() + "\n"
     row = lambda k: rows.get(k, dict(code=-1, more=""))
     v13 = BUILD.startswith("13.10")
+    like13 = v13 or BUILD.startswith("13.00")      # 13.00.9044 behaves as 13.10 in both (port-1300.md)
     check("realize2: a test of the stack local a in equal arms is uses:_a 2>3 for the packer (code 0 on 14.00/15.00, "
           "the memory test stays on 13.10)",
-          ("slots: uses:_a:2>3" in row(("sc", "eqa"))["more"], row(("sc", "eqa"))["code"] == 0), (True, not v13))
+          ("slots: uses:_a:2>3" in row(("sc", "eqa"))["more"], row(("sc", "eqa"))["code"] == 0), (True, not like13))
     check("realize2: a statement reading a in equal arms on a register value: uses:_a 2>3 (code 0 on 13.10)",
-          ("slots: uses:_a:2>3" in row(("sp", "eqb"))["more"], row(("sp", "eqb"))["code"] == 0), (True, v13))
+          ("slots: uses:_a:2>3" in row(("sp", "eqb"))["more"], row(("sp", "eqb"))["code"] == 0), (True, like13))
     check("realize2: the statement after an if at the end of both arms: one hidden pick (ins:3), same instructions",
           ("ins:3(gone)" in row(("pt", "dup"))["more"], row(("pt", "dup"))["code"]), (True, 0))
-    check("realize2: an initialised declaration two statements earlier moves 3 named keys, same code",
-          ("3 of 12 named keys moved" in row(("kd", "early"))["more"], row(("kd", "early"))["code"]), (True, 0))
-    check("realize2: an empty inline helper with 4 parameters is tmp+4 frame+4 keys, same code",
-          ("keys: tmp+4 frame+4" in row(("kp", "h4"))["more"], row(("kp", "h4"))["code"]), (True, 0))
+    if lacking("symkeys"):
+        skip("realize2: named keys moved (kd early, kp h4)", lacking("symkeys"))
+    else:
+        check("realize2: an initialised declaration two statements earlier moves 3 named keys, same code",
+              ("3 of 12 named keys moved" in row(("kd", "early"))["more"], row(("kd", "early"))["code"]), (True, 0))
+        check("realize2: an empty inline helper with 4 parameters is tmp+4 frame+4 keys, same code",
+              ("keys: tmp+4 frame+4" in row(("kp", "h4"))["more"], row(("kp", "h4"))["code"]), (True, 0))
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "edit", RZ, "--func", "pt__base", "ins:3",
                         "--keep", os.path.join(tempfile.mkdtemp(), "rz")] + fl, capture_output=True, text=True, cwd=HERE)
     if VERBOSE:
@@ -705,7 +751,9 @@ def realize2_tests():
         except Exception as e:
             got.append(str(e)[:60])
     check("realize2 load levers: alias2 1 -> 3 loads, ptrlocal 2 -> 1, subobj read+store -> one RMW (13.10: 2 loads)",
-          got, [((1, 0, 0), (3, 0, 0)), ((2, 1, 0), (1, 1, 0)), ((1, 1, 0), (2, 1, 0) if v13 else (1, 0, 1))])
+          got, [((1, 0, 0), (3, 0, 0)), ((1, 1, 0), (1, 1, 0)), ((1, 1, 0), (2, 1, 0))] if BUILD.startswith("13.00") else
+          [((1, 0, 0), (3, 0, 0)), ((2, 1, 0), (1, 1, 0)), ((1, 1, 0), (2, 1, 0) if v13 else (1, 0, 1))])
+    # (13.00.9044: ptrlocal's base already reads p->q once, so the lever has nothing to remove)
 
 
 realize2_tests()
@@ -717,7 +765,7 @@ def realize_ins_tests():
     one hidden pick, the same instructions; 13.10 keeps both copies."""
     RZ = os.path.join(HERE, "tests", "data", "realize_ins.cpp")
     fl = ["--", "/TP", "/MT", "/EHsc", "/Gy", "/O2"]
-    v13 = BUILD.startswith("13.10")
+    v13 = BUILD.startswith(("13.10", "13.00"))     # 13.00.9044 keeps both copies too (port-1300.md)
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "realize.py"), "pairs", RZ, "--scratch"] + fl,
                        capture_output=True, text=True, cwd=HERE)
     if VERBOSE:
@@ -852,7 +900,10 @@ def bdiff_tests():
                                     tsweep.orig_instrs(os.path.join(d, "s", f + ".s"))))
     except Exception as e:
         got = "%s: %s" % (type(e).__name__, e)
-    check("bdiff: listing vs its linked image: 0 (3 functions)", got, [0, 0, 0])
+    if lacking("link"):
+        skip("bdiff: listing vs its linked image (3 functions)", lacking("link"))
+    else:
+        check("bdiff: listing vs its linked image: 0 (3 functions)", got, [0, 0, 0])
 
 
 def rdiff_tests():
@@ -1271,17 +1322,23 @@ def merges_tests():
         out = tool("merges", src, "--func", fn_, "--", "/O2")
         m = re.search(r"^tail \S+: (\d+) pair\(s\)(?:, (\d+) merged)?", out, re.M)
         got[fn_] = (int(m.group(2) or 0) if m else None, out)
-    check("merges: twins f1/f2 stop the walk at the call (call target _f2 / _f1)",
-          "stop: call target _f2 / _f1" in got["c2"][1], True)
-    check("merges: a forwarder to f1 merges like one callee (c3 = c1)", got["c3"][0], got["c1"][0])
-    check("merges: one scratch pick per arm: every pair stops at a register, none merged",
-          (got["r1"][0], len(re.findall(r"stop: register", got["r1"][1].split("-- iteration 2")[0])) >= 3), (0, True))
-    check("merges: three picks per arm: the same lea register, both pairs merged", got["r2"][0], 2)
-    out = tool("il", os.path.join(HERE, "tests", "data", "callnames.cpp"), "--func", "call_names", "--at",
-               "@Encode@4", "--grep", "call",
-               "--", "/TP", "/O2")
-    names = [n for n in ("?g1@@YAXH@Z", "?m@A@@QAEXH@Z", "?g2@@YAHHH@Z", "?s@A@@SAHH@Z", "?loc@@YAHH@Z") if n in out]
-    check("il: every call target printed by its own name", len(names), 5)
+    if lacking("merges"):
+        skip("merges: tail-merge walks (c1, c2, c3, r1, r2: 4 checks)", lacking("merges"))
+    else:
+        check("merges: twins f1/f2 stop the walk at the call (call target _f2 / _f1)",
+              "stop: call target _f2 / _f1" in got["c2"][1], True)
+        check("merges: a forwarder to f1 merges like one callee (c3 = c1)", got["c3"][0], got["c1"][0])
+        check("merges: one scratch pick per arm: every pair stops at a register, none merged",
+              (got["r1"][0], len(re.findall(r"stop: register", got["r1"][1].split("-- iteration 2")[0])) >= 3), (0, True))
+        check("merges: three picks per arm: the same lea register, both pairs merged", got["r2"][0], 2)
+    if lacking("noinline"):
+        skip("il: every call target printed by its own name (callnames.cpp)", lacking("noinline"))
+    else:
+        out = tool("il", os.path.join(HERE, "tests", "data", "callnames.cpp"), "--func", "call_names", "--at",
+                   "@Encode@4", "--grep", "call",
+                   "--", "/TP", "/O2")
+        names = [n for n in ("?g1@@YAXH@Z", "?m@A@@QAEXH@Z", "?g2@@YAHHH@Z", "?s@A@@SAHH@Z", "?loc@@YAHH@Z") if n in out]
+        check("il: every call target printed by its own name", len(names), 5)
     d = tempfile.mkdtemp()
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2trace.py"), src, "--keep", "kk", "--max", "3",
                         "-H", "@Color@4", "--", "/O2"],
@@ -1319,7 +1376,7 @@ def slots_tests():
     check("slots what-if: a conflict between a and b: b opens a 2nd slot at the top, c, s, a move down (3 moved)",
           m.groups() if m else None, ("2", "3"))
     gh = offs(snap("gshome"))
-    want = 8 if BUILD.startswith("13.10") else -24
+    want = 8 if BUILD.startswith(("13.10", "13.00")) else -24       # 13.00.9044: no /GS at all (cl ignores it)
     check("slots /GS: x in p's home on 13.10, a new slot on 14.00/15.00 (x at %d)" % want, gh.get("_x"), want)
     # the original's slot map, with our own listing as the original: every element agrees
     import c2slots, tsweep
@@ -1385,7 +1442,10 @@ def loadcse_tests():
           "unalias ref &re = x.e removed" in r.stdout and "(2 uses)" in r.stdout, True)
 
 
-loadcse_tests()
+if lacking("loadcse"):
+    skip("loadcse: load reuse / RMW rules on loadcse.cpp (8 checks)", lacking("loadcse"))
+else:
+    loadcse_tests()
 
 
 def sulever_tests():
@@ -1401,7 +1461,10 @@ def sulever_tests():
     check("sulever: the view-mask spelling puts lo second", bool(m and m.group(1).startswith("_lo+0")), True)
 
 
-sulever_tests()
+if lacking("symkeys"):
+    skip("sulever: SU-order decisions (2 checks)", lacking("symkeys"))
+else:
+    sulever_tests()
 
 
 def toolgap_tests():
@@ -1423,7 +1486,7 @@ def toolgap_tests():
             return sum("+92]" in o for _, o in tsweep.listing_instrs(asm, func))
         except Exception as e:
             return str(e)[:40]
-    v13 = c2trace.c2build.name().startswith("13.10")
+    v13 = c2trace.c2build.name().startswith(("13.10", "13.00"))      # 13.00.9044 as 13.10: one load
     check("realize alias2:p->m with two reads: a construct, 1 -> %d loads" % (1 if v13 else 2),
           ("read 2 of 2 through it (one use)" in r.stdout, loads(os.path.join(d, "base", "base.asm"), "lt__base"),
            loads(os.path.join(d, "e0_000", "e0_000.asm"), "lt__base")), (True, 1, 1 if v13 else 2))
@@ -1541,6 +1604,9 @@ def schedwant_tests():
                        capture_output=True, text=True, cwd=HERE).stdout
     if VERBOSE:
         print(r[-3000:])
+    if lacking("schedwant"):
+        skip("schedwant: replay = traced order; unalias gives the wanted order", lacking("schedwant"))
+        return
     check("schedwant: the replay reproduces the traced order", "(= traced)" in r, True)
     check("schedwant: unalias of that load gives the wanted order",
           bool(re.search(r"^\s+WANTED\s+unalias:%d\s*$" % L, r, re.M)), True)
@@ -1586,8 +1652,11 @@ def effectmine_tests():
           any(any(re.match(r"ref:n:\d+:\+2$", e) for e in x["eff"]["R"]) and any(e.startswith("P:") for e in x["eff"]["R"])
               and x["code"]["code"] == 0 for x in cp), True)
     pad = [x for x in db if x["cls"] == "pad.init.top" and x["meta"].get("n") == 1 and x["ok"]]
-    check("effectmine: one unused initialised local is one frame key, code identical",
-          [("keys:frame:+1" in x["eff"].get("K", []), x["code"]["ident"]) for x in pad], [(True, 0)])
+    if lacking("symkeys"):
+        skip("effectmine: one unused initialised local is one frame key", lacking("symkeys"))
+    else:
+        check("effectmine: one unused initialised local is one frame key, code identical",
+              [("keys:frame:+1" in x["eff"].get("K", []), x["code"]["ident"]) for x in pad], [(True, 0)])
     dec = [x for x in db if x["cls"] == "decl.extvar.before" and x["ok"]]
     check("effectmine: dummy extern declarations before the function: compiled, effects recorded",
           bool(dec) and all("types" in x for x in dec), True)
@@ -1649,9 +1718,12 @@ def untraced_tests():
     open(orig, "w").write("".join("%08x %s %s\n" % tuple(r) for r in rows))
     out = tool("regmap", src, "--func", "addsum", "--asm-vs", orig, "--asm-func", "_addsum")
     wants = re.findall(r"^(\S+)\s+\S+\s+\S+\s+\S+\s+(WANTS \S+|mixed.*)$", out, re.M)
-    check("regmap: commutative two-address op in the other order: only the sum WANTS, noted as operand order",
-          (len(wants), all(w[1].startswith("WANTS") for w in wants), "commutative two-address op" in out,
-           "      from: scratch pick" in out), (1, True, True, True))
+    if lacking("codeshape"):
+        skip("regmap: commutative two-address op in the other order", lacking("codeshape"))
+    else:
+        check("regmap: commutative two-address op in the other order: only the sum WANTS, noted as operand order",
+              (len(wants), all(w[1].startswith("WANTS") for w in wants), "commutative two-address op" in out,
+               "      from: scratch pick" in out), (1, True, True, True))
     # base/index order inside an address and two nearby instructions issued the other way round are not register votes
     sys.path.insert(0, os.path.join(HERE, "tools"))
     import regmap
@@ -1742,22 +1814,25 @@ def icount_tests():
         return j.get("ours", 0) - j.get("orig", 0), sorted(j.get("classes", {}))
     hints = {}
 
-    old13 = BUILD.startswith("13.10")
-    check("icount: one load where the original reloads: removed-by:GlobalOptimize/CSE", classes("cse"),
-          (-1, ["removed-by:GlobalOptimize/CSE"]))
-    dl, cl = classes("alias")
-    check("icount: a reference used twice keeps a reload: kept:alias", (dl, cl == ["kept:alias"]), (1, True))
-    dl, cl = classes("kill")
-    check("icount: a store through a loaded pointer between two reads: kept:kill", (dl, "kept:kill" in cl), (2, True))
-    dl, cl = classes("range")
-    check("icount: the struct copy's field tested twice: %s" % ("folded:range-check (13.10)" if old13 else
-          "folded in both variants (14.00, 15.00)"), (dl, "folded:range-check" in cl) if old13 else (dl, cl),
-          (-5, True) if old13 else (0, []))
-    check("icount: the first of two stores is dead: removed-by:GlobalOptimize/DeadStores", classes("dead"),
-          (-1, ["removed-by:GlobalOptimize/DeadStores"]))
-    dl, cl = classes("tail")
-    check("icount: equal tails merged (twins from the merge events): merged:FgDoLateFlowOpts",
-          (dl, "merged:FgDoLateFlowOpts" in cl), (-8, True))
+    old13 = BUILD.startswith(("13.10", "13.00"))      # 13.00.9044: no /fp option either
+    if lacking("gopt"):
+        skip("icount: pass attribution (cse, alias, kill, range, dead, tail: 6 checks)", lacking("gopt"))
+    else:
+        check("icount: one load where the original reloads: removed-by:GlobalOptimize/CSE", classes("cse"),
+              (-1, ["removed-by:GlobalOptimize/CSE"]))
+        dl, cl = classes("alias")
+        check("icount: a reference used twice keeps a reload: kept:alias", (dl, cl == ["kept:alias"]), (1, True))
+        dl, cl = classes("kill")
+        check("icount: a store through a loaded pointer between two reads: kept:kill", (dl, "kept:kill" in cl), (2, True))
+        dl, cl = classes("range")
+        check("icount: the struct copy's field tested twice: %s" % ("folded:range-check (13.10)" if old13 else
+              "folded in both variants (14.00, 15.00)"), (dl, "folded:range-check" in cl) if old13 else (dl, cl),
+              (-5, True) if old13 else (0, []))
+        check("icount: the first of two stores is dead: removed-by:GlobalOptimize/DeadStores", classes("dead"),
+              (-1, ["removed-by:GlobalOptimize/DeadStores"]))
+        dl, cl = classes("tail")
+        check("icount: equal tails merged (twins from the merge events): merged:FgDoLateFlowOpts",
+              (dl, "merged:FgDoLateFlowOpts" in cl), (-8, True))
     check("icount: a statement the original has: structure", classes("stmt"), (-1, ["structure"]))
     classes("fp")
     check("icount: a float rounded through its home where the original keeps it: %s" % (
@@ -1881,7 +1956,10 @@ def rules_calls_tests():
     check("R1050: null test kept after (inline size-parameter memcpy, memset, call)", got, want[RKEY])
 
 
-rules_calls_tests()
+if lacking("rules"):
+    skip("rules_calls_tests: rule probes (tests/data/rules)", lacking("rules"))
+else:
+    rules_calls_tests()
 
 
 def rules_question_tests():
@@ -1968,7 +2046,10 @@ def rules_question_tests():
     check("R200/R450: OPMUL sort hashes [p+0]/[q+0] 4008/2008; p->c, q->b 81/59 (13.10: 7e/56)", hs, want[RKEY])
 
 
-rules_question_tests()
+if lacking("rules"):
+    skip("rules_question_tests: rule probes (tests/data/rules)", lacking("rules"))
+else:
+    rules_question_tests()
 
 
 def rules_misc_tests():
@@ -2191,7 +2272,10 @@ def rules_misc_tests():
     check("R1310: f's catch block (Tidy, rethrow) after its ret, in the same function", 0 < k_ret < k_catch, True)
 
 
-rules_misc_tests()
+if lacking("rules"):
+    skip("rules_misc_tests: rule probes (tests/data/rules)", lacking("rules"))
+else:
+    rules_misc_tests()
 
 
 def tool_portability_tests():
@@ -2288,6 +2372,10 @@ def probe_modules():
     so they use check(), rule_compile(), rule_proc(), rule_trace(), RKEY and the other helpers directly."""
     import glob
     for f in sorted(glob.glob(os.path.join(HERE, "tests", "probes", "*.py"))):
+        why = lacking("probe:" + os.path.basename(f))
+        if why:
+            skip("probes/%s" % os.path.basename(f), why)
+            continue
         exec(compile(open(f).read(), f, "exec"), dict(globals(), __file__=f))
 
 
