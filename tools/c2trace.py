@@ -1192,11 +1192,19 @@ def func_match(pat, name):
 
 def listing_proc(text, func):
     """(start, end) of the PROC..ENDP text of the function selected by `func` (any --func form) in a /FAsc listing;
-    the first match wins.  KeyError when there is none."""
+    a PROC named exactly that wins, else the first whose name contains it (a decorated name is contained in the names
+    of its local classes' members: `?normalize_inl@vec4n@?2??compute_normals@mesh@rgl@@QAEXXZ@QAEMXZ` comes before
+    `?compute_normals@mesh@rgl@@QAEXXZ` in Mount & Blade's mesh listing).  KeyError when there is none."""
     pat = anon_ns(func_pat(func) or "")
+    first = None
     for m in re.finditer(r"^(\S+)[ \t]+PROC\b", text, re.M):
-        if pat in anon_ns(m.group(1)):
+        name = anon_ns(m.group(1))
+        if name == pat:
             return m.start(), text.index("ENDP", m.end())
+        if first is None and pat in name:
+            first = m
+    if first is not None:
+        return first.start(), text.index("ENDP", first.end())
     raise KeyError("%s PROC not in the listing" % func)
 
 

@@ -5,6 +5,7 @@ usage: judge.py SRC --func DECORATED --asm-vs ORIG.s [--show] -- <cl args>      
        judge.py --listing OURS.asm --func DECORATED --asm-vs ORIG.s [--show]    judge an existing listing (/FAsc)
        judge.py export ROWS.jsonl -o JOBS.jsonl     rows {id, func, orig, asm}: decode both sides (capstone, here)
        judge.py mutants JOBS.jsonl [--ids FILE] -o MUTANTS.jsonl   single-instruction mutants of the originals
+       judge.py hints OUT.jsonl --out DIR           the pairings of a run, one <id>.json each, for another prover
        judge.py run JOBS.jsonl -o OUT.jsonl [--jobs N] [--timeout S] [--budget STEPS]
                                                     judge exported jobs, one subprocess each (standard library only:
                                                     runs on a machine without the project's environment)
@@ -265,6 +266,29 @@ def _listing_symbol(ops):
     return None
 
 
+def frame_objects(asm, func):
+    """[(name, value, size, escaped)] of our listing's frame variables (`_x$ = -12 ; size = 12` before the PROC
+    line). The value is relative to a frame base the listing does not print (entry esp, or 4 below it): pass 1
+    measures it (Side.fcands). Escaped: its address is taken (`lea` of it) in the function."""
+    import c2trace
+    text = open(asm, errors="replace").read()
+    i, j = c2trace.listing_proc(text, func)
+    head = text[:i].splitlines()[-400:]
+    decls = []
+    for ln in reversed(head):
+        m = re.match(r"([$\w?@]+\$\d*)\s*=\s*(-?\d+)\s*;\s*size\s*=\s*(\d+)", ln.strip())
+        if m:
+            decls.append((m.group(1), int(m.group(2)), int(m.group(3))))
+        elif re.search(r"\bSEGMENT\b|\bENDP\b", ln):
+            break
+    body = text[i:j]
+    out = []
+    for name, v, size in decls:
+        esc = bool(re.search(r"\blea\b[^\n]*\b%s\[" % re.escape(name), body))
+        out.append((name, v, size, esc))
+    return out
+
+
 def ours_instrs(lst):
     """[Ins] of our listing (tsweep.listing_instrs: capstone text of the code bytes, relocated fields known)."""
     if lst.decoded is None:
@@ -348,6 +372,10 @@ class Side:
         self.order = sorted(self.blocks)
         self.image = image                                 # (lo, hi) image range: constants there are addresses
         self.escaped = self._escaped(ins)
+        self.regions = None                                # [(base, size)]: the frame bytes that are memory (pass 2)
+        self.escapes = set()                               # frame offsets whose address became a value
+        self.fsyms = {}                                    # our listing's frame variable -> its value
+        self.fcands = []                                   # entry offset - value of each access: the frame base
         self.npred = collections.Counter()
         for a in self.order:
             for t in self.static_succ(a):
@@ -394,6 +422,15 @@ class Side:
             if i.mn == "mov" and re.match(r"\s*e(?!sp|bp)\w\w\s*,\s*esp\s*$", i.ops):
                 return True
         return False
+
+    def region_of(self, off):
+        """(base, size, object index) of the smallest escaped object holding frame offset off, or None (pass 2
+        only). The index is our listing's: the same object on both sides."""
+        best = None
+        for b, n, k in self.regions or ():
+            if b <= off < b + n and (best is None or (n, k) < (best[1], best[2])):
+                best = (b, n, k)
+        return best
 
     def succ(self, a):
         """The block a control transfer to address a really reaches (a block that is only `jmp X` folded)."""
@@ -472,8 +509,8 @@ def mem_alias(a1, s1, a2, s2):
         d = (c1 - c2) & M32
         d = d - (1 << 32) if d & 0x80000000 else d
         return -(s1 // 8) < d < s2 // 8
-    f1 = any(t[0] == "a" and t[1] == "fa" for t in t1)
-    f2 = any(t[0] == "a" and t[1] == "fa" for t in t2)
+    f1 = any(t[0] == "a" and t[1] in ("fa", "fobj") for t in t1)
+    f2 = any(t[0] == "a" and t[1] in ("fa", "fobj") for t in t2)
     s1_ = any(t[0] == "a" and t[1] == "sym" for t in t1) and len(t1) == 1
     s2_ = any(t[0] == "a" and t[1] == "sym" for t in t2) and len(t2) == 1
     if s1_ and s2_ and t1 != t2:
@@ -510,6 +547,11 @@ class Exec:
             else:
                 parts.append(C(_num(t) * k))
         a = add(*parts)
+        if self.side.fsyms:
+            mm = re.search(r"([$\w?@]+\$\d*)\[", ins.text)
+            off = self.frame_off(a) if mm and mm.group(1) in self.side.fsyms else None
+            if off is not None:
+                self.side.fcands.append(off - self.side.fsyms[mm.group(1)])
         if ins.sym and ins.sym[2]:                         # a relocated displacement: our symbol
             c, ts = lin(a)
             a = mk_sum(c, {**ts, ("a", "sym", ins.sym[0]): 1})
@@ -534,11 +576,31 @@ class Exec:
         return ("a", "fa", off)
 
     def frame_value(self, a):
-        """Frame addresses that escape as values become fa atoms (incoming arguments keep their offset)."""
+        """Frame addresses that escape as values become fa atoms (pass 1: one per offset, incoming arguments keep
+        their offset; pass 2: the escaped region's base atom plus the offset in it)."""
         off = self.frame_off(a)
-        if off is not None and off <= 0:
+        if off is None:
+            return a
+        if self.side.regions is not None:
+            r = self.side.region_of(off)
+            if r is not None:
+                return add(("a", "fobj", r[2]), C(off - r[0]))
+            return self.fa(off) if off <= 0 else a
+        if off <= 0:
+            self.side.escapes.add(off)
             return self.fa(off)
         return a
+
+    def frame_mem(self, off):
+        """The memory address of frame offset off if it is memory, else None (a variable of the state)."""
+        if off in self.st.pushed:
+            return None
+        if self.side.regions is not None:
+            r = self.side.region_of(off)
+            return add(("a", "fobj", r[2]), C(off - r[0])) if r is not None else None
+        if off > 0 or not self.side.escaped:
+            return None
+        return self.fa(off)
 
     def size(self, o, default=32):
         m = re.match(r"^\s*(\w+)\s+ptr\b", o)
@@ -573,15 +635,16 @@ class Exec:
 
     def load(self, a, bits):
         off = self.frame_off(a)
-        if off is not None and (off > 0 or not self.side.escaped or off in self.st.pushed):
+        fm = self.frame_mem(off) if off is not None else None
+        if off is not None and fm is None:
             if bits != 32:
                 v = self.st.slot(off & ~3) if off % 4 == 0 else None
                 if v is None:
                     raise Unknown("unaligned frame access")
                 return op("trunc", bits, v)
             return self.st.slot(off)
-        if off is not None:
-            a = self.fa(off)
+        if fm is not None:
+            a = fm
         chain = ("chain",) + tuple(t for e, t in self.st.inh + list(zip(self.st.effects, self.st.eff_atoms))
                                    if self._may_alias(e, a, bits))
         return ("ld", bits, a, ("mem", self.st.phi("mem"), chain))
@@ -598,7 +661,8 @@ class Exec:
 
     def store(self, a, v, bits):
         off = self.frame_off(a)
-        if off is not None and (off > 0 or not self.side.escaped or off in self.st.pushed):
+        fm = self.frame_mem(off) if off is not None else None
+        if off is not None and fm is None:
             if bits != 32:
                 if off % 4:
                     raise Unknown("unaligned frame store")
@@ -606,8 +670,8 @@ class Exec:
             else:
                 self.st.slots[off] = v
             return
-        if off is not None:
-            a = self.fa(off)
+        if fm is not None:
+            a = fm
         self.effect(("st", a, v, bits))
 
     def val(self, o, ins, bits=None):
@@ -825,8 +889,26 @@ class Exec:
             tgt = self.val(ops[0], i)
             name = i.sym[0] if i.sym else None
         conv, pop = convention(name, len(st.pushes), indirect=tgt[0] != "a")
+        own = False
+        if tgt[0] != "a" and name is None:                 # an indirect call: virtual (thiscall) only through a
+            c_, ts_ = lin(tgt[2]) if tgt[0] == "ld" else (0, {})   # vtable, `call [[obj] + k]`; else a function
+            virtual = len(ts_) == 1 and next(iter(ts_))[0] == "ld"     # pointer: cdecl when the caller cleans up
+            nxt = getattr(self, "next_ins", None)
+            if not virtual:
+                cdecl = nxt is not None and nxt.mn == "add" and re.match(r"\s*esp\s*,", nxt.ops)
+                conv, pop = ("cdecl", 0) if cdecl else ("stdcall", 4 * len(st.pushes))
+                own = True                                 # each side reads its own cleanup
         k = len(st.calls)
-        if self.cleanups is not None:                      # the original's side: the paired call's cleanup
+        if (name or "").lstrip("_") in ("chkstk", "alloca_probe", "alloca_probe_16") or (
+                self.cleanups is not None and k < len(self.cleanups) and self.cleanups[k][0] == "chkstk"):
+            size = self.reg("eax")                         # the stack probe: esp -= eax, nothing else observable
+            if not is_c(size):
+                raise Unknown("a stack probe of a non-constant size")
+            st.depth += size[1]
+            st.calls.append(("chkstk", 0))
+            st.regs["eax"] = ("a", "clob", (self.side.name, st.blk, len(st.effects), "chk"))
+            return
+        if self.cleanups is not None and not own:          # the original's side: the paired call's cleanup
             if k >= len(self.cleanups):
                 pop = 4 * len(st.pushes) if tgt[0] != "a" else 0
             else:
@@ -1023,7 +1105,8 @@ class Exec:
         self.st.absorbed = []
         while True:
             term = None
-            for i in insns:
+            for q, i in enumerate(insns):
+                self.next_ins = insns[q + 1] if q + 1 < len(insns) else None
                 if is_jcc(i.mn):
                     term = ("jcc", self.cond(i.mn[1:]), target(i), self.side.next_addr(blk))
                     break
@@ -1036,7 +1119,10 @@ class Exec:
             if term is None:
                 nxt = self.side.next_addr(blk)
                 if nxt is None:
-                    raise Unknown("falls off the end of the function")
+                    if insns and insns[-1].mn == "call":
+                        return ("noret", 0)                # a call that does not return (a throw, exit)
+                    raise Unknown("falls off the end of the function (%s's disassembly ends without ret/jmp: "
+                                  "truncated?)" % ("our listing" if self.side.name == "o" else "the original"))
                 term = ("jmp", nxt)
             if term[0] == "jmp":
                 t = self.side.succ(term[1])
@@ -1160,9 +1246,9 @@ class Pairing:
             return False
         if a[1] != b[1] and not (a[1] in ("phi", "init") and b[1] in ("phi", "init")):
             return False
-        if a[1] == "init" or b[1] == "init":
+        if a[1] in ("init", "fobj") or b[1] in ("init", "fobj"):
             if a != b:
-                return False                               # entry values are fixed by the calling convention
+                return False                               # entry values (the convention), our frame object k
         if a[1] in ("ret", "ret2", "clob", "fret", "strend") and False:
             return False
         self.fw[a], self.bw[b] = b, a
@@ -1343,13 +1429,70 @@ class Verdict(Exception):
     pass
 
 
-def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, known=None):
-    """Judge two instruction lists ([Ins]). Returns {verdict, reason, blocks, symbols}."""
+def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, known=None, frame=None,
+          frame_objects=False):
+    """Judge two instruction lists ([Ins]). With `frame` (frame_objects of our listing) and a local whose address
+    escapes: pass 1 treats every local as memory (and pairs the escaped addresses), pass 2 only the escaped objects'
+    bytes (ours from the listing; the original's: the paired address, our object's size). Pass 1's EQUIVALENT
+    stands; otherwise pass 2's verdict."""
+    if not frame_objects:                                  # pass 2 is off by default: it used our object's size
+        frame = None                                       # for the original's (docs/c2/judge.md section 4)
+    fsyms = {name: v for name, v, n, esc in frame or ()}
+    r1 = _judge(ours, orig, func, image, show_pairs, budget, known, collect=True, fsyms=fsyms)
+    keys = ("_fa", "_escaped", "_orig_escapes", "_our_escapes", "_F")
+    if r1["verdict"] == "EQUIVALENT" or not frame or not r1.get("_escaped") or r1.get("_F") is None:
+        for k in keys:
+            r1.pop(k, None)
+        return r1
+    F = r1["_F"]
+    objs = [(v + F, n, k) for k, (name, v, n, esc) in enumerate(frame) if esc]
+    pairs_fa = r1["_fa"]                                  # our escaped offset -> the original's
+    ours_regions = objs
+    orig_regions = []
+    for o, n, k in objs:
+        if o > 0:                                          # an incoming argument: the convention fixes it
+            orig_regions.append((o, n, k))
+            continue
+        e = next((e for e in sorted(pairs_fa) if o <= e < o + n), None)   # any paired address inside it
+        if e is not None:
+            orig_regions.append((pairs_fa[e] - (e - o), n, k))
+    inside = lambda e, rs: any(b <= e < b + n for b, n, _ in rs)
+    used = {k for o, n, k in objs if any(o <= e < o + n for e in r1["_our_escapes"])}
+    if any(not inside(e, orig_regions) for e in r1["_orig_escapes"]) or \
+            any(not inside(e, ours_regions) for e in r1["_our_escapes"]) or \
+            not used <= {k for _, _, k in orig_regions}:
+        r1["reason"] += " (pass 2 not run: escaped frame objects that do not pair)"
+        for k in keys:
+            r1.pop(k, None)
+        return r1
+    r2 = _judge(ours, orig, func, image, show_pairs, budget, known, regions=(ours_regions, orig_regions))
+    for k in keys:
+        r2.pop(k, None)
+    r2["hints"] = r2.get("hints") or r1.get("hints")
+    r2["frame"] = "objects"
+    return r2
+
+
+def _merge(regions):
+    out = []
+    for b, n in sorted(regions):
+        if out and b <= out[-1][0] + out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][0] + out[-1][1], b + n) - out[-1][0])
+        else:
+            out.append((b, n))
+    return out
+
+
+def _judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, known=None, regions=None,
+           collect=False, fsyms=None):
     try:
         A = Side("o", ours)
         B = Side("r", orig, image=image)
     except Unknown as e:
         return dict(verdict="UNKNOWN", reason=str(e))
+    if regions is not None:
+        A.regions, B.regions = regions
+    A.fsyms = dict(fsyms or {})
     P = Pairing(budget)
     P.known = dict(known or {})
     ret = returns(func)
@@ -1365,16 +1508,36 @@ def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, k
         pe = ends[(side.name, pred)] if pred is not None else None
         return State(side, blk, pe.depth if pe else 0, pred is None, node=node)
 
+    first = []                                             # collect mode: the first mismatch, the walk goes on
+
+    def fail(msg):
+        if not collect:
+            raise Verdict(("MISMATCH", msg))
+        if not first:
+            first.append(msg)
+
     def compare_effects(a, b, sa, sb):
         ia, ib = canon_effects(sa.effects), canon_effects(sb.effects)
         if len(ia) != len(ib):
+            if collect:                                    # still pair what lines up (the escaped addresses),
+                import difflib                             # aligned by kind: calls with calls
+                ka = [sa.effects[k][0] for k in ia]
+                kb = [sb.effects[k][0] for k in ib]
+                for blk_ in difflib.SequenceMatcher(None, ka, kb, autojunk=False).get_matching_blocks():
+                    for q in range(blk_.size):
+                        m = P.mark()
+                        if not eq(sa.effects[ia[blk_.a + q]], sb.effects[ib[blk_.b + q]], P):
+                            P.undo(m)
             raise Verdict(("MISMATCH", "block %#x / %#x: %d effects against %d: ours %s; original %s" % (
                 a, b, len(ia), len(ib), "; ".join(show(sa.effects[k]) for k in ia[:6]),
                 "; ".join(show(sb.effects[k]) for k in ib[:6]))))
         for kx, ky in zip(ia, ib):
             x, y = sa.effects[kx], sb.effects[ky]
+            m = P.mark()
             if not eq(x, y, P) or not P.bind(sa.eff_atoms[kx], sb.eff_atoms[ky]):
-                raise Verdict(("MISMATCH", "block %#x / %#x: ours %s; original %s" % (a, b, show(x), show(y))))
+                P.undo(m)
+                P.bind(sa.eff_atoms[kx], sb.eff_atoms[ky])
+                fail("block %#x / %#x: ours %s; original %s" % (a, b, show(x), show(y)))
 
     pairs = nodes
     try:
@@ -1414,6 +1577,8 @@ def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, k
                 raise Verdict(("UNKNOWN", "block %#x ends in %s, the original's %#x in %s" % (a, ta[0], b, tb[0])))
             if node[0] != "path":
                 pass
+            if ta[0] == "noret":
+                continue
             if ta[0] == "ret":
                 if sa.depth != 0 or sb.depth != 0:
                     raise Verdict(("UNKNOWN", "stack depth at ret %d / %d" % (sa.depth, sb.depth)))
@@ -1449,8 +1614,9 @@ def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, k
                 if eq(ca, negate(cb), P):
                     nxt = [(sa_t, sb_f), (sa_f, sb_t)]
                 else:
-                    raise Verdict(("MISMATCH", "block %#x / %#x branch: ours %s; original %s" % (
-                        a, b, show(ca), show(cb))))
+                    P.undo(m)
+                    fail("block %#x / %#x branch: ours %s; original %s" % (a, b, show(ca), show(cb)))
+                    nxt = [(sa_t, sb_t), (sa_f, sb_f)]
             for x, y in nxt:
                 work.append((x, y, node, node))
         # every edge into a product node: the node's entry pairings hold on it (induction over the paths)
@@ -1499,6 +1665,8 @@ def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, k
                     if not eq(va, vb, P):
                         raise Verdict(("MISMATCH", "entering %#x / %#x: our %s is %s; the original's %s is %s" % (
                             node + (name_of(key_a), show(va), name_of(key_b), show(vb)))))
+        if first:
+            raise Verdict(("MISMATCH", first[0]))
         res = dict(verdict="EQUIVALENT", reason="%d paths and loop heads paired" % len(pairs), blocks=len(pairs))
     except Verdict as v:
         res = dict(verdict=v.args[0][0], reason=v.args[0][1], blocks=len(pairs))
@@ -1506,9 +1674,57 @@ def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, k
         res = dict(verdict="UNKNOWN", reason=str(e), blocks=len(pairs))
     except RecursionError:
         res = dict(verdict="UNKNOWN", reason="expression too deep", blocks=len(pairs))
+    if first and res["verdict"] != "MISMATCH":             # collect mode: the first mismatch is the verdict
+        res = dict(verdict="MISMATCH", reason=first[0], blocks=len(pairs))
     res["symbols"] = {a: "%#x" % b for a, b in P.symoff.items() if b is not None} if show_pairs else len(P.symoff)
     res["unanchored"] = sum(1 for a in P.symoff if a not in P.known)   # pairings assumed, not from the project's map
+    res["_escaped"] = A.escaped or B.escaped
+    res["_fa"] = {x[2]: y[2] for x, y in P.fw.items() if x[1] == "fa"}
+    res["_orig_escapes"] = sorted(B.escapes)
+    res["_our_escapes"] = sorted(A.escapes)
+    res["_F"] = min(A.fcands) if A.fcands else None
+    res["hints"] = hints(P, B)
     return res
+
+
+def _hname(key):
+    """A pairing key as a hint name: a register, or `esp+0x18` / `esp-0x1c` (offset from esp at entry)."""
+    if isinstance(key, tuple) and key[0] == "s":
+        return "esp%s%#x" % ("+" if key[1] >= 0 else "-", abs(key[1]))
+    return str(key)
+
+
+def hints(P, B):
+    """What the judge paired, for another prover: per loop head, our register / stack slot holding the same value as
+    the original's (`at`); the pairings that hold at every loop head (`regs`, `slots`); escaped stack addresses;
+    our symbols with the original's addresses (`globals`), those no project map anchored listed in `assumed`."""
+    at = collections.defaultdict(lambda: dict(regs={}, slots={}))
+    for x, y in P.fw.items():
+        if x[1] != "phi" or y[1] != "phi" or not isinstance(x[2][1], tuple) or x[2][1][0] == "path":
+            continue
+        node, kx, ky = x[2][1], x[2][2], y[2][2]
+        if kx == "mem" or (isinstance(kx, tuple) and kx[0] == "st"):
+            continue
+        kind = "slots" if isinstance(kx, tuple) else "regs"
+        at["%#x" % B.blocks[node[1]][0].addr if node[1] in B.blocks else str(node)][kind]["ours:" + _hname(kx)] = \
+            "orig:" + _hname(ky)
+    flat = dict(regs={}, slots={})
+    clash = set()
+    for m in at.values():
+        for kind in ("regs", "slots"):
+            for a, b in m[kind].items():
+                if flat[kind].get(a, b) != b:
+                    clash.add((kind, a))
+                flat[kind][a] = b
+    for kind, a in clash:
+        flat[kind].pop(a, None)
+    for x, y in P.fw.items():                              # escaped stack addresses
+        if x[1] == "fa" and y[1] == "fa":
+            flat["slots"].setdefault("ours:" + _hname(("s", x[2])), "orig:" + _hname(("s", y[2])))
+    glob = {"ours:" + a: "orig:%#x" % b for a, b in P.symoff.items() if b is not None}
+    return dict(regs=flat["regs"], slots=flat["slots"], globals=glob,
+                assumed=sorted("ours:" + a for a in P.symoff if a not in P.known),
+                at={k: v for k, v in sorted(at.items())})
 
 
 def end_value(st, key):
@@ -1529,7 +1745,7 @@ def name_of(key):
 
 # --------------------------------------------------------------------------------------------------------- CLI
 
-def judge_files(asm, func, orig_s, show_pairs=False):
+def judge_files(asm, func, orig_s, show_pairs=False, frame_objects=False):
     import tsweep
     lst = tsweep.listing_instrs(asm, func)
     org = tsweep.orig_instrs(orig_s)
@@ -1537,9 +1753,10 @@ def judge_files(asm, func, orig_s, show_pairs=False):
         ours = ours_instrs(lst)
     except Unknown as e:
         return dict(verdict="UNKNOWN", reason=str(e))
-    image = tsweep._addr_range(org.va0)
+    lo, hi = tsweep._addr_range(org.va0)
     org_ins = orig_instrs(_trim_orig(org))
-    return judge(ours, org_ins, func, image=image, show_pairs=show_pairs)
+    return judge(ours, org_ins, func, image=(lo, max(hi, lo + 0x10000000)), show_pairs=show_pairs,
+                 frame=globals()["frame_objects"](asm, func), frame_objects=frame_objects)
 
 
 def _trim_orig(org):
@@ -1580,7 +1797,8 @@ def export_row(r, symbols=None):
         org = tsweep.orig_instrs(r["orig"])
         lo, hi = tsweep._addr_range(org.va0)
         job["image"] = [lo, max(hi, lo + 0x10000000)]      # .bss can lie far above the code (Mount & Blade 0x8ee....)
-        job["ours"] = [[i.addr, i.mn, i.ops, list(i.sym) if i.sym else None] for i in ours_instrs(lst)]
+        job["ours"] = [[i.addr, i.mn, i.ops, list(i.sym) if i.sym else None, i.text] for i in ours_instrs(lst)]
+        job["frame"] = frame_objects(r["asm"], r["func"])
         job["orig"] = [[i.addr, i.mn, i.ops] for i in orig_instrs(org)]
         if symbols:                                        # the project's addresses of the names our code uses
             names = {x[3][0] for x in job["ours"] if x[3]}
@@ -1592,13 +1810,15 @@ def export_row(r, symbols=None):
     return job
 
 
-def judge_job(job, budget=2000000):
+def judge_job(job, budget=2000000, frame_objects=False):
     if "verdict" in job:
         return dict(id=job["id"], verdict=job["verdict"], reason=job["reason"])
-    ours = [Ins(a, mn, ops, sym=tuple(sym) if sym else None, text="%s %s" % (mn, ops)) for a, mn, ops, sym in job["ours"]]
+    ours = [Ins(x[0], x[1], x[2], sym=tuple(x[3]) if x[3] else None, text=x[4] if len(x) > 4 else "%s %s" % (x[1], x[2]))
+            for x in job["ours"]]
     orig = [Ins(a, mn, ops, text="%s %s" % (mn, ops)) for a, mn, ops in job["orig"]]
     sys.setrecursionlimit(20000)
-    res = judge(ours, orig, job["func"], image=tuple(job["image"]), budget=budget, known=job.get("known"))
+    res = judge(ours, orig, job["func"], image=tuple(job["image"]), budget=budget, known=job.get("known"),
+                frame=job.get("frame"), frame_objects=frame_objects or job.get("frame_objects", False))
     res["id"] = job["id"]
     return res
 
@@ -1704,14 +1924,23 @@ def main(argv):
         ap.add_argument("rows")
         ap.add_argument("-o", required=True)
         ap.add_argument("--symbols", action="append", default=[],
-                        help="a project's symbol file or directory (`VA name` lines): anchors the pairing of our "
-                             "symbols with the original's addresses")
+                        help="PROJECT=PATH: a project's symbol file or directory (`VA name` lines), for the rows of "
+                             "that project (id prefix `PROJECT_` or the row's `game`): anchors the pairing of our "
+                             "symbols with the original's addresses. A bare PATH applies to every row")
         a = ap.parse_args(argv[1:])
-        syms = load_symbols(a.symbols) if a.symbols else None
+        maps = collections.defaultdict(list)
+        for x in a.symbols:
+            proj, _, path = x.rpartition("=") if "=" in x and not os.path.exists(x) else ("", "", x)
+            maps[proj].append(path)
+        syms = {proj: load_symbols(paths) for proj, paths in maps.items()}
         with open(a.o, "w") as f:
             for l in open(a.rows):
-                if l.strip():
-                    f.write(json.dumps(export_row(json.loads(l), syms)) + "\n")
+                if not l.strip():
+                    continue
+                r = json.loads(l)
+                proj = r.get("game") or r["id"].split("_")[0]
+                m = dict(syms.get("", {}), **syms.get(proj, {}))      # one project's map never anchors another's
+                f.write(json.dumps(export_row(r, m or None)) + "\n")
         return 0
     if argv and argv[0] == "run":
         ap = argparse.ArgumentParser(prog="judge.py run")
@@ -1722,6 +1951,24 @@ def main(argv):
         ap.add_argument("--budget", type=int, default=2000000)
         a = ap.parse_args(argv[1:])
         run_jobs(a.jobs_file, a.o, a.jobs, a.timeout, a.budget)
+        return 0
+    if argv and argv[0] == "hints":
+        ap = argparse.ArgumentParser(prog="judge.py hints")
+        ap.add_argument("results", help="judge.py run output (each line carries `hints`)")
+        ap.add_argument("--out", required=True, help="directory: one <va>.json per row")
+        ap.add_argument("--project", help="only rows of this project (id prefix PROJECT_)")
+        a = ap.parse_args(argv[1:])
+        os.makedirs(a.out, exist_ok=True)
+        n = 0
+        for l in open(a.results):
+            r = json.loads(l)
+            proj, _, hexva = r["id"].partition("_")
+            if not r.get("hints") or (a.project and proj != a.project):
+                continue
+            h = dict(va="0x" + (hexva.lstrip("0") or "0"), verdict=r["verdict"], **r["hints"])
+            json.dump(h, open(os.path.join(a.out, "%s.json" % (hexva or r["id"])), "w"), indent=1)
+            n += 1
+        print(n, "hint files in", a.out)
         return 0
     if argv and argv[0] == "one":
         budget = int(argv[2]) if len(argv) > 2 and argv[1] == "--budget" else 2000000
@@ -1737,6 +1984,8 @@ def main(argv):
     ap.add_argument("--asm-vs", required=True)
     ap.add_argument("--listing")
     ap.add_argument("--show", action="store_true")
+    ap.add_argument("--frame-objects", action="store_true",
+                    help="experimental pass 2: only escaped listing objects' bytes are memory (not sound: section 4)")
     a = ap.parse_args(argv)
     if a.listing:
         asm = a.listing
@@ -1744,7 +1993,7 @@ def main(argv):
         import tsweep
         asm = compile_listing(a.src, a.func, cl, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                                                               "work", "judge", tsweep.out_name(a.src, a.func)))
-    res = judge_files(asm, a.func, a.asm_vs, show_pairs=a.show)
+    res = judge_files(asm, a.func, a.asm_vs, show_pairs=a.show, frame_objects=a.frame_objects)
     print("%s: %s%s" % (res["verdict"], res["reason"], "; %d symbol pairings assumed (no project map entry: --show)"
                                                        % res["unanchored"] if res.get("unanchored") else ""))
     if a.show and isinstance(res.get("symbols"), dict):

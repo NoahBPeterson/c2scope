@@ -898,11 +898,12 @@ def judge_tests():
     def ins(lines, base):           # `call ?name`: our side's callee by name (the listing's), as a relocation
         out = []
         for k, l in enumerate(lines):
+            l, _, text = l.partition(" ;; ")           # `capstone ;; listing text` (a frame variable's name)
             mn, _, ops = l.partition(" ")
             sym = None
             if mn == "call" and ops.startswith("?"):
                 sym, ops = (ops.strip(), False, False), hex(base + 4 * k + 5)
-            out.append(J.Ins(base + 4 * k, mn, ops.strip(), sym=sym, text=l))
+            out.append(J.Ins(base + 4 * k, mn, ops.strip(), sym=sym, text=text or l))
         return out
 
     def addr(lines, base):          # jump targets written as L<k>: the k-th instruction
@@ -941,6 +942,10 @@ def judge_tests():
     loop2 = ["mov edx, dword ptr [esp + 4]", "xor eax, eax", "mov ecx, dword ptr [edx]", "add eax, ecx",
              "add edx, 4", "cmp edx, dword ptr [esp + 8]", "jb L2", "ret"]
     check("judge: a loop in other registers, the load folded or not: EQUIVALENT", vj(loop, loop2), "EQUIVALENT")
+    hl = J.judge(ins(addr(loop, 0), 0), ins(addr(loop2, 0x401000), 0x401000), "?f@@YAHPAH@Z",
+                 image=(0x400000, 0x4000000))["hints"]
+    check("judge hints: at the loop head our ecx is the original's edx, eax is eax",
+          (hl["regs"].get("ours:ecx"), hl["regs"].get("ours:eax"), list(hl["at"])), ("orig:edx", "orig:eax", ["0x401008"]))
     check("judge: the loop stepping 8 instead of 4: MISMATCH",
           vj(loop, [x.replace("edx, 4", "edx, 8") for x in loop2]), "MISMATCH")
     check("judge: a call's arguments and its result",
@@ -967,6 +972,18 @@ def judge_tests():
           "project's symbol map anchors it",
           (vk(two, two_r, {}), vk(two, two_r, {"?a@@YAXXZ": 0x478f30, "?b@@YAXXZ": 0x478f80})),
           ("EQUIVALENT", "MISMATCH"))
+    keep = ["push esi", "mov esi, ecx", "sub esp, 4", "lea eax, [esp] ;; lea eax, _v$[esp+8]", "push eax",
+            "call ?g@@YAXPAH@Z", "add esp, 4", "mov eax, esi", "add esp, 4", "pop esi", "ret"]
+    spill = ["sub esp, 8", "mov dword ptr [esp + 4], ecx", "lea eax, [esp]", "push eax", "call 0x478f30",
+             "add esp, 4", "mov eax, dword ptr [esp + 4]", "add esp, 8", "ret"]
+    def vf(a, b, frame):
+        return J.judge(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), "?f@@YAHXZ",
+                       image=(0x400000, 0x4000000), frame=frame, frame_objects=True)["verdict"]
+    check("judge (--frame-objects, experimental): a local's address escapes and the original spills a value we keep "
+          "in a register: MISMATCH with every local as memory, EQUIVALENT with the listing's frame objects",
+          (vf(keep, spill, None), vf(keep, spill, [("_v$", -8, 4, True)]),
+           vf(keep, [x.replace("ecx", "edx") if "esp + 4], ecx" in x else x for x in spill], [("_v$", -8, 4, True)])),
+          ("MISMATCH", "EQUIVALENT", "MISMATCH"))
     job = dict(id="t", func="?f@@YAHPAH@Z", image=[0x400000, 0x4000000],
                ours=[[i.addr, i.mn, i.ops, None] for i in ins(addr(loop, 0), 0)],
                orig=[[i.addr, i.mn, i.ops] for i in ins(addr(loop2, 0x401000), 0x401000)])
