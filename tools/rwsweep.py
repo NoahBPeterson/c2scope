@@ -4,6 +4,9 @@
 usage: rwsweep.py <tu.cpp> --func DECORATED [--asm-vs ORIG.s] [--want 'A>B'] [--pass K] [--families a,b,...] [--vars v,w]
                   [--jobs 8] [--max-combo 2] [--verify 8] [--limit N] [--list] [-- <cl args>]
 
+Every compile of a run reads a snapshot of the unit's headers taken at its start (tools/incsnap.py), so the tree may
+be edited while it runs.
+
 helpersweep covers one rule (reference bindings in inline helpers of EH functions). This tool is the general
 form: it does not know which rewrite will work, it enumerates every site of several rewrite families in the
 target's own body, compiles each variant once with the regs trace, and sorts them by what they did.
@@ -1531,6 +1534,15 @@ def main():
     hdr = os.path.dirname(os.path.abspath(a.tu))
     text = re.sub(r'#include "([^"/][^"]*)"', lambda m: '#include "%s"' % os.path.join(hdr, m.group(1))
                   if os.path.exists(os.path.join(hdr, m.group(1))) else m.group(0), text)
+    # every variant compiles against the headers as they are now: the unit's include closure is copied to a temp
+    # folder and the unit's includes and the /I dirs point there (an edit of the tree during a run broke every
+    # later variant: Mount & Blade, stream.h during a 22-minute run)
+    snap = None
+    if not a.list:
+        import atexit, incsnap, tempfile
+        snap = incsnap.Snapshot(a.tu, cl, tempfile.mkdtemp(prefix="rwsweep_inc_"), text=text)
+        atexit.register(shutil.rmtree, snap.dest, True)
+        text, cl = snap.text(text), snap.cl
     a.func = c2trace.func_decl(a.func)         # Class::method or method@Class -> ?method@Class@ (any namespace)
     # a full decorated `?method@Class@@..` given by hand: one @ fewer also selects a class inside a namespace
     tfunc = a.func[:-1] if re.fullmatch(r"\?\w+@\w+@@", a.func) else a.func
@@ -1561,6 +1573,7 @@ def main():
         for i, v in enumerate(variants):
             print("  v%04d %-6s %s" % (i, v[0], v[1]))
         return
+    print("include snapshot: %s" % snap.summary(), flush=True)
     if ncolsim.is_x64():               # cl 17.00 x64: NColor, predicted with ncolsim (docs/c2/ncolor.md 10)
         return main_x64(a, cl, text, raw, variants, tfunc, nthis)
     # the source's directory enters the name (as in tsweep): two agents' v3.cpp must not share, and rmtree, one directory

@@ -25,6 +25,9 @@ usage: ncolsim.py prio   EXPORT.json [EXPORT.json ..]      the priority formula 
                                                            lifetimes from the IL before NColSubsumption (IL_SUB);
                                                            ilmodel-fit / ilfull-fit: neither, as the functions'
                                                            defaults)
+       --walk K1,K2 (replay, sim, ilfull, ..)               the order walk's rules (default WALK_READ: extra, cut,
+                                                           extend, r15b, strict, used, cover, bound, pwlink; '' the
+                                                           earlier walk; docs/c2/ncolor.md 4.8)
        ncolsim.py whatif EXPORT.json --func F EDIT [EDIT..] the registers after an edit, against the unedited run:
                                                            +app:VAR:B[:N] / -app:VAR:B[:N] (N more / fewer
                                                            appearances of VAR in block B), prio:VAR=P,
@@ -180,7 +183,8 @@ def free_since(av, lo):
 ANTI = {0: ("r12",), 1: ("rbp", "r13"), 2: ("r12", "rbp", "r13")}   # TLS+0x119c8 / cc / d0
 
 
-def order_walk(av, ranges, recent=RECENT, prefwin=None, own=None, tied=None, avoid=(), use=None, order=None):
+def order_walk(av, ranges, recent=RECENT, prefwin=None, own=None, tied=None, avoid=(), use=None, order=None,
+               strict=None, cover=None):
     """NColDeterminePhysregAvail's order loop (docs/c2/ncolor.md 4.3) over registers that cover every range:
     a register (not the candidate's tied one) inside another lifetime's preference window overlapping the first
     range is fallback A (callee-saved) or B (scratch, first only); a callee-saved register returns fallback C if
@@ -197,10 +201,11 @@ def order_walk(av, ranges, recent=RECENT, prefwin=None, own=None, tied=None, avo
             continue
         if use is not None and r not in use:
             continue
-        if not covers(av[n], ranges):
+        if not (cover(r) if cover is not None else covers(av[n], ranges)):
             continue
         if prefwin is not None and n != tied and any(
-                (b < hi and lo < e if STRICT else b <= hi and lo <= e) and (b, e) != own for b, e in prefwin.get(n, [])):
+                (b < hi and lo < e if (STRICT if strict is None else strict) else b <= hi and lo <= e) and (b, e) != own
+                for b, e in prefwin.get(n, [])):
             if r in SAVED:
                 fa = fa or r
             else:
@@ -214,6 +219,651 @@ def order_walk(av, ranges, recent=RECENT, prefwin=None, own=None, tied=None, avo
         if gap is not None and gap > fcgap:
             fc, fcgap = r, gap
     return fc or fb or fa
+
+
+import re as _re
+_PHYS_TOK = _re.compile(r"(?<![\w$])([a-z][a-z0-9]*)(?==)")
+
+
+def _phys_in(texts):
+    """The master registers named as physical registers (`ecx=t5`, `cl=t641`) in some leaf texts."""
+    out = set()
+    for x in texts:
+        for m in _PHYS_TOK.findall(x):
+            g = ALIAS.get(m)
+            if g:
+                out.add(g)
+    return out
+
+
+def _first_overlap(av, lo, hi):
+    """NColFindFirstOverlappingAvailRegion 0x100c9120: the index of the first available interval overlapping
+    [lo, hi], or None."""
+    return next((i for i, (b, e) in enumerate(av) if e >= lo and b <= hi), None)
+
+
+def il_tupmap(f):
+    """{tup#: tuple} of the record's IL (cached on the record), or None without one."""
+    if "_tmap" not in f:
+        f["_tmap"] = {t["n"]: t for t in il_parse(f["il"])} if f.get("il") else None
+    return f["_tmap"]
+
+
+def extra_avail(tmap, c, av, use=None):
+    """NColIdentifyExtraPhysAvail 0x100c8c80 [C]: for every use of the candidate that is a copy (NColMdIsCopyInstr's
+    opcodes) `mov P <- cand` whose first source is the candidate's own leaf (its SYM, not a view) and whose first
+    destination is a temporary (SYM kind 3) tied to a physical register P: when P's available interval ends at that
+    tuple t, the next one begins at a tuple u of the same block that reads P (FindSrcRegInterf) and does not write it,
+    and no tuple strictly between defines the candidate or P, the two intervals are joined over [t, u] (NColCanMakeAvail
+    / NColAddToAvails: P holds the candidate's value there). -> [(master, t, u)] in use order (the f6dc list: the
+    first region's preference list gets these registers at its head, PCR 0x10068b2b) and av updated in place."""
+    sym = c.get("sym")
+    if tmap is None or sym is None:
+        return []
+    out = []
+    for n in sorted(set(c.get("apps") or [])):
+        t = tmap.get(n)
+        if t is None or not _copy_op(t) or t["srck"][:1] != [1] or t["dstk"][:1] != [1]:
+            continue
+        ls = t.get("leafsym") or []
+        nd = len(t["dst"])
+        s0 = ls[nd] if len(ls) > nd else None
+        d0 = ls[0] if ls else None
+        if not s0 or s0[0] != sym or not d0 or len(d0) < 4 or (d0[3] & 0xff) != 3:
+            continue
+        lw = t["leafwords"][0] if t["leafwords"] else []
+        if len(lw) < 11 or not lw[10]:
+            continue
+        _cn, ph = _regleaf(t["dst"][0])
+        P = ALIAS.get(ph) if ph else None
+        if P not in NUM or NUM[P] not in av:
+            continue
+        lst = av[NUM[P]]
+        i = _first_overlap(lst, n, n)
+        if i is None or lst[i][1] != n or i + 1 >= len(lst):
+            continue
+        u = lst[i + 1][0]
+        tu = tmap.get(u)
+        if tu is None or tu["kind"] != "I" or tu["op"] == "op577":
+            continue
+        if _blk_of(tmap, n) != _blk_of(tmap, u):
+            continue
+        if P not in _phys_in(tu["src"]) or P in _phys_in(tu["dst"]):
+            continue
+        bad = False
+        for k in range(n + 1, u):
+            y = tmap.get(k)
+            if y is None or y["kind"] != "I":
+                continue
+            if sym in (y.get("dstr") or []) or P in _phys_in(y["dst"]):
+                bad = True
+                break
+        if bad:
+            continue
+        lst = list(lst)
+        lst[i:i + 2] = [(lst[i][0], lst[i + 1][1])]
+        av[NUM[P]] = lst
+        out.append((P, n, u))
+    return out
+
+
+def _blk_of(tmap, n):
+    """The block number of a tuple (B tuples counted in order; cached on the map)."""
+    bm = tmap.get("_blk")
+    if bm is None:
+        bm, b = {}, -1
+        for k in sorted(x for x in tmap if isinstance(x, int)):
+            if tmap[k]["kind"] == "B":
+                b += 1
+            bm[k] = b
+        tmap["_blk"] = bm
+    return bm.get(n)
+
+
+def restore_extra(av, extra):
+    """NColRestoreExtraPhysAvail 0x10069f20 [C]: each joined window [t, u] is taken out again from what is left of
+    its register: the first interval overlapping [t, u] is cut to end at t / begin at u, or split in two."""
+    for P, t, u in extra:
+        lst = list(av[NUM[P]])
+        i = _first_overlap(lst, t, u)
+        if i is None:
+            continue
+        b, e = lst[i]
+        if b > t:
+            lst[i] = (u, e)
+        elif e < u:
+            lst[i] = (b, t)
+        else:
+            lst[i:i + 1] = [(b, t), (u, e)]
+        av[NUM[P]] = lst
+
+
+def _touches(t, sym, side):
+    """The tuple has a REG leaf (kind 1 / 2) of the candidate (its root SYM: the whole or a view) among its sources
+    ('s') or destinations ('d')."""
+    ks, rs = (t["srck"], t.get("srcr") or []) if side == "s" else (t["dstk"], t.get("dstr") or [])
+    return any(k in (1, 2) and i < len(rs) and rs[i] == sym for i, k in enumerate(ks))
+
+
+def _tkind(t):
+    w = t.get("words") or []
+    return w[3] & 0xff if len(w) > 3 else None
+
+
+def _is_instr(t):
+    """Tuple +0xd bit 0 (an instruction): the I tuples of the dump (op577 too)."""
+    return t is not None and t["kind"] == "I"
+
+
+def cut_exact(av, ranges, tmap, sym):
+    """NColUpdatePhysregAvail 0x1006b120 [C]: every range [B, E] of the region is taken out of the register's list;
+    the piece before keeps B only when the tuple at B is an instruction that defines the candidate without reading it
+    and is no branch (NColIsNoLoadDef; tuple kinds 0x11 / 0x13 excluded; not a load point of the region), else it ends
+    at B - 1; the piece after keeps E unless the tuple at E is no instruction, a branch / switch, or defines the
+    candidate (then it begins at E + 1), or the region's next range begins at E + 1 on a block's first tuple."""
+    rg = sorted(tuple(r) for r in ranges)
+    out = list(av)
+    for k, (lo, hi) in enumerate(rg):
+        tb, te = tmap.get(lo), tmap.get(hi)
+        keep_lo = _is_instr(tb) and _tkind(tb) not in (0x11, 0x13) and not _touches(tb, sym, "s")
+        keep_hi = _is_instr(te) and _tkind(te) not in (0x11, 0x13) and not _touches(te, sym, "d")
+        if keep_hi and k + 1 < len(rg) and rg[k + 1][0] <= hi + 1:
+            nb = tmap.get(hi + 1)
+            if nb is not None and nb["kind"] == "B":
+                keep_hi = False
+        nxt = []
+        for b, e in out:
+            if hi < b or e < lo:
+                nxt.append((b, e))
+                continue
+            if b < lo:
+                nxt.append((b, lo if keep_lo else lo - 1))
+            if hi < e:
+                nxt.append((hi if keep_hi else hi + 1, e))
+        out = nxt
+    return out
+
+
+def fold_info(f):
+    """{T root: (uses, sources)} of the folds NColProcessCandidate makes while allocating (il_proc_folds; the record's
+    `fold_made` when il_model_state applied them in processing order), or {} without an IL."""
+    if "fold_made" in f:
+        return f["fold_made"]
+    if "_folds" not in f:
+        out = {}
+        if f.get("il"):
+            try:
+                for T, _d, uses, srcs, _k in il_proc_folds(il_parse(f["il"]), il_inputs(f)):
+                    out[T] = (sorted(uses), list(srcs))
+            except (KeyError, IndexError, TypeError):
+                out = {}
+        f["_folds"] = out
+    return f["_folds"]
+
+
+def fold_extend(f, c, done, av):
+    """NColFoldAwayRegion -> NColInsertUse 0x10186d20 [C] for a folded candidate c: each source already processed
+    (`done`: root -> [[register, ranges]] per region) gets every use of c that lies outside its ranges: the range
+    before the use is extended to it and [its end, the use] is cut from the region's register
+    (NColUpdatePhysregAvail with flag 1: no piece ending at the range's begin is kept)."""
+    info = fold_info(f).get(c.get("sym"))
+    if not info:
+        return
+    uses, srcs = info
+    tm = il_tupmap(f)
+    for q in srcs:
+        regs = done.get(q)
+        if not regs:
+            continue
+        for u in uses:
+            if any(lo <= u <= hi for _r, rg in regs for lo, hi in rg):
+                continue
+            best = None
+            for k, (r, rg) in enumerate(regs):
+                for j, (lo, hi) in enumerate(rg):
+                    if hi < u and (best is None or hi > best[2]):
+                        best = (k, j, hi)
+            if best is None:
+                continue
+            k, j, hi = best
+            r, rg = regs[k]
+            rg[j] = (rg[j][0], u)
+            if r in NUM and NUM[r] in av:
+                lst, out = av[NUM[r]], []
+                te = tm.get(u) if tm else None
+                keep_hi = _is_instr(te) and _tkind(te) not in (0x11, 0x13) and not _touches(te, q, "d")
+                for b, e in lst:
+                    if u < b or e < hi:
+                        out.append((b, e))
+                        continue
+                    if b < hi:
+                        out.append((b, hi - 1))
+                    if u < e:
+                        out.append((u if keep_hi else u + 1, e))
+                av[NUM[r]] = out
+
+
+def _bc_ctx(f):
+    """The flow graph NColBestCoverage walks (cached on the record): block first / last tuples, successors and
+    predecessors (il_blocks), each block's innermost loop as a block-number span (BLOCK+0xac's first / last block:
+    the natural loop of il_blocks' back edges [I])."""
+    if "_bc" not in f:
+        tups = il_parse(f["il"])
+        blocks = il_blocks(tups)
+        n = len(blocks)
+        preds = [[] for _ in range(n)]
+        for i, b in enumerate(blocks):
+            for s in b["succ"]:
+                preds[s].append(i)
+        dom = [set(range(n)) for _ in range(n)]
+        if n:
+            dom[0] = {0}
+        changed = True
+        while changed:
+            changed = False
+            for i in range(1, n):
+                ps = [dom[p] for p in preds[i]]
+                nd = ({i} | set.intersection(*ps)) if ps else {i}
+                if nd != dom[i]:
+                    dom[i], changed = nd, True
+        loops = {}
+        for i in range(n):
+            for s in blocks[i]["succ"]:
+                if s in dom[i]:
+                    body = loops.setdefault(s, {s})
+                    stack = [i]
+                    while stack:
+                        x = stack.pop()
+                        if x not in body:
+                            body.add(x)
+                            stack.extend(preds[x])
+        loop = [None] * n
+        for _h, body in sorted(loops.items(), key=lambda hb: len(hb[1]), reverse=True):
+            for x in body:
+                loop[x] = (min(body), max(body))
+        f["_bc"] = dict(first=[b["first"] for b in blocks], last=[b["last"] for b in blocks],
+                        succ=[b["succ"] for b in blocks], preds=preds, loop=loop)
+    return f["_bc"]
+
+
+def _noload_def(t, sym):
+    """NColIsNoLoadDef 0x1006b660 [C, the partial-view case approximated]: an instruction that writes the
+    candidate's whole SYM and does not read it."""
+    if not _is_instr(t) or sym is None:
+        return False
+    ds = t.get("dstr") or []
+    dv = t.get("dstv") or []
+    whole = any(i < len(ds) and ds[i] == sym and (i >= len(dv) or dv[i][0]) and k in (1, 2)
+                for i, k in enumerate(t["dstk"]))
+    return whole and not _touches(t, sym, "s")
+
+
+def best_coverage(f, c, av, ranges, order, use, scores=None, done=None):
+    """NColBestCoverage 0x1006a030 [C] for a region no register covers entirely: per register of the order in the
+    useable set, clusters grow from each appearance where the register is available (NColCanUsePhysregAtStartPoint /
+    EndPoint at the tuples where its interval begins / ends): in the appearance's block to the block's end, the
+    range's end or the interval's end; on to successor blocks (NColMarkSuccessors: the candidate's range continues at
+    the block's start and the register is available there) block by block in number order; a block with entries from
+    outside the cluster (predecessors outside the region's blocks, earlier blocks not in a cluster, later ones where the
+    register is not available at their exit, other clusters) is taken when it has an appearance, or when the loop it is
+    in has one (NColAddingLoopBodyToCluster), and not after such an empty pass-through block; reaching another cluster
+    merges the two (NColMergeClusters). benefit = the appearances covered << 2 * zone depth; cost = a load at the
+    start unless it is a definition (NColIsNoLoadDef), plus the entries of each block with appearances, same weights.
+    A register's score is its best cluster's benefit - cost; the strictly greatest wins (ties: the earlier register).
+    -> (register or None, the covered ranges: NColCopyClusterToRangesArray's block pieces)."""
+    tm = il_tupmap(f)
+    st = f["state"]
+    if tm is None or not ranges:
+        return None, []
+    ctx = _bc_ctx(f)
+    sym = c.get("sym")
+    rg = sorted(tuple(r) for r in ranges)
+    first, last = rg[0][0], rg[-1][1]
+    blk = lambda t: _blk_of(tm, t)
+    bfirst, blast = ctx["first"], ctx["last"]
+    nb = len(bfirst)
+    speed = st.get("speed", 1)
+    sh = lambda t: 2 * depth(st, blk(t)) if speed else 0
+    B0, B1 = blk(first), blk(last)
+    if B0 is None or B1 is None:
+        return None, []
+    rng_at = {}                                   # f678: range begins and block starts inside a range -> range
+    for r in rg:
+        rng_at[r[0]] = r
+        for b in range(blk(r[0]) + 1, blk(r[1]) + 1):
+            rng_at[bfirst[b]] = r
+    apps = sorted(a for a in (c.get("apps") or []) if first <= a <= last and any(lo <= a <= hi for lo, hi in rg))
+    byblk = {}                                    # f684: per block the appearances in order (duplicates kept)
+    for a in apps:
+        byblk.setdefault(blk(a), []).append(a)
+
+    def node_at(lst, t):
+        return next(((b, e) for b, e in lst if b <= t <= e), None)
+
+    def src_has(t, P):
+        return _in_list(f, t, "s", P, done)
+
+    def dst_has(t, P):
+        return _in_list(f, t, "d", P, done)
+
+    def can_start(t, P):
+        x = tm.get(t)
+        if not _is_instr(x):
+            return True
+        if not _touches(x, sym, "s") and _noload_def(x, sym):
+            return True
+        return not src_has(t, P)
+
+    def can_end(t, P):
+        x = tm.get(t)
+        if not _is_instr(x):
+            return True
+        return not (dst_has(t, P) and _touches(x, sym, "d"))
+
+    def appears_in_loop(j):
+        sp = ctx["loop"][j]
+        if sp is None:
+            return True                           # BLOCK+0xac == 0: no loop, the block may be added
+        return any(byblk.get(k) for k in range(max(sp[0], B0), min(sp[1], B1) + 1))
+
+    best, best_r, best_cl, best_f680 = None, None, None, None
+    for r in order:
+        if use is not None and r not in use:
+            continue
+        if NUM[r] not in av:
+            continue
+        lst = av[NUM[r]]
+        avail = lambda t: any(b <= t <= e for b, e in lst)
+        f680 = {}                                 # block -> dict(own, cont, start, end, mark, pass)
+        F = lambda j: f680.setdefault(j, dict(own=0, cont=0, start=0, end=0, mark=0, pas=0))
+        left = {a: 0 for a in apps}               # the appearance bits still set (one per tuple)
+        for a in apps:
+            left[a] += 1
+        clusters = []
+        cid = 1
+        for t in apps:
+            if not left.get(t):
+                continue
+            if not avail(t):
+                continue
+            if not avail(t - 1) and not can_start(t, r):
+                continue
+            if not avail(t + 1) and not can_end(t, r):
+                continue
+            N = node_at(lst, t)
+            if N[0] == t and not can_start(t, r):
+                continue
+            if N[1] == t and not can_end(t, r):
+                continue
+            C = dict(id=cid, fb=blk(t), lb=blk(t), begin=t, end=t, benefit=0, cost=0)
+            cid += 1
+            clusters.insert(0, C)
+            b = blk(t)
+            myr = next(x for x in rg if x[0] <= t <= x[1])
+            if _noload_def(tm.get(t), sym):
+                start = t
+                C["cost"] = 0
+            else:
+                start = max(bfirst[b], myr[0])
+                if start <= N[0]:
+                    start = N[0] if can_start(N[0], r) else N[0] + 1
+                C["cost"] = 1 << sh(t)
+            C["begin"] = start
+            if start == bfirst[b]:
+                F(b)["own"] = C["id"]
+            be = blast[b]
+            if be > myr[1]:
+                cont, end = False, myr[1]
+            else:
+                cont, end = True, be
+            if N[1] <= end:
+                end = N[1]
+                if not can_end(N[1], r):
+                    end, cont = N[1] - 1, False
+                elif N[1] != be or dst_has(N[1], r):
+                    cont = False
+            C["end"] = end
+            k = 0
+            for a in byblk.get(b, []):
+                if a < start:
+                    continue
+                if a > end:
+                    break
+                k += 1
+                left[a] = 0
+            C["benefit"] = k << sh(end)
+            if not cont:
+                if F(b)["own"] == C["id"]:
+                    F(b)["end"] = end
+                continue
+            F(b)["cont"] = C["id"]
+            F(b)["start"] = start
+            j = b + 1
+            for s in ctx["succ"][b]:              # NColMarkSuccessors
+                bs = bfirst[s]
+                if first <= bs <= last and bs in rng_at and F(s)["own"] != C["id"] and avail(bs):
+                    j = min(j, s)
+                    F(s)["mark"] = 1
+            while j <= B1:
+                fj = F(j)
+                if not fj["mark"]:
+                    j += 1
+                    continue
+                fj["mark"] = 0
+                nxt = j + 1
+                if fj["own"] and fj["own"] != C["id"]:
+                    _merge(clusters, C, f680, fj["own"])
+                    j = nxt
+                    continue
+                bs = bfirst[j]
+                Nj = node_at(lst, bs)
+                ren = rng_at[bs][1] if bs in rng_at else last
+                be = blast[j]
+                if be > ren:
+                    cont, end = False, ren
+                else:
+                    cont, end = True, be
+                skip = False
+                if Nj is not None and Nj[1] <= end:
+                    end = Nj[1]
+                    x = tm.get(end)
+                    if _is_instr(x) and dst_has(end, r) and _touches(x, sym, "d"):
+                        end, cont = end - 1, False
+                    elif Nj[1] == be:
+                        if _is_instr(x) and dst_has(end, r):
+                            cont = False
+                    else:
+                        cont = False
+                if not cont:
+                    ap = byblk.get(j)
+                    if not ap or ap[0] > end:
+                        skip = True
+                if skip:
+                    j = nxt
+                    continue
+                ent = oth = 0
+                own_pass = False
+                for p in ctx["preds"][j]:
+                    if p < B0 or p > B1:
+                        ent += 1
+                        continue
+                    fp = F(p)
+                    if fp["cont"] == C["id"]:
+                        if fp["pas"]:
+                            own_pass = True
+                        continue
+                    if fp["cont"]:
+                        oth += 1
+                        continue
+                    if p >= j and any(b_ <= blast[p] <= e_ for b_, e_ in lst):
+                        continue
+                    ent += 1
+                w = ent
+                add = True
+                if oth and not ent:
+                    if own_pass:
+                        w += oth
+                        ent_path = True
+                    else:
+                        for p in ctx["preds"][j]:
+                            if B0 <= p <= B1 and F(p)["cont"] and F(p)["cont"] != C["id"]:
+                                _merge(clusters, C, f680, F(p)["cont"])
+                        ent_path = False
+                else:
+                    if oth:
+                        w += oth
+                    ent_path = bool(ent)
+                if ent_path:
+                    if own_pass:
+                        add = False
+                    elif not byblk.get(j):
+                        if appears_in_loop(j):
+                            own_pass = True
+                        else:
+                            add = False
+                elif not oth and own_pass and byblk.get(j):
+                    own_pass = False
+                if not add:
+                    j = nxt
+                    continue
+                fj["own"] = C["id"]
+                C["lb"] = max(C["lb"], j)
+                C["fb"] = min(C["fb"], j)
+                k = 0
+                for a in byblk.get(j, []):
+                    if a < start:                 # [ebp-0x10]: the growth's start tuple
+                        continue
+                    if a > end:
+                        break
+                    k += 1
+                    left[a] = 0
+                C["benefit"] += k << sh(end)
+                if k:
+                    C["cost"] += w << sh(end)
+                if cont:
+                    fj["cont"] = C["id"]
+                    fj["pas"] = own_pass
+                    for s in ctx["succ"][j]:
+                        bs = bfirst[s]
+                        if first <= bs <= last and bs in rng_at and F(s)["own"] != C["id"] and avail(bs):
+                            nxt = min(nxt, s)
+                            F(s)["mark"] = 1
+                else:
+                    fj["end"] = end
+                j = nxt
+        score, sc = None, None
+        for C in clusters:
+            v = C["benefit"] - C["cost"]
+            if score is None or v > score:
+                score, sc = v, C
+        if scores is not None:                    # (c2ncol --cov's COVREG probe reads the same per register)
+            scores.append((r, score, [(C["begin"], C["end"], C["benefit"], C["cost"], C["fb"], C["lb"])
+                                      for C in clusters]))
+        if score is not None and (best is None or score > best):
+            best, best_r, best_cl, best_f680 = score, r, sc, {k: dict(v) for k, v in f680.items()}
+    if best_r is None:
+        return None, []
+    return best_r, _cluster_ranges(best_cl, best_f680, bfirst, blast)
+
+
+def _intersect(ranges, pieces):
+    """The tuples of `ranges` inside `pieces` (NColRangesToMinTupleRegions: the region keeps what the cluster covers)."""
+    out = [(max(lo, a), min(hi, b)) for lo, hi in ranges for a, b in pieces if a <= hi and lo <= b]
+    return sorted(set(out))
+
+
+def _subtract(ranges, held):
+    """The tuples of `ranges` outside `held` (NColSubtractRangesFromTupRegions: the remainder region)."""
+    out = []
+    for lo, hi in ranges:
+        cur = [(lo, hi)]
+        for a, b in held:
+            nxt = []
+            for x, y in cur:
+                if b < x or y < a:
+                    nxt.append((x, y))
+                    continue
+                if x < a:
+                    nxt.append((x, a - 1))
+                if b < y:
+                    nxt.append((b + 1, y))
+            cur = nxt
+        out += cur
+    return sorted(out)
+
+
+def _merge(clusters, C, f680, other):
+    """NColMergeClusters 0x10188ac0: the cluster `other` joins C (benefit, cost, block span; its blocks relabelled)."""
+    O = next((x for x in clusters if x["id"] == other), None)
+    if O is None or O is C:
+        return
+    clusters.remove(O)
+    C["benefit"] += O["benefit"]
+    C["cost"] += O["cost"]
+    for k in range(O["fb"], O["lb"] + 1):
+        v = f680.get(k)
+        if v is None:
+            continue
+        if v["own"] == other:
+            v["own"] = C["id"]
+        if v["cont"] == other:
+            v["cont"] = C["id"]
+    C["fb"] = min(C["fb"], O["fb"])
+    C["lb"] = max(C["lb"], O["lb"])
+
+
+def _cluster_ranges(C, f680, bfirst, blast):
+    """NColCopyClusterToRangesArray 0x1018d6a0 [C]: the cluster's pieces block by block."""
+    i = C["id"]
+    g = lambda k: f680.get(k) or dict(own=0, cont=0, start=0, end=0)
+    if C["fb"] == C["lb"] and not (g(C["fb"])["own"] == i and g(C["fb"])["cont"] == i):
+        return [(C["begin"], C["end"])]
+    out = []
+    for k in range(C["fb"], C["lb"] + 1):
+        v = g(k)
+        if v["own"] == i:
+            if v["cont"] == i:
+                if v["end"]:
+                    out += [(bfirst[k], v["end"]), (v["start"], blast[k])]
+                else:
+                    out.append((bfirst[k], blast[k]))
+            else:
+                out.append((bfirst[k], v["end"]))
+        elif v["cont"] == i:
+            out.append((v["start"], blast[k]))
+    return out
+
+
+def region_ranges(c, r):
+    """The ranges a traced region of the candidate holds: all of them for the only region of a lifetime NColBestCoverage
+    did not cut, else its ranges overlapping the region's [first, last] (its first and last appearance); for a region
+    NColBestCoverage cut out (c2ncol --cov's `separate`: the pieces NColSeparateProcessedRegion kept, TLS+0xf668), only
+    the parts inside those pieces."""
+    if len(c["regions"]) == 1 and not c.get("separate"):
+        return [tuple(x) for x in c["ranges"]]     # the region is the lifetime (R+0x24 / +0x28: first / last appearance)
+    rr = [(lo, hi) for lo, hi in c["ranges"] if lo <= r["last"] and r["first"] <= hi] or [(r["first"], r["last"])]
+    best = None
+    for s in c.get("separate") or []:               # R+0x24 / +0x28 are the region's first / last appearance: the
+        if not s["ranges"] or len(s["ranges"]) < s["n"]:   # pieces that hold both, the fewest tuples
+            continue
+        pieces = [(w[0], w[1]) for w in s["ranges"]]
+        got = sorted(set((max(lo, a), min(hi, b)) for lo, hi in c["ranges"] for a, b in pieces if a <= hi and lo <= b))
+        inside = lambda t: any(lo <= t <= hi for lo, hi in got)
+        if got and inside(r["first"]) and inside(r["last"]):
+            size = sum(hi - lo + 1 for lo, hi in got)
+            if best is None or size < best[0]:
+                best = (size, got)
+    return best[1] if best else rr
+
+
+def cut_of(f, c, lst, ranges):
+    """The availability list after the candidate's ranges in that register: cut_exact when the walk has `cut` and the
+    record has its IL, else cut()."""
+    if "cut" in walk_of(f) and c.get("sym") is not None:
+        tm = il_tupmap(f)
+        if tm is not None:
+            return cut_exact(lst, ranges, tm, c["sym"])
+    return cut(lst, ranges)
 
 
 def useable(c):
@@ -293,6 +943,139 @@ def avoid(c, st):
     return next((ANTI[i] for i, x in enumerate(an) if a and x == a), ())
 
 
+WALK = ()      # the order walk's rules as read (docs/c2/ncolor.md 4; a record's `walk` overrides; the functions'
+               # default keeps the earlier model, the CLI and il_predict use WALK_READ)
+# extra: NColIdentifyExtraPhysAvail's joined windows and their registers at the head of the preference list; cut:
+# NColUpdatePhysregAvail's piece boundaries; extend: NColInsertUse's extension of a source processed before a fold;
+# r15b: the byte set's r15b (its second BV chunk); strict: a preference window conflicts only by a strict overlap;
+# used: NColMdGetPrefRegOrder's used callee-saved registers first; cover: NColBestCoverage for a region no register
+# covers; bound: NColDetermineCovered's boundary tests; pwlink: the preference-window lists as linked lists;
+# remainder (not in WALK_READ): the rest of a partly covered region processed again in simulate
+WALK_READ = ("extra", "cut", "extend", "r15b", "strict", "used", "cover", "bound", "pwlink")
+
+
+def walk_of(f):
+    w = f.get("walk")
+    return WALK if w is None else w
+
+
+def _in_list(f, t, side, P, done):
+    """NColPhysregInOprList 0x1006b7b0 [C]: the tuple's destination ('d') or source ('s') operands name P: a
+    physical register leaf of P's master, a candidate leaf whose processed region covering the tuple has P (`done`:
+    root -> [[register, ranges]]), or a REGSET leaf whose set has P (the calls' clobbers, c2ncol's REGSET probe)."""
+    tm = il_tupmap(f)
+    x = tm.get(t) if tm else None
+    if x is None or x["kind"] != "I":
+        return False
+    texts, ks, rs = (x["dst"], x["dstk"], x.get("dstr") or []) if side == "d" else (x["src"], x["srck"], x.get("srcr") or [])
+    if P in _phys_in(texts):
+        return True
+    for k, r in zip(ks, rs):
+        if k == 1 and done and r in done:
+            for reg, rg in done[r]:
+                if reg == P and any(lo <= t <= hi for lo, hi in rg):
+                    return True
+        if k == 0xa:
+            for rs_ in f.get("regsets") or []:
+                if rs_.get("n") == t and P in {regname(n) for n in rs_["regs"]}:
+                    return True
+    return False
+
+
+def covers_exact(f, c, lst, ranges, P, done):
+    """NColDeterminePhysregAvail's order loop test / NColDetermineCovered 0x1018f620 [C]: every range inside one
+    available interval; where the interval begins at the range's begin, the tuple there must not name P among its
+    sources unless it is a definition of the candidate that needs no load and does not read it; where it ends at the
+    range's end, the tuple must not both define the candidate and name P among its destinations."""
+    tm = il_tupmap(f)
+    sym = c.get("sym")
+    for lo, hi in ranges:
+        nd = next(((b, e) for b, e in lst if b <= lo and hi <= e), None)
+        if nd is None:
+            return False
+        if tm is None or sym is None:
+            continue
+        if lo == nd[0] and _is_instr(tm.get(lo)):
+            x = tm[lo]
+            if (_touches(x, sym, "s") or not _noload_def(x, sym)) and _in_list(f, lo, "s", P, done):
+                return False
+        if hi == nd[1] and _is_instr(tm.get(hi)):
+            if _touches(tm[hi], sym, "d") and _in_list(f, hi, "d", P, done):
+                return False
+    return True
+
+
+def pick(f, c, st, av, pw, prefs, extra=None, done=None):
+    """The register NColDeterminePhysregAvail returns for a candidate's (first) region: the preference list, then the
+    order walk. -> (register or None, the extra-availability windows to restore after the candidate's cut)."""
+    walk = walk_of(f)
+    c.pop("_covered", None)
+    u = useable(c)
+    if "r15b" in walk and u is not None and _byte_set(c):
+        u = u | {"r15"}
+    if extra is None:
+        extra = extra_avail(il_tupmap(f), c, av) if "extra" in walk else []
+    if extra:
+        ex = []
+        for P, _t, _u in extra:
+            if (u is None or P in u) and P not in prefs and P not in ex:
+                ex.append(P)
+        prefs = ex + list(prefs)
+    wa = walk_args(c, st, pw)
+    wa["use"] = u
+    if "strict" in walk:
+        wa["strict"] = True
+    if "used" in walk and klass(c) == "int":
+        wa["order"] = used_order(f)
+    cv = (lambda x: covers_exact(f, c, av[NUM[x]], c["ranges"], x, done)) if "bound" in walk else \
+        (lambda x: covers(av[NUM[x]], c["ranges"]))
+    if "bound" in walk:
+        wa["cover"] = cv
+    r = next((x for x in prefs if x in NUM and NUM[x] in av and (u is None or x in u) and cv(x)), None) or \
+        order_walk(av, c["ranges"], **wa)
+    if r is None and "cover" in walk:
+        av_ = wa.get("avoid") or ()
+        order = [x for x in wa["order"] if x not in av_] + [x for x in wa["order"] if x in av_]
+        r, cov = best_coverage(f, c, av, c["ranges"], order, u, done=done)
+        if r is not None:
+            c["_covered"] = cov
+    return r, extra
+
+
+T1_ORDER = ["rax", "rcx", "rdx", "rbx", "rdi", "rsi", "rbp"]           # NColMdGetPrefRegOrder's tables 0x10002704
+T2_ORDER = ["r8", "r9", "r10", "r11", "r14", "r15", "r12", "r13"]     # and 0x1000553c
+
+
+def used_order(f):
+    """NColMdGetPrefRegOrder 0x1009e500 [C]: T1's registers that are scratch or already used (physreg P+9 & 0x10), T2's
+    scratch ones, T1's callee-saved unused ones, T2's callee-saved ones. `used`: the registers the IL before NColor
+    names as physical registers (NColBuildInfo marks every physreg leaf and every REGSET register it meets); as
+    NColRewriteCandidate marks the allocated ones only after all candidates, the order is fixed for the function."""
+    if "_regorder" not in f:
+        src = f.get("il_pre") or f.get("il")
+        used = set()
+        if src:
+            for t in il_parse(src):
+                if t["kind"] == "I":
+                    used |= _phys_in(t["dst"] + t["src"])
+        for r in f.get("regsets") or []:
+            used |= {regname(n) for n in r["regs"] if regname(n)}
+        f["_regorder"] = [r for r in T1_ORDER if r not in SAVED or r in used] + [r for r in T2_ORDER if r not in SAVED] + \
+            [r for r in T1_ORDER if r in SAVED and r not in used] + [r for r in T2_ORDER if r in SAVED]
+    return f["_regorder"]
+
+
+def _byte_set(c):
+    """The region's useable set is the byte bank (al .. r14b, numbers 49..63 of its first chunk): r15b is number 64,
+    in the sparse BV's second chunk, which the export does not read; NColMdGetInitialRegisters' byte set has it and
+    only r13 is ever trimmed (NColMdTrimUseableRegisters), so it is in the set [I]."""
+    u = (c.get("useable") or [None])[0]
+    if not u or len(u) < 3 or u[0] != 0:
+        return False
+    m = (u[2] << 32) | u[1]
+    return bool(m >> 49) and not (m & ((1 << 49) - 2))
+
+
 def cmd_replay(fns, show=10):
     """Each integer candidate whose traced result is one register over its whole range: is the model's first
     covering register in INT_ORDER the traced one? Availability: the traced initial lists, minus the ranges of
@@ -305,47 +1088,130 @@ def cmd_replay(fns, show=10):
         if not st or "avail" not in st:
             continue
         av = avail_of(st)
-        pw = {int(r): [tuple(x) for x in v] for r, v in (st.get("prefwin") or {}).items()} if st.get("prefwin") else None
+        pw = pw_init(f, st)
         hidden, ghost = _pw_hidden(st), set()
         pof = il_prefs_of(f, f["prefs_src"]) if f.get("prefs_src") is not None else None
         given = {}                            # name -> the traced register (the partners of the IL's preferences)
+        done = {}                             # root -> [[register, ranges]] (fold_extend)
         for c in f["cands"]:
             regs = c["regions"]
             if not regs or not c.get("ranges"):
+                if not regs and c.get("ranges") and "extend" in walk_of(f):
+                    fold_extend(f, c, done, av)
                 continue
             av.bank = xbank(c)
             got = ALIAS.get(regs[0]["reg"])
+            extra = extra_avail(il_tupmap(f), c, av) if "extra" in walk_of(f) else []
             if len(regs) == 1 and got in NUM and NUM[got] in av:
                 n += 1
                 prefs = pof(c, given) if pof else [regname(n) for n, _t in (c.get("prefs") or [[]])[0]]
-                u = useable(c)
-                model = next((r for r in prefs if r in NUM and NUM[r] in av and (u is None or r in u) and
-                              covers(av[NUM[r]], c["ranges"])), None) or \
-                    order_walk(av, c["ranges"], **walk_args(c, st, pw))
+                model, extra = pick(f, c, st, av, pw, prefs, extra, done)
                 kinds[klass(c)][0] += 1
                 kinds[klass(c)][1] += model == got
                 if model == got:
                     ok += 1
                 else:
-                    bad.append((f["func"], c["name"], got, model, c["ranges"][:3]))
+                    near = lambda r: [w for w in (av[NUM[r]] if r in NUM and NUM[r] in av else [])
+                                      if w[1] >= c["ranges"][0][0] - 2 and w[0] <= c["ranges"][-1][1] + 2][:4]
+                    bad.append((f["func"], c["name"], got, model, c["ranges"][:3],
+                                "prefs %s tied %s window %s; %s %s, %s %s" % (
+                                    prefs, regname(c["tied"]) if c.get("tied") else "-", c.get("prefwin"),
+                                    got, near(got), model, near(model) if model else "")))
             if WINDOW_GOES and pw is not None and c.get("prefwin"):   # its own preference window is no longer
-                _pw_drop(pw, tuple(c["prefwin"]), hidden, ghost)      # anyone else's obstacle
+                pw_drop(pw, tuple(c["prefwin"]), hidden, ghost)       # anyone else's obstacle
             if regs:
                 given[c["name"]] = [(r["first"], r["last"], ALIAS.get(r["reg"])) for r in regs] \
                     if f.get("prefs_by_region") else ALIAS.get(regs[0]["reg"])
             for r in regs:                        # what the trace did is what the next candidates see
                 g = ALIAS.get(r["reg"])
                 if g in NUM and NUM[g] in av:
-                    rr = [(lo, hi) for lo, hi in c["ranges"] if lo <= r["last"] and r["first"] <= hi] or \
-                         [(r["first"], r["last"])]
-                    av[NUM[g]] = cut(av[NUM[g]], rr)
+                    rr = region_ranges(c, r) if "cover" in walk_of(f) else \
+                        [(lo, hi) for lo, hi in c["ranges"] if lo <= r["last"] and r["first"] <= hi] or \
+                        [(r["first"], r["last"])]
+                    av[NUM[g]] = cut_of(f, c, av[NUM[g]], rr)
+                    done.setdefault(c.get("sym"), []).append([g, list(rr)])
+            if regs:
+                restore_extra(av, extra)
     print("replay: %d of %d single-region integer candidates got the model's register" % (
         kinds["int"][1], kinds["int"][0]))
     if kinds["xmm"][0]:
         print("replay: %d of %d single-region xmm candidates" % (kinds["xmm"][1], kinds["xmm"][0]))
     for b in bad[:show]:
-        print("  %s %s: traced %s, model %s  ranges %s" % b)
+        print("  %s %s: traced %s, model %s  ranges %s\n      %s" % b)
     return 0
+
+
+class PWLinks(dict):
+    """The preference-window lists f6a0[reg] as linked lists (`pwlink`, NColAddRegPrefRange 0x101850c0 / the unlink at
+    0x10068528 [C]): every window in list order, the hidden ones (inserted before the head) first; the users walk from
+    the head by next. Unlinking a node sets next.prev = prev and prev.next = next, or the head = next when it has no
+    prev: so unlinking the first hidden window makes the ones after it visible again, and a head unlinked while hidden
+    windows precede it stays on the walk with its stale next."""
+
+    def __init__(self, vis, hid):
+        dict.__init__(self)
+        self.head, self.nodes = {}, {}
+        for r in set(vis) | set(hid or {}):
+            ws = [tuple(w) for w in (hid or {}).get(r, [])] + [tuple(w) for w in vis.get(r, [])]
+            ns = [[w, None, None, True] for w in ws]          # [window, next, prev, linked]
+            for a, b in zip(ns, ns[1:]):
+                a[1], b[2] = b, a
+            self.nodes[r] = ns
+            self.head[r] = ns[len((hid or {}).get(r, []))] if len(ns) > len((hid or {}).get(r, [])) else None
+
+    def walk(self, r):
+        out, x, k = [], self.head.get(r), 0
+        while x is not None and k < 10000:
+            out.append(x[0])
+            x, k = x[1], k + 1
+        return out
+
+    def get(self, r, default=None):
+        return self.walk(r) if r in self.head else default
+
+    def items(self):
+        return [(r, self.walk(r)) for r in self.head]
+
+    def __bool__(self):
+        return True
+
+    def drop(self, own):
+        for r, ns in self.nodes.items():
+            x = next((n for n in ns if n[3] and n[0] == own), None)
+            if x is None:
+                continue
+            x[3] = False
+            if x[1] is not None:
+                x[1][2] = x[2]
+            if x[2] is not None:
+                x[2][1] = x[1]
+            else:
+                self.head[r] = x[1]
+            return
+
+
+def pw_init(f, st):
+    """The preference windows the order walk sees: PWLinks when the walk has `pwlink` and the record knows the hidden
+    windows (il_prefwin_lists), else {reg: windows} as the state probe read them (or None)."""
+    if not st.get("prefwin"):
+        return None
+    if "pwlink" in walk_of(f) and st.get("prefwin_hidden") is not None:
+        return PWLinks({int(r): v for r, v in st["prefwin"].items()},
+                       {int(r): v for r, v in st["prefwin_hidden"].items()})
+    if "pwlink" in walk_of(f):               # traced lists: the hidden windows from the traced ties, windows, indices
+        vis, hid = il_prefwin_lists([(c.get("index", 0), c["tied"], tuple(c["prefwin"])) for c in f["cands"]
+                                     if c.get("tied") and c.get("prefwin") and c.get("apps")])
+        tv = {int(r): [tuple(x) for x in v] for r, v in st["prefwin"].items() if v}
+        if {r: v for r, v in vis.items() if v} == tv:
+            return PWLinks(tv, hid)
+    return {int(r): [tuple(x) for x in v] for r, v in st["prefwin"].items()}
+
+
+def pw_drop(pw, own, hidden=None, ghost=None):
+    if isinstance(pw, PWLinks):
+        pw.drop(own)
+    elif pw is not None:
+        _pw_drop(pw, own, hidden, ghost)
 
 
 def _pw_hidden(st):
@@ -412,7 +1278,8 @@ def simulate(f, prio_of=None, lists=None, prefs_of=None):
     preference list computed from the registers given so far (il_prefs) instead of the traced one."""
     st = f["state"]
     av = avail_of(st)
-    pw = {int(r): [tuple(x) for x in v] for r, v in (st.get("prefwin") or {}).items()}
+    pw = pw_init(f, st) if "pwlink" in walk_of(f) else \
+        {int(r): [tuple(x) for x in v] for r, v in (st.get("prefwin") or {}).items()}
     hidden, ghost = _pw_hidden(st), set()
     pr = []
     for i, c in enumerate(f["cands"]):
@@ -428,6 +1295,8 @@ def simulate(f, prio_of=None, lists=None, prefs_of=None):
         bk = buckets(f["cands"])
         order = sorted(range(len(f["cands"])), key=lambda i: (bk[i], -pr[i], f["cands"][i].get("index", i)))
     got = {}
+    done = {}                                   # root -> [[register, ranges]] (fold_extend)
+    ext = "extend" in walk_of(f)
     for i in order:
         c = f["cands"][i]
         av.bank = xbank(c)
@@ -436,17 +1305,35 @@ def simulate(f, prio_of=None, lists=None, prefs_of=None):
             for r in c["regions"]:              # not modelled: what the trace did
                 g = ALIAS.get(r["reg"])
                 if g in NUM and NUM[g] in av:
-                    av[NUM[g]] = cut(av[NUM[g]], [(r["first"], r["last"])])
+                    av[NUM[g]] = cut_of(f, c, av[NUM[g]], [(r["first"], r["last"])])
+                    done.setdefault(c.get("sym"), []).append([g, [(r["first"], r["last"])]])
+            if ext and not c["regions"] and c.get("ranges"):
+                fold_extend(f, c, done, av)
             continue
-        u = useable(c)
         prefs = prefs_of(c, got) if prefs_of is not None else [regname(n) for n, _t in (c.get("prefs") or [[]])[0]]
-        r = next((x for x in prefs if x in NUM and NUM[x] in av and (u is None or x in u) and
-                  covers(av[NUM[x]], c["ranges"])), None) or order_walk(av, c["ranges"], **walk_args(c, st, pw))
+        r, extra = pick(f, c, st, av, pw, prefs, done=done)
+        cov = c.pop("_covered", None)
         got[c["name"]] = r
         if r is not None:
-            av[NUM[r]] = cut(av[NUM[r]], c["ranges"])
+            held = _intersect(c["ranges"], cov) if cov else [tuple(x) for x in c["ranges"]]
+            av[NUM[r]] = cut_of(f, c, av[NUM[r]], held)
+            done[c.get("sym")] = [[r, held]]
+            rem = _subtract(c["ranges"], held) if cov else []
+            for _k in range(8 if "remainder" in walk_of(f) else 0):   # NColProcessCandidate's loop: the rest is a region of its own
+                if not rem:
+                    break
+                c2 = dict(c, ranges=rem, first=rem[0][0], last=rem[-1][1])
+                r2, _x = pick(f, c2, st, av, pw, prefs, extra=[], done=done)
+                cov2 = c2.pop("_covered", None)
+                if r2 is None:                # folded, a memory operand, a stolen or forced register: not modelled
+                    break
+                h2 = _intersect(rem, cov2) if cov2 else rem
+                av[NUM[r2]] = cut_of(f, c2, av[NUM[r2]], h2)
+                done[c.get("sym")].append([r2, h2])
+                rem = _subtract(rem, h2) if cov2 else []
+        restore_extra(av, extra)
         if c.get("prefwin"):
-            _pw_drop(pw, tuple(c["prefwin"]), hidden, ghost)
+            pw_drop(pw, tuple(c["prefwin"]), hidden, ghost)
     return got
 
 
@@ -3309,13 +4196,15 @@ def cmd_ilmodel(fns, show=10, extra=()):
     return c
 
 
-def il_predict(f, use=None):
+def il_predict(f, use=None, walk=None):
     """{short name: register} the model gives from the function's IL alone (il_model_state + simulate): for a compile
     of an edited source whose block structure changed (eqif, duplicated tails: docs/c2/ncolor.md 12), NColor's inputs
     are recomputed from that compile's IL instead of being edited on the base run. Default: the read rules
     (IL_READ + IL_FOLD, ncolor.md 12.4, 12.5); `use=IL_USE + IL_MODEL` gives the earlier fitted model,
-    `IL_USE + IL_MODEL + IL_READ` the rules of 12.4 alone."""
+    `IL_USE + IL_MODEL + IL_READ` the rules of 12.4 alone. walk: the order walk's rules (default WALK_READ, ncolor.md
+    4; () the earlier walk)."""
     g = il_model_state(f, use or IL_USE + IL_MODEL + IL_READ + IL_FOLD)
+    g["walk"] = WALK_READ if walk is None else walk
     got = simulate(g, prio_of=g.get("prio_of"), lists=g.get("lists"),
                    prefs_of=il_prefs_of(g, g["prefs_src"]) if g.get("prefs_src") else None)
     return {short(k): v for k, v in got.items()}
@@ -3339,6 +4228,12 @@ def main(argv):
     if "--show" in argv:
         i = argv.index("--show")
         show = int(argv[i + 1])
+        del argv[i:i + 2]
+    global WALK
+    WALK = WALK_READ                         # the order walk as read (docs/c2/ncolor.md 4)
+    if "--walk" in argv:                     # --walk extra,cover,.. ('' = the earlier walk)
+        i = argv.index("--walk")
+        WALK = tuple(x for x in argv[i + 1].split(",") if x)
         del argv[i:i + 2]
     if argv[0] == "whatif":
         i = argv.index("--func")

@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """Scheduler inverse: which DAG changes give the issue order the original has.  Doc: docs/c2/sched.md
 
-usage: schedwant.py <src> --func F --asm-vs ORIG.s [--asm-func F] [--region K] [--depth 1|2] [-- <cl args>]
+usage: schedwant.py <src> --func F --asm-vs ORIG.s [--asm-func F] [--region K] [--depth 1|2] [--keep DIR | --from-keep DIR] [-- <cl args>]
        schedwant.py <src> --func F --region K --want-lex 1,2,4,3,... [-- <cl args>]
 
 c2sched.py prints what the list scheduler did (heights, successor counts, priorities, issue order). This tool runs
 the other way. For each scheduled region whose issue order differs from the original's, it:
 
-  1. finds the original's order: the region's instructions are matched to a window of ORIG.s (mnemonic and the set
-     of registers, esp left out) and the window's order is read back as lexical positions; or --want-lex;
-  2. replays the scheduler with sched.md rules 5-7 (height = 1 + max(successor height + edge latency), priority =
-     (height + successors) << 10 | reads memory << 15 | sets the branch flags << 23, then repeatedly issue the
-     ready node with the highest (priority, -lex)). The traced order is replayed first as a check;
+  1. finds the original's order: each node's tuple is placed in our listing by its offset in the final IL
+     (@Encode@4), that instruction is matched to ORIG.s around the place the two listings align (same text, then
+     same text nearby, then same mnemonic in place), and the matched nodes are put in the original's order; when
+     that fails, the region's pre-schedule instructions are matched to a window of ORIG.s (mnemonic and the set of
+     registers, esp left out); or --want-lex. The pre-schedule IL alone does not find the regions: `_jcc`, a load
+     that a broken dependence or a fold into a cmp rewrites later (Mount & Blade, cl 13.10: no region found in any
+     function). The last line counts the regions: in the original's order, differing (printed), not located;
+  2. replays the scheduler with sched.md rules 5-8 (height = 1 + max(successor height + edge latency), priority =
+     (height + successors) << 10 | reads memory << 15 | sets the branch flags << 23, then cycle by cycle the
+     unit / busy / earliest-cycle selection c2sched.simulate_p6 checks; a breakable dependence, read off the trace,
+     does not hold its consumer back). The traced order is replayed first as a check;
   3. tries DAG perturbations and replays each one, keeping those that give the wanted order (or more of its
      prefix than the traced DAG does):
        unalias:X        X loses every memory edge (types 0x20/0x40/0x80): X reads/writes a symbol nothing else in the region
@@ -44,6 +50,7 @@ REG = r"\b(e[a-d]x|e[sd]i|ebp|[a-d][lhx]|[sd]il?|bp|xmm\d|mm\d|st\(?\d?\)?)\b"
 ETYPE = {1: "true", 2: "anti", 4: "output", 0x20: "mem-true", 0x40: "mem-anti", 0x80: "mem-output",
          0x2000: "volatile", 0x80000: "control"}
 MEM = 0xe0
+DELAY_CMP = [int(x, 16) for x in c2trace.c2build.get("sched_delay_cmp", [])]
 
 
 def tkey(text):
@@ -74,6 +81,30 @@ def _prio(ht, ns, fl):
     return _sh(fl >> 1 & 1, w[0]) + _sh(ht, w[1]) + _sh(ns, w[2]) + _sh(fl & 1, w[3]) + _sh(fl >> 2 & 1, w[5])
 
 
+def breakable_edges(r, N):
+    """{(producer, consumer)}: the traced true edges that did not hold their consumer back (sched.md rule 8:
+    SchmdDepIsBreakable / SchmdBreakDep). A node enters the ready list when only breakable predecessors are left; its
+    predecessor count at SchAddToReadyList (`np`) is then above 0, and those predecessors are the ones not issued
+    before the consumer's cycle. The trace carries no break kind on these builds' edges (13.10's edge +0x16 is 0 on
+    Mount & Blade 0x4ea030, whose `mov eax,[esi]` issues before the `lea esi,[ecx+edx*8+4]` that feeds it), so an
+    edge that could break but did not is not seen; a replay does not need it."""
+    icyc = {}
+    for c, ts in r["issue"]:
+        for t in ts:
+            icyc.setdefault(t, c)
+    preds = {}
+    for a, b, lat, typ, plat, eb in r["edges"]:
+        if a in N and b in N:
+            preds.setdefault(b, set()).add(a)
+    out = set()
+    for t, n in N.items():
+        if n.get("np", 0) <= 0:
+            continue
+        late = sorted((p for p in preds.get(t, ()) if icyc.get(p, 1 << 30) >= n["rdy"]), key=lambda p: -icyc.get(p, 1 << 30))
+        out.update((p, t) for p in late[:n["np"]])
+    return out
+
+
 class Region:
     def __init__(self, r, txt):
         self.N = {t: dict(n) for t, n in r["nodes"].items() if t}
@@ -81,6 +112,9 @@ class Region:
         self.edges = [(a, b, lat, typ) for a, b, lat, typ, plat, eb in r["edges"]]
         self.order = [t for c, ts in r["issue"] for t in ts if t]
         self.bylex = {n["lex"]: t for t, n in self.N.items()}
+        self.brk = breakable_edges(r, self.N)
+        # the cycle model needs every node's unit and op (13.00.9044's P5 pairing model is not replayed: shortcut)
+        self.cycles = c2trace.c2build.get("sched_model") != "p5" and all("unit" in n and "op" in n for n in self.N.values())
 
     def name(self, t):
         return "%d:%s" % (self.N[t]["lex"], c2sched.short(self.txt.get(t, "?")).split("<-")[0].strip()[:28])
@@ -91,7 +125,7 @@ class Region:
         succ, pred = {}, {}
         for a, b, lat, typ in edges:
             succ.setdefault(a, []).append((b, lat))
-            if a in N and b in N:
+            if a in N and b in N and (a, b) not in self.brk:     # a breakable edge does not hold b back (rule 8)
                 pred.setdefault(b, set()).add(a)
         ht = {}
 
@@ -105,7 +139,19 @@ class Region:
         prio = {}
         for t, n in N.items():
             ns = len(succ.get(t, ())) + (nsd or {}).get(t, 0)
-            prio[t] = _prio(h(t), ns, n["fl"])
+            # the static priority's bit the rule does not give (an x87 store's +1, HWT[6]) is kept from the trace
+            prio[t] = _prio(h(t), ns, n["fl"]) + (n["prio"] - _prio(n["ht"], n["ns"], n["fl"]) if n["prio"] >= _prio(n["ht"], n["ns"], n["fl"]) else 0)
+        if not self.cycles:
+            return self._shortcut(pred, prio), prio
+        lat_in = {}
+        for a, b, lat, typ in edges:
+            if a in N and b in N:
+                lat_in.setdefault(b, []).append((a, lat))
+        return self._simulate(pred, lat_in, prio), prio
+
+    def _shortcut(self, pred, prio):
+        """sched.md rule 7's shortcut: repeatedly the ready node with the highest (priority, -lex)."""
+        N = self.N
         done, out = set(), []
         while len(out) < len(N):
             ready = [t for t in N if t not in done and pred.get(t, set()) <= done]
@@ -114,7 +160,67 @@ class Region:
             t = min(ready, key=lambda x: (-prio[x], N[x]["lex"]))
             out.append(t)
             done.add(t)
-        return out, prio
+        return out
+
+    def _simulate(self, pred, lat_in, prio):
+        """SchSchedGraph / SchSelectInstrs cycle by cycle with the unit model c2sched.simulate_p6 checks against the
+        trace (sched.md rule 7): each cycle walk the ready list (priority descending, lex ascending) and issue the
+        first node whose unit is free (busy < 3, one node per unit and cycle; unit >= 4 = any, counted on unit 0) and
+        whose earliest cycle (the latest issued predecessor's cycle + the edge latency; a node with none: its traced
+        est) is <= cycle + busy; then walk again, up to 3 issues. An issue adds the op's cost to the unit's busy
+        counter; every cycle subtracts 1. Latency and units matter where integer and x87 code interleave (Mount &
+        Blade 0x4dc350) and after imul / idiv, which the shortcut ignores."""
+        N = self.N
+        issued, out, busy, cyc = {}, [], [0, 0, 0, 0], 0
+        while len(out) < len(N) and cyc < 100000:
+            used = set()
+            for _slot in range(3):
+                ready = sorted((t for t in N if t not in issued and pred.get(t, set()) <= issued.keys()),
+                               key=lambda x: (-prio[x], N[x]["lex"]))
+                pick = None
+                for x in ready:
+                    u = N[x]["unit"] & 0xff
+                    if u >= 4:
+                        u = 0 if all(b < 3 for b in busy) else None
+                    elif u in used or busy[u] >= 3:
+                        u = None
+                    if u is None:
+                        continue
+                    ps = [issued[a] + lat for a, lat in lat_in.get(x, ()) if a in issued]
+                    est = max(ps) if ps else N[x]["est"]
+                    if est <= cyc + max(busy[u], 0) and not self._delayed(x, pred, issued):
+                        pick = (x, u)
+                        break
+                if pick is None:
+                    break
+                x, u = pick
+                issued[x] = cyc
+                out.append(x)
+                used.add(u)
+                busy[u] = max(busy[u], 0) + c2sched.op_cost(N[x]["op"])[1]
+            cyc += 1
+            busy = [b - 1 for b in busy]
+        return out
+
+    def _delayed(self, x, pred, issued):
+        """cl 15.00 (table key sched_delay_cmp): SchmdShouldDelayCmp keeps a cmp/test whose one successor is a jcc
+        back while that jcc has another unissued predecessor (c2sched.simulate_p6)."""
+        dly = DELAY_CMP
+        N = self.N
+        if not dly or N[x]["op"] not in dly[:2]:
+            return False
+        succ = {b for a, b, _l, _t in self.edges if a == x}
+        if len(succ) != 1:
+            return False
+        j = next(iter(succ))
+        if j not in N or N[j]["op"] != dly[2]:
+            return False
+        xx, jx = N[x].get("x"), N[j].get("x")
+        if xx and jx and not (xx[1] & 0xff == 1 or xx[2] & 0xff == 1):
+            return False
+        if xx and jx and N[x]["op"] == dly[0] and (jx[0] >> 16 & 0x1f) not in (1, 2, 7, 8, 9, 10):
+            return False
+        return len([p for a, p, _l, _t in self.edges if p == j and a in N and a not in issued]) != 1
 
 
 def anchor_map(ours, orig):
@@ -176,6 +282,85 @@ def want_from_orig(reg, orig, ours=None, amap=None):
     return order, s, best[0]
 
 
+def final_offsets(log, func, hk):
+    """{tuple id: listing offset} from the final IL at @Encode@4 (hook index hk), as regmap / scratch read it."""
+    import c2scratch
+    final, on = [], False
+    for ln in log.splitlines():
+        if ln.startswith("T "):
+            if on:
+                final.append(ln[2:])
+            continue
+        if "|" not in ln or ln.startswith("#"):
+            continue
+        head, _, rest = ln.partition("|")
+        f = head.split()
+        on = False
+        if f[0] == "E" and int(f[3]) == hk:
+            name = c2trace._split(rest)[0].strip('"')
+            if c2trace.func_match(func, name):
+                final, on = [], True
+    return {int(k, 16): o for k, (o, _op) in c2scratch.offsets(final).items()}
+
+
+def _norm(ins):
+    return ins[0].lower(), re.sub(r"\s+", " ", ins[1].lower()).strip()
+
+
+def want_from_listing(reg, offmap, ours, orig, amap, near=8):
+    """The original's order of this region's instructions, read through our listing: each node's tuple is placed at
+    its offset in our final code (offmap, from @Encode@4) and that instruction is matched to one of the original's,
+    around the place anchor_map aligns it with (the nearest anchored neighbour's diagonal): the same text there; else
+    the same text at most `near` instructions away (an instruction the original issues elsewhere); else the
+    instruction there when it has the same mnemonic (other registers: an allocation difference, not the order);
+    else the same mnemonic and registers nearby. The matched nodes are put in the original's order in the slots they
+    have in the traced order; nodes the final code dropped or changed (a load folded into a cmp, a label) keep their
+    slot. -> (lex order, orig window start, nodes matched) or None when the region cannot be placed."""
+    at = {o: i for i, o in enumerate(ours.addrs)}
+    pos = {t: at[offmap[t]] for t in reg.order if offmap.get(t) in at}
+    if len(pos) < 2 or not amap:
+        return None
+    anchors = sorted(amap)
+    import bisect
+
+    def diag(p):
+        k = bisect.bisect_left(anchors, p)
+        cand = [anchors[x] for x in (k - 1, k) if 0 <= x < len(anchors)]
+        a = min(cand, key=lambda x: abs(x - p))
+        return p + amap[a] - a if abs(a - p) <= 2 * near else None
+    on = [_norm(x) for x in orig]
+    mine = {t: _norm(ours.cs[pos[t]]) for t in pos}
+    dj = {t: diag(pos[t]) for t in pos}
+    used, match = set(), {}
+
+    def take(t, j):
+        match[t] = j
+        used.add(j)
+    ts = sorted((t for t in pos if dj[t] is not None), key=lambda t: pos[t])
+    for t in ts:                                        # 1. the same text in place
+        if 0 <= dj[t] < len(on) and on[dj[t]] == mine[t] and dj[t] not in used:
+            take(t, dj[t])
+    for key, far in ((lambda x: x, True), (None, False), (okey, True)):
+        for t in ts:
+            if t in match:
+                continue
+            if not far:                                 # 3. the same mnemonic in place
+                if 0 <= dj[t] < len(on) and dj[t] not in used and on[dj[t]][0] == mine[t][0]:
+                    take(t, dj[t])
+                continue
+            js = [j for j in range(max(0, dj[t] - near), min(len(on), dj[t] + near + 1))
+                  if j not in used and key(on[j]) == key(mine[t])]
+            if js:                                      # 2. the same text nearby; 4. same mnemonic and registers
+                take(t, min(js, key=lambda j: abs(j - dj[t])))
+    if len(match) < 2:
+        return None
+    slots = [k for k, t in enumerate(reg.order) if t in match]
+    order = list(reg.order)
+    for k, t in zip(slots, sorted(match, key=lambda t: match[t])):
+        order[k] = t
+    return order, min(match.values()), len(match)
+
+
 def prefix(a, b):
     k = 0
     while k < min(len(a), len(b)) and a[k] == b[k]:
@@ -209,7 +394,9 @@ def analyse(reg, want, a):
     base, prio = reg.replay(reg.edges)
     print("   traced order : %s" % " ".join(str(L(t)) for t in reg.order))
     print("   replayed     : %s%s" % (" ".join(str(L(t)) for t in base),
-                                       "  (= traced)" if base == reg.order else "  (model differs from the trace)"))
+                                       "  (= traced)" if base == reg.order else "  (model differs from the trace%s: its answers are not reliable)" % (
+                                           "" if reg.cycles else "; replayed by the priority shortcut, the build's "
+                                           "P5 pairing / AGI model is not")))
     print("   wanted       : %s" % " ".join(str(L(t)) for t in want))
     p0 = prefix(base, want)
     if base == want:
@@ -299,6 +486,8 @@ def main(argv):
     ap.add_argument("--depth", type=int, default=2)
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--edges", action="store_true", help="also print the region's DAG edges")
+    ap.add_argument("--keep", help="keep the traced compile (log, listing) in this directory")
+    ap.add_argument("--from-keep", metavar="DIR", help="no compile: read the trace and listing a --keep run left in DIR")
     cl = []
     if "--" in argv:
         k = argv.index("--")
@@ -306,16 +495,24 @@ def main(argv):
     a = ap.parse_args(argv)
     if not a.asm_vs and not a.want_lex and not a.want_src:
         ap.error("need --asm-vs ORIG.s, --want-src VARIANT.cpp or --region K --want-lex ...")
-    import tempfile, shutil
-    kd = tempfile.mkdtemp(prefix="schedwant_")
-    img, hk, rc, out, log = c2trace.run_trace(a.src, c2sched.HOOKS, cl, keep=kd, quiet=True)
+    import tempfile, shutil, c2scratch
+    # the final IL at @Encode@4 too (scratch's hook 3): it places every scheduled tuple at its offset in our listing
+    enc = [h for h in c2scratch.HOOKS if h.startswith("@Encode@")]
+    hooks = c2sched.HOOKS + enc[:1]
+    if a.from_keep:
+        kd, rc, out = a.from_keep, 0, ""
+        log = open(os.path.join(kd, "c2trace.log"), errors="replace").read()
+    else:
+        kd = a.keep or tempfile.mkdtemp(prefix="schedwant_")
+        img, hk, rc, out, log = c2trace.run_trace(a.src, hooks, cl, keep=kd, quiet=True)
     ours = None
     try:
-        ours = list(tsweep.listing_instrs(os.path.join(kd, os.path.splitext(os.path.basename(a.src))[0] + ".asm"),
-                                          a.asm_func or a.func))
+        ours = tsweep.listing_instrs(os.path.join(kd, os.path.splitext(os.path.basename(a.src))[0] + ".asm"),
+                                     a.asm_func or a.func)
     except (KeyError, OSError):
         pass
-    shutil.rmtree(kd, ignore_errors=True)
+    if not a.keep and not a.from_keep:
+        shutil.rmtree(kd, ignore_errors=True)
     if rc:
         sys.stdout.write(out)
     funcs = c2sched.parse(log, a.func)
@@ -327,10 +524,17 @@ def main(argv):
         d = tempfile.mkdtemp(prefix="schedwant_")
         c2trace.run_trace(a.want_src, c2sched.HOOKS, cl, keep=d, quiet=True)
         asm = os.path.join(d, os.path.splitext(os.path.basename(a.want_src))[0] + ".asm")
-        orig = list(tsweep.listing_instrs(asm, a.asm_func or a.func))
+        try:
+            orig = [tuple((x.split(None, 1) + [""])[:2]) for o, x in sorted(tsweep.listing_cs_offsets(asm, a.asm_func or a.func).items())]
+        except KeyError:
+            orig = None
         if not orig:
             sys.exit("--want-src: %s not in the variant's listing" % a.func)
-    amap = anchor_map(ours, orig) if ours and orig else None
+    if ours:
+        ours.cs = tsweep.cs_text(ours)          # capstone's text of our bytes: the form of orig.s
+    amap = anchor_map(ours.cs, orig) if ours and orig else None
+    offmap = final_offsets(log, a.func, len(c2sched.HOOKS)) if enc and ours and getattr(ours, "addrs", None) else {}
+    stats = dict(same=0, differ=0, lost=0)
     for name, pre, post, regions in funcs[:1]:
         txt = c2sched.instr_text(pre)
         print("== %s: %d regions" % (name, len(regions)))
@@ -344,16 +548,26 @@ def main(argv):
                 want = [reg.bylex[int(x)] for x in a.want_lex.split(",")]
                 want += [t for t in sorted(reg.N, key=lambda t: reg.N[t]["lex"]) if t not in want]
             else:
-                w = want_from_orig(reg, orig, ours if amap else None, amap)
+                w = want_from_listing(reg, offmap, ours, orig, amap) if offmap and amap else None
+                how = "through our listing"
                 if w is None:
+                    w = want_from_orig(reg, orig, ours if amap else None, amap)
+                    how = "by instruction keys"
+                if w is None:
+                    stats["lost"] += 1
                     if a.region is not None:
                         print("-- region %d: no window of the original matches its instructions" % k)
                     continue
                 want, s, sc = w
                 if want == reg.order:
+                    stats["same"] += 1
+                    if a.region is not None:
+                        print("-- region %d: the original has the traced order (%d of %d instructions matched %s)" % (
+                            k, sc, len(reg.N), how))
                     continue
-                print("-- region %d (%d instrs; original window at line %d, %d of %d instructions matched)" % (
-                    k, len(reg.N), s + 1, sc, len(reg.N)))
+                stats["differ"] += 1
+                print("-- region %d (%d instrs; original window at line %d, %d of %d instructions matched %s)" % (
+                    k, len(reg.N), s + 1, sc, len(reg.N), how))
             if a.want_lex:
                 print("-- region %d (%d instrs)" % (k, len(reg.N)))
             for t in sorted(reg.N, key=lambda t: reg.N[t]["lex"]):
@@ -361,6 +575,10 @@ def main(argv):
                 print("   %3d ht %2d ns %d %-4s %6x  %s" % (n["lex"], n["ht"], n["ns"], c2sched.flags(n["fl"]), n["prio"],
                                                         c2sched.short(txt.get(t, "?"))))
             analyse(reg, want, a)
+    if not a.want_lex:
+        print("# %d regions with 2+ instructions: %d in the original's order, %d differ%s, %d not located in the original%s" % (
+            sum(stats.values()), stats["same"], stats["differ"], " (above)" if stats["differ"] else "", stats["lost"],
+            "" if offmap else " (no final-IL offsets: matched by pre-schedule instruction keys only)"))
     return rc
 
 

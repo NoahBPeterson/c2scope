@@ -643,7 +643,7 @@ def main(argv):
         export(a.export, a.func, segs, pos, rcalls, orig)
     if a.phase:
         asm = os.path.join(a.keep, os.path.splitext(os.path.basename(a.src))[0] + ".asm")
-        return phase(a, segs[body]["picks"], pos, asm, a.export, body)
+        return phase(a, segs[body]["picks"], pos, asm, a.export, body, final)
     for k, s in enumerate(segs):
         if k != body and not a.all:
             continue
@@ -782,8 +782,41 @@ def _ranges(ks):
     return ",".join(r)
 
 
-def orig_regs(picks, pos, asm, func, orig_path):
-    """{pick n: (the original's register at the aligned instruction or None, why)}."""
+def temp_votes(final, asm, func, src, picks):
+    """{pick n: (register, why)} for the picks whose temp regmap can judge as a whole: the original's register read
+    at every aligned instruction that names the temp (its definition and its uses), with regmap's verdict rule
+    (`ok`: ours; `WANTS r`: r; a mixed verdict is not used). Only a temp that has one pick in this run and one
+    register in our code. The pick's own instruction is not enough on its own: when the original issues two loads
+    the other way round (`mov edx,[esp+0x10]; mov eax,[esi+4]` against our `mov edx,[esi+4]; mov eax,[esp+0x10]`),
+    each definition aligns to the other value's load, which has the same register, and both picks look right
+    although every use of both temps has the other register (Mount & Blade 0x406e50, picks 6 and 7)."""
+    import regmap
+    have, votes, where, agree, _order, _notes = regmap.analyse(final, asm, func, src)
+    names = {}
+    for p in picks:
+        for t in {"t%d" % p["tmp"] if isinstance(p.get("tmp"), int) else p.get("tmp"),
+                  (re.match(r"\s*(t\d+):", _instr(p)[2]) or [None, None])[1]} - {None}:
+            names.setdefault(t, []).append(p["n"])
+    out = {}
+    for t, ns in names.items():
+        key = (t, "int")
+        if len(ns) != 1 or len(have.get(key, ())) != 1 or not votes.get(key):
+            continue
+        reg = next(iter(have[key]))
+        bad = collections_counter((w[3], w[4]) for w in where[key])
+        nbad = sum(bad.values())
+        if not nbad:
+            out[ns[0]] = (reg, "")
+        elif len(bad) == 1 and nbad >= agree[key]:
+            (_fr, to), = bad
+            out[ns[0]] = (to, "%s: %d of %d aligned uses have %s" % (t, nbad, nbad + agree[key], to))
+    return out
+
+
+def orig_regs(picks, pos, asm, func, orig_path, final=None):
+    """{pick n: (the original's register at the aligned instruction or None, why)}. With the final IL, a pick whose
+    temp regmap judges as a whole (temp_votes) takes that register instead (its definition alone can align to the
+    other value's instruction)."""
     import regmap, tsweep
     lst = tsweep.listing_cs_offsets(asm, func)     # capstone of our bytes: the operand order of orig.s (test, xchg)
     offs = sorted(lst)
@@ -813,12 +846,16 @@ def orig_regs(picks, pos, asm, func, orig_path):
             res[p["n"]] = (None, "no register operand to compare")
             continue
         res[p["n"]] = (rb[ra.index(p["reg"])], "")
+    if final:
+        for n, (r, why) in temp_votes(final, asm, func, src, picks).items():
+            if res.get(n, (None,))[0] != r:
+                res[n] = (r, why or "the temp's other instructions")
     return res, len(pair), len(ours), len(orig)
 
 
-def phase(a, picks, pos, asm, snap, body):
+def phase(a, picks, pos, asm, snap, body, final=None):
     func = a.asm_func or a.func
-    got, npair, nours, norig = orig_regs(picks, pos, asm, func, a.phase)
+    got, npair, nours, norig = orig_regs(picks, pos, asm, func, a.phase, final)
     starts, srcl = listing_groups(asm, func) if a.by == "case" else ([], {})
     by = a.by if starts else "block"
     names, gof = [], {}

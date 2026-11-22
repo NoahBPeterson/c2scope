@@ -43,6 +43,10 @@ text positions, the site context, the code numbers and every model's effect stri
 `work/effectmine/runs/<tu>-<hash>[@build]/<run>/` (per run: the base and the `--keep-variants` best variants,
 sources and listings; every trace is deleted once it is read). `EFFECTMINE_DIR` moves all of it (the tests use a scratch directory).
 
+Headers: at the start the unit's include closure (and the /I dirs) is copied to a temp folder (`tools/incsnap.py`)
+and every source and compile of the run uses the copy, so editing the tree during a run does not reach it; the
+records, the base text and its sha keep the live paths. rwsweep does the same.
+
 ## 2. What one variant costs and what is recorded
 
 One compile with the `regs` hooks gives the final code and the allocation's input. Its record:

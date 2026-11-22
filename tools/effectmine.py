@@ -1257,7 +1257,7 @@ class Ref:
         self.dir = os.path.join(miner.out, tag)
         os.makedirs(self.dir, exist_ok=True)
         self.path = os.path.join(self.dir, tag + ".cpp")
-        open(self.path, "w").write(text)
+        open(self.path, "w").write(miner.src_text(text))
         self.fn = miner.trace_regs(self.path, self.dir)
         self.sig = ilsig(self.fn)
         self.feat = {}
@@ -1362,6 +1362,14 @@ class Miner:
         self.out = os.path.join(RUNS, stem + "-" + hashlib.md5(os.path.abspath(a.src).encode()).hexdigest()[:6] +
                                 ("@" + self.build if self.build != "14.00" else ""), self.run + "-%d" % os.getpid())
         os.makedirs(self.out, exist_ok=True)
+        # every compile reads the headers as they are now: the unit's include closure is copied to a temp folder and
+        # each source written (self.src_text) and the cl args (self.cl) point there; self.text, self.sha and
+        # self.flags keep the live paths, so the database keys do not change (an edit of the tree during a run broke
+        # every later variant: Mount & Blade, stream.h)
+        import atexit, incsnap, tempfile
+        self.snap = incsnap.Snapshot(a.src, cl, tempfile.mkdtemp(prefix="effectmine_inc_"), text=self.text)
+        atexit.register(shutil.rmtree, self.snap.dest, True)
+        self.cl = self.snap.cl
         os.makedirs(TEXTS, exist_ok=True)
         tp = os.path.join(TEXTS, self.sha + ".cpp.gz")
         if not os.path.exists(tp):
@@ -1386,6 +1394,10 @@ class Miner:
         self.ctl_lock = threading.Lock()
 
     # -- compiles
+    def src_text(self, text):
+        """A source as it is compiled: its includes of the live tree pointed at the run's snapshot (incsnap)."""
+        return self.snap.text(text)
+
     def spend(self, n=1):
         with self.clock:
             self.compiles += n
@@ -1552,7 +1564,7 @@ class Miner:
             rec = self.record(v, None, None, "control: " + str(e)[:200], ctx)
             self.write(rec)
             return rec
-        open(p, "w").write(self.text_of(v))
+        open(p, "w").write(self.src_text(self.text_of(v)))
         fn, err = None, None
         try:
             fn = self.trace_regs(p, d)
@@ -2068,7 +2080,7 @@ def deep_search(M, recs, wants, wl, stats, a):
             d = os.path.join(M.out, "deep%d" % bi)
             os.makedirs(d, exist_ok=True)
             p = os.path.join(d, "deep%d.cpp" % bi)
-            open(p, "w").write(prelude(set(b.get("helpers", [])), M.have) + t2)
+            open(p, "w").write(M.src_text(prelude(set(b.get("helpers", [])), M.have) + t2))
             fn2 = M.trace_regs(p, d)
             c2 = GenCtx(t2, M.func, fn2)
             c2._mtype = M.c._mtype

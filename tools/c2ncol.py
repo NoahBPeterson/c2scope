@@ -24,7 +24,8 @@ import c2build   # noqa: E402  (--c2 is taken out of argv here)
 import c2trace   # noqa: E402
 
 # event kinds in hooks.ncol order; --why adds STATE (hooks.ncol_state: the liveness arrays after prioritization)
-CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF, PRE, REGSET, PERFUNC = range(11)
+CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF, PRE, REGSET, PERFUNC, COVREG, COVBEST, SEPARATE = range(14)
+DPA_TRY, DPA_COVER, DPA_C, DPA_B, DPA_A = range(14, 19)
 # --il: the IL also at NColSubsumption's entry (0x1009ab40, after NColInitializeSyms / NColBuildInfo, before the copies
 # are coalesced and NColFoldTooCheap folds: the stream the lifetime indices, live counts and availability come from)
 PRE_HOOK = "1009ab40=tdccc>0>0>4$,tdccc>0>8>0>0x1c%"
@@ -37,6 +38,24 @@ REGSET_HOOK = "100d7b53=s7,s3,esi>0x24>0*16:0:4:12,esi>0x24>0*16:8:8:12"
 # (0x10092733..0x1009279b): FUNC+0xe4 (0x80 floating point, 0x4801000 EH), FUNC+0xe8, the frame-reference score
 # NColCanon summed (TLS+0x1196c, rbp is reserved at 6 * 24 when favoring speed) and TLS+0x1073c (docs/c2/ncolor.md 12.5)
 PERFUNC_HOOK = "100925b0=ecx>0xe4,ecx>0xe8,t1196c>0,t1073c>0"
+# --cov (with --export --il): NColBestCoverage's intermediate state (docs/c2/ncolor.md 4.4). COVREG_HOOK at 0x1006a348
+# (`cmp ecx, [ebp-0x98]`, 6 bytes, the flags it sets feed the jg after it: the trampoline runs it last): one register
+# done, ecx = its best cluster's score (benefit - cost; 0x80000000 none), [ebp-0x20] = the physreg SYM, [ebp-0x98] = the
+# best score so far, and every cluster of the register ([ebp-0x4c], next at +0): begin / end tuple (+0x10 / +0x14),
+# benefit / cost (+0x18 / +0x1c), first / last block (+8 / +0xc). COVBEST_HOOK at 0x1006aeb3 (9 bytes): a new best,
+# edx = its cluster. SEPARATE_HOOK at NColSeparateProcessedRegion's entry (0x100c7a20): the covered ranges BestCoverage
+# (or NColMakePhysregAvail) left in TLS+0xf668 (0x18-byte entries), [esp+8] their number; edx = R (+0x24 / +0x28)
+NCLU = 24
+COVREG_HOOK = ("1006a348=ecx,ebp>-0x20>0x20,ebp>-0x98,ebp>-0x4c*%d:16:20,ebp>-0x4c*%d:24:28,ebp>-0x4c*%d:8:12"
+               % (NCLU, NCLU, NCLU))
+COVBEST_HOOK = "1006aeb3=ecx,ebp>-0x20>0x20,edx>0x10,edx>0x14,edx>0x18,edx>0x1c"
+NSEP = 96            # f668 entries read at NColSeparateProcessedRegion (a split global has one per block it keeps)
+SEPARATE_HOOK = "100c7a20=s2,edx>0x24,edx>0x28,tf668>0#%d" % (6 * NSEP)
+# --dpa (with --export --il, after --cov's hooks): NColDeterminePhysregAvail's order loop (docs/c2/ncolor.md 7): a
+# register number that passed the useable test (0x10069635, esi), a physreg that covers every range (0x10069750, its
+# number; the displaced cmp feeds a later jae), the fallbacks C (0x100699d0, ecx = its gap), B (0x10069a35), A
+# (0x100699fb); the result is the FIRST event (0x10068751; the common exit 0x1006988e displaces the ret)
+DPA_HOOKS = ["10069635=esi", "10069750=esi>0x20", "100699d0=esi>0x20,ecx", "10069a35=esi>0x20", "100699fb=esi>0x20"]
 FN_FLAGS = ",ecx>0xe4"   # NColor's entry (ecx = FUNC): FUNC+0xe4, whose bit 0x80 stops NColMdAdjustPriority
 NAVAIL = 80          # nodes of each register's initial availability list (--export)
 # register numbers of _RegName whose lists are exported: rax..r15; fxmm0l..15l (doubles), fxmm0s..15s (floats);
@@ -136,6 +155,27 @@ def parse_all(text, fn_flags=False):
             g = lambda x: hx(x) if x not in ("?", "") else None
             if len(v) >= 4:
                 rec["perfunc"] = dict(e4=g(v[0]), e8=g(v[1]), rbpscore=g(v[2]), m1073c=g(v[3]))
+            continue
+        if kind in (COVREG, COVBEST, SEPARATE) and cur is not None:     # --cov
+            g = lambda x: hx(x) if x not in ("?", "") else None
+            pairs = lambda t: [(x[2 * k], x[2 * k + 1]) for x in [arr(t)] for k in range(len(x) // 2)] \
+                if t.startswith("[") else []
+            if kind == COVREG and len(v) >= 6:
+                cl = [dict(begin=b, end=e, benefit=bn, cost=co, blocks=bl) for (b, e), (bn, co), bl in
+                      zip(pairs(v[3]), pairs(v[4]), pairs(v[5]))]
+                cur.setdefault("cov", []).append(dict(reg=g(v[1]), score=g(v[0]), best=g(v[2]), clusters=cl))
+            elif kind == COVBEST and len(v) >= 6:
+                cur.setdefault("covbest", []).append(dict(score=g(v[0]), reg=g(v[1]), begin=g(v[2]), end=g(v[3]),
+                                                          benefit=g(v[4]), cost=g(v[5])))
+            elif kind == SEPARATE and len(v) >= 4:
+                n, w = g(v[0]) or 0, arr(v[3]) if v[3].startswith("[") else []
+                cur.setdefault("separate", []).append(dict(n=n, first=g(v[1]), last=g(v[2]),
+                                                           ranges=[w[6 * k:6 * k + 6] for k in range(min(n, len(w) // 6))]))
+            continue
+        if DPA_TRY <= kind <= DPA_A and cur is not None:                # --dpa
+            g = lambda x: hx(x) if x not in ("?", "") else None
+            tag = ("try", "cover", "C", "B", "A")[kind - DPA_TRY]
+            cur.setdefault("dpa", []).append([tag] + [g(x) for x in v])
             continue
         if kind == REGSET:                 # --il: a REGSET leaf's registers (NColBuildInfo, before il_pre)
             if len(v) >= 4 and v[2].startswith("[") and v[3].startswith("["):
@@ -270,6 +310,11 @@ def main(argv):
                     "words (T R: branch targets) and each leaf's symbol (T S: root, size, offset), the IL at "
                     "NColSubsumption's entry and every REGSET leaf's registers (the calls' clobber sets), for ncolsim's "
                     "trace-free inputs (docs/c2/ncolor.md 11, 12)")
+    ap.add_argument("--cov", action="store_true", help="with --export --il: NColBestCoverage's scores and clusters per "
+                    "register, its new bests and the ranges NColSeparateProcessedRegion keeps (candidates get cov, "
+                    "covbest, separate; docs/c2/ncolor.md 4.4)")
+    ap.add_argument("--dpa", action="store_true", help="with --export --il --cov: NColDeterminePhysregAvail's order "
+                    "loop per region (candidates get dpa: [event, register ..]; docs/c2/ncolor.md 4.3)")
     ap.add_argument("--keep")
     argv, cl = c2trace.split_cl(argv)
     a = ap.parse_args(argv)
@@ -295,6 +340,10 @@ def main(argv):
             hk.append(PRE_HOOK)
             hk.append(REGSET_HOOK)
             hk.append(PERFUNC_HOOK)
+            if a.cov or a.dpa:
+                hk += [COVREG_HOOK, COVBEST_HOOK, SEPARATE_HOOK]
+            if a.dpa:
+                hk += DPA_HOOKS
     img, hk, rc, out, text = c2trace.run_trace(a.src, hk, cl or ["/O2"], keep=a.keep,
                                                func=a.func if a.func else (False if a.export else None))
     if rc:

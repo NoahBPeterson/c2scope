@@ -2788,6 +2788,22 @@ def slot_answers(c, a, top=12, pool=40):
     return [eds for v, eds in best[:top]]
 
 
+def scratch_wrong(snap, tgt):
+    """[(pick n, temp, our register, the original's)] for the body run's picks whose register differs from the
+    target's (c2trace.py scratch --phase), in pick order."""
+    try:
+        s, t = json.load(open(snap)), json.load(open(tgt))
+    except (OSError, ValueError):
+        return []
+    runs = s.get("runs") or []
+    body = next((r for r in runs if r.get("body")), runs[0] if runs else None)
+    if body is None:
+        return []
+    ours = {p["n"]: p for p in body.get("picks", [])}
+    return [(k, ours[k].get("tmp") or "?", ours[k].get("reg"), r) for k, r in t.get("want", [])
+            if k in ours and ours[k].get("reg") != r]
+
+
 def scratch_answers(c, a, top=12, pool=8):
     """The scratch model's answers against the original: `c2trace.py scratch --phase` (our picks against the
     original's registers) and rasim's re-alignment scan of single inserted / removed picks, then the scan again on
@@ -2801,7 +2817,12 @@ def scratch_answers(c, a, top=12, pool=8):
     if not os.path.exists(tgt):
         print("# scratch: no phase report (%s)" % (r.stderr.strip().splitlines() or ["?"])[-1])
         return []
+    return scratch_scan(snap, tgt, top, pool)
 
+
+def scratch_scan(snap, tgt, top=12, pool=8):
+    """rasim's re-alignment scan of a `scratch --phase` snapshot and target (singles, then pairs), printed and
+    returned as answers ranked by known picks on the original's register (scratch_answers)."""
     def scan(given):
         q = subprocess.run([RASIM, "scratch", snap, "--target", tgt, "--top", "60"] + given, capture_output=True, text=True).stdout
         m = re.search(r"baseline: (\d+) of (\d+) known picks", q)
@@ -2810,9 +2831,18 @@ def scratch_answers(c, a, top=12, pool=8):
         out = [(b + int(x.group(2)), x.group(1)) for x in re.finditer(r"^edit (\S+) .*?picks ([+-]\d+)", q, re.M)]
         return b, n, out
     b0, n, one = scan([])
-    print("# scratch: %d of %d known picks on the original's register" % (b0, n))
+    wrong = scratch_wrong(snap, tgt)
+    print("# scratch: %d of %d known picks on the original's register%s" % (b0, n, "; wrong: " + ", ".join(
+        "pick %d %s (ours %s, original %s)" % w for w in wrong[:6]) if wrong else ""))
     rows = [(v, [e]) for v, e in one if v > b0]
-    for v1, e1 in sorted(one, key=lambda x: -x[0])[:pool]:
+    # pairs: on top of the best `pool` singles, and of every single at the first wrong pick. An inserted pick there
+    # fixes that pick but shifts the rotation of every later one, so on its own it scores low (Mount & Blade
+    # 0x406e50: ins:6 = 7 of 18, ins:6 + ins:8 = 18 of 18), and the best singles are late edits that cannot fix it.
+    near = set() if not wrong else {"%s:%d" % (k, m) for k in ("ins", "drop")
+                                    for m in range(max(1, wrong[0][0] - 1), wrong[0][0] + 2)}
+    seeds = sorted(one, key=lambda x: -x[0])[:pool]
+    seeds += [x for x in one if x[1] in near and x not in seeds]
+    for v1, e1 in seeds:
         _b, _n, two = scan([e1])
         delta = v1 - _b
         rows += [(v + delta, sorted([e1, e2])) for v, e2 in two if v + delta > max(b0, v1)]
@@ -2853,7 +2883,8 @@ def cmd_pipeline(c, a):
         c.wantregs.setdefault(v, r)
     print("%s: %d blocks, %d instructions%s; wanted: %s; %d answers read" % (
         c.func, len(c.base.blocks), len(c.base.code), "" if c.orig is None else ", rdiff %d, bdiff %d (regdiff %d)" % (c.regdiff(c.base), c.bdiff(c.base), c.oldreg(c.base)),
-        " ".join("%s=%s" % kv for kv in c.wantregs.items()) or "(none: give --want-regs or --asm-vs)", len(answers)))
+        " ".join("%s=%s" % kv for kv in c.wantregs.items()) or ("the %s model's target (above)" % a.from_model if a.from_model
+                                                                 else "(none: give --want-regs or --asm-vs)"), len(answers)))
     st = dict(ncomp=0, closest=None, done=set(), pool=[])
     tried, nocon, seen = 0, [], set()
     snap = os.path.join(c.out, "base.json")

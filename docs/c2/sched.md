@@ -188,6 +188,17 @@ answer, and the copy from the parameters (`k2.instanceID = a0; ..; row = k2`, no
 byte match. When no perturbation helps, the pre-schedule order differs (an operand sort, statement order, or for
 reloads the allocator's insertion order; equal priorities fall back to it).
 
+Since 2026-11-22 the region is placed through our listing (each tuple's offset at @Encode@4, matched to the
+original around where the two listings align), the replay runs cycle by cycle with the unit / busy / est model of
+rule 7 and lets a breakable dependence (rule 8, read off the trace: a node added with predecessors left) go first,
+and the last line counts the regions (in the original's order / differ / not located). Before, matching the
+pre-schedule IL (`_jcc`, a load rewritten by a break or folded into a cmp) to the original found no region on any
+Mount & Blade function (13.10), and the replay missed the break of 0x4ea030's `lea esi` / `mov eax,[esi]` and the
+x87/integer interleave of 0x4dc350. Now: 0x4ea030 region 4 found, replay = traced, `unalias:3` (the store of the
+address-taken `idx`) among 48 answers; 0x406e50 all 37 regions in the original's order (its diff is the
+allocator's); 0x4dc350 regions 1 and 2 replayed exactly, no perturbation gives the original's order. Test:
+`schedwant_break_tests` (tests/data/schedbreak.cpp).
+
 Registers are allocated before this pass, so only priorities and dependencies can be changed:
 - Height and successor counts come from the DAG: adding or removing a use of a value, or changing which value
   feeds a push, changes them (q4: in `a*b + c*d` the load of `c` jumps above the first `imul`, while in `a*b +

@@ -269,7 +269,9 @@ for every allocated reg). Passes, all skipping regs in A:
 Resulting default order with nothing used yet: rax rcx rdx | r8 r9 r10 r11 | rbx rdi rsi rbp |
 r14 r15 r12 r13. Note `used` is updated by `NColRewriteCandidate`, which runs after all candidates
 are processed, so during allocation it only reflects registers present before NColor (parameters,
-calls, fixed-register instructions) **[I]** unless another writer exists that was not read.
+calls, fixed-register instructions; NColBuildInfo marks every physreg leaf and REGSET register it meets) **[C for the
+writers read; measured]**: a function whose IL names rdi (gen_bitlen's `rep stos`) has the order rax rcx rdx rdi r8 ..
+r11 rbx rsi rbp r14 r15 r12 r13 for every candidate (4.8, `used`).
 
 RegAttrib (0x10001a40, DWORD per register number, 364 registers): bit 0 callee-saved, bit 1 not
 allocatable (rsp, segment, x87, cc...), 0x8000 on r10/r11/r12, 4 on ymm?h.
@@ -278,64 +280,113 @@ allocatable (rsp, segment, x87, cc...), 0x8000 on r10/r11/r12, 4 on ymm?h.
 
 Args: ecx = L, edx = R, [ebp+8] = useable BV, [ebp+0xc] = first, [ebp+0x10] = last, [ebp+0x14] =
 preference list (physreg SYM chained by +0x34), [ebp+0x18] = &fullCover, [ebp+0x1c] = &benefit.
-Returns physreg SYM* or 0.
+Returns physreg SYM* or 0. The preference list it gets is the one NColDeterminePhysregUseable built with, for the
+lifetime's first region, the registers of NColIdentifyExtraPhysAvail (4.6) chained in front (PCR 0x10068b2b: each
+entry of TLS+0xf6dc whose register number is in the useable BV and that is not yet in the list, the earliest use's
+at the head).
 
 **A. Preferences first.** Two passes over the preference list: first the preferred registers that are
 *not* in the anti-pref set SYM+0x44, then (only if SYM+0x44 != 0) those that are. For each D:
 `r = NColFindFirstOverlappingAvailRegion(D, first, last)`; if `NColDetermineCovered(R.ranges, r, L, D)`
--> *fullCover = 1, **return D**. The register numbers of the first and of the last preference tried
-are remembered and skipped in B.
+(0x1018f620: the same range test and boundary tests as B.3) -> *fullCover = 1, **return D**. The register numbers of
+the first and of the last preference tried are remembered and skipped in B.
 
-**B. Order loop.** `order = NColMdGetRegOrder(sym)`. For each register number r:
+**B. Order loop.** `order = NColMdGetRegOrder(sym)` (4.2: with the used callee-saved registers in T1's first pass).
+For each register number r:
 
-1. r must be in the useable BV and not one of the two remembered preference numbers.
-2. P = physreg table (TLS+0x113f4) + r*0x64. The first available range of P overlapping
-   [first, last] is located through f65c[(block(first)*364 + r)] (per-block entry points into one
-   sorted doubly linked list of {next, prev, begin, end} per register). None -> next register.
-3. Every range of R must lie inside one available range. Boundary cases: if an available range begins
-   exactly at the region range's begin, the tuple there must not have P among its sources when the
-   candidate is also a source there (or the def needs a load, `NColIsNoLoadDef`); if it ends exactly
-   at the range end, the tuple must not define P while also defining the candidate
-   (`NColPhysregInOprList`, `Tuple::FindSrcSym/FindDstSym`). Any failure -> next register.
+1. r must be in the useable BV (every chunk of the sparse BV: r15b is number 64, in the second chunk) and not one of
+   the two remembered preference numbers.
+2. P = physreg table (TLS+0x113f4) + r*0x64. The first available range of P overlapping [first, last] is located
+   through f65c[(block(first)*364 + r)] (per-block entry points into one sorted doubly linked list of
+   {next, prev, begin, end} per register). None -> next register.
+3. Every range of R must lie inside **one** available range (two touching ranges `[.., t] [t+1, ..]`, the mark of a
+   clobber or definition at t, do not join). Boundary cases: if an available range begins exactly at the region
+   range's begin, the tuple there must not name P among its sources when the candidate is also a source there or the
+   tuple is not a definition that needs no load (`NColIsNoLoadDef`); if it ends exactly at the range's end, the tuple
+   must not name P among its destinations while also defining the candidate. "Names P" is `NColPhysregInOprList`
+   (0x1006b7b0): a physical-register leaf of P's master, **a candidate leaf whose processed region covering the tuple
+   has P** (the lifetime's region tree, R+0x1c), or a REGSET leaf whose set overlaps P. Any failure -> next register.
 4. Covered: *fullCover = 1. Then classification of P:
    * P number in 0x76..0x7f (ymm6..ymm15): remembered as **fallback A** (first such only), continue.
-   * opt, and P's master register != L+0x38, and the list f6a0[master reg] contains a preference
-     range of another lifetime overlapping R's first range: if the master is callee-saved ->
-     fallback A, else **fallback B** (first only); continue.
-   * master register callee-saved (RegAttrib bit 0, via `MscGetCorrespondingXMMRegister(P, 0)`, which
-     for integer regs just returns P+0xc): **return fallback C if set, else P**.
-   * otherwise (scratch register): gap = first - begin of the available range. If gap >= 1 (int) or
-     >= 3 (non-int) -> **return P**. Else P becomes **fallback C** if its gap is larger than the
-     current fallback C's; continue. (A register freed by the immediately preceding tuple is avoided
-     when another one will do.)
+   * opt, P's master register != L+0x38, and the list walked from f6a0[master reg] by next has a window
+     **strictly** overlapping R's first range (window.begin < range.end and range.begin < window.end, 0x100697a1..:
+     a window that only shares an end tuple does not count; the walk stops at the first window beginning after the
+     range): if the master is callee-saved -> fallback A, else **fallback B** (first only); continue.
+   * master register callee-saved (RegAttrib bit 0, via `MscGetCorrespondingXMMRegister(P, 0)`):
+     **return fallback C if set, else P**.
+   * otherwise (scratch register): gap = first - begin of the first available range overlapping [first, last]. If
+     gap >= 1 (int) or >= 3 (non-int: the class test is on P's type) -> **return P**. Else P becomes **fallback C**
+     if its gap is larger than the current fallback C's; continue.
 5. End of the order: return fallback C, else fallback B, else fallback A, else
-   `NColBestCoverage(L, R, useable, first, last, &benefit)` with *fullCover left 0.
+   `NColBestCoverage(L, R, useable, first, last, &nRanges)` (4.4) with *fullCover left 0.
 
-Consequences useful for rasim **[C]**: among scratch registers the first one in order that has been
-free for at least one tuple wins; a callee-saved register is reached only after all scratch registers
-in the order failed, and then the first fully covering one is taken at once (preference-range
-conflicts are not looked at for a callee-saved hit that passes the f6a0 test).
+The preference windows (f6a0) are linked lists **[C]** (NColAddRegPrefRange 0x101850c0, the unlink at 0x10068528):
+NColPrioritizeCandidates inserts the windows of the tied lifetimes in index order, each before the first node whose
+begin is not below its own, and sets f6a0[reg] only for the first; a window inserted before the head is linked but
+off the walk. NColProcessCandidate unlinks the candidate's own window after it: next.prev = prev, and prev.next =
+next or, without a prev, **f6a0[reg] = next**. So when the first of the hidden windows is unlinked, every window
+after it becomes visible again (deflateParams: err$1's (402, 417) is the head, t269's, t308's and bstate$1's windows
+are hidden before it; t269 is processed first, its unlink sets the head to t308's window, and t424 [347, 348] then
+meets bstate$1's (346, 358): rax is fallback B, rcx is taken, as the --dpa probe shows), and a head unlinked while
+hidden windows precede it stays on the walk with its stale next.
 
-### 4.4 NColBestCoverage (0x1006a030) [C for the frame, I for cluster-growth details]
+### 4.4 NColBestCoverage (0x1006a030) [C]
 
-Args: ecx = L, edx = R, [ebp+8] = useable BV, [ebp+0xc] = first, [ebp+0x10] = last, [ebp+0x14] =
-&nRanges (out). Returns physreg SYM* or 0. 4.3 KB; read in full only for the outer loop and scoring.
+Args: ecx = L, edx = R, [ebp+8] = useable BV, [ebp+0xc] = first, [ebp+0x10] = last, [ebp+0x14] = &nRanges (out).
+Returns physreg SYM* or 0. Read in full (0x1006a030..0x1006b118 and the cold blocks 0x102cf96d..0x102cfa5a; the PGO
+variants, TLS+0x1073c == 2, count edge weights instead of entries and are not modelled).
 
-For each register of the same order list that is in the useable BV: `NColGetPhysregAvail` builds a
-bit vector of the tuples where the register is available in [first-1, last+1]. Starting at each
-appearance of the candidate where the register is available, a *cluster* (alloca, 0x20 bytes:
-+0 next, +4 id, +8 first block, +0xc last block, +0x10 begin tup, +0x14 end tup, +0x18 benefit,
-+0x1c cost) is grown block by block over successors while the register stays available
-(`NColMarkSuccessors`, `NColCanUsePhysregAtStartPoint/EndPoint`, `NColRegAvailAtExit`; the callback
-TLS+0xf6b0 decides whether a loop body / hot trace may be added; overlapping clusters are merged by
-`NColMergeClusters`). benefit += appearances covered << (2 * zone depth); cost = loads on entry
-(1 << 2*depth, 0 if the first appearance is a def that needs no load) plus entry edges from
-uncovered predecessors. Score of a register = max over its clusters of (benefit - cost)
-(0x1006a334). The register with the **strictly** greatest score wins (0x1006a348 `jg`), so ties go
-to the earlier register in the order. On a new best: `NColCopyClusterToRangesArray(f668, cluster)`
-writes the covered ranges to TLS+0xf668 and its return value to *nRanges (0x1006aeb3). If the
-candidate has more than 1000 appearances in play ([ebp-0x68] > 0x3e8) the search stops at the first
-register that scores.
+Set-up: f678[t] = the range of R containing t for each range begin and each block start inside a range; an
+appearance BV of R's defs and uses; B0 = block(first), B1 = block(last). For each register of the same order list
+(NColMdGetRegOrder) that is in the useable BV:
+
+* f680[B0..B1] (0x18 bytes per block: +0 the cluster that owns the block's entry, +4 the cluster that continues out
+  of it, +8 its start tuple, +0xc its stop tuple, +0x10 marked, +0x14 entered as a pass-through block) is cleared;
+  the appearance bits are set again; `NColGetPhysregAvail` sets a BV of the tuples of P's available ranges in
+  [first-1, last+1]. The first time only, f684[b] gets each block's appearances in order (duplicates of a tuple kept).
+* For each appearance t of L from R's first, up to last, whose bit is still set and where P is available: if P is
+  not available at t-1, `NColCanUsePhysregAtStartPoint(t)` (0x1005e8b0: true unless the tuple names P among its
+  sources while it reads the candidate or is not a no-load definition) must hold; if not at t+1,
+  `NColCanUsePhysregAtEndPoint(t)` (0x101925c0: false when the tuple names P among its destinations and defines the
+  candidate); the same at t when P's available range N begins / ends there. A **cluster** C (alloca 0x20: +0 next,
+  +4 id, +8 first block, +0xc last block, +0x10 begin, +0x14 end, +0x18 benefit, +0x1c cost) starts:
+  * start = t and cost 0 when t is a no-load definition (`NColIsNoLoadDef`); else start = max(block start, range
+    begin), or N.begin (N.begin + 1 when the start-point test fails there) when that is not later, and cost =
+    `1 << 2 * zone depth(t)` (1 when not favoring speed);
+  * if start is the block's first tuple the cluster owns the block's entry (f680.+0);
+  * end = the block's last tuple, or the range's end if that comes first (then no continuation); if N ends at or
+    before it: end = N.end (N.end - 1, no continuation, when the end-point test fails), and the cluster continues only
+    if N.end is the block's last tuple and that tuple does not name P among its destinations;
+  * benefit = the appearances of the block in [start, end] (their bits cleared) `<< 2 * zone depth(end)`;
+  * continuing: f680[b].+4 = C, +8 = start; `NColMarkSuccessors` (0x100c9060) marks every successor s whose first
+    tuple lies in [first, last] and in a range of R (f678), that C does not own, and where P is available, and
+    returns the lowest block index to visit (min(b + 1, s)); not continuing: f680[b].+0xc = end if C owns the entry.
+* Worklist, j from that index to B1: an unmarked block is skipped; a marked one is unmarked; if another cluster owns
+  its entry, `NColMergeClusters(.., j, 1)` (0x10188ac0: the other's benefit, cost and block span join C, its f680
+  labels become C's) and next. Else: end and continuation as above from P's range at the block's first tuple (the
+  range of R from f678); a block that does not continue is visited only if it has an appearance at or before end.
+  Its predecessors: one outside [B0, B1] is an **entry**; one in C that continues: none, but if it was a
+  pass-through block (+0x14) the flag carries; one continuing another cluster: *other*; one in no cluster: an entry
+  if it is earlier in block order, or a later one at whose last tuple P is not available (`NColRegAvailAtExit`).
+  * no entries, no other: added (a pass-through flag is dropped when the block has appearances);
+  * entries (+ other, counted as entries): not added after a pass-through block; added if the block has
+    appearances; otherwise added as a pass-through block if `TLS+0xf6b0` (`NColAddingLoopBodyToCluster` 0x1018a120:
+    the block is in no loop, BLOCK+0xac, or the candidate appears in a block of that loop, `NColAppearsInLoop`) allows;
+  * other only, no pass-through: the other clusters of the predecessors merge into C (flag 0), then added.
+  Added: C owns the entry, its block span grows, benefit += the block's appearances >= the cluster's start tuple and
+  <= end (bits cleared) `<< 2 * zone depth(end)`, and **only if there were any**, cost += the entries `<< 2 * zone
+  depth(end)`; continuing: f680.+4 = C, the pass-through flag, its successors marked as above (the next j is the
+  lowest marked); else f680.+0xc = end.
+* After the appearances (and if more than 1000 blocks have appearances, after the first register): the register's
+  score is the best of its clusters' benefit - cost (the latest cluster first, `jg`); **the strictly greatest score
+  wins** (0x1006a348, from 0x80000000), so ties go to the earlier register in the order; the new best's cluster is
+  copied to TLS+0xf668 by `NColCopyClusterToRangesArray` (0x1018d6a0: per block from its first to its last block,
+  [block start, block end] / [block start, stop] / [start, block end] by the f680 labels; a one-block cluster its
+  [begin, end]), *nRanges = their number. `NColFillInRangesAppears` fills each entry's first / last appearance and
+  count (words 2..4 of the 0x18-byte entry, word 5 a flag).
+
+The region is then cut to those pieces (`NColSeparateProcessedRegion` / `NColRangesToMinTupleRegions`, 4.5) and the
+rest is processed as a new region; the STORE probe's R+0x24 / R+0x28 are the region's first and last appearance.
 
 ### 4.5 Gaps, windows, splits
 
@@ -353,10 +404,113 @@ register that scores.
   processed) contains [begin, end] and that have no def and no use inside it; hot zones flagged by
   `NColZoneIsProblematic` are excluded; keeps the cheapest (initial best = 0x7fffffff).
 * `NColSeparateProcessedRegion` (0x100c7a20; ecx = L, edx = R, stack: next, nRanges): keeps in R the
-  ranges of f668 (`NColRangesToMinTupleRegions`), moves the rest
-  (`NColSubtractRangesFromTupRegions`) with their defs/uses into a new region and returns it.
+  ranges of f668 (`NColRangesToMinTupleRegions`, 0x100c7bb0, **not read**: on inflate_fast state$1 it keeps less than
+  the pieces, measured: dmask$1, processed three candidates later, finds rdi free over [52, 177] where state$1's
+  pieces run [8, 60], [61, 61] .. [162, 174]), moves the rest (`NColSubtractRangesFromTupRegions`) with their
+  defs/uses into a new region and returns it.
 * `NColSplitRegion` (0x10222880; ecx = R, edx = tup#): split at a tuple whose register constraints
   emptied the useable set.
+* **A fold extends the sources processed before** **[C]**: `NColFoldAwayRegion` calls `NColInsertUse(source,
+  use)` (0x10186d20) for each use of the folded candidate; for a source already processed whose ranges miss the use,
+  the range before the use is extended to it, the region covering that range gets the use, and
+  `NColUpdatePhysregAvail(its register, {[range end, use]}, L, flag 1, ..)` cuts the window from the register (flag 1:
+  no piece before is kept at the range end). A source not yet processed gets the use in its lists (12.5).
+
+### 4.6 NColIdentifyExtraPhysAvail (0x100c8c80) and NColRestoreExtraPhysAvail (0x10069f20) [C]
+
+Called by NColProcessCandidate (opt) before the first region. For every use t of the lifetime (L+0x18) whose tuple
+is a copy by opcode (mov, movap*, movdqa / movdqu and v-forms; movsd / movss / their v-forms with a scalar float
+type), whose first source is the candidate's own leaf (operand+0x24 == L+4, not a view) and whose first destination
+is a REG leaf with a preassigned physreg P (operand+0x28) whose SYM is a temporary (kind 3): `mov ecx=tN <- op`.
+If P's available range r ends exactly at t, the next one n begins at u in the same block, the tuple at u reads P
+(`FindSrcRegInterf`) and does not write it, no tuple strictly between defines the candidate or P (an overlapping
+alias), and every alias of P overlapping it has the same two ranges (`NColCanMakeAvail` 0x100c7210):
+`NColAddToAvails` (0x100c7470) joins r and n into [r.begin, n.end] for P and those aliases and records {t, u, P} in
+TLS+0xf6dc. The register is then at the head of the first region's preference list (4.3). After the candidate's
+regions have cut their registers (`NColUpdateRegisterUsage`), `NColRestoreExtraPhysAvail` takes [t+1, u-1] out again:
+the first range overlapping [t, u] is cut to end at t, to begin at u, or split in two. This is the shift count:
+`movzx op <- ..; mov ecx=t <- op; shr hold, cl; sub bits, op` gives op ecx although rcx's ranges [.., t] [u, ..]
+touch at the copy (inflate_fast op$1..op$5, compress_block, send_tree, _tr_align, inflate's bit loops: 47 of the 84).
+
+### 4.7 NColUpdatePhysregAvail's pieces (0x1006b120) [C]
+
+For every range [B, E] of the region and every alias of P overlapping it, each available range overlapping [B, E] is
+unlinked; the piece before is kept as [begin, B] only when the tuple at B is an instruction, no branch / switch (tuple
+kinds 0x11 / 0x13), does not read the candidate, defines it with no load (`NColIsNoLoadDef`), is not a load point of
+the region (`NColIsLoadPoint`) and flag is 0; else [begin, B - 1]. The piece after is [E, end], or [E + 1, end] when
+the tuple at E is no instruction, a branch / switch, or defines the candidate (or an overlapping view), or the
+region's next range begins at E + 1 on a block's first tuple. So a register whose last holder ends with a write at E
+(`neg t <- t`, the RMW before `sbb t', t'` that materialises a carry: check_header t323, inflate t2129, inflate_table
+t1417) is free from E + 1 only, and a candidate beginning there has gap 0 (fallback C).
+
+### 4.8 The model (tools/ncolsim.py: pick / order_walk / best_coverage; `walk` keys, 2026-11-22)
+
+`ncolsim.pick` is NColDeterminePhysregAvail for a candidate's first region: extra_avail (4.6) and its registers at
+the head of the preference list, the preferences, order_walk, best_coverage; replay and simulate cut with cut_exact
+(4.7), extend the sources of a fold (fold_extend, 4.5) and restore the joined windows (restore_extra). The rules are
+`walk` keys (a record's `walk`, else the module's `WALK`); `WALK_READ` = all of them except `remainder`, the default of
+the CLI and of `il_predict` (the functions' module default stays the earlier walk, so earlier tests stand):
+
+| key | rule [C] | zlib replay (traced inputs) gained |
+|---|---|---|
+| extra | 4.6, and the extra registers first among the preferences | 47 |
+| cut | 4.7 | 3 |
+| extend | 4.5, NColInsertUse's cut of the extension window | 1 |
+| r15b | the byte set's r15b, number 64, in the BV's second chunk (the export reads the first; NColMdGetInitialRegisters' byte set has it, only r13 is ever trimmed) [I for the export] | 2 |
+| strict | 4.3 B.4: a window conflicts only by a strict overlap | 6 |
+| used | 4.2: T1's callee-saved registers that are already used (a physreg leaf in the IL before NColor, or a REGSET register) come in the first pass (gen_bitlen's rdi from its `rep stos`) | 4 |
+| cover | 4.4 (best_coverage), and the traced regions' kept pieces (c2ncol --cov's `separate`) in replay's cuts | 18 |
+| bound | 4.3 B.3 with NColPhysregInOprList's processed regions | 0 (as read) |
+| pwlink | 4.3's linked window lists (PWLinks; for traced inputs the hidden windows from the traced ties, windows and indices when they give the probe's visible lists) | 1 |
+| remainder | simulate processes the rest of a partly covered region again (without TryToImprove / folds / MakePhysregAvail: worse, -3 sim) | - |
+
+**The 84 replay misses of 12.5, by kind** (zlib 1.2.1 /O2, traced inputs; every one is now explained):
+
+| kind | n | examples |
+|---|---|---|
+| a copy to a fixed register at a use (`mov ecx=t <- op` for a shift count, the candidate in rcx across it) | 47 | inflate_fast op$1, compress_block t906.., send_tree t1221.., _tr_align, inflate t1836.. |
+| no register covers every range (NColBestCoverage) | 19 | deflate_slow t1041 (rdi, rsi, rbp all score 14: rdi), longest_match wmask$1 / t424, inflate_fast state$1 |
+| window overlap that only shares an end tuple | 6 | compressBound t132, longest_match_fast t189, _tr_stored_block t282 / t159, build_tree t572, deflateParams t334 |
+| a used callee-saved register first in the order | 4 | gen_bitlen t723, t756, t730, t725 (rdi) |
+| the previous holder's last write (piece after begins at E + 1) | 3 | check_header t323, inflate t2129, inflate_table t1417 |
+| the byte set's r15b | 2 | longest_match scan_end$1, inflateBack last$5 |
+| a fold's extension of a source processed before | 1 | inflate_table t1622 (t1332's lea folded into 141, t1625 extended in rax) |
+| a hidden window made visible by an unlink | 1 | deflateParams t424 |
+| an earlier split candidate's kept pieces (replay's state) | 1 | inflate t2580 (flush$1) |
+
+Left (2): inflate_fast dmask$1 and inflate t1992, both NColBestCoverage on a state where an earlier split candidate
+(state$1; t1992's predecessors in inflate) holds less than its pieces (NColRangesToMinTupleRegions, 4.5, not read).
+
+**NColBestCoverage against its probes** (c2ncol `--cov`: every register's score at 0x1006a348, the new bests at
+0x1006aeb3, the kept pieces at NColSeparateProcessedRegion's entry): zlib, the first call of each of the 88 candidates
+that reach it: the winning register **72 / 88**, every register's score in 31 (1053 / 1253 registers); in the 8 calls
+whose function had no split candidate before (the replay state exact) 7 / 8, 113 / 117 registers. The misses are
+replay states (inflateBack: stolen windows and kept pieces not modelled) and one cluster that the trace grows into
+inflateBack's block 133 and the model does not (in_desc$1: 145 against 129). tests/data/ncol/walk (walk.c): 59 / 60.
+
+**Numbers** (`ncolsim.py replay / sim / ilfull`; before = the earlier walk, `--walk ''`):
+
+| | replay int | xmm | sim | ilfull replay | ilfull sim |
+|---|---|---|---|---|---|
+| zlib 1.2.1 /O2 (97 functions) before | 2585 / 2669 | 21 / 21 | 2549 / 2690 | 2585 | 2565 |
+| zlib after | **2667** | 21 | **2656** | **2667** | **2672** |
+| tests/data/ncol (c1, c2, fp, sum) | 128 -> 130 / 131 | 159 -> 160 / 160 | 283 -> 289 / 291 | | |
+| ncol/il, ilpre (c1, c2, sum) | 53 -> 54 / 54 | 9 / 9 | 61 -> 63 / 63 | 53 -> 54 | 61 -> 63 |
+| xmm (xmm.c, fp.cpp) | 99 -> 101 / 101 | 213 -> 214 / 214 | 309 -> 314 / 315 | 99 -> 101 | 309 -> 314 |
+| calls | 70 -> 74 / 74 | | 59 -> 72 / 74 | 70 -> 74 | 61 -> 74 |
+| flags | 67 -> 70 / 70 | 4 / 4 | 71 -> 74 / 74 | 67 -> 70 | 71 -> 74 |
+| fold (fold.c, tls fp, flags, fp) | 212 -> 219 / 219 | 155 -> 156 / 156 | 363 -> 374 / 375 | 212 -> 219 | 363 -> 374 |
+| walk (walk.c) | 42 -> 44 / 44 | | 42 -> 44 / 44 | 42 -> 44 | 42 -> 44 |
+
+il_predict on the eqif / copies variants: 20 / 20, 12 / 12 (every candidate: 139 / 139, 88 / 88) either way.
+Offline test: `ncolsim_walk_tests` (tests/run_tests.py).
+
+**Not modelled**: NColRangesToMinTupleRegions (what a split region keeps of its pieces); NColTryToImproveAllocation,
+NColSearchForRegionWithGap and NColMakePhysregAvail (a region without a register: simulate takes the trace's
+regions for it); the remainder of a partly covered region in simulate (`remainder`, measured worse without the
+above); `foldext` still decides with the earlier candidates' traced registers (the folds change the lists of the
+candidates processed after the folded one, which il_model_state computes before simulate runs; deciding them in
+simulate's order means recomputing those lists there); the PGO weights of NColBestCoverage.
 
 ---------------------------------------------------------------------------------------------------
 
@@ -529,6 +683,10 @@ them on the original stack.
 | 0x1006aeb3 (BestCoverage) | 9 | new best: ecx = score, edx = cluster, [ebp-0x20] = physreg SYM* |
 | 0x100c69ca (TryToImprove exit) | 6 | eax = stolen physreg SYM* or 0. Displaces the `ret 0x14` |
 | 0x100d7b53 (NColBuildInfo, a REGSET leaf) | 7 | esi = the kind-0xa leaf (+0x24 its register-set sparse BV: {head, pool}, nodes {base, low, high, next}); [esp+0xc] = tup#, [esp+0x1c] = Tuple*. Second displaced instruction is esp-relative. `c2ncol.REGSET_HOOK` (12.4) |
+| 0x1006a348 (BestCoverage, one register done) | 6 | `c2ncol.COVREG_HOOK` (`--cov`): ecx = the register's best cluster score, [ebp-0x20] = P, [ebp-0x98] = best so far, [ebp-0x4c] = its clusters (+0x10 / +0x14 begin / end, +0x18 / +0x1c benefit / cost, +8 / +0xc blocks). The displaced cmp feeds the jg after it |
+| 0x1006aeb3 (BestCoverage, new best) | 9 | `c2ncol.COVBEST_HOOK`: ecx = score, edx = the cluster |
+| 0x100c7a20 (NColSeparateProcessedRegion entry) | 6 | `c2ncol.SEPARATE_HOOK`: [esp+8] = nRanges, edx = R (+0x24 / +0x28 first / last appearance), TLS+0xf668 the pieces (0x18 bytes each: begin, end, first / last appearance, count, flag) |
+| 0x10069635, 0x10069750, 0x100699d0, 0x10069a35, 0x100699fb (DPA order loop) | 5 / 7 / 5 / 5 / 5 | `c2ncol.DPA_HOOKS` (`--dpa`): the rows above as events per candidate (`dpa`: try / cover / C (with the gap) / B / A); 0x1006988e cannot be used (c2trace refuses to displace the `ret 0x18`) |
 
 Avoid: 0x100697bf (the "next register" join in DPA) -- 0x100697c2 is a branch target inside; and
 0x1006988c -- 0x1006988e is a branch target inside.
@@ -602,6 +760,7 @@ before and after. Ties are broken by the lifetime index (exported), as NColColPr
 Open: a value copied into another lifetime that the trace shows in the same register over the same tuples
 (coalesced copies: NColSubsumption / NColCombineLifetimes, not modelled), the boundary rules of 4.3 step 3,
 split regions (NColBestCoverage), xmm candidates, and computing the availability and liveness without a trace.
+(Since: the inputs from the IL, sections 11 and 12; the walk as read, section 4.8: replay 2667 / 2669, sim 2656 / 2690.)
 
 ---------------------------------------------------------------------------------------------------
 
@@ -846,6 +1005,7 @@ traced; `ilfull-read` adds IL_READ, 12.4; `ilfull`, the default since 12.5, adds
 | IL_READ with `subsume` | 3099 | 2574 | 21 | 2427 |
 | **IL_FOLD (`ilfull`, 12.5): + the fold cost test in processing order, ties, window lists, partial definitions, float flag and frame score as read** | **3187** | **2585** (the traced inputs' 84 misses, the same ones) | 21 | **2565** |
 | IL_FOLD with IL_SUB (`ilfull-sub`: the lifetimes from `il_pre`, il_subsume + NColFoldTooCheap) | **3189** | 2585 | 21 | 2565 |
+| **IL_FOLD + the order walk as read (WALK_READ, section 4.8; the CLI's default since 2026-11-22)** | 3187 | **2667** (traced inputs: 2667) | 21 | **2672** (traced inputs: 2656) |
 
 Fixtures: replay 52 / 54 and 9 / 9, sim 60 / 63 (traced inputs: 53 / 54, 9 / 9, 61 / 63); with IL_READ 53 / 54, 9 / 9,
 61 / 63. What the fitted path lacked (the preference lists, the clobber set of a call to a function of the same unit,
@@ -1146,10 +1306,10 @@ memory leaf whose +0x2c SYM is not in the dump scores 6 only on an OPLOCALSCALED
 SYM is that stack local) and otherwise falls to the leaf rules **[I]** (91 / 97 counting every unknown one 6:
 deflate_slow, deflate_fast, _tr_tally, compress_block, inflate: +18 / +42 from lea and load addresses, 0x4fe / 0x4ff).
 
-**Still not computed / not exact**: the order walk itself (replay's 84 misses are the traced inputs' 84: compressBound,
-longest_match, deflate_slow's long globals with no full cover, ..: NColBestCoverage / gaps, section 4); `foldext` reads the
-earlier candidates' registers from the trace (simulate does not yet decide the extension with its own choices, nor cut
-the extension window from the source register's availability); NColMemOprModifiedInLife and
+**Still not computed / not exact**: (the order walk: read in section 4, 2026-11-22; replay 2667 / 2669, sim 2672 / 2690
+with WALK_READ; what is left of it: 4.8) `foldext` reads the earlier candidates' registers from the trace (simulate now
+cuts the extension window from the source register with its own choices, `extend`, but does not decide the fold with
+them); NColMemOprModifiedInLife and
 NColMdCanReplaceCandWithMemWithAlignment are approximated by shapes; the blocks' +0xac (as loop depth); the +0x2c SYM kind
 of the frame score's unknown leaves (read by the probe instead); constant folds (simulate takes them from the trace);
 IL_SUB's float coalescing; inflateBack have$1's ranges and gen_bitlen base$1's appearances at processing.

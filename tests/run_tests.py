@@ -806,6 +806,44 @@ def realize_ins_tests():
 realize_ins_tests()
 
 
+def realize_scratch_swap_tests():
+    """scratch --phase / realize --from scratch, offline: tests/data/scratchswap/ holds one traced compile of swap.cpp's
+    Dlg::f1 (14.00: its picks and final IL as f1.json, the listing, the scratch --export snapshot) and orig.s, that
+    listing with the second statement's two loads (`cur`, `list`) issued the other way round and their registers
+    exchanged. Each load then aligns with the other value's load, which has the same register, so the pick's own
+    instruction says both picks agree; every use has the other register (Mount & Blade 0x406e50, picks 6 / 7, where
+    realize said 18 of 18 and regmap a swap). The temp's whole vote finds both; the pair scan seeded at the first
+    wrong pick re-aligns them although no single edit does."""
+    import argparse, shutil, c2scratch, realize
+    D = os.path.join(HERE, "tests", "data", "scratchswap")
+    fx = json.load(open(os.path.join(D, "f1.json")))
+    pos = c2scratch.offsets(fx["final"])
+    asm, orig = os.path.join(D, "swap.lst"), os.path.join(D, "orig.s")
+    one, *_ = c2scratch.orig_regs(fx["picks"], pos, asm, fx["func"], orig)
+    got, *_ = c2scratch.orig_regs(fx["picks"], pos, asm, fx["func"], orig, fx["final"])
+    check("scratch --phase: swapped loads look right at the picks' own instructions (5 ecx, 6 edx)",
+          (one[5][0], one[6][0]), ("ecx", "edx"))
+    check("scratch --phase: the temps' uses say picks 5 / 6 want edx / ecx; the other 6 picks agree",
+          ((got[5][0], got[6][0]), sum(1 for p in fx["picks"] if got[p["n"]][0] == p["reg"])), (("edx", "ecx"), 6))
+    d = tempfile.mkdtemp()
+    snap = os.path.join(d, "snap.json")
+    shutil.copy(os.path.join(D, "snap.json"), snap)
+    a = argparse.Namespace(asm_func=fx["func"], func=fx["func"], phase=orig, by="block", brief=True, no_scan=False, top=5)
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        c2scratch.phase(a, fx["picks"], pos, asm, snap, 0, fx["final"])
+        wrong = realize.scratch_wrong(snap, os.path.join(d, "snap_target.json"))
+        ans = realize.scratch_scan(snap, os.path.join(d, "snap_target.json"), pool=0)
+    if VERBOSE:
+        print(buf.getvalue()[-3000:])
+    check("realize --from scratch: 6 of 8, wrong picks 5 and 6; a pair seeded at pick 5 re-aligns all 8",
+          (bool(re.search(r"^# scratch: 6 of 8 known picks", buf.getvalue(), re.M)), [w[0] for w in wrong],
+           bool(re.search(r"^#\s+8 of 8 ", buf.getvalue(), re.M)) and len(ans[0]) == 2), (True, [5, 6], True))
+
+
+realize_scratch_swap_tests()
+
+
 def regdiff_norm_tests():
     """tsweep.regdiff: printing differences between the listing and capstone are not differences."""
     import tsweep
@@ -1255,6 +1293,82 @@ def ncolsim_fold_tests():
           (55, 54, 55))
 
 
+def ncolsim_walk_tests():
+    """ncolsim's order walk as read (WALK_READ, docs/c2/ncolor.md 4), offline: NColIdentifyExtraPhysAvail's joined
+    windows, NColUpdatePhysregAvail's piece boundaries, NColInsertUse's extensions, the used callee-saved registers in
+    NColMdGetPrefRegOrder, the strict window overlap, the preference windows as linked lists, NColDetermineCovered's
+    boundary tests and NColBestCoverage, against the earlier walk; fixtures tests/data/ncol/walk (walk.c: `c2ncol.py
+    --export --il --cov --dpa`, gzipped: BestCoverage's per-register scores) and the fold / xmm / calls / flags ones."""
+    import gzip, json, io, contextlib, ncolsim as N
+    d = os.path.join(HERE, "tests", "data", "ncol")
+    gz = lambda *p: json.loads(gzip.open(os.path.join(d, *p)).read())["functions"]
+    sets = (("walk", lambda: gz("walk", "walk.json.gz")),
+            ("fold", lambda: [f for n in ("fold.json.gz", "tlsfp.json.gz", "flags.json.gz", "fp.json.gz")
+                              for f in gz("fold", n)]),
+            ("xmm", lambda: gz("xmm", "xmm.json.gz") + gz("xmm", "fp.json.gz")), ("calls", lambda: gz("calls", "calls.json.gz")),
+            ("flags", lambda: gz("flags", "flags.json.gz")))
+    lines = lambda b: [ln.split(":")[1].split("single")[0].strip() for ln in b.getvalue().splitlines() if " of " in ln]
+    saved = N.WALK
+    got = {}
+    try:
+        for walk in ((), N.WALK_READ):
+            N.WALK = walk
+            for tag, fs in sets:
+                b = io.StringIO()
+                with contextlib.redirect_stdout(b):
+                    N.cmd_replay(fs(), 0)
+                    N.cmd_sim(fs(), 0)
+                    N.cmd_ilfull(fs(), 0, N.IL_USE + N.IL_MODEL + N.IL_READ + N.IL_FOLD)
+                got[(tag, bool(walk))] = lines(b)
+        N.WALK = N.WALK_READ
+        n = ok = 0
+        sx = lambda v: None if v is None or v == 0x80000000 else (v - (1 << 32) if v & 0x80000000 else v)
+        for f in gz("walk", "walk.json.gz"):        # BestCoverage's first call per candidate: every register's score
+            st = f["state"]
+            av, pw, done = N.avail_of(st), N.pw_init(f, st), {}
+            for c in f["cands"]:
+                regs = c["regions"]
+                if not c.get("ranges") or not regs:
+                    continue
+                extra = N.extra_avail(N.il_tupmap(f), c, av)
+                if c.get("cov") and len(c["cov"]) >= 15:
+                    wa = N.walk_args(c, st, pw)
+                    a_ = wa.get("avoid") or ()
+                    order = N.used_order(f)
+                    order = [x for x in order if x not in a_] + [x for x in order if x in a_]
+                    sc = []
+                    N.best_coverage(f, c, av, c["ranges"], order, N.useable(c), sc, done=done)
+                    mine = {x[0]: x[1] for x in sc}
+                    for e in c["cov"][:15]:
+                        n += 1
+                        ok += mine.get(N.regname(e["reg"])) == sx(e["score"])
+                if c.get("prefwin"):
+                    N.pw_drop(pw, tuple(c["prefwin"]))
+                for r in regs:
+                    g = N.ALIAS.get(r["reg"])
+                    if g in N.NUM and N.NUM[g] in av:
+                        rr = N.region_ranges(c, r)
+                        av[N.NUM[g]] = N.cut_of(f, c, av[N.NUM[g]], rr)
+                        done.setdefault(c.get("sym"), []).append([g, list(rr)])
+                N.restore_extra(av, extra)
+    finally:
+        N.WALK = saved
+    check("ncolsim walk: walk.c replay, sim, ilfull (replay, sim): the earlier walk / WALK_READ",
+          (got[("walk", False)], got[("walk", True)]),
+          (["42 of 44", "42 of 44", "42 of 44", "42 of 44"], ["44 of 44", "44 of 44", "44 of 44", "44 of 44"]))
+    check("ncolsim walk: fold fixtures (replay int / xmm, sim, ilfull) the earlier walk / WALK_READ",
+          (got[("fold", False)], got[("fold", True)]),
+          (["212 of 219", "155 of 156", "363 of 375", "212 of 219", "155 of 156", "363 of 375"],
+           ["219 of 219", "156 of 156", "374 of 375", "219 of 219", "156 of 156", "374 of 375"]))
+    check("ncolsim walk: xmm + fp.cpp, calls, flags with WALK_READ (replay, sim, ilfull)",
+          (got[("xmm", True)], got[("calls", True)], got[("flags", True)]),
+          (["101 of 101", "214 of 214", "314 of 315", "101 of 101", "214 of 214", "314 of 315"],
+           ["74 of 74", "72 of 74", "74 of 74", "74 of 74"],
+           ["70 of 70", "4 of 4", "74 of 74", "70 of 70", "4 of 4", "74 of 74"]))
+    check("ncolsim best_coverage: walk.c's NColBestCoverage scores per register as c2ncol --cov read them", (ok, n),
+          (59, 60))
+
+
 def sched17_predict_tests():
     """tools/c2sched17.py --predict offline: each region's DAG, latencies, units and static priorities built from
     its IL (tests/data/sched17/il/*.json: `c2sched17.py --il --export` of tests/data/ncol's c1 / c2 / sum and zlib's
@@ -1539,6 +1653,7 @@ ncolsim_il_tests()
 ncolsim_ilmodel_tests()
 ncolsim_ilread_tests()
 ncolsim_fold_tests()
+ncolsim_walk_tests()
 symkeys17_tests()
 
 
@@ -1935,6 +2050,51 @@ def schedwant_tests():
 schedwant_tests()
 
 
+def schedwant_break_tests():
+    """schedwant auto mode and its replay on a breakable dependence (sched.md rule 8), every build: Table::take2's
+    `mov esi, [eax]` issues before the `lea eax, [ecx+edx*8+4]` that feeds it. Mount & Blade 0x4ea030 (13.10): the
+    replay ignored the break ("model differs from the trace"), and auto mode matched pre-schedule IL keys to the
+    original (`_jcc`, the load before its break, a load folded into a cmp) and printed nothing for any function.
+    Against our own listing every region is in the original's order; against it with the element store moved
+    above `push eax` the region is placed through our listing and the wanted order moves that store."""
+    if lacking("schedwant"):
+        skip("schedwant: breakable dependence replayed, auto mode through our listing", lacking("schedwant"))
+        return
+    src = os.path.join(HERE, "tests", "data", "schedbreak.cpp")
+    d = tempfile.mkdtemp()
+    kd = os.path.join(d, "k")
+    sw = [sys.executable, os.path.join(HERE, "tools", "schedwant.py"), src, "--func", "?take2@Table@"]
+    r = subprocess.run(sw + ["--region", "0", "--want-lex", "1", "--keep", kd, "--", "/TP", "/O2"],
+                       capture_output=True, text=True, cwd=HERE).stdout
+    if VERBOSE:
+        print(r[-3000:])
+    m = re.search(r"^\s+traced order : (.*)$", r, re.M)
+    tr = m.group(1).split() if m else []
+    check("schedwant: take2's load issues before its lea (a broken dependence); the replay = traced",
+          (bool(tr) and tr.index("5") < tr.index("4"), "(= traced)" in r), (True, True))
+    orig = orig_from_listing(os.path.join(kd, "schedbreak.asm"), "?take2@Table@", os.path.join(d, "same.s"))
+    r = subprocess.run(sw + ["--asm-vs", orig, "--from-keep", kd], capture_output=True, text=True, cwd=HERE).stdout
+    check("schedwant auto: against our own code every region is in the original's order (and it says so)",
+          bool(re.search(r"^# (\d+) regions with 2\+ instructions: \1 in the original's order, 0 differ", r, re.M)), True)
+    ls = open(orig).read().splitlines()
+    i = next(k for k, l in enumerate(ls) if l.split(None, 1)[1] == "push eax")
+    j = next(k for k, l in enumerate(ls) if l.split(None, 1)[1] == "mov dword ptr [ecx + edx*8], edi")
+    ls[i], ls[j] = ls[i].split()[0] + " " + ls[j].split(None, 1)[1], ls[j].split()[0] + " " + ls[i].split(None, 1)[1]
+    open(os.path.join(d, "moved.s"), "w").write("\n".join(ls) + "\n")
+    r = subprocess.run(sw + ["--asm-vs", os.path.join(d, "moved.s"), "--from-keep", kd], capture_output=True, text=True,
+                       cwd=HERE).stdout
+    if VERBOSE:
+        print(r[-3000:])
+    m = re.search(r"^\s+wanted\s+: (.*)$", r, re.M)
+    w = m.group(1).split() if m else []
+    check("schedwant auto: the moved store is found through our listing; wanted: the store (7) before push eax (9)",
+          ("matched through our listing" in r, bool(w) and w.index("7") < w.index("9"), "(= traced)" in r),
+          (True, True, True))
+
+
+schedwant_break_tests()
+
+
 def framefields_tests():
     d = os.path.join(HERE, "tests", "data", "framefields")
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "framefields.py"), os.path.join(d, "a.cpp"),
@@ -1986,6 +2146,88 @@ def effectmine_tests():
 
 
 effectmine_tests()
+
+
+def incsnap_tests():
+    """tools/incsnap.py: rwsweep and effectmine compile every variant against a snapshot of the unit's include
+    closure taken at the start, so an edit of the tree during a run does not reach them (Mount & Blade: stream.h
+    edited during a 22-minute rwsweep run broke every later variant). tests/data/incsnap: unit.cpp includes
+    "inc/a.h", which includes "../inc/b.h" and <c.h> from the /I dir sys/. The tree is copied to a temp dir; its
+    headers are broken (#error) once the snapshot exists: rwsweep when it prints its variant count (before any
+    compile), effectmine once its base source is written, the direct compile after the snapshot was made."""
+    import incsnap, shutil
+    d = tempfile.mkdtemp(prefix="incsnap_t_")
+    live = os.path.join(d, "live")
+    shutil.copytree(os.path.join(HERE, "tests", "data", "incsnap"), live)
+    tu, sysd = os.path.join(live, "unit.cpp"), os.path.join(live, "sys")
+    cl = ["/TP", "/O2", "/I" + sysd]
+
+    def breakit():
+        for h in ("inc/a.h", "inc/b.h", "sys/c.h"):
+            open(os.path.join(live, h), "w").write("#error the live tree was edited during the run\n")
+
+    def restore():
+        for h in ("inc/a.h", "inc/b.h", "sys/c.h"):
+            shutil.copy(os.path.join(HERE, "tests", "data", "incsnap", h), os.path.join(live, h))
+    text = open(tu).read().replace('"inc/a.h"', '"%s"' % os.path.join(live, "inc", "a.h"))     # as rwsweep writes it
+    sn = incsnap.Snapshot(tu, cl, os.path.join(d, "snap"), text=text)
+    st = sn.text(text)
+    check("incsnap: the closure (quoted, ../ relative, <> from /I), the /I dir and the unit's include point at copies",
+          (sorted(os.path.relpath(f, live) for f in sn.files), sn.cl[:2], sn.cl[2] == "/I" + sn.path(sysd),
+           os.path.join(d, "snap") in st and live + os.sep + "inc" not in st),
+          (["inc/a.h", "inc/b.h", "sys/c.h"], ["/TP", "/O2"], True, True))
+    breakit()
+    p = os.path.join(d, "v.cpp")
+    open(p, "w").write(st)
+    out = tool("regs", p, "--func", "sum_pair", "--", *sn.cl)
+    open(p, "w").write(text)
+    bad = tool("regs", p, "--func", "sum_pair", "--", *cl)
+    check("incsnap: with the live headers broken, the snapshot compiles and the live tree does not",
+          (bool(re.search(r"^\?sum_pair@@\S*\s+\(\d+ globregs", out, re.M)), "the live tree was edited" in bad),
+          (True, True))
+    restore()
+    r = subprocess.Popen([sys.executable, os.path.join(HERE, "tools", "rwsweep.py"), tu, "--func", "sum_pair",
+                          "--families", "split,const", "--jobs", "2", "--verify", "0", "--"] + cl,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=HERE)
+    lines = []
+    for ln in r.stdout:
+        lines.append(ln)
+        if re.match(r"\d+ variables, \d+ statements", ln):        # printed before any compile
+            breakit()
+    r.wait()
+    o = "".join(lines)
+    if VERBOSE:
+        print(o[-3000:])
+    m = re.search(r"^(\d+) measured, (\d+) failed to compile", o, re.M)
+    check("rwsweep: the tree broken right after the snapshot: baseline and every variant still compile",
+          (bool(re.search(r"^baseline: \d+ instructions", o, re.M)), m and int(m.group(1)) >= 2, m and m.group(2)),
+          (True, True, "0"))
+    restore()
+    env = dict(os.environ, EFFECTMINE_DIR=os.path.join(d, "em"))
+    em = subprocess.Popen([sys.executable, os.path.join(HERE, "tools", "effectmine.py"), "mine", tu, "--func", "sum_pair",
+                           "--features", "regs", "--classes", r"^copy$", "--max-compiles", "3", "--depth", "1", "--jobs", "1", "--"] + cl,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=HERE, env=env)
+    import time
+    t0 = time.time()
+    while time.time() - t0 < 600 and em.poll() is None and not glob_any(os.path.join(d, "em", "runs", "*", "*", "base", "base.cpp")):
+        time.sleep(0.2)
+    breakit()                        # the snapshot is made before the base source is written
+    o = em.communicate()[0]
+    if VERBOSE:
+        print(o[-3000:])
+    db = [json.loads(l) for l in open(os.path.join(d, "em", "effects.jsonl"))] \
+        if os.path.exists(os.path.join(d, "em", "effects.jsonl")) else []
+    check("effectmine: the tree broken after the snapshot: the copies compile; the database keeps the live paths",
+          (bool(db) and all(x["ok"] for x in db), [x.get("err") for x in db if "edited" in (x.get("err") or "")],
+           bool(db) and all(x.get("src") == tu for x in db)), (True, [], True))
+
+
+def glob_any(pat):
+    import glob
+    return bool(glob.glob(pat))
+
+
+incsnap_tests()
 
 
 def untraced_tests():

@@ -524,8 +524,13 @@ replayed offsets, or the picks against `rasim scratch BASE EDITS`.
 `slots`: c2slots' map of the original against our listing, every single what-if (uses ±3, visiting positions,
 the refused conflicts and the colour mates), and every pair of the 40 best singles with any single, replayed and
 ranked by elements at the original's offset; `scratch`: `c2trace.py scratch --phase ORIG.s --by block`, rasim's
-re-alignment scan of single `ins:` / `drop:`, and the scan again on top of each of the 8 best (pairs), ranked by
-known picks on the original's register. The 12 best answers are realised as below.
+re-alignment scan of single `ins:` / `drop:`, and the scan again on top of each of the 8 best and of every single
+at the first wrong pick (pairs), ranked by known picks on the original's register. The 12 best answers are realised
+as below. A pick's register in the original is read from all of its temp's aligned instructions (regmap's vote,
+`c2scratch.temp_votes`), not from the pick's instruction alone: when the original issues two loads the other way
+round, each load aligns with the other value's load, which has the same register (Mount & Blade 0x406e50 on 13.10:
+"18 of 18" before, 16 of 18 with picks 6 and 7 wrong as regmap says; `ins:6 + ins:8` re-aligns all 18, and no
+construct realises it). Test: `realize_scratch_swap_tests` (offline, tests/data/scratchswap).
 
 **Answers of two edits, and pair search.** Every answer is realised edit by edit (each construct measured once per
 run, whatever answer names it); an answer of two or more edits then as the products of the best three

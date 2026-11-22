@@ -1,0 +1,359 @@
+{
+ "kind": "scratch",
+ "func": "?f1@Dlg@",
+ "c2": "14.00.50727.762",
+ "order": [
+  "eax",
+  "ecx",
+  "edx",
+  "esi",
+  "edi",
+  "ebx",
+  "ebp"
+ ],
+ "scratch": [
+  "eax",
+  "ecx",
+  "edx"
+ ],
+ "runs": [
+  {
+   "run": 0,
+   "body": true,
+   "speed": 1,
+   "global_conflicts": true,
+   "blocks": 4,
+   "spills": 0,
+   "fixes": [],
+   "picks": [
+    {
+     "n": 1,
+     "tmp": "t144",
+     "cls": "int",
+     "byte": false,
+     "block": 2,
+     "cur": "eax",
+     "cur_after": "ecx",
+     "pref": null,
+     "pref_pre": null,
+     "pref_src": null,
+     "how": "ROT",
+     "reg": "eax",
+     "busy": {
+      "esi": "phys",
+      "edi": "phys"
+     },
+     "avail": [
+      "eax",
+      "ecx",
+      "edx",
+      "ebx",
+      "ebp",
+      "esi",
+      "edi"
+     ],
+     "conf": [
+      "esi",
+      "edi"
+     ],
+     "cand": [
+      "eax",
+      "ecx",
+      "edx"
+     ],
+     "why": "",
+     "spill": false,
+     "off": 6,
+     "op": "mov",
+     "instr": "t144:1004 <- [esi=_this:1004+0]:1004 esi=_this:1004"
+    },
+    {
+     "n": 2,
+     "tmp": "t137",
+     "cls": "int",
+     "byte": false,
+     "block": 2,
+     "cur": "ecx",
+     "cur_after": "edx",
+     "pref": null,
+     "pref_pre": null,
+     "pref_src": null,
+     "how": "ROT",
+     "reg": "ecx",
+     "busy": {
+      "eax": "t144",
+      "esi": "phys",
+      "edi": "phys"
+     },
+     "avail": [
+      "eax",
+      "ecx",
+      "edx",
+      "ebx",
+      "ebp",
+      "esi",
+      "edi"
+     ],
+     "conf": [
+      "esi",
+      "edi"
+     ],
+     "cand": [
+      "ecx",
+      "edx"
+     ],
+     "why": "",
+     "spill": false,
+     "off": 3,
+     "op": "mov",
+     "instr": "t137:1004 <- [esi=_this:1004+4]:1004 esi=_this:1004"
+    },
+    {
+     "n": 3,
+     "tmp": "t138",
+     "cls": "int",
+     "byte": false,
+     "block": 2,
+     "cur": "edx",
+     "cur_after": "eax",
+     "pref": null,
+     "pref_pre": null,
+     "pref_src": null,
+     "how": "ROT",
+     "reg": "edx",
+     "busy": {
+      "eax": "t144",
+      "esi": "phys",
+      "edi": "phys"
+     },
+     "avail": [
+      "eax",
+      "ecx",
+      "edx",
+      "ebx",
+      "ebp",
+      "esi",
+      "edi"
+     ],
+     "conf": [
+      "esi",
+      "edi"
+     ],
+     "cand": [
+      "ecx",
+      "edx"
+     ],
+     "why": "",
+     "spill": false,
+     "off": 8,
+     "op": "mov",
+     "instr": "t138:1004 <- [ecx=t137:1004+4]:1004 ecx=t137:1004"
+    },
+    {
+     "n": 4,
+     "tmp": "t136",
+     "cls": "int",
+     "byte": false,
+     "block": 2,
+     "cur": "eax",
+     "cur_after": "ecx",
+     "pref": null,
+     "pref_pre": null,
+     "pref_src": null,
+     "how": "ROT",
+     "reg": "eax",
+     "busy": {
+      "esi": "phys",
+      "edi": "phys"
+     },
+     "avail": [
+      "eax",
+      "ecx",
+      "edx",
+      "ebx",
+      "ebp",
+      "esi",
+      "edi"
+     ],
+     "conf": [
+      "esi",
+      "edi"
+     ],
+     "cand": [
+      "eax",
+      "ecx",
+      "edx"
+     ],
+     "why": "",
+     "spill": false,
+     "off": 11,
+     "op": "mov",
+     "instr": "t136:1004 <- [edx=t138:1004+eax=t144:1004*4+0]:1004 edx=t138:1004 eax=t144:1004"
+    },
+    {
+     "n": 5,
+     "tmp": "t134",
+     "cls": "int",
+     "byte": false,
+     "block": 2,
+     "cur": "ecx",
+     "cur_after": "edx",
+     "pref": null,
+     "pref_pre": null,
+     "pref_src": null,
+     "how": "ROT",
+     "reg": "ecx",
+     "busy": {
+      "esi": "phys",
+      "edi": "phys"
+     },
+     "avail": [
+      "eax",
+      "ecx",
+      "edx",
+      "ebx",
+      "ebp",
+      "esi",
+      "edi"
+     ],
+     "conf": [
+      "esi",
+      "edi"
+     ],
+     "cand": [
+      "eax",
+      "ecx",
+      "edx"
+     ],
+     "why": "",
+     "spill": false,
+     "off": 26,
+     "op": "mov",
+     "instr": "t134:1004 <- [esi=_this:1004+0]:1004 esi=_this:1004"
+    },
+    {
+     "n": 6,
+     "tmp": "t139",
+     "cls": "int",
+     "byte": false,
+     "block": 2,
+     "cur": "edx",
+     "cur_after": "eax",
+     "pref": null,
+     "pref_pre": null,
+     "pref_src": null,
+     "how": "ROT",
+     "reg": "edx",
+     "busy": {
+      "edi": "phys"
+     },
+     "avail": [
+      "eax",
+      "ecx",
+      "edx",
+      "ebx",
+      "ebp",
+      "esi",
+      "edi"
+     ],
+     "conf": [
+      "edi"
+     ],
+     "cand": [
+      "eax",
+      "ecx",
+      "edx"
+     ],
+     "why": "",
+     "spill": false,
+     "off": 28,
+     "op": "mov",
+     "instr": "t139:1004 <- [esi=_this:1004+4]:1004 esi=_this:1004"
+    },
+    {
+     "n": 7,
+     "tmp": "t140",
+     "cls": "int",
+     "byte": false,
+     "block": 2,
+     "cur": "eax",
+     "cur_after": "ecx",
+     "pref": null,
+     "pref_pre": null,
+     "pref_src": null,
+     "how": "ROT",
+     "reg": "eax",
+     "busy": {
+      "edi": "phys"
+     },
+     "avail": [
+      "eax",
+      "ecx",
+      "edx",
+      "ebx",
+      "ebp",
+      "esi",
+      "edi"
+     ],
+     "conf": [
+      "edi"
+     ],
+     "cand": [
+      "eax",
+      "ecx",
+      "edx"
+     ],
+     "why": "",
+     "spill": false,
+     "off": 31,
+     "op": "mov",
+     "instr": "t140:1004 <- [edx=t139:1004+4]:1004 edx=t139:1004"
+    },
+    {
+     "n": 8,
+     "tmp": "t135",
+     "cls": "int",
+     "byte": false,
+     "block": 2,
+     "cur": "ecx",
+     "cur_after": "edx",
+     "pref": null,
+     "pref_pre": null,
+     "pref_src": null,
+     "how": "ROT",
+     "reg": "ecx",
+     "busy": {},
+     "avail": [
+      "eax",
+      "ecx",
+      "edx",
+      "ebx",
+      "ebp",
+      "esi",
+      "edi"
+     ],
+     "conf": [],
+     "cand": [
+      "eax",
+      "ecx",
+      "edx"
+     ],
+     "why": "",
+     "spill": false,
+     "off": 35,
+     "op": "mov",
+     "instr": "t135:1004 <- [eax=t140:1004+edi=_k:1004*4+0]:1004 eax=t140:1004 edi=_k:1004"
+    }
+   ]
+  }
+ ],
+ "unmodelled": [
+  {
+   "tmp": "t133",
+   "reg": "ecx",
+   "off": 1,
+   "phase": "Color: given ecx before RewriteAsReal without a ChoosePhysReg pop (a temp tied to a fixed register)",
+   "instr": "mov | esi=_this:1004 <- ecx=t133:1004"
+  }
+ ]
+}
