@@ -24,10 +24,15 @@ import c2build   # noqa: E402  (--c2 is taken out of argv here)
 import c2trace   # noqa: E402
 
 # event kinds in hooks.ncol order; --why adds STATE (hooks.ncol_state: the liveness arrays after prioritization)
-CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF, PRE = range(9)
+CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF, PRE, REGSET = range(10)
 # --il: the IL also at NColSubsumption's entry (0x1009ab40, after NColInitializeSyms / NColBuildInfo, before the copies
 # are coalesced and NColFoldTooCheap folds: the stream the lifetime indices, live counts and availability come from)
 PRE_HOOK = "1009ab40=tdccc>0>0>4$,tdccc>0>8>0>0x1c%"
+# --il: every kind-0xa (REGSET) leaf NColBuildInfo's backward walk meets (0x100d7b53, `mov ecx, [esi+0x24]` before
+# SbvNextEx: esi = the leaf, [esp+0xc] = the tuple number, [esp+0x1c] = the tuple): its register-set bit vector, which
+# the IL dump prints as `regset:0`. A call's clobber set: the Win64 volatiles, or for a callee of the same unit compiled
+# before, the registers it uses (interprocedural register usage). Sparse BV nodes {+0 base, +4 low, +8 high, +0xc next}.
+REGSET_HOOK = "100d7b53=s7,s3,esi>0x24>0*16:0:4:12,esi>0x24>0*16:8:8:12"
 NAVAIL = 80          # nodes of each register's initial availability list (--export)
 # register numbers of _RegName whose lists are exported: rax..r15; fxmm0l..15l (doubles), fxmm0s..15s (floats);
 # preference windows are kept per master: rax..r15 and ymm0..15 (the xmm family's master, docs/c2/ncolor.md 9)
@@ -93,7 +98,8 @@ def parse_all(text):
             fns.append(c["fn"])
         return c
     hx = lambda x: int(x, 16)
-    arr = lambda t: [hx(x) for x in t.strip("[]").split()]
+    # '?' = a word the probe could not read (the state probe reads the block arrays past their end): 0
+    arr = lambda t: [hx(x) if x != "?" else 0 for x in t.strip("[]").split()]
     for ln in text.splitlines():
         if ln.startswith("# thread "):
             th = int(ln.split()[2])
@@ -118,6 +124,15 @@ def parse_all(text):
         rec, cur = c["fn"], c["cur"]
         if kind == PRE:
             ilrec[th] = (rec, "il_pre")    # --il: the IL before NColSubsumption (T lines follow)
+            continue
+        if kind == REGSET:                 # --il: a REGSET leaf's registers (NColBuildInfo, before il_pre)
+            if len(v) >= 4 and v[2].startswith("[") and v[3].startswith("["):
+                lo, hi = arr(v[2]), arr(v[3])
+                regs = []
+                for k in range(min(len(lo), len(hi)) // 2):
+                    base, m = lo[2 * k], lo[2 * k + 1] | hi[2 * k] << 32
+                    regs += [base + i for i in range(64) if m >> i & 1]
+                rec.setdefault("regsets", []).append(dict(tup=v[0], n=hx(v[1]), regs=regs))
             continue
         if kind == CAND:
             cur = dict(name=symtext(v[0], v[1], v[2]), prio=int(v[3], 16) if v[3] != "?" else None,
@@ -240,8 +255,9 @@ def main(argv):
     ap.add_argument("--export", help="JSON of every function's NColor run (candidates, liveness, initial "
                     "availability): rasim's input; --func optional (empty: all functions)")
     ap.add_argument("--il", action="store_true", help="with --export: also the IL after prioritization, with raw "
-                    "words (T R: branch targets) and each leaf's symbol (T S: root, size, offset), for ncolsim's "
-                    "trace-free inputs (docs/c2/ncolor.md 11)")
+                    "words (T R: branch targets) and each leaf's symbol (T S: root, size, offset), the IL at "
+                    "NColSubsumption's entry and every REGSET leaf's registers (the calls' clobber sets), for ncolsim's "
+                    "trace-free inputs (docs/c2/ncolor.md 11, 12)")
     ap.add_argument("--keep")
     argv, cl = c2trace.split_cl(argv)
     a = ap.parse_args(argv)
@@ -265,6 +281,7 @@ def main(argv):
         hk.append(c2build.hooks("ncol_pref", None))
         if a.export and a.il and c2build.name().startswith("17.00"):
             hk.append(PRE_HOOK)
+            hk.append(REGSET_HOOK)
     img, hk, rc, out, text = c2trace.run_trace(a.src, hk, cl or ["/O2"], keep=a.keep,
                                                func=a.func if a.func else (False if a.export else None))
     if rc:
@@ -276,6 +293,9 @@ def main(argv):
     if a.export:
         import json
         fns = [f for f in parse_all(text) if f["cands"]]
+        if a.il:
+            for f in fns:                     # the REGSET probe ran: a function without an event has no such leaf
+                f.setdefault("regsets", [])
         json.dump(dict(c2=c2build.name(), src=os.path.basename(a.src), functions=fns), open(a.export, "w"))
         print("%d functions, %d candidates -> %s" % (len(fns), sum(len(f["cands"]) for f in fns), a.export))
         return 0

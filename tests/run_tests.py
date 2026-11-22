@@ -1139,6 +1139,66 @@ def ncolsim_ilmodel_tests():
               "IL / from the base run's measured edits" % tag, (ok, n, edits), want)
 
 
+def ncolsim_ilread_tests():
+    """ncolsim's NColor inputs as read since ncolor.md 12 (IL_READ, docs/c2/ncolor.md 12.4), offline: the xmm
+    availability banks and each call's clobber set (c2ncol's REGSET probe) from the IL before NColSubsumption, the
+    preference lists, anti-preference sets, the float flag that stops NColMdAdjustPriority, the rbp reservation and the
+    load folds; fixtures `c2ncol.py --export --il` of tests/data/ncol/xmm (xmm.c, fp.cpp; xmm.json with
+    C2TRACE_ILRAW=16), calls (calls.c: static callees of the same unit), flags (flags.cpp, /O2 /EHsc), gzipped."""
+    import gzip, json, io, contextlib, ncolsim as N
+    gz = lambda *p: json.loads(gzip.open(os.path.join(HERE, "tests", "data", "ncol", *p)).read())["functions"]
+    xm, fp = gz("xmm", "xmm.json.gz"), gz("xmm", "fp.json.gz")
+    ca, fl = gz("calls", "calls.json.gz"), gz("flags", "flags.json.gz")
+
+    def lists(fs, probe=True):
+        xa = na = ia = ni = 0
+        for f in fs:
+            tp, st = N.il_parse(f["il_pre"]), f["state"]
+            r = N.il_regsets(f) if probe else None
+            X = N.il_xavail(tp, st["ntup"], r)
+            A = N.il_avail(tp, st["ntup"], regsets=r) if r is not None else N.il_avail(tp, st["ntup"])
+            xa += sum([tuple(q) for q in st["avail"][str(k)]] == v for k, v in X.items())
+            na += len(X)
+            ia += sum([tuple(q) for q in st["avail"][str(k)]] == v for k, v in A.items())
+            ni += len(A)
+        return xa, na, ia, ni
+    check("ncolsim il_xavail / il_avail with the REGSET probe: xmm banks and integer lists as traced (xmm+fp, calls)",
+          [lists(xm + fp), lists(ca)], [(800, 800, 375, 375), (384, 384, 180, 180)])
+    check("ncolsim the same with the Win64 volatiles for every call (no probe): same-unit callees clobber less",
+          [lists(xm + fp, False), lists(ca, False)], [(772, 800, 358, 375), (192, 384, 146, 180)])
+    for tag, fs, want, full, fit in (
+            ("xmm+fp", xm + fp, (25, 24, 316, 315, 316, 316), ["99 of 101", "212 of 214", "309 of 315"],
+             ["97 of 101", "210 of 214", "273 of 315"]),
+            ("calls", ca, (12, 12, 75, 75, 75, 75), ["70 of 74", "61 of 74"], ["54 of 74", "47 of 74"]),
+            ("flags", fl, (5, 5, 74, 74, 74, 74), ["67 of 70", "4 of 4", "71 of 74"],
+             ["67 of 70", "4 of 4", "71 of 74"])):
+        with contextlib.redirect_stdout(io.StringIO()):
+            c = N.cmd_ilmodel(fs, 0, N.IL_READ)
+        check("ncolsim ilmodel (IL_READ) %s: functions, order, candidates, preferences, useable, anti-preference" % tag,
+              tuple(c[k] for k in ("functions", "order same", "cands", "prefs same", "useable same", "anti same")), want)
+        got = []
+        for use in (N.IL_USE + N.IL_MODEL + N.IL_READ, N.IL_USE + N.IL_MODEL):
+            b = io.StringIO()
+            with contextlib.redirect_stdout(b):
+                N.cmd_ilfull(fs, 0, use)
+            got.append([ln.split(":")[1].split("single")[0].strip() for ln in b.getvalue().splitlines()[1:]])
+        check("ncolsim ilfull %s: replay (int, xmm) and sim, IL_READ / the fitted IL_MODEL" % tag, got, [full, fit])
+    sp = lambda p: p - (1 << 32) if p & 0x80000000 else p
+    out = []
+    for f in fl:
+        g = N.il_model_state(f, ("order", "fpflag"))
+        pr, I = [sp(c["prio"]) for c in f["cands"]], list(range(len(f["cands"])))
+        tp = N.il_parse(f["il"])
+        moved = N.order_of(dict(f, no_adjust=False), pr, g["lists"]) != N.order_of(dict(f, no_adjust=True), pr,
+                                                                                  g["lists"])
+        out.append((f["func"].split("@")[0][1:], moved and N.order_of(dict(f, no_adjust=False), pr, g["lists"]) == I,
+                    N.il_uses_float(tp), N.il_has_try(tp)))
+    check("ncolsim NColMdAdjustPriority moves a global unless the function uses floating point (FUNC+0xe4 & 0x80), a "
+          "try block or not: (function, moved as traced, float, try)", sorted(out),
+          [("dtor_int", True, False, False), ("float_int", False, True, False), ("plain_int", True, False, False),
+           ("try_float", False, True, True), ("try_int", True, False, True)])
+
+
 
 def sched17_predict_tests():
     """tools/c2sched17.py --predict offline: each region's DAG, latencies, units and static priorities built from
@@ -1170,6 +1230,43 @@ def sched17_predict_tests():
     lf = S._leaf("[rsi=a$1:1008+rdi=n$1:1008*4+-8]@22:1004", 6, 0)
     check("sched17 predict: memory leaf text", (lf["base"], lf["index"], lf["scale"], lf["pas"], lf["disp"]),
           (r["rsi"], r["rdi"], 2, 0x22, "-8"))
+
+
+def sched17_atom_tests():
+    """tools/c2sched17.py's Atom model (/favor:ATOM, docs/c2/sched17.md 7) offline: tests/data/sched17/atom/*.json are
+    `c2sched17.py --il --export` of tests/data/ncol's c1 / c2 / sum and zlib's adler32 compress uncompr zutil
+    inftrees inffast under /O2 /favor:ATOM. The replay from the traced DAG needs no DLL (ports and throughputs are in
+    the export); the prediction from the IL reads OpSchedInfoAtom from the 17.00 c2.dll."""
+    import glob, io, contextlib
+    os.environ.setdefault("C2_BUILD", "14.00")
+    import c2sched17 as S
+    fns = []
+    for p in sorted(glob.glob(os.path.join(HERE, "tests", "data", "sched17", "atom", "*.json"))):
+        fns += S.load_export(p)
+    check("sched17 atom: every exported function traced with the Atom model (MOD+0x398 bit 6)",
+          sorted({f.get("model") for f in fns}), ["atom"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        got = S.check(fns, 0)
+    regs = [r for f in fns for r in f["regions"] if len(r["sel"]) >= 2]
+    order = lambda r, **kw: S.simulate(r, **kw) == [s["lex"] for s in r["sel"]]
+    check("sched17 atom: regions in the traced order (Atom replay / with breakable edges / K8 rules)",
+          (got, sum(order(r, model="atom", breaks=True) for r in regs), sum(order(r) for r in regs)),
+          ((127, 132), 132, 81))
+    if not S.have_c2_1700():
+        print("  sched17 atom predict: skipped (reads OpSchedInfoAtom from the 17.00 c2.dll, which is not set up here)")
+        return
+    c, _ = S.compare_dag(fns)
+    check("sched17 atom predict: traced edges reproduced from the IL (+ alias facts)",
+          (c["edges both"], c["edges traced"], c["edges predicted"]), (1836, 1840, 1836))
+    check("sched17 atom predict: node latency, unit, height, static priority from the IL and OpSchedInfoAtom",
+          (c["lat"], c["unit"], c["height"], c["static"], c["nodes"]), (877, 877, 877, 877, 877))
+    check("sched17 atom predict: DAG exact / issue order with the predicted DAG / with the traced DAG",
+          (c["dag exact"], c["order predicted dag"], c["order traced dag"], c["regions"]), (128, 132, 127, 132))
+    # a 32-bit _imul3 (callbacks): port 0, throughput 1, latency 5, the multiply unit
+    v = S.sel_tuple(dict(opc=0xf6, ttype=0x1004, srck=[1, 7], dstk=[1], srcw=[[0x1004, 0, 0, 0], [0x1004, 5, 0, 0]],
+                         dstw=[[0x1004, 0]]))
+    check("sched17 atom: _imul3 r32, r32, imm port / throughput / latency / unit",
+          (S.atom_port(v), S.atom_throughput(v), S.atom_latency(v), S.atom_unit(v)), (0x10, 1, 5, 1))
 
 
 def symkeys17_tests():
@@ -1353,8 +1450,10 @@ ncolsim_tests()
 ncol_levers_tests()
 sched17_tests()
 sched17_predict_tests()
+sched17_atom_tests()
 ncolsim_il_tests()
 ncolsim_ilmodel_tests()
+ncolsim_ilread_tests()
 symkeys17_tests()
 
 

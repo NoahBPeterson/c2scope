@@ -1034,7 +1034,9 @@ def install():
         _replace(os.path.join(TBIN, "c2trace.dll"), open(os.path.join(d, "c2trace.dll"), "rb").read())
     print("patched %s (entry -> cave at rva %x), built %s" % (os.path.join(TBIN, "c2.dll"), CAVE_RVA,
                                                              os.path.join(TBIN, "c2trace.dll")))
-    hook = os.path.expanduser("~/.config/c2trace-post-install")   # local: e.g. copy the new DLLs to a compile server
+    # local to this checkout (work/ is never shared): e.g. copy the new DLLs to a compile server. Per checkout, not
+    # per user: another checkout (c2scope next to this repo) must not run this one's deploy.
+    hook = os.path.join(ROOT, "work", "c2trace-post-install")
     if os.path.isfile(hook):
         cmd = open(hook).read().strip()
         if cmd:

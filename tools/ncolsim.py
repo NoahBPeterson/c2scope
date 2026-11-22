@@ -16,7 +16,10 @@ usage: ncolsim.py prio   EXPORT.json [EXPORT.json ..]      the priority formula 
                                                            preferences, useable / anti-preference sets, lists, and
                                                            from the IL before NColSubsumption live counts,
                                                            availability, lifetime index) against the trace; replay +
-                                                           sim on all of them (docs/c2/ncolor.md 12)
+                                                           sim on all of them (docs/c2/ncolor.md 12; with IL_READ:
+                                                           the xmm banks, the calls' REGSET probe, the preference
+                                                           lists as read, the float flag; ilmodel-fit / ilfull-fit:
+                                                           without them, as the functions' defaults)
        ncolsim.py whatif EXPORT.json --func F EDIT [EDIT..] the registers after an edit, against the unedited run:
                                                            +app:VAR:B[:N] / -app:VAR:B[:N] (N more / fewer
                                                            appearances of VAR in block B), prio:VAR=P,
@@ -410,7 +413,7 @@ def cmd_sim(fns, show=10):
     for f in fns:
         if not f.get("state") or "avail" not in f["state"]:
             continue
-        got = simulate(f, lists=f.get("lists"),
+        got = simulate(f, prio_of=f.get("prio_of"), lists=f.get("lists"),
                        prefs_of=il_prefs_of(f, f["prefs_src"]) if f.get("prefs_src") is not None else None)
         for c in f["cands"]:
             if c["name"] not in got or len(c["regions"]) != 1:
@@ -965,6 +968,7 @@ def il_parse(lines):
                 cur["words"] = w
             else:
                 cur["leafwords"].append(w)
+                cur.setdefault("leafaddr", []).append(int(ln.split()[1], 16))
                 cur.setdefault("leafsym", []).append(None)
         elif k == "S" and cur is not None and cur.get("leafsym"):
             x = [int(y, 16) for y in ln.split()[1:]]
@@ -1572,7 +1576,108 @@ PREF_WHOLE = False    # a def copy counts only between whole symbols (not a view
 PREF_LEA = False      # an lea def adds its base (NColMdLeaPref, as read): measured worse
 
 
-def il_pref_sources(tups, x):
+# NColMdGetInitialRegisters / NColMdGetRegOrder: the first register number of the bank a type's candidates live in
+_BANK = {(5, 8): 320, (5, 4): 336, (0xc, 0x10): 144, (0xc, 8): 240, (0xc, 4): 288, (0xc, 0x20): 112,
+         (0xd, 0x10): 160, (0xe, 0x10): 176, (0xe, 8): 272}
+
+
+def _reg_number(master, ty):
+    """The register number a candidate of type ty holds in master (rcx + a dword type -> ecx, 18; xmm3 + a float ->
+    fxmm3s, 339), or None."""
+    if not master or ty is None:
+        return None
+    cl, sz = (ty >> 12) & 0x1f, ty & 0xfff
+    if master.startswith("xmm"):
+        b = _BANK.get((cl, sz))
+        return b + int(master[3:]) if b is not None else None
+    b = {8: 1, 4: 17, 2: 33, 1: 49}.get(sz)
+    return b + FULL.index(master) if b is not None and master in FULL else None
+
+
+def _useable_nums(c):
+    """The register numbers of the region's useable set (its first sparse-BV chunk), or None."""
+    u = (c.get("useable") or [None])[0]
+    if not u or len(u) < 3:
+        return None
+    m = (u[2] << 32) | u[1]
+    return {u[0] + i for i in range(64) if m >> i & 1}
+
+
+def il_pref_sources(tups, x, read=False):
+    """The region preference lists before they are resolved: read=True the rules as read (il_pref_sources_read,
+    il_model_state's `prefread`), else the earlier fitted rule (il_pref_sources_fit: PREF_LOADS / PREF_WHOLE /
+    PREF_LEA)."""
+    return il_pref_sources_read(tups, x) if read else il_pref_sources_fit(tups, x)
+
+
+def il_pref_sources_read(tups, x):
+    """{root: [(tuple, (kind, partner, n))]}: NColDeterminePhysregUseable's preference list before it is resolved
+    (0x10068eb8..) [C]. At the *last use* (the last node of the use list): if the tuple is a copy (NColMdIsCopyInstr:
+    mov, movapd / movaps, movdqa / movdqu and their v-forms by opcode; movsd / movss / vmovsd / vmovss of a scalar float
+    type), or an lea whose source is a memory operand (opcode 0x4fe / 0x501), its first destination; then for every
+    *definition* in order: a copy's first source, put at the head, or an lea's base (NColMdLeaPref 0x101a3080: the
+    memory leaf's +0x30 for 0x4fe [base+disp], +0x34 for 0x501 [index*scale+disp]), appended. NColAddToPreferences (0x100691f0) takes REG operands only: a
+    physical register as it is (`rcx=t..`, `eax`), a candidate by the register of its region covering that tuple
+    (processed candidates only), and adds the register only when its *number* is in the useable set: a partner of
+    another width or bank (an ecx for a qword candidate, an fxmm0l for a float) is no preference. The entry carries
+    the register number (phys) or the partner's type (cand) for that test, and the list is kept as the sequence of
+    calls (`head` / `tail`): a register already in the list stays where it is (il_prefs_of builds it)."""
+    by = {t["n"]: t for t in tups}
+    ty = il_types(tups)
+    regs = _regnames()
+    out = {}
+
+    def leaf(t, side, i):
+        q = _leaf_reg(t, side, i)
+        if not q:
+            return None
+        if q[0] == "phys":
+            ops = t["dst"] if side == "d" else t["src"]
+            ph = _regleaf(ops[i])[1]
+            return ("phys", q[1], regs.get(ph))
+        return ("cand", q[1], ty.get(q[1]))
+
+    def copy(t):
+        if t["kind"] != "I" or t["op"] not in COPY_OPS + ("vmovapd", "vmovaps", "vmovdqa", "vmovdqu", "vmovsd",
+                                                          "vmovss"):
+            return False
+        if t["op"] in ("movsdx", "movss", "vmovsd", "vmovss"):
+            w = t.get("words") or []
+            return len(w) > 4 and (w[4] & 0x1f000) == 0x5000
+        return True
+
+    def memsrc(t):
+        w = (t.get("srcw") or [None])[0]
+        return bool(w) and len(w) > 2 and w[2] in (0x4fe, 0x501)
+    for r, y in x["cands"].items():
+        lst = []
+        uses = [n for n in y["apps"] if r in (by[n].get("srcr") or [])]
+        defs = sorted({n for n in y["apps"] if r in (by[n].get("dstr") or [])})
+        if uses:
+            n = max(uses)
+            t = by[n]
+            if (copy(t) or t["kind"] == "I" and t["op"] == "lea" and memsrc(t)) and t["dst"]:
+                q = leaf(t, "d", 0)
+                if q and q[1] != r:
+                    lst.append((n, q, "tail"))
+        for n in defs:
+            t = by[n]
+            if copy(t):
+                q = leaf(t, "s", 0) if t["src"] else None
+                if q and q[1] != r:
+                    lst.append((n, q, "head"))
+            elif t["kind"] == "I" and t["op"] == "lea" and memsrc(t):
+                # 0x4fe [base+disp]: the base (+0x30); 0x501 [index*scale+disp]: the index (+0x34); either is the
+                # memory leaf's only register leaf, the next source (0x4ff base+index and 0x500 give none)
+                q = leaf(t, "s", 1) if len(t["src"]) > 1 else None
+                if q and q[1] != r:
+                    lst.append((n, q, "tail"))
+        if lst:
+            out[r] = lst
+    return out
+
+
+def il_pref_sources_fit(tups, x):
     """{root: [(tuple, ('phys', reg) / ('cand', root))]}: NColDeterminePhysregUseable's preference list before it
     is resolved: at the last use, a mov (NColMdIsCopyInstr is the opcode alone) into a REG leaf: its destination
     (appended); then every mov defining the whole candidate from a whole REG leaf: the source, put at the head (the
@@ -1619,10 +1724,20 @@ def il_prefs_of(f, src):
     def prefs_of(c, got):
         out = []
         u = useable(c)
-        for _n, (k, v) in src.get(c.get("sym"), []):
+        un = _useable_nums(c)
+        for e in src.get(c.get("sym"), []):
+            q = e[1]
+            k, v = q[0], q[1]
             r = v if k == "phys" else got.get(names.get(v))
+            if len(q) > 2 and un is not None:   # il_pref_sources_read: the register's number must be useable
+                num = q[2] if k == "phys" else _reg_number(r, q[2])
+                if num is not None and num not in un:
+                    continue
             if r and r not in out and (u is None or r in u):
-                out.append(r)
+                if len(e) > 2 and e[2] == "head":    # NColAddToPreferences: prepend (a def copy) / append
+                    out.insert(0, r)
+                else:
+                    out.append(r)
         return out
     return prefs_of
 
@@ -1681,6 +1796,90 @@ def il_anti(tups):
                 continue
             out[base] = out.get(base, 0) | (1 if idx is None else 0) | (2 if disp == "0" else 0)
     return {r: {1: 0, 2: 1, 3: 2}[m_] for r, m_ in out.items() if m_}
+
+def _mem_fields(t, i):
+    """A memory leaf's (base, index, disp, scale shift) as NColMdAddToPreferences reads them: with the raw words of
+    +0x30 / +0x34 / +0x38 (C2TRACE_ILRAW >= 15) base / index are the addresses of their REG leaves; otherwise from the
+    text, base / index as the position of their leaf (the memory leaf's next leaves: base, then index)."""
+    w = t["leafwords"][i] if i < len(t["leafwords"]) else []
+    if len(w) >= 15:
+        return w[12], w[13], w[14], w[7] & 0xf
+    ops = t["dst"] + t["src"]
+    txt = ops[i] if i < len(ops) else ""
+    if not txt.startswith("[") or "]" not in txt:
+        return None
+    parts = txt[1:txt.index("]")].split("+")
+    has_b = bool(parts) and "*" not in parts[0] and not parts[0].lstrip("-").isdigit()
+    ix = next((q for q in parts if "*" in q), None)
+    sc = {"1": 0, "2": 1, "4": 2, "8": 3}.get(ix.rsplit("*", 1)[1], 0) if ix else 0
+    d = parts[-1] if len(parts) > 1 and parts[-1].lstrip("-").isdigit() else "0"
+    nm = lambda q: q.rsplit(":", 1)[0]
+    pos = [k for k in range(len(t["dst"]), len(ops)) if k != i]   # the source leaves: a memory operand's base and
+    if i >= len(t["dst"]):                                         # index follow it; a stored value comes first
+        pos = [k for k in pos if k > i]
+    bn = nm(parts[0]) if has_b else None
+    inm = nm(ix.rsplit("*", 1)[0]) if ix else None
+    bpos = [k for k in pos if nm(ops[k]) == bn] if has_b else []
+    ipos = [k for k in pos if nm(ops[k]) == inm] if ix else []
+    if i >= len(t["dst"]):
+        base = ("pos", bpos[0]) if bpos else 0
+        index = ("pos", next((k for k in ipos if not bpos or k > bpos[0]), ipos[0])) if ipos else 0
+    else:
+        index = ("pos", ipos[-1]) if ipos else 0
+        base = ("pos", next((k for k in reversed(bpos) if not ipos or k < ipos[-1]), bpos[-1])) if bpos else 0
+    return base or (("pos", -1) if has_b else 0), index or (("pos", -1) if ix else 0), int(d) != 0, sc
+
+
+def il_anti_read(tups, apps):
+    """{root: 0 / 1 / 2}: NColMdAddToPreferences (0x10069010) as read [C], called by NColDeterminePhysregUseable for
+    every appearance with the candidate's leaf in that tuple (a use: the first source REG leaf of the lifetime's root;
+    the anti set goes to that leaf's own SYM +0x44, so a view's is not the candidate's). The memory operand's base must
+    be *that leaf* (the field +0x30 points to it): mov (0x13b): the first destination if it is memory, else the first
+    source; lea (0x114, the leaf not its destination): the memory source (kind 5) by base, or with no base by an index
+    of scale 2 (`[i*2]` is encoded [i+i]: an index present). No index -> r12, no displacement (+0x38) -> rbp / r13;
+    the union over the lifetime's appearances (apps: {root: tuple numbers}). A definition never matches (its leaf is a
+    destination)."""
+    out = {}
+    for t in tups:
+        if t["kind"] != "I" or t["op"] not in ("mov", "lea"):
+            continue
+        nd = len(t["dst"])
+        ks = list(t["dstk"]) + list(t["srck"])
+        ls = t.get("leafsym") or []
+        la = t.get("leafaddr") or []
+        roots = list(t.get("dstr") or []) + list(t.get("srcr") or [])
+        first = {}
+        for j in range(nd, len(ks)):
+            if ks[j] in (1, 2) and j < len(roots) and roots[j]:
+                first.setdefault(roots[j], j)
+        for r, j in first.items():
+            if t["n"] not in apps.get(r, ()):
+                continue
+            x = ls[j] if j < len(ls) else None
+            if x and len(x) > 4 and x[4] and x[4] != x[0]:
+                continue                              # a view: the set lands on the view's SYM
+            me = la[j] if j < len(la) else None
+            hit = lambda v: v != 0 and (v == ("pos", j) if isinstance(v, tuple) else me is not None and v == me)
+            bits = None
+            if t["op"] == "lea":
+                if nd < len(ks) and ks[nd] == 5:
+                    m = _mem_fields(t, nd)
+                    if m and hit(m[0]):
+                        bits = (m[1] == 0, not m[2])
+                    elif m and m[0] == 0 and hit(m[1]) and m[3] == 1:
+                        bits = (False, not m[2])
+            else:
+                m = _mem_fields(t, 0) if nd and ks[0] in (5, 6) else None
+                if m and hit(m[0]):
+                    bits = (m[1] == 0, not m[2])
+                elif nd < len(ks) and ks[nd] in (5, 6):
+                    m = _mem_fields(t, nd)
+                    if m and hit(m[0]):
+                        bits = (m[1] == 0, not m[2])
+            if bits:
+                out[r] = out.get(r, 0) | (1 if bits[0] else 0) | (2 if bits[1] else 0)
+    return {r: {1: 0, 2: 1, 3: 2}[v] for r, v in out.items() if v}
+
 
 def il_index(tups):
     """NColInitializeSyms (0x1017a350): {root SYM: lifetime index}. Tuples forward, in each instruction the destinations
@@ -1815,11 +2014,37 @@ def il_live(tups):
 CALL_CLOBBER = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")   # a call's kind-0xa destination (Win64 volatiles) [I]
 
 
-def il_avail(tups, ntup, regs=FULL):
+def il_regsets(f):
+    """{tuple address: set of master names} from c2ncol's REGSET probe (f['regsets']: every kind-0xa leaf NColBuildInfo
+    reads, a call's clobber set; a callee of the same unit compiled before clobbers only what it uses), or None when the
+    export has no probe. Register numbers -> masters (ymmN -> xmmN); rsp and the not-allocatable ones dropped."""
+    if "regsets" not in f:
+        return None
+    out = {}
+    for r in f["regsets"]:
+        out.setdefault(r["tup"], set()).update(
+            m for m in (regname(n) for n in r["regs"] if not _upper_half(n)) if m and m != "rsp" and (m in NUM))
+    return out
+
+
+def _upper_half(n):
+    """A register number of an upper half of the xmm family (ymmNh 128..143, xmmNh / dxmmNh / ixmmNh 196..243): it
+    does not overlap the low 64 bits the fxmm banks hold (a call lists ymm0h, ymm6h..15h, the Win64 volatile upper
+    halves, among its destinations: they leave the banks alone)."""
+    return 128 <= n < 144 or 196 <= n < 244
+
+
+def _phys_upper(ph):
+    return ph in _regnames() and _upper_half(_regnames()[ph])
+
+
+def il_avail(tups, ntup, regs=FULL, regsets=None):
     """NColBuildInfo's initial availability lists (NColInitializeAvailability / NColStartAvailability /
     NColTerminateAvailability, docs/c2/ncolor.md 12), integer masters: built backwards; a register is available at a
     defining tuple and at the last use of the value defined there and busy strictly between; a definition or clobber
     with no tied use later splits [.., t] / [t+1, ..]; a tied value read by the tuple that clobbers is not cut there.
+    regsets ({tuple address: masters}, il_regsets): the call's clobber set read by the REGSET probe instead of
+    CALL_CLOBBER (any tuple with such a leaf); regs may include xmm0..15 (the xmm family by master: il_xavail).
     -> {register number: [(begin, end)]} with the [0, 0] / [n, n] sentinels, as the export's state['avail']."""
     nodes = {r: [] for r in regs}          # finished nodes, backwards
     head = {r: [None, ntup] for r in regs}  # the open node: [begin (None: pending), end]
@@ -1842,18 +2067,20 @@ def il_avail(tups, ntup, regs=FULL):
         t = T["n"]
         A = set()
         srcroots = set(T.get("srcr") or [])
-        if T["op"] == "call":
+        if regsets is not None:
+            A |= regsets.get(T["text"].split()[1], set()) & set(regs)
+        elif T["op"] == "call":
             # the Win64 volatiles; a callee of this unit compiled before may clobber fewer (interprocedural register
-            # usage: zlib _tr_init -> init_block keeps rcx, r9..r11), its set is not in the dump
+            # usage: zlib _tr_init -> init_block keeps rcx, r9..r11): read by c2ncol's REGSET probe (regsets)
             A |= set(CALL_CLOBBER)
         for i, (k, x) in enumerate(zip(T["dstk"], T["dst"])):
             if k != 1:
                 continue
             c, ph = _regleaf(x)
-            if ph is None or ph.startswith("cc"):
+            if ph is None or ph.startswith("cc") or _phys_upper(ph):
                 continue
             m = ALIAS.get(ph)
-            if m is None:
+            if m is None or m not in head:
                 continue
             r = (T.get("dstr") or [None] * 9)[i]
             if "=" not in x:
@@ -1871,7 +2098,7 @@ def il_avail(tups, ntup, regs=FULL):
                 continue
             c, ph = _regleaf(x)
             m = ALIAS.get(ph) if ph else None
-            if m is None or ph.startswith("cc"):
+            if m is None or ph.startswith("cc") or _phys_upper(ph) or m not in head:
                 continue
             r = (T.get("srcr") or [None] * 9)[i]
             if r not in live_t:
@@ -1884,6 +2111,26 @@ def il_avail(tups, ntup, regs=FULL):
             continue
         lst = [head[r]] + nodes[r][::-1]   # forward order: the open head first
         out[NUM[r]] = [(0, 0)] + [(b or 0, e) for b, e in lst] + [(ntup, ntup)]
+    return out
+
+
+def il_xavail(tups, ntup, regsets=None):
+    """The xmm availability banks (fxmm0l..15l 320.., fxmm0s..15s 336..: one list per master xmmK, both banks the same)
+    by il_avail's rules over xmm0..15: a tied xmm leaf (xmm0=t..), a physreg destination, a call's REGSET (its ymm
+    registers). Without the probe, as measured on the probe's sets of calls to other units: the Win64 volatiles
+    xmm0..5 in a function that uses floating point (il_uses_float), all of xmm0..15 in one that does not (zlib's
+    calls list ymm0..15: nothing of the xmm family lives across a call there) [I]."""
+    xs = list(XMM_ORDER)
+    if regsets is None:
+        regsets = {}
+        vol = {"xmm%d" % k for k in range(6 if il_uses_float(tups) else 16)}
+        for T in tups:
+            if T["kind"] == "I" and T["op"] == "call":
+                regsets[T["text"].split()[1]] = set(CALL_CLOBBER) | vol
+    av = il_avail(tups, ntup, xs, regsets)
+    out = {}
+    for k in range(16):
+        out[XBANKS[0] + k] = out[XBANKS[1] + k] = av[NUM["xmm%d" % k]]
     return out
 
 
@@ -2078,6 +2325,184 @@ def il_rbp_reserved(tups, speed=True):
     return sc >= 6 * (24 if speed else 12)
 
 
+def il_addr_folds(tups, x):
+    """The address temporaries NColor folds away while allocating [C for the place, measured for the rule]: an
+    `lea T <- [S + disp]` (OPBASED source, 0x4fe) that is T's only definition, every other appearance of T a base or
+    index of a memory operand. NColProcessCandidate (single def, NColMdIsFoldableDef, NColCanRecalc) finds recomputing
+    cheaper than a register (NColFoldAwayRegion): T gets none, the address goes into its uses, S's lists lose the lea
+    and gain T's uses, S's range grows over them (zlib: 550 of 550 such temps, none of the 128 with a plain register
+    use). -> [(T, S, lea tuple)] in tuple order."""
+    by = {t["n"]: t for t in tups}
+    out = []
+    for t in tups:
+        if t["kind"] != "I" or t["op"] != "lea" or len(t["src"]) != 2 or not t.get("srcw"):
+            continue
+        w = t["srcw"][0]
+        if len(w) < 3 or w[2] != 0x4fe:
+            continue
+        T = (t.get("dstr") or [None])[0]
+        S = (t.get("srcr") or [None, None])[1]
+        y = x["cands"].get(T)
+        if not T or not S or T == S or not y or S not in x["cands"]:
+            continue
+        if sorted(set(y.get("defs") or [n for n in y["apps"] if T in (by[n].get("dstr") or [])])) != [t["n"]]:
+            continue
+        ok = True
+        for n in set(y["apps"]) - {t["n"]}:
+            u = by[n]
+            if T in (u.get("dstr") or []):
+                ok = False
+                break
+            names = {o.rsplit(":", 1)[0] for o, r in zip(u["src"], u.get("srcr") or []) if r == T}
+            inside = set()
+            for o in u["dst"] + u["src"]:
+                if o.startswith("[") and "]" in o:
+                    inside |= {q.split("*")[0].rsplit(":", 1)[0] for q in o[1:o.index("]")].split("+")}
+            if not names or not names <= inside:
+                ok = False
+                break
+        if ok:
+            out.append((T, S, t["n"]))
+    return out
+
+
+LOADFOLD_ALU = ("add", "sub", "xor", "and", "or", "adc", "sbb")
+LOADFOLD_EXT = ("movsxd", "movzx", "_movzxw", "movsx", "_movsxw", "test")
+
+
+def il_load_folds(tups, x):
+    """Loads NColor folds into their only use while allocating (NColSourceOfLoadCanBeFolded / NColDoLoadFold, read
+    by name only; the rule is measured on zlib): `mov T <- [mem]` is T's only definition, T has one use u, and u can
+    take the memory operand in T's place: a two-operand ALU op (add sub xor and or adc sbb) reading T second into a
+    register that is also its first source, or an extension / test reading T first; u in the load's block (a use in
+    another block is left alone: measured). T gets no register; the memory
+    operand's base and index lifetimes appear at u instead of the load and live until u. -> [(T, load, u, [base and
+    index roots])]."""
+    by = {t["n"]: t for t in tups}
+    out = []
+    for r, y in x["cands"].items():
+        defs = sorted({n for n in y["apps"] if r in (by[n].get("dstr") or [])})
+        uses = sorted({n for n in y["apps"] if r in (by[n].get("srcr") or [])} - set(defs))
+        if len(defs) != 1 or len(uses) != 1 or uses[0] < defs[0]:
+            continue
+        d, u = by[defs[0]], by[uses[0]]
+        if d["op"] != "mov" or len(d["dst"]) != 1 or not d["src"] or (d["srck"] or [0])[0] not in (5, 6):
+            continue
+        sr = u.get("srcr") or []
+        if sr.count(r) != 1:
+            continue
+        pos = sr.index(r)
+        mem_dst = any(o.startswith("[") for o in u["dst"])
+        if u["op"] in LOADFOLD_ALU:
+            ok = pos == 1 and not mem_dst and (u.get("dstr") or [None])[0] == sr[0] and not u["src"][0].startswith("[")
+        elif u["op"] in LOADFOLD_EXT:
+            ok = pos == 0 and not mem_dst and not any(o.startswith("[") for o in u["src"][1:])
+        else:
+            ok = False
+        if ok and x["blk"][d["n"]] == x["blk"][u["n"]]:
+            regs = [q for q in (d.get("srcr") or [])[1:] if q and q in x["cands"]]
+            out.append((r, d["n"], u["n"], regs))
+    return out
+
+
+def il_apply_load_folds(x, folds):
+    """x with the load folds applied: each base / index lifetime has the use tuple for the load and lives until it."""
+    import copy
+    cands = copy.deepcopy(x["cands"])
+    for _T, d, u, regs in folds:
+        for q in regs:
+            a = cands.get(q)
+            if a is None:
+                continue
+            apps = list(a["apps"])
+            if d in apps:
+                apps[apps.index(d)] = u
+            a["apps"] = sorted(apps)
+            rg = [list(v) for v in a["ranges"]]
+            for v in rg:
+                if v[0] <= d <= v[1] and v[1] < u:
+                    v[1] = u
+            merged = []
+            for lo, hi in sorted(rg):
+                if merged and lo <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], hi)
+                else:
+                    merged.append([lo, hi])
+            a["ranges"] = [tuple(v) for v in merged]
+            a["first"], a["last"] = merged[0][0], merged[-1][1]
+    return dict(x, cands=cands)
+
+
+def il_apply_addr_folds(x, folds, blocks=None):
+    """x (il_inputs) with the folds of il_addr_folds applied to the sources' lifetimes (a copy of x['cands'];
+    a fold of a temporary that is itself folded goes to its source)."""
+    import copy
+    cands = copy.deepcopy(x["cands"])
+    to = {}
+    for T, S, n in folds:
+        while S in to:
+            S = to[S]
+        a, b = cands.get(S), cands.get(T)
+        if a is None or b is None:
+            continue
+        apps = list(a["apps"])
+        if n in apps:
+            apps.remove(n)
+        apps += [q for q in b["apps"] if q != n]
+        a["apps"] = sorted(apps)
+        rg = sorted([list(q) for q in a["ranges"]] + [list(q) for q in b["ranges"]])
+        merged = []
+        for lo, hi in rg:
+            if merged and lo <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        a["ranges"] = [tuple(q) for q in merged]
+        a["first"], a["last"] = merged[0][0], merged[-1][1]
+        pass                                   # T keeps its lists: it is still processed (and folded)
+        to[T] = S
+    return dict(x, cands=cands), to
+
+
+def il_rbp_score(tups):
+    """The frame-reference score NColCanon accumulates in TLS+0x1196c (0x10090040..0x10090147, 0x1009049b) [C]: for
+    every instruction tuple, every source and destination leaf: a memory leaf (kind 5 / 6) whose +0x2c SYM is a
+    temporary / variable (SYM kinds 3..6) scores 6; otherwise a leaf of opcode 0x4fc (a symbol leaf: `s7:1008`,
+    `stream:1008`) or 0x500 ([index*scale]) scores 6 when its root SYM has the +9 bit 2, else 1. The +0x2c SYM's own
+    kind is in the dump only when that SYM is also some leaf's symbol; an unknown one counts as 6 [I: zlib: only then
+    does inflate_table reach the threshold, which its traced useable sets say it does]."""
+    syms = {}
+    for t in tups:
+        for x in t.get("leafsym") or []:
+            if x and len(x) > 4:
+                syms.setdefault(x[0], x)
+    sc = 0
+    for t in tups:
+        if t["kind"] != "I":
+            continue
+        ls = t.get("leafsym") or []
+        for i, w in enumerate(t["leafwords"]):
+            if len(w) < 12:
+                continue
+            if (w[3] & 0xff) in (5, 6) and w[11]:
+                x = syms.get(w[11])
+                if x is None or (x[3] & 0xff) in (3, 4, 5, 6):
+                    sc += 6
+                    continue
+            if w[2] in (0x4fc, 0x500):
+                x = ls[i] if i < len(ls) else None
+                r = syms.get(x[4] or x[0], x) if x and len(x) > 4 else None
+                sc += 6 if r is not None and (r[3] >> 8) & 2 else 1
+    return sc
+
+
+def il_rbp_reserved_read(tups, speed=True):
+    """NColMdPerFuncInit 0x10092788..0x100927d6 [C]: rbp is reserved as a frame base (FUNC+0x58 = 6, out of the
+    useable sets) when il_rbp_score reaches 6 * 24 (favoring speed; 6 * 12 otherwise), rbp is in the initial integer
+    set and not yet used (P+9 & 0x10) and the frame registers checked before are the default ones (not modelled)."""
+    return il_rbp_score(tups) >= 6 * (24 if speed else 12)
+
+
 def il_has_try(tups):
     """A try block (OPEHTRY in the IL): the frame keeps rbp (FUNC+0xe4 / +0xe8 flags of an EH frame: rbp leaves the
     useable sets) and NColMdAdjustPriority does not move a global (FUNC+0xe4 & 0x80) [I: tests/data/ncol c2.cpp's f2;
@@ -2085,7 +2510,28 @@ def il_has_try(tups):
     return any(t["kind"] in "IK" and t["op"] == "OPEHTRY" for t in tups)
 
 
+def il_uses_float(tups):
+    """FUNC+0xe4 & 0x80, which stops NColMdAdjustPriority: set by OtlScanFuncLeaves (0x101df4e0) for a leaf of type
+    class 5 (float / double; also by RdrFinalCleanup and PtInlProcessInstr, not read) [C for the scan]: any REG,
+    memory or constant leaf typed 5xxx in the IL (tests/data/ncol c2.cpp's f2, which also has a try block, and the
+    float loops of tests/data/ncol/xmm, fp.cpp)."""
+    for t in tups:
+        if t["kind"] != "I":
+            continue
+        for x in t["dst"] + t["src"]:
+            ty = x.rsplit(":", 1)[1] if ":" in x else ""
+            if len(ty) == 4 and ty[0] == "5":
+                return True
+    return False
+
+
 IL_MODEL = ("tied", "prefs", "useable", "anti", "order", "live", "avail", "index")   # il_model_state's default
+# the rules read since (docs/c2/ncolor.md 12.4): the xmm banks from the IL, each call's clobber set from c2ncol's REGSET
+# probe (avail / xavail; without the probe the Win64 volatiles), the preference lists as read, NColMdAdjustPriority off
+# in a function that uses floating point (FUNC+0xe4 & 0x80), the anti-preference set by the leaf a memory operand points
+# to, the rbp reservation by NColCanon's score as read. The CLI's ilmodel / ilfull use them; the functions' defaults (and
+# il_predict) keep IL_MODEL.
+IL_READ = ("xavail", "regsets", "prefread", "fpflag", "antiread", "rbpread", "loadfold")
 
 
 def il_model_state(f, use=IL_USE + IL_MODEL):
@@ -2093,7 +2539,11 @@ def il_model_state(f, use=IL_USE + IL_MODEL):
     (il_pref_sources: the record gets `prefs_src`, resolved in simulate), useable, anti, order (the record gets
     `lists`: simulate orders by order_of instead of the traced buckets); with the IL before NColSubsumption
     (`il_pre`, c2ncol --il) also live (il_live), avail (il_avail: the integer registers; xmm banks stay traced) and
-    index (il_index)."""
+    index (il_index). IL_READ's keys (docs/c2/ncolor.md 12.4): xavail (il_xavail: the xmm banks), regsets (the calls'
+    REGSET sets of c2ncol's probe for avail / xavail), prefread (il_pref_sources_read), fpflag (no NColMdAdjustPriority
+    in a function with floating point), antiread (il_anti_read), rbpread (il_rbp_reserved_read), loadfold / addrfold
+    (il_load_folds / il_addr_folds: the lists as NColor holds them at processing; the record gets `prio_of`, the
+    priorities before the folds)."""
     g = il_state(f, tuple(u for u in use if u in ("apps", "ranges", "live", "depth", "blk")))
     tups = il_parse(f["il"])
     x = il_inputs(f)
@@ -2101,6 +2551,11 @@ def il_model_state(f, use=IL_USE + IL_MODEL):
     st = g["state"]
     names = {c.get("sym"): c for c in g["cands"]}
     pre = il_parse(f["il_pre"]) if f.get("il_pre") else None
+    xf = x                                      # the lists as NColor holds them when the candidate is processed
+    if "addrfold" in use:
+        xf, _to = il_apply_addr_folds(x, il_addr_folds(tups, x))
+    if "loadfold" in use:
+        xf = il_apply_load_folds(xf, il_load_folds(tups, x))
     if "tied" in use:
         td = il_tied(tups, x) if pre is None else \
             il_tied_pre(pre, il_inputs(f, "il_pre"), x, il_premap(pre, tups))
@@ -2113,15 +2568,21 @@ def il_model_state(f, use=IL_USE + IL_MODEL):
                 pw.setdefault(_master_num(v[0]), []).append(v[1])
         st["prefwin"] = {r: sorted(w) for r, w in pw.items()}
     if "prefs" in use:
-        g["prefs_src"] = il_pref_sources(tups, x)
+        g["prefs_src"] = il_pref_sources(tups, xf, read="prefread" in use)
     if "useable" in use:
-        rbp = il_rbp_reserved(pre if pre is not None else tups, st.get("speed", 1)) or il_has_try(tups)
+        rbp = (il_rbp_reserved_read if "rbpread" in use else il_rbp_reserved)(
+            pre if pre is not None else tups, st.get("speed", 1)) or il_has_try(tups)
         for c in g["cands"]:
             t = ty.get(c.get("sym"))
             u = il_useable(c, t, frame_rbp=rbp)
             if u is not None and c.get("useable"):
                 c["useable"] = [u]
-    if "anti" in use:
+    if "anti" in use and "antiread" in use:      # as read: by the leaf the memory operand points to
+        an = il_anti_read(tups, {r: set(y["apps"]) for r, y in xf["cands"].items()})
+        for c in g["cands"]:
+            k = an.get(c.get("sym"))
+            c["anti_r"] = [st["anti"][k] if k is not None and st.get("anti") else 0]
+    elif "anti" in use:
         an = il_anti(tups)
         names_by = {c["name"]: c for c in g["cands"]}
         for c in g["cands"]:
@@ -2131,10 +2592,14 @@ def il_model_state(f, use=IL_USE + IL_MODEL):
         lv = il_live(pre)
         st["live"] = lv + [0] * max(0, len(st["live"]) - len(lv))
         st["maxlive"] = max(lv or [0])
+    rsets = il_regsets(f) if "regsets" in use else None
     if pre is not None and "avail" in use:
-        av = il_avail(pre, st["ntup"])
+        av = il_avail(pre, st["ntup"], regsets=rsets) if rsets is not None else il_avail(pre, st["ntup"])
         st["avail"] = {int(k): v for k, v in st["avail"].items()}
         st["avail"].update(av)
+    if pre is not None and "xavail" in use:        # the xmm banks (the calls' sets: the REGSET probe, else Win64)
+        st["avail"] = {int(k): v for k, v in st["avail"].items()}
+        st["avail"].update(il_xavail(pre, st["ntup"], rsets))
     if pre is not None and "index" in use:
         ix = il_index(pre)
         for c in g["cands"]:
@@ -2147,13 +2612,22 @@ def il_model_state(f, use=IL_USE + IL_MODEL):
             if v and v["apps"] and v["ranges"]:
                 c["apps"], c["ranges"] = list(v["apps"]), [tuple(q) for q in v["ranges"]]
                 c["first"], c["last"] = v["ranges"][0][0], v["ranges"][-1][1]
+    if "addrfold" in use or "loadfold" in use:   # the priorities are the ones before the folds; the lists of
+                                                     # the lifetimes they touch change
+        g["prio_of"] = {c["name"]: prio(c, st) for c in g["cands"]}
+        for c in g["cands"]:
+            y = xf["cands"].get(c.get("sym"))
+            if y is not None and y["ranges"] and c.get("ranges") and y["ranges"] != x["cands"][c["sym"]]["ranges"]:
+                c["ranges"] = [tuple(q) for q in y["ranges"]]
+                c["apps"] = list(y["apps"])
     if "order" in use:
         g["lists"] = il_lists(g, tups)
-        g["no_adjust"] = il_has_try(tups)
+        g["no_adjust"] = il_uses_float(pre if pre is not None else tups) or il_uses_float(tups) \
+            if "fpflag" in use else il_has_try(tups)
     return g
 
 
-def cmd_ilmodel(fns, show=10):
+def cmd_ilmodel(fns, show=10, extra=()):
     """Part 2's inputs from the IL against the traced ones: per candidate the tied register and window, the preference
     list (partners' registers as traced), the useable set, the anti-preference set; per function the order (lists,
     priorities and indices as traced) and the lists. -> Counter."""
@@ -2164,7 +2638,7 @@ def cmd_ilmodel(fns, show=10):
     for f in fns:
         if not f.get("il") or not f.get("state"):
             continue
-        g = il_model_state(f, ("tied", "prefs", "useable", "anti", "order"))
+        g = il_model_state(f, ("tied", "prefs", "useable", "anti", "order") + tuple(extra))
         pof = il_prefs_of(g, g["prefs_src"])
         given = {}
         c["functions"] += 1
@@ -2213,9 +2687,11 @@ def cmd_ilmodel(fns, show=10):
 def il_predict(f, use=None):
     """{short name: register} the model gives from the function's IL alone (il_model_state + simulate): for a compile
     of an edited source whose block structure changed (eqif, duplicated tails: docs/c2/ncolor.md 12), NColor's inputs
-    are recomputed from that compile's IL instead of being edited on the base run."""
-    g = il_model_state(f, use or IL_USE + IL_MODEL)
-    got = simulate(g, lists=g.get("lists"), prefs_of=il_prefs_of(g, g["prefs_src"]) if g.get("prefs_src") else None)
+    are recomputed from that compile's IL instead of being edited on the base run. Default: the read rules
+    (IL_READ, ncolor.md 12.4); `use=IL_USE + IL_MODEL` gives the earlier fitted model."""
+    g = il_model_state(f, use or IL_USE + IL_MODEL + IL_READ)
+    got = simulate(g, prio_of=g.get("prio_of"), lists=g.get("lists"),
+                   prefs_of=il_prefs_of(g, g["prefs_src"]) if g.get("prefs_src") else None)
     return {short(k): v for k, v in got.items()}
 
 
@@ -2248,7 +2724,9 @@ def main(argv):
     return {"prio": cmd_prio, "replay": lambda f: cmd_replay(f, show), "sim": lambda f: cmd_sim(f, show),
             "ilin": lambda f: cmd_ilin(f, show) and 0, "ilprio": lambda f: cmd_ilprio(f) and 0,
             "ilprio+live": lambda f: cmd_ilprio(f, IL_USE + ("live",)) and 0,
-            "ilmodel": lambda f: cmd_ilmodel(f, show) and 0, "ilfull": lambda f: cmd_ilfull(f, show),
+            "ilmodel": lambda f: cmd_ilmodel(f, show, IL_READ) and 0,
+            "ilfull": lambda f: cmd_ilfull(f, show, IL_USE + IL_MODEL + IL_READ),
+            "ilmodel-fit": lambda f: cmd_ilmodel(f, show) and 0, "ilfull-fit": lambda f: cmd_ilfull(f, show),
             "ilsim": lambda f: cmd_ilsim(f, show)}[argv[0]](fns)
 
 

@@ -528,6 +528,7 @@ them on the original stack.
 | 0x1006a348 (BestCoverage) | 6 | per register: ecx = best cluster score (0x80000000 = none), [ebp-0x20] = physreg SYM*, [ebp-0x98] = best so far, [ebp-0x38] = L, [ebp-0x7c] = R |
 | 0x1006aeb3 (BestCoverage) | 9 | new best: ecx = score, edx = cluster, [ebp-0x20] = physreg SYM* |
 | 0x100c69ca (TryToImprove exit) | 6 | eax = stolen physreg SYM* or 0. Displaces the `ret 0x14` |
+| 0x100d7b53 (NColBuildInfo, a REGSET leaf) | 7 | esi = the kind-0xa leaf (+0x24 its register-set sparse BV: {head, pool}, nodes {base, low, high, next}); [esp+0xc] = tup#, [esp+0x1c] = Tuple*. Second displaced instruction is esp-relative. `c2ncol.REGSET_HOOK` (12.4) |
 
 Avoid: 0x100697bf (the "next register" join in DPA) -- 0x100697c2 is a branch target inside; and
 0x1006988c -- 0x1006988e is a branch target inside.
@@ -812,11 +813,12 @@ measured on zlib 1.2.1 at /O2 (97 functions, 3189 candidates, re-exported with `
 |---|---|---|---|
 | lifetime index (`il_index`) | NColInitializeSyms 0x1017a350: tuples forward, destinations then sources, REG leaves by root; an untied leaf numbers its root as a candidate, a tied one (preassigned register, root not a physreg) in the nPhys sequence, in the same field SYM+0x38: first role seen wins. The gaps of the traced indices are lifetimes absorbed later | 3189 / 3189 | 65 / 65 |
 | live count per block, maxLive (`il_live`) | NColBuildInfo 0x100d7220, backward: liveness of the *global* lifetimes only (candidates and tied lifetimes whose first and last appearance are in different blocks), pruned by NColDoLiveness' second fixpoint (in = live-in & U pred out; out = live-out & (appears \| in - defs)); per block the count starts at \|out\| and adds one per source whose bit is not set (a birth: a value used again after it died counts twice); a definition never adds (sets, then clears the bit unless the tuple reads it or it is a partial view); block 0 stores 0 | 2528 / 2528 blocks | 65 / 65 |
-| integer availability (`il_avail`) | NColInitializeAvailability / NColStartAvailability / NColTerminateAvailability, backward: a register is available at a defining tuple and at the last use of the value defined there, busy strictly between; a def or clobber with no tied use later splits `[.., t] / [t+1, ..]`; a register the clobbering tuple reads is not cut; calls clobber rax rcx rdx r8..r11 **[I]**; `[0,0]` / `[n,n]` are sentinels | 1442 / 1455 lists (92 of 97 functions all exact) | 60 / 60 |
+| integer availability (`il_avail`) | NColInitializeAvailability / NColStartAvailability / NColTerminateAvailability, backward: a register is available at a defining tuple and at the last use of the value defined there, busy strictly between; a def or clobber with no tied use later splits `[.., t] / [t+1, ..]`; a register the clobbering tuple reads is not cut; calls clobber rax rcx rdx r8..r11 **[I]**; `[0,0]` / `[n,n]` are sentinels. With the REGSET probe (12.4) a call clobbers what its kind-0xa leaf says **[C]** | 1442 / 1455 lists (92 of 97 functions all exact); with the probe **1455 / 1455** | 60 / 60 |
+| xmm availability (`il_xavail`, 12.4) | the same rules over xmm0..15 by master; both banks (fxmm l 320.., s 336..) are one list per register; the upper halves a call lists (ymm0h, ymm6h..15h) do not touch them; a call's clobbers: the REGSET probe, else the Win64 volatiles xmm0..5 in a function with floating point and all 16 in one without **[I]** | 1552 / 1552 with the probe (1376 without) | 800 / 800 |
 | tied register, window (`il_tied_pre`) | set in NColBuildInfo by both sites as overwrites in a backward walk: the qualifying copy with the smallest tuple number; `mov x <- phys` (any def) or `mov phys <- x` where the use ends one of x's ranges; NColMdIsCopyInstr: mov, movaps / movapd / movdqa / movdqu, movsd / movss (scalar float types); never movzx / movsx / lea. NColCombineLifetimes gives the survivor the absorbed tie if it has none; the window is the range that begins (or ends) at the copy, clipped to 15 tuples | 3182 / 3181 of 3189 | 65 / 64 |
-| region preference list (`il_pref_sources`) | the destination of a mov at the last use, then the source of every mov defining the candidate, each at the head; partners resolved with the registers given so far (simulate's `prefs_of`). Adding loads at the last use or NColMdLeaPref's lea base measured worse | 3042 / 3189 | 63 / 65 |
-| useable set (`il_useable`) | NColMdGetInitialRegisters: every integer register but rsp (the masters lack rbp; NColMdPerFuncInit adds it back unless a frame register or a reservation needs it); rbp out when the function has a try block (OPEHTRY) **[I]** or NColMdPerFuncInit reserves it as a frame base (0x1009271d: TLS+0x1196c >= 6 * 24 when favoring speed; the score NColCanon accumulates, fitted as 6 per stack-symbol leaf + 1 per kind-5 memory operand **[I]**: inflate, inflateBack, inflate_table) | 3189 / 3189 | 65 / 65 |
-| anti-preference (`il_anti`) | NColMdAddToPreferences 0x10069010: the memory operand of a mov (first destination, else first source) or an lea source whose base is the candidate: no index -> r12, no displacement -> rbp / r13, both -> all three; a union over the appearances | 3147 / 3189 | 64 / 65 |
+| region preference list (`il_pref_sources`) | the destination of a mov at the last use, then the source of every mov defining the candidate, each at the head; partners resolved with the registers given so far (simulate's `prefs_of`). Adding loads at the last use or NColMdLeaPref's lea base measured worse. As read (12.4, `prefread`): loads and leas count, the partner's register *number* must be in the useable set | 3042 / 3189; read **3187** | 63 / 65; read 65 |
+| useable set (`il_useable`) | NColMdGetInitialRegisters: every integer register but rsp (the masters lack rbp; NColMdPerFuncInit adds it back unless a frame register or a reservation needs it); rbp out when the function has a try block (OPEHTRY; 12.4: FUNC+0xe4 & 0x4801000 / +0xe8 & 0x100 **[C]**, set for EH frames) or NColMdPerFuncInit reserves it as a frame base (0x1009271d: TLS+0x1196c >= 6 * 24 when favoring speed; the score NColCanon accumulates, fitted as 6 per stack-symbol leaf + 1 per kind-5 memory operand **[I]**: inflate, inflateBack, inflate_table; read in 12.4, `rbpread`) | 3189 / 3189 | 65 / 65 |
+| anti-preference (`il_anti`) | NColMdAddToPreferences 0x10069010: the memory operand of a mov (first destination, else first source) or an lea source whose base is the candidate: no index -> r12, no displacement -> rbp / r13, both -> all three; a union over the appearances. As read (12.4, `antiread`): the base must be the candidate's own leaf in that tuple | 3147 / 3189; read **3171** | 64 / 65; read 65 |
 | lists and order (`il_lists`, `order_of`) | below | 97 / 97 functions | 4 / 4 |
 
 **Lists [C].** class = (SYM type >> 12) & 0x1f from the IL's `T S` line of the candidate's root; int when `(1 << class)
@@ -827,9 +829,11 @@ coalescing grew some). Lists 4 / 5: one definition whose sources are all constan
 7, 3, 4: `NColUsesOnlyConsts`). NColMdAdjustPriority: with a loop in the function the int-global of highest priority
 above 16 * max(1, highest int-local priority) goes to the head of list 2; list 3 is built by pushing on its head and
 scanned with `>`, so a tie goes to the *higher* lifetime index; not in a function with a try block (c2.cpp's f2: FUNC+0xe4
-& 0x80 **[I]**). With traced priorities and indices this gives the traced order of every zlib function.
+& 0x80 **[I]**; 12.4: the flag is "uses floating point" **[C]**, f2 has a double; `fpflag`). With traced priorities and
+indices this gives the traced order of every zlib function.
 
-**Numbers** (`ncolsim.py ilfull`: every input above from the IL, xmm availability still traced):
+**Numbers** (`ncolsim.py ilfull-fit`, the functions' defaults: every input above from the IL, xmm availability still
+traced; `ilfull` adds IL_READ, 12.4):
 
 | | priorities | replay int | replay xmm | sim |
 |---|---|---|---|---|
@@ -838,11 +842,12 @@ scanned with `>`, so a tie goes to the *higher* lifetime index; not in a functio
 | all from the IL (`ilfull`) | 3182 | 2547 | 21 | 2498 |
 | the same with the traced preference lists | 3182 | 2563 | 21 | 2514 |
 | the same, lifetimes coalesced by the model from `il_pre` (`subsume`) | 3099 | 2538 | 21 | 2366 |
+| **IL_READ (`ilfull`, 12.4): + xmm banks and the calls' REGSET sets, preferences, anti-preference, float flag, rbp score, load folds** | 3182 | **2580** | 21 (xmm availability from the IL) | **2561** |
+| IL_READ with `subsume` | 3099 | 2574 | 21 | 2427 |
 
-Fixtures: replay 52 / 54 and 9 / 9, sim 60 / 63 (traced inputs: 53 / 54, 9 / 9, 61 / 63). What the trace-free path
-still lacks: the preference lists (16 replay cases of zlib), the clobber set of a call to a function of the same unit
-compiled before (interprocedural register usage: `_tr_init -> init_block` keeps rcx and r9..r11; the dump shows only
-`regset:0`), and the xmm availability banks.
+Fixtures: replay 52 / 54 and 9 / 9, sim 60 / 63 (traced inputs: 53 / 54, 9 / 9, 61 / 63); with IL_READ 53 / 54, 9 / 9,
+61 / 63. What the fitted path lacked (the preference lists, the clobber set of a call to a function of the same unit,
+the xmm availability banks) is read in 12.4; what still remains is listed there.
 
 ### 12.1 The list lever (T20 0x1400bd4f0)
 
@@ -891,3 +896,127 @@ Measured on the rwsweep miss class of 10.3 (value copies): `T V_a = V;` before e
 uses V, later uses renamed (levers.cpp, 62 variants in one compile; 20 moved a range or added / removed a candidate, 10
 changed a register): from the base run's measured edits 52 of 62 (10 of the 20); from the variant's IL **62 of 62** (56
 with `subsume`). Fixture tests/data/ncol/copies (12 variants).
+
+### 12.4 The rest read (IL_READ; 2026-11-21)
+
+`ncolsim.py ilmodel` / `ilfull` now run with `IL_READ` = (`xavail`, `regsets`, `prefread`, `fpflag`, `antiread`,
+`rbpread`, `loadfold`) on top of IL_USE + IL_MODEL; `ilmodel-fit` / `ilfull-fit` and the functions' defaults
+(`cmd_ilfull(fns)`, `il_model_state(f)`, `il_predict(f)`: IL_MODEL) are unchanged, so earlier numbers and tests stand.
+Measured on zlib 1.2.1 /O2 re-exported with the new probe (97 functions, 3189 candidates; the traced-input numbers of the
+new exports are the old ones: 3159 / 2585 / 21 / 2549) and on new fixtures: tests/data/ncol/xmm (xmm.c, our float source:
+xmm parameters, extern and static callees, conversions, loops; fp.cpp), tests/data/ncol/calls (calls.c: static noinline
+helpers of the same unit), tests/data/ncol/flags (flags.cpp /O2 /EHsc: try / destructor / float combinations around an
+adler32-like loop); `ncolsim_ilread_tests`.
+
+**Calls' clobber sets: the REGSET probe [C].** NColBuildInfo's backward walk (0x100d7b4b) takes every kind-0xa leaf
+(OPREGSET 0x50b, `regset:0` in the dump), walks its register-set sparse BV (+0x24) with SbvNextEx, marks each register
+used (P+9 |= 0x10) and ORs `NColPhysregOverlapsBvs[reg]` into the set that NColStartAvailability splits. `c2ncol.py
+--export --il` hooks 0x100d7b53 (`REGSET_HOOK`, defined in the tool like PRE_HOOK: `mov ecx, [esi+0x24]; lea edx,
+[esp+0x38]`, 7 bytes, nothing branches inside) and logs the tuple, its number and the BV's nodes; the record gets
+`regsets` ([] for a function without such a leaf). What the sets say: a call to another unit clobbers rax rcx rdx r8..r11
+(minus the return register, a destination of its own) and **ymm0..15 when the caller has no floating point, ymm0/1..5
+when it has** (zlib, calls.c: all 16; xmm.c, fp.cpp: 1..5); a static callee compiled before clobbers only what it uses
+(calls.c: `rax`, `rcx`, `rcx rdx`, `rcx r8 r9 r10 r11`; s_sq clobbers nothing: no leaf at all). `il_regsets(f)` maps them
+to masters (ymmN -> xmmN, upper halves dropped); `il_avail(.., regsets=)` uses them instead of CALL_CLOBBER. zlib integer
+lists **1455 / 1455** (1442 without); calls.c 180 / 180 (146 without): replay 70 / 74 and sim 61 / 74 with them, 54 and
+47 without (traced inputs 70 / 59).
+
+**xmm availability banks** (`il_xavail`) **[C for the rules, measured]**: il_avail's walk over xmm0..15 by master (tied
+`fxmm0s=t..` leaves, physreg destinations, the calls' sets); one list per register for both banks (320 + k and 336 + k
+are always equal); the upper halves a call lists among its destinations (ymm0h, ymm6h..15h: the Win64 volatile upper
+halves, numbers 128..143 and 196..243) do not overlap the low 64 bits and leave the banks alone. zlib **1552 / 1552**
+(every function's 16; 1376 with the fallback below), xmm.c + fp.cpp 800 / 800 (772). Without the probe: the Win64
+volatiles xmm0..5 in a function that uses floating point, all 16 otherwise **[I]**. Replay / sim with the IL's banks
+equal those with the traced ones (zlib 21 / 21; xmm.c 63 / 63, sim 87 / 87; fp.cpp 149 / 151, the traced inputs 150).
+
+**Preference lists as read** (`prefread`, `il_pref_sources_read`) **[C]**: NColDeterminePhysregUseable 0x10068eb8..: at
+the *last use* (the last node of the region's use list) NColAddToPreferences(first destination) when the tuple is a copy
+by NColMdIsCopyInstr 0x10069170 (opcodes 0x13b mov, 0x13c / 0x13d movapd / movaps, 0x142 / 0x143 movdqa / movdqu,
+0x326.. the v-forms; 0x154 movsdx, 0x159 movss, 0x33e / 0x342 only with a scalar float tuple type 0x5000) **whatever its
+source**, so a load through the candidate counts, or an lea whose source is a memory leaf of opcode 0x4fe (OPBASED) /
+0x501 (OPSCALED); then for every definition: a copy's first source at the head, or an lea's NColMdLeaPref operand
+(0x101a3080: +0x30 of an OPBASED source, +0x34 of an OPSCALED one; OPINDEXED / OPLOCALSCALED give none) appended.
+NColAddToPreferences 0x100691f0 takes a REG operand only, a physreg as it is, a candidate by the register of its region
+covering the tuple, adds it only if its **register number** is in the useable BV (a dword partner's ecx is not in a qword
+candidate's set; an fxmm0l not in a float's), and never twice: a register already in the list keeps its place (the list is
+modelled as the sequence of head / tail calls). zlib **3187 / 3189** (3042 fitted); the two left: deflateCopy ss$1 (a
+load's destination whose region covering the tuple has no register) and inflate_table mask$1 (a partner renamed by the
+coalescing). Replay +16, sim +16. The xmm last-use copy (`movsd fxmm0l <- x`) is what the fitted rule missed in fp.cpp.
+
+**Anti-preference as read** (`antiread`, `il_anti_read`) **[C]**: NColMdAddToPreferences 0x10069010 is called per
+appearance with the candidate's own leaf in that tuple (a use: the first source REG leaf of the lifetime; the set is
+stored on that leaf's SYM +0x44, so a view's never reaches the candidate). The memory operand's base field (+0x30)
+must be **that leaf**: mov (0x13b): the first destination if it is memory (kind 5 / 6), else the first source; lea
+(0x114): the source if it is kind 5 and its base is the leaf, or it has no base and the leaf is an index of scale 2
+(`[i*2]` = `[i+i]`). No index (+0x34) -> r12; no displacement (+0x38, the numeric displacement) -> rbp / r13. The fitted
+rule matched the base by name (another lifetime's leaf of that name, an index-only `[i*4]` taken for a base). With
+C2TRACE_ILRAW=16 the fields are raw words (+0x30 / +0x34 / +0x38 are words 12..14 and point at the leaves); with the
+default 12 they come from the text (same result on zlib). zlib **3171 / 3189** (3147); the 18 left are candidates whose
+lists the folds below changed before they were processed (an lea temporary of the candidate folded away: its tuple
+leaves the list, its uses come in with another base) and deflateParams t717 (an `[t717+t797*1]` load that should give
+rbp / r13 and does not; scale 1 is the only feature that sets it apart, not read). No replay change on zlib.
+
+**NColMdAdjustPriority's flag** (`fpflag`, `il_uses_float`) **[C]**: FUNC+0xe4 & 0x80 is written by OtlScanFuncLeaves
+0x101df4e0 for any leaf of type class 5 (float / double), and by RdrFinalCleanup / PtInlProcessInstr (not read). It has
+nothing to do with EH: flags.cpp's `try_int` (try, no float) has its global moved, `float_int` (float, no EH) not, f2 of
+c2.cpp has both. The fitted try rule got xmm.c / fp.cpp's float loops wrong (order 18 of 25 functions; 24 with the flag;
+sim xmm.c 78 -> 84 of 87, fp.cpp 195 -> 216 of 228 by the flag alone, 87 and 222 with all of IL_READ).
+
+**EH and rbp** **[C for the test, I for which constructs set the bits]**: NColMdPerFuncInit adds rbp (NColMdSetAvailReg(6),
+0x1009261f) and takes it out again (NColMdClrAvailReg(6), 0x1009286b) when FUNC+0xe4 & 0x4801000 or FUNC+0xe8 & 0x100.
+0x4000000 is written by RgnMdPrepFunclet (a funclet: a catch / finally handler) and by OtlScanTuplist for opcode 0x56b;
+0x1000 by RdrGetTuples and WvmLoIntrin. Measured: try blocks take rbp out, a destructor-only unwind does not (flags.cpp
+try_int / try_float against dtor_int), which is what il_has_try keeps doing.
+
+**The rbp reservation score as read** (`rbpread`, `il_rbp_score`) **[C, one I]**: NColCanon 0x10090040..0x10090147 /
+0x1009049b, per instruction tuple, every source and destination leaf: a memory leaf (kind 5 / 6) whose +0x2c SYM is of
+kind 3..6 adds 6; else a leaf of opcode 0x4fc (OPLOCAL, a symbol leaf `s7:1008`) or 0x500 (OPLOCALSCALED) adds 6 when its
+root SYM has +9 bit 2, else 1. NColMdPerFuncInit (0x10092788..0x100927d6) reserves rbp when the score is >= 6 * 24 (speed;
+6 * 12 otherwise), rbp is in the initial set and not yet used, and the frame registers are the defaults. The +0x2c SYM's
+kind is in the dump only when that SYM is also some leaf's symbol; counting an unknown one as 6 **[I]** gives inflateBack
+577, inflate 204, inflate_table 186 (559, 186, 96 counting them 0: only then does inflate_table reach 144, as its traced
+useable sets say it does), the next 89 (spring, fp.cpp) and 73 (compress2): the same three functions as the fit, now from
+the code.
+
+**Folds while allocating (`loadfold`; `addrfold` optional)** **[measured; the places C, the cost test not read]**: the
+traced lists are those of NColProcessCandidate's entry, after earlier candidates were folded (NColFoldAwayRegion,
+NColDoLoadFold) and their address went into their uses; the priorities were computed before (so `prio_of` keeps them).
+`il_load_folds`: `mov T <- [mem]` as T's only definition, one use in the same block that can take the memory operand in
+T's place (add / sub / xor / and / or / adc / sbb reading T second into its own first source, movsx / movzx / test reading
+T first): the memory's base and index lifetimes appear at the use and live until it (crc32's unrolled `c$n` chains: the
+18 range misses of crc32_little / crc32_big). `il_addr_folds`: `lea T <- [S + disp]` (OPBASED) as T's only definition,
+every use of T an address component: S loses the lea, gains T's uses (zlib: 550 of 550 such temps folded, none of the 128
+with a plain register use). zlib replay **2565 -> 2580**, sim **2518 -> 2561**; addrfold adds nothing to either (it moves
+the apps match 3140 -> 3151 of 3189).
+
+**zlib, step by step** (`ncolsim.py ilfull` with the keys added in turn; prio 3182 throughout):
+
+| IL_MODEL + | replay int | xmm | sim |
+|---|---|---|---|
+| (fitted) | 2547 / 2669 | 21 / 21 | 2498 / 2690 |
+| regsets | 2549 | 21 | 2502 |
+| xavail | 2549 | 21 (from the IL) | 2502 |
+| prefread | 2565 | 21 | 2518 |
+| fpflag, antiread, rbpread | 2565 | 21 | 2518 |
+| loadfold (= IL_READ) | **2580** | 21 | **2561** |
+| traced inputs | 2585 | 21 | 2549 |
+
+Of the replay cases, 6 are missed from the IL that the traced inputs get (deflate t793, gen_bitlen t726 / t785, get_byte
+t188, gzread t774 / t775: ranges the folds and the coalescing leave different) and 1 the other way. Substituting a traced
+input for the IL's moves replay by at most 2 (ranges: 2582 / 2561; before the load folds the traced ranges were worth 18). Fixtures with
+IL_READ / fitted: xmm.c + fp.cpp replay 99 / 101 and 212 / 214, sim 309 / 315 (97, 210, 273); calls.c 70 / 74, sim 61 / 74
+(54, 47); flags.cpp 67 / 70, 4 / 4, 71 / 74 (both). il_predict on the eqif / copies variants: 20 / 20 and 12 / 12 either
+way.
+
+**il_subsume (the apps 97%).** The traced appearance lists it was compared with are read at processing, after the folds
+above: of the 123 survivors whose lists differ from il_subsume's, 97 differ exactly by folded single-def temporaries of
+the candidate (its tuple gone, the temporary's uses in), and the rest mostly by several of them. Folds applied to its
+lifetimes take the apps match from 3066 to 3137 of 3189 (ranges 3105 -> 3108); `subsume` with IL_READ: replay 2574, sim
+2427 (its priorities, 3099, are the loss). NColSubsumption itself was not changed.
+
+**Still not computed / not exact**: the tie (3182 / 3189) and window (3181); 18 anti-preference sets (lists changed by
+folds of earlier candidates, and one scale-1 load); 2 preference lists; the ranges of a few lifetimes at processing
+(the 6 replay cases above); the cost test of NColFoldAwayRegion / NColDoLoadFold (the fold rules are measured shapes);
+the kinds of some memory leaves' +0x2c SYMs in the rbp score; the writers of FUNC+0xe4 & 0x80 other than OtlScanFuncLeaves
+and the source constructs behind FUNC+0xe4 & 0x4801000. The live counts, lists, index, availability (integer and xmm,
+with the probe), useable sets and order are exact on zlib.

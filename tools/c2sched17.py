@@ -9,7 +9,8 @@ usage: c2sched17.py SRC --func F [--ready] [--check] [--predict] [--il] [--raw] 
             logged at DAG construction, --il) and measure them and the schedule against the trace
             (docs/c2/sched17.md 6.x); --il with --export keeps the IL for offline --predict
 
-One pass after register allocation (dop2_PreEncode -> Schedule), K8 model at /O2. Per region (a DAG of up to 81
+One pass after register allocation (dop2_PreEncode -> Schedule), K8 model at /O2, the Atom model with /favor:ATOM
+(MOD+0x398 bit 6, logged per function; sched17.md 7: 2 issues, dyn = static + 2^25 for a port pair). Per region (a DAG of up to 81
 tuples ending in a branch or label), the report lists each issued instruction:
 
   cyc  slot  #lex  instruction            static = B L nsucc height C S   dyn   est  lat unit
@@ -31,12 +32,15 @@ OPNAME = "100226e8"
 
 def hooks(ready, il=False):
     h = [
-        "@Schedule@8=tdccc>0>0>4$",                                  # 0 a function
+        "@Schedule@8=tdccc>0>0>4$,t850>0>0x398",                     # 0 a function; MOD+0x398 (bit 6: Atom)
         "100e5440=ecx",                                              # 1 SchSchedGraph: a region (graph)
         # 2 a node issued: name, lexical index | height, static, dyn, est, cycle, unit (local), latency, flags
         "100e56fb=edi>0x1c>8~%s$,edi>0x38,edi>0x2c,edi>0x30,edi>0x34,ebp>-4,ebp>-0xc,edi>0x3c,edi>0x40,"
         "edi>0x24,edi>0x1c>0x20,edi,edi>0xc*24:0xc:0x14,edi>0x3e" % OPNAME +  # + node, successor edges (to, lat), unit
-        ",edi>0x1c>8,edi>0x1c>0x30*8:0xc:0xc:4,edi>0x1c>0x34*8:0xc:0xc:4",   # opcode; src / dst leaf kinds (decoder)
+        ",edi>0x1c>8,edi>0x1c>0x30*8:0xc:0xc:4,edi>0x1c>0x34*8:0xc:0xc:4"    # opcode; src / dst leaf kinds (decoder)
+        # 17..20, for the Atom model's port / throughput callbacks (sched17.md 7): the tuple's type word, (+0x10
+        # type, +0x28 value) and (+0x2c, +8) of its first four sources, (+0x10, +0x28) of its first two destinations
+        ",edi>0x1c>0x10,edi>0x1c>0x30*4:0x10:0x28:4,edi>0x1c>0x30*4:0x2c:8:4,edi>0x1c>0x34*2:0x10:0x28:4",
     ]
     if il:      # every successor edge (a region has at most 82 nodes; the default probe logs 24), and their types
         h[2] = h[2].replace("edi>0xc*24:0xc:0x14", "edi>0xc*90:0xc:0x14") + ",edi>0xc*90:0xc:0x10"
@@ -162,6 +166,8 @@ def parse(text):
             continue
         if kind == FN:
             cur[th] = dict(func=v[0].strip('"'), regions=[])
+            if len(v) > 1 and v[1] not in ("?", ""):     # MOD+0x398 bit 6: the Atom model (SchmdInitialize)
+                cur[th]["model"] = "atom" if int(v[1], 16) & 0x40 else "k8"
             fns.append(cur[th])
         elif th in cur and kind == REGION:
             reg[th] = dict(sel=[], ready=[])
@@ -184,8 +190,15 @@ def parse(text):
                                        u=(hx(v[13]) & 0xffff) if len(v) > 13 and hx(v[13]) is not None else None,
                                        opc=hx(v[14]) if len(v) > 14 else None,
                                        srck=kinds(v[15]) if len(v) > 15 else [], dstk=kinds(v[16]) if len(v) > 16 else []))
-            if len(v) > 17 and v[17].startswith("["):    # --il: successor edge types, in the order of succ
-                reg[th]["sel"][-1]["etype"] = [int(b, 16) for a, b in zip(*[iter(v[17].strip("[]").split())] * 2)]
+            x = reg[th]["sel"][-1]
+            if len(v) > 20 and v[18].startswith("["):    # tuple type word, leaf words (the Atom callbacks)
+                x["ttype"] = hx(v[17])
+                a, b = pairs(v[18]), pairs(v[19])
+                x["srcw"] = [p + q for p, q in zip(a, b)]          # (+0x10, +0x28, +0x2c, +8) per source
+                x["dstw"] = pairs(v[20])                            # (+0x10, +0x28) per destination
+            et = 21 if len(v) > 21 else 17
+            if len(v) > et and v[et].startswith("[") and et == len(v) - 1:   # --il: successor edge types
+                x["etype"] = [int(b, 16) for a, b in zip(*[iter(v[et].strip("[]").split())] * 2)]
         elif th in reg and kind == READY:
             x = [int(t, 16) for t in v[0].strip("[]").split()] if v and v[0].startswith("[") else []
             reg[th]["ready"].append([((x[2 * k] & 0xffff), x[2 * k + 1]) for k in range(len(x) // 2)])
@@ -264,6 +277,9 @@ def main(argv):
             for r in f["regions"]:
                 for x in r["sel"]:
                     x["dec"] = k8_decoder(x["opc"], x["srck"], x["dstk"])
+                    if f.get("model") == "atom":
+                        v = sel_tuple(x)
+                        x["port"], x["thr"] = atom_port(v), atom_throughput(v)
         json.dump(dict(c2=c2build.name(), src=os.path.basename(a.src), functions=fns), open(a.export, "w"))
         print("%d functions -> %s" % (len(fns), a.export))
         return 0
@@ -314,14 +330,18 @@ FUSIBLE = {"cmp", "test", "add", "sub", "and", "inc", "dec"}
 CAPS = {0: 10, 1: 4, 2: 5, 3: 5, 4: 5}          # SchmdGetK8FuncUnit's caps per unit (sched17.md 1.6)
 
 
-def simulate(region, issue_rate=3, traced_bonus=False, breaks=False):
+def simulate(region, issue_rate=3, traced_bonus=False, breaks=False, model="k8"):
     """The order SchSchedGraph issues the region's nodes in, from the traced DAG (successor edges, latencies,
     static priorities, units) by the rules of docs/c2/sched17.md 1.6 / 1.8. Decoder pairing (+8) is taken from the
     trace (dyn - static at issue). breaks: also the breakable dependences (6.x): an edge whose latency word has a
     break kind (bits 16..20) does not hold its consumer back (ready when npred == nbreak), is broken (removed) when
     the consumer issues first, and a node waits while a producer of an anti break (kind >= 0x10) could issue by
-    the next cycle. -> [lexical index, ...]"""
+    the next cycle. model "atom": the Atom path (sched17.md 7: SchAtomPairing, SchAtomGetFuncUnit, 2 issues, busy
+    = max(busy, throughput), no macro-fusion hold). -> [lexical index, ...]"""
     sel = region["sel"]
+    atom = model == "atom"
+    if atom:
+        issue_rate = 2
     if not sel or any(s["node"] is None for s in sel):
         return None
     by = {s["node"]: s for s in sel}
@@ -337,7 +357,12 @@ def simulate(region, issue_rate=3, traced_bonus=False, breaks=False):
                 preds[to].append([s["node"], kb, True])
     est = {n: 0 for n in by}
     dyn = {n: by[n]["static"] for n in by}
-    dec = {n: by[n]["dec"] if "dec" in by[n] else k8_decoder(by[n]["opc"], by[n]["srck"], by[n]["dstk"]) for n in by}
+    if atom:
+        port = {n: by[n]["port"] if "port" in by[n] else atom_port(sel_tuple(by[n])) for n in by}
+        thr = {n: by[n]["thr"] if "thr" in by[n] else atom_throughput(sel_tuple(by[n])) for n in by}
+    else:
+        dec = {n: by[n]["dec"] if "dec" in by[n] else k8_decoder(by[n]["opc"], by[n]["srck"], by[n]["dstk"])
+               for n in by}
     busy = {}
     ready = [n for n in by if npred[n] == nbreak[n]]
     nlive = {n: len(by[n]["succ"]) for n in by}
@@ -374,7 +399,56 @@ def simulate(region, issue_rate=3, traced_bonus=False, breaks=False):
             dyn[a] = by[a]["static"] + 8
             dyn[b] = by[b]["static"] + 8
 
+    def can_pair(a, b):
+        return atom_can_pair(port[a], port[b])
+
+    def pairing(cycle):
+        """SchAtomPairing 0x10226160 (sched17.md 7.2): the first issuable ready node A and one partner B by issue
+        port; both get static + 2^25 (dyn is never reset on Atom)."""
+        if len(ready) < 2:
+            return
+        a = next((x for x in ready if est[x] <= cycle), None)
+        if a is None or port[a] == 0x30:
+            return
+        pa, b = port[a], None
+        for x in ready[ready.index(a) + 1:]:
+            if est[x] > cycle or not can_pair(a, x):
+                continue
+            px = port[x]
+            if pa == 0x40 and px == 0x20:
+                if b is None or port[b] == 0x40:
+                    b = x
+                continue
+            if px == {0x40: 0x10, 0x10: 0x20}.get(pa, 0x10):
+                b = x
+                break
+            if b is None and px == 0x40:
+                b = x
+        if b is None:
+            b = next((to for to, lat in by[a]["succ"] if to in npred and npred[to] == 1 and (lat & 0xffff) == 0 and
+                      est[to] <= cycle and can_pair(a, to)), None)
+        if b is not None:
+            dyn[a] = by[a]["static"] + (1 << 25)
+            dyn[b] = by[b]["static"] + (1 << 25)
+
+    def atom_unit_busy(n, slot, issued):
+        """SchAtomGetFuncUnit 0x10226000: unit u needs busy[u] < cap[u] (caps 1, 5, 1); integer (0) also needs the
+        multiplier idle and, unless its latency is 1, unit 2 free; 1 and 2 need the other two free; the second slot
+        must pair with the first by port. -> True when refused"""
+        u = by[n]["u"] or 0
+        av = lambda k: busy.get(k, 0) < ATOM_CAPS.get(k, 0)
+        if not av(u):
+            return True
+        if u == 0:
+            if busy.get(1, 0) > 0 or (not av(2) and by[n]["lat"] > 1):
+                return True
+        elif not (av(0) and av(2 if u == 1 else 1)):
+            return True
+        return slot != 0 and not can_pair(issued[0], n)
+
     def held(n):
+        if atom:
+            return False
         s = by[n]
         if s["op"] not in FUSIBLE or len(s["succ"]) != 1:
             return False
@@ -390,14 +464,18 @@ def simulate(region, issue_rate=3, traced_bonus=False, breaks=False):
         issued = []
         ready.sort(key=key)
         if not traced_bonus:
-            dynamic(cycle)
+            if atom:
+                pairing(cycle)
+            else:
+                dynamic(cycle)
         for slot in range(issue_rate):
             ready.sort(key=key)
             pick = None
             for n in ready:
                 u = by[n]["u"] or 0
                 d = max(busy.get(u, 0), 0)
-                if busy.get(u, 0) >= CAPS.get(u, 10) or held(n) or waits(n, cycle) or est[n] > cycle + d:
+                full = atom_unit_busy(n, slot, issued) if atom else busy.get(u, 0) >= CAPS.get(u, 10)
+                if full or held(n) or waits(n, cycle) or est[n] > cycle + d:
                     continue
                 pick = (n, d)
                 break
@@ -441,6 +519,10 @@ def simulate(region, issue_rate=3, traced_bonus=False, breaks=False):
                         ready.append(to)
         for n in issued:
             u = by[n]["u"] or 0
+            if atom:     # cold 0x102d3a92: busy = max(busy, SchmdDagThroughput), real opcodes only
+                if by[n]["opc"] is not None and 0 < by[n]["opc"] < 0x4f5:
+                    busy[u] = max(busy.get(u, 0), thr[n])
+                continue
             busy[u] = max(busy.get(u, 0), 0) + by[n]["lat"]
         cycle += 1
         for u in busy:
@@ -455,7 +537,7 @@ def check(fns, show=10):
         for k, r in enumerate(f["regions"]):
             if len(r["sel"]) < 2:
                 continue
-            sim = simulate(r)
+            sim = simulate(r, model=f.get("model", "k8"))
             if sim is None:
                 continue
             tr = [s["lex"] for s in r["sel"]]
@@ -468,6 +550,283 @@ def check(fns, show=10):
     for b in bad[:show]:
         print("  %s region %d\n    traced %s\n    model  %s" % b)
     return ok, n
+
+
+# ------------------------------------------------------------------------------------------ the Atom model (7)
+# MOD+0x398 bit 6 (c2 -atom, from cl /favor:ATOM) selects OpSchedInfoAtom 0x10023ac0, SchAtomGetFuncUnit and
+# SchAtomPairing; docs/c2/sched17.md 7. A "tuple view" for the callbacks: dict(opc, size = tuple +0x10 & 0xfff,
+# src / dst = [dict(kind, size, cls, lo, hi, w8)]: leaf kind, +0x10 & 0xfff, (+0x10 >> 12) & 0x1f, +0x28, +0x2c,
+# +8), from the issue probe (sel_tuple) or from the IL (il_view).
+ATOM_CAPS = {0: 1, 1: 5, 2: 1}                  # 0x10016310 + 20: units 0 integer, 1 multiply, 2 SSE
+ATOM_MASKS = (2, 1, 4, 0, 0)                    # 0x10016338 + 20 (SchmdInstrFuncUnitID)
+
+
+def _s8(x):
+    x &= 0xff
+    return x - 0x100 if x & 0x80 else x
+
+
+def atom_row(opc):
+    """OpSchedInfoAtom row (latency, throughput, port words); 0, 0, 0 for opcode 0 and >= 0x4f5."""
+    if opc is None or not 0 < opc < 0x4f5:
+        return 0, 0, 0
+    return _c2_1700()["atom"][opc]
+
+
+def _lf(t, side, i):
+    x = t[side]
+    return x[i] if i < len(x) else dict(kind=None, size=None, cls=None, lo=None, hi=None, w8=None)
+
+
+def _amem(t, dst=False, src=False):
+    """SchmdHasMemoryAccesses(t, dst, src): a leaf of kind 6, 3, 4 or 2."""
+    return any(l["kind"] in (2, 3, 4, 6) for l in (t["dst"] if dst else []) + (t["src"] if src else []))
+
+
+def sel_tuple(s):
+    """The tuple view of a node of the issue probe (fields 15..20)."""
+    def leaves(kinds, words):
+        out = []
+        for i, k in enumerate(kinds):
+            w = words[i] if i < len(words) else []
+            ty = w[0] if w else None
+            out.append(dict(kind=k, size=ty & 0xfff if ty is not None else None,
+                            cls=ty >> 12 & 0x1f if ty is not None else None, lo=w[1] if len(w) > 1 else None,
+                            hi=w[2] if len(w) > 2 else None, w8=w[3] if len(w) > 3 else None))
+        return out
+    tt = s.get("ttype")
+    return dict(opc=s["opc"] or 0, size=tt & 0xfff if tt is not None else None, kind=None,
+                src=leaves(s["srck"], s.get("srcw") or []), dst=leaves(s["dstk"], s.get("dstw") or []))
+
+
+def il_view(t):
+    """The tuple view of an il_tuple (+0x2c and +8 are not in the IL dump: hi = 0, w8 unknown)."""
+    def lv(l):
+        ty = l.get("type") or 0
+        lo = l.get("w28")
+        if l["kind"] == 7:
+            v = _imm(l)
+            lo = v & 0xffffffff if v is not None else lo
+        return dict(kind=l["kind"], size=ty & 0xfff, cls=ty >> 12 & 0x1f, lo=lo, hi=0, w8=None, reg=l.get("reg"),
+                    base=l.get("base"), index=l.get("index"))
+    return dict(opc=t["opc"], size=t["type"] & 0xfff, kind=t["kind"], src=[lv(l) for l in t["src"]],
+                dst=[lv(l) for l in t["dst"]])
+
+
+def _imm_kind(l):
+    """The src[1] test shared by several callbacks: an ICONST (7), kind 4, kind 3 unless +8 == 0x4fc, kind 5 with
+    +8 0x502 / 0x503 (w8 unknown: kind 3 counts, kind 5 does not)."""
+    k = l["kind"]
+    return k in (7, 4) or (k == 3 and l["w8"] != 0x4fc) or (k == 5 and l["w8"] in (0x502, 0x503))
+
+
+def _imm1(l):
+    return l["kind"] == 7 and l["lo"] == 1 and (l["hi"] or 0) == 0
+
+
+def atom_port(t):
+    """SchmdDagIssuePort 0x10253ab0: 0x10 port 0, 0x20 port 1, 0x40 either, 0x30 not pairable [I for the names]."""
+    if t is None:
+        return 0x30
+    w = atom_row(t["opc"])[2]
+    if w == 0:
+        return 0x30
+    if w & 0x20000:
+        return _atom_port_cb(t)
+    if _amem(t, True, True) and w & 0xf000:
+        return (w >> 8) & 0xf0
+    return w & 0xf0
+
+
+def _atom_port_cb(t):
+    """SchmdPortCallbacks 0x10253cd0."""
+    opc, s1 = t["opc"], _lf(t, "src", 1)
+    if opc == 0x12:                                    # bt: register 0x20; memory: by the bit operand
+        if not _amem(t, src=True):
+            return 0x20
+        return 0x30 if s1["kind"] == 1 else 0x40
+    if opc <= 0xf6:                                    # _imul2 / _imul3: 32-bit on port 0, else not pairable
+        return 0x10 if t["size"] == 4 else 0x30
+    if opc == 0x103:                                   # jmp
+        return 0x20 if _lf(t, "src", 0)["kind"] in (4, 1) else 0x30
+    if opc == 0x1e2 or opc <= 0x1eb:                   # psll* / psr*: an immediate count on port 0
+        return 0x10 if _imm_kind(s1) else 0x30
+    return 0x10 if _imm1(s1) else 0x30                 # rcl: by 1
+
+
+def atom_throughput(t):
+    """SchmdDagThroughput 0x10253be0: OpSchedInfoAtom +4 (bit 16: SchmdThroughputCallbacks + 1), else byte 0 + 1
+    + byte 1 with a memory leaf; 0 without a tuple."""
+    if t is None:
+        return 0
+    w = atom_row(t["opc"])[1]
+    if w & 0x10000:
+        return _atom_thr_cb(t) + 1
+    return _s8(w) + 1 + (_s8(w >> 8) if _amem(t, True, True) else 0)
+
+
+def _atom_thr_cb(t):
+    """SchmdThroughputCallbacks 0x10253dc0."""
+    opc, sz = t["opc"], t["size"]
+    s0, s1, d0 = _lf(t, "src", 0), _lf(t, "src", 1), _lf(t, "dst", 0)
+    ms, md = int(_amem(t, src=True)), int(_amem(t, dst=True))
+    if opc in (0xf5, 0xf6):                            # _imul2 / _imul3
+        if sz == 2:
+            return ms + 4
+        if sz == 4:
+            return 0
+        return 0xc if _imm_kind(s1) else 9
+    if opc == 0x12:                                    # bt
+        return 7 if ms and s1["kind"] == 1 else 0
+    if opc <= 0x15:                                    # btc btr bts
+        if not md:
+            return 0
+        return 9 + (sz == 2) if s1["kind"] == 1 else 1
+    if opc == 0x18:                                    # call
+        return 0 if s0["kind"] in (4, 1) else 1
+    if opc in (0x69, 0x6f):                            # cvtss2si / cvttss2si
+        return (d0["size"] != 4) + 6 + ms
+    if opc <= 0xf6:                                    # div / idiv: by the operand size
+        return {1: 0x1f, 2: 0x28, 4: 0x37}.get(s0["size"], 0xc3)
+    if opc == 0x163:                                   # mul
+        return 10 if s0["size"] == 8 else ms + 4
+    if opc <= 0x1e7:                                   # psrad / psraw
+        return 0 if _imm_kind(s1) else ms
+    if opc == 0x200:                                   # rcl
+        return 0 if _imm1(s1) else 0xc
+    if opc == 0x203:                                   # rcr
+        return (5 if md else 3) if _imm1(s1) else 10
+    if opc == 0x289:                                   # shld
+        return (2 if md else 0) if sz == 4 else 9
+    return (2 if md else 0) if sz == 4 else 7          # shrd
+
+
+def atom_latency(t):
+    """SchmdDagLatency with OpSchedInfoAtom: +0 as on K8 (byte 0 + 1 + byte 1 with a memory leaf; bit 16: the Atom
+    half of SchmdLatencyCallbacks, cold 0x102df85b, + 1)."""
+    w = atom_row(t["opc"])[0]
+    if w & 0x10000:
+        return _atom_lat_cb(t) + 1
+    return _s8(w) + 1 + (_s8(w >> 8) if _amem(t, True, True) else 0)
+
+
+def _atom_lat_cb(t):
+    """SchmdLatencyCallbacks, Atom (cold 0x102df85b)."""
+    opc, sz = t["opc"], t["size"]
+    s0, s1, d0 = _lf(t, "src", 0), _lf(t, "src", 1), _lf(t, "dst", 0)
+    ms, md = int(_amem(t, src=True)), int(_amem(t, dst=True))
+    if opc in (0x143, 0x15e):                          # movdqu / movupd
+        return 2 if ms else int(bool(md))
+    if opc == 0x15f:                                   # movups
+        return 1 if md else (2 if ms else 0)
+    if opc in (0x18, 0x103):                           # call / jmp
+        return 0 if s0["kind"] in (4, 1) else 1
+    if opc == 0x12:                                    # bt
+        if not ms:
+            return 0
+        return (s0["size"] == 2) + (8 if s1["kind"] == 1 else 0)
+    if opc <= 0x15:                                    # btc btr bts
+        if not ms:
+            return 0
+        return (sz == 2) + (0xa if s1["kind"] == 1 else 1)
+    if opc == 0x66:                                    # cvtsi2sd
+        return 4 if ms else int(s0["size"] == 4) + 5
+    if opc == 0x67:                                    # cvtsi2ss
+        return 6 if ms else int(s0["size"] != 4) + 5
+    if opc in (0x76, 0xf3):                            # div / idiv
+        return {1: 0x20, 2: 0x29, 4: 0x38}.get(s0["size"], 0xc4)
+    if opc in (0xf5, 0xf6):                            # _imul2 / _imul3
+        if sz == 2:
+            return ms + 5
+        if sz == 4:
+            return 4
+        return 0xd if _imm_kind(s1) else 0xa
+    if opc <= 0x142 and opc > 0x6f:                    # movd ...: an integer register destination
+        return 2 if (d0["cls"] or 0) in (1, 2, 3, 4) and d0["kind"] == 1 else 0
+    if opc <= 0x6f:                                    # cvtss2si / cvttss2si
+        return (d0["size"] != 4) + 7 + ms
+    if opc in (0x15b, 0x160):                          # movsx / movzx
+        return ms + 1 if sz == 2 else 0
+    if opc == 0x163:                                   # mul
+        return 0xb if s0["size"] == 8 else ms + 5
+    if opc == 0x200:                                   # rcl
+        return 0 if _imm1(s1) else 0xd
+    if opc == 0x203:                                   # rcr
+        return (6 if md else 4) if _imm1(s1) else 0xb
+    if opc in (0x289, 0x28b):                          # shld / shrd
+        return (2 if md else 0) + 1 if sz == 4 else (0xa if opc == 0x289 else 8)
+    return 0 if _imm_kind(s1) else ms + 1             # psll* / psr*
+
+
+def atom_unit(t):
+    """SchmdInstrFuncUnitID with the Atom masks {2, 1, 4, 0, 0} on the port word."""
+    if t is None or not 0 < (t["opc"] or 0) < 0x4f5:
+        return 0
+    m = atom_row(t["opc"])[2]
+    return next((u for u, b in enumerate(ATOM_MASKS) if m & b), 0)
+
+
+def atom_can_pair(pa, pb):
+    """SchAtomCanBePaired 0x10225fb0 on two issue ports."""
+    if pa == 0x10:
+        return pb in (0x40, 0x20)
+    if pa == 0x20:
+        return pb in (0x40, 0x10)
+    if pa == 0x30:
+        return False
+    return pb in (0x40, 0x10, 0x20)
+
+
+def atom_implicit_sp(opc):
+    """SchAtomHasImplicitSPUpdate 0x102260a0: call, _epop/_epush/_eret, leave, pop, push, pushf, ret/fatret/retf."""
+    return opc in (0x18, 0x80, 0x81, 0x82, 0x115, 0x1d4, 0x1fd, 0x1fe, 0x212, 0x213, 0x214)
+
+
+RSI, RDI = 7, 8
+
+
+def atom_agi(pt, ct, reg):
+    """SchAtomAgiStall 0x10225d80 (pt, ct: il_view of producer / consumer; reg: the register of the edge): 3 when the
+    consumer computes an address from reg (any memory leaf, as base or index) or reads it implicitly, 0 when the
+    producer is a lea (or both ends move rsp implicitly)."""
+    fam = reginfo(reg)[0]
+    lea = pt["opc"] == 0x114
+    sp_p = atom_implicit_sp(pt["opc"])
+
+    def found():
+        if lea:
+            return 0
+        if fam == RSP:
+            return 0 if sp_p else 3
+        return 3
+    o = ct["opc"]
+    if o in (0x66, 0x67, 0x13e, 0x151, 0x1c8):        # cvtsi2sd/ss, movd, movq, pinsrw: an integer register in
+        if 1 <= reg <= 68:
+            return found()
+    elif o in (0x12f, 0x130, 0x29c):                   # maskmovdqu, maskmovq, stos: rdi
+        if fam == RDI and not lea:
+            return 3
+    elif o == 0x153:                                   # movs: rsi, rdi
+        if (fam == RSI or fam == RDI) and not lea:
+            return 3
+    for l in ct["src"] + ct["dst"]:
+        if l["kind"] in (5, 6) and reg in (l.get("base"), l.get("index")):
+            return found()
+    if fam != RSP or not atom_implicit_sp(o) or sp_p:
+        return 0
+    return 0 if lea else 3
+
+
+def atom_true_lat(pt, ct, plat, reg):
+    """SchmdAdjustRegTrueDepStall on Atom (and its inline copy in DagBuildGraph, cold 0x10298f98): producer latency
+    + SchAtomLoadToUseStall (-1: a 32-bit mov load feeding anything but an address) + SchAtomCCFlagStall (+1: flags
+    into a non-branch) + SchAtomAgiStall."""
+    agi = atom_agi(pt, ct, reg)
+    ltu = 0
+    if pt["opc"] == 0x13b and pt["size"] == 4 and pt["src"] and pt["src"][0]["kind"] in (5, 6, 2) and agi == 0:
+        ltu = -1
+    ccf = 1 if reginfo(reg)[0] == CC and ct["kind"] != 0x11 else 0
+    return plat + ltu + ccf + agi
 
 
 # ------------------------------------------------------------------------------------- the DAG from the IL (6.x)
@@ -515,6 +874,7 @@ def _c2_1700():
             o = va - base
             return img[o:img.index(b"\0", o)].decode("latin1")
         _C2["k8"] = [struct.unpack_from("<III", img, 0x10012788 - base + 12 * i) for i in range(0x4f5)]
+        _C2["atom"] = [struct.unpack_from("<III", img, 0x10023ac0 - base + 12 * i) for i in range(0x4f5)]
         _C2["regs"] = {cstr(d(0x10001ff0 + 4 * r)): r for r in range(1, 364)}
     return _C2
 
@@ -807,10 +1167,12 @@ def mem_interf(e, c, facts=None):
     return pas_interf(e.get("pas"), c.get("pas"), pf, e, c)
 
 
-def predict_dag(region, alias=True):
+def predict_dag(region, alias=True, model="k8"):
     """DagBuildGraph + SchmdFindCBranchDep + SchComputeStaticPriority from the region's IL -> list of nodes
     (lexical order, the entry node 0 and the exit node N+1 included) with succ = [(to lex, type, lat)] in
-    creation order, lat, unit, decoder, height, B/L/S/C flags, static priority."""
+    creation order, lat, unit, decoder, height, B/L/S/C flags, static priority. model "atom": OpSchedInfoAtom's
+    latencies, units, ports and throughputs, the Atom true / output edge latencies and breakable cases (7)."""
+    atom = model == "atom"
     tups = [il_tuple(n) for n in sorted(region["nodes"], key=lambda n: n["lex"])]
     N = len(tups)
     facts = None
@@ -821,6 +1183,12 @@ def predict_dag(region, alias=True):
     for k, t in enumerate(tups):
         f = (4 if any(l["kind"] in (6, 2) for l in t["src"]) else 0) | \
             (8 if any(l["kind"] in (6, 2) for l in t["dst"]) else 0)
+        if atom:
+            v = il_view(t)
+            nodes.append(dict(lex=k + 1, t=t, v=v, succ=[], pred=[], flags=f, lat=atom_latency(v) if t["instr"] else 0,
+                              u=atom_unit(v) if t["instr"] else 0, dec=None, port=atom_port(v),
+                              thr=atom_throughput(v)))
+            continue
         nodes.append(dict(lex=k + 1, t=t, succ=[], pred=[], flags=f, lat=k8_latency(t) if t["instr"] else 0,
                           u=k8_unit(t), dec=k8_dec(t)))     # a non-instruction tuple: latency 0 (0x100e3e67)
     edge = {}
@@ -862,6 +1230,11 @@ def predict_dag(region, alias=True):
     def true_dep(prod, n, reg):
         e = mk(prod, n, 1)
         pt = nodes[prod]["t"]
+        if atom:
+            lat = 0 if pt is None or pt["opc"] == 0x517 else \
+                atom_true_lat(nodes[prod]["v"], nodes[n]["v"], nodes[prod]["lat"], reg)
+            e["lat"] = max(e["lat"], lat)
+            return
         lat = 0 if pt is not None and pt["opc"] == 0x517 else nodes[prod]["lat"] + agi(n, reg)
         e["lat"] = max(e["lat"], lat)
 
@@ -870,7 +1243,9 @@ def predict_dag(region, alias=True):
             for (dr, dn) in st["defs"]:
                 if not isinstance(dr, int) or not _overlap(dr, r):
                     continue
-                mk(dn, n, 4)                           # output: latency max(lat, 0) on K8
+                oe = mk(dn, n, 4)                      # output: latency max(lat, 0) on K8, max(lat, 1) on Atom
+                if atom:
+                    oe["lat"] = max(oe["lat"], 1)
                 if reginfo(r)[0] == CC:
                     continue                           # a flags definition kills nothing
                 if _covers(dr, r):
@@ -1043,7 +1418,7 @@ def predict_dag(region, alias=True):
         nd["nbreak"] = 0
     for nd in nodes[:-1]:
         for e in list(nd["succ"]):
-            dep_is_breakable(nodes, e, mk)
+            dep_is_breakable(nodes, e, mk, model)
         if nd["lex"] and len(nd["pred"]) == nd["nbreak"]:
             # DagMakeBackwardControlDep: only breakable predecessors: a control edge from the nearest earlier
             # control point
@@ -1107,7 +1482,7 @@ def _disp(m):
         return 0
 
 
-def dep_is_breakable(nodes, e, mk):
+def dep_is_breakable(nodes, e, mk, model="k8"):
     """SchmdDepIsBreakable 0x100e67b0 (K8), the add / sub / inc / dec / lea-with-own-base cases: an edge between
     an instruction that moves an address register by a constant and a memory access through that register can be
     broken by rewriting the access's displacement. Marks the edge's break kind (latency word bits 16..20; >= 0x10:
@@ -1160,6 +1535,12 @@ def dep_is_breakable(nodes, e, mk):
                 if a.get("index") is not None and a.get("scale", 0):
                     return False
                 kind = 7
+            elif model == "atom":
+                # kind 9 (0x100e6db1): the register is the leaf's index; the lea's address is base + disp or
+                # base + index, and the two scales add up to <= 3 (seen on Atom only; K8 kept as measured)
+                if a.get("index") is not None and a.get("scale", 0) + m.get("scale", 0) > 3:
+                    return False
+                kind = 9
             else:
                 return False      # the register as the consumer's index (kind 9): not taken in zlib's traces
         else:
@@ -1185,13 +1566,21 @@ def dep_is_breakable(nodes, e, mk):
         e["brk"] = kind
         for pe in list(p["pred"]):
             if pe["type"] & 1:
+                new = not any(x["frm"] == pe["frm"] for x in c["pred"])
                 ne = mk(pe["frm"], c["lex"], 1)
+                if model == "atom":
+                    if new:            # the new edge gets the broken edge's latency; cold 0x102df7a5 then sets
+                        ne["lat"] = e["lat"]       # the producer's own predecessor edge to 1
+                        pe["lat"] = 1
+                    continue
                 ne["lat"] = max(ne["lat"], e["lat"])
             elif pe["type"] & 0x80000:
                 mk(pe["frm"], c["lex"], 0x80000)
         c["nbreak"] += 1
         return True
     if e["type"] & 2:
+        if model == "atom" and ct["opc"] != 0x114:
+            return False       # cold 0x102df7b1: on Atom only a lea consumer breaks an anti edge
         delta = mover(ct)
         if delta is None:
             return False
@@ -1201,6 +1590,8 @@ def dep_is_breakable(nodes, e, mk):
         if ct["opc"] == 0x114 and not -0x80000000 <= _disp(m) - delta <= 0x7fffffff:
             return False
         e["brk"] = {3: 0x10, 0x29e: 0x11, 0xf7: 0x15, 0x75: 0x16, 0x114: 0x13}[ct["opc"]]
+        if ct["opc"] == 0x114 and m.get("base") != sym and m.get("index") == sym:
+            e["brk"] = 0x14    # 0x100e6e76: the register is the producer's index (only kb >= 0x10 is replayed)
         c["nbreak"] += 1
         return True
     return False
@@ -1211,9 +1602,9 @@ def dep_is_breakable(nodes, e, mk):
 CALL_CLOBBERS = [1, 2, 3, 9, 10, 11, 12] + [112 + i for i in range(6)]
 
 
-def predicted_sel(region, nodes=None):
+def predicted_sel(region, nodes=None, model="k8"):
     """The predicted DAG in the shape simulate() reads (node = lexical index)."""
-    nodes = nodes or predict_dag(region)
+    nodes = nodes or predict_dag(region, model=model)
     out = []
     for nd in nodes[1:-1]:
         t = nd["t"]
@@ -1222,6 +1613,8 @@ def predicted_sel(region, nodes=None):
                         srck=_kinds(t, "src"), dstk=_kinds(t, "dst"), dec=nd["dec"],
                         succ=[(e["to"], e["lat"] | e.get("brk", 0) << 16) for e in nd["succ"]],
                         etype=[e["type"] for e in nd["succ"]]))
+        if "port" in nd:
+            out[-1].update(port=nd["port"], thr=nd["thr"])
     return out
 
 
@@ -1235,8 +1628,9 @@ def compare_dag(fns, show=0, alias=True):
         for k, r in enumerate(f["regions"]):
             if len(r["sel"]) < 2 or not r.get("nodes") or any("etype" not in s for s in r["sel"]):
                 continue
-            nodes = predict_dag(r, alias)
-            pr = {s["lex"]: s for s in predicted_sel(r, nodes)}
+            model = f.get("model", "k8")
+            nodes = predict_dag(r, alias, model)
+            pr = {s["lex"]: s for s in predicted_sel(r, nodes, model)}
             tr = {s["lex"]: s for s in r["sel"]}
             lexof = {s["node"]: s["lex"] for s in r["sel"]}
             exit_lex = len(r["nodes"]) + 1
@@ -1266,8 +1660,8 @@ def compare_dag(fns, show=0, alias=True):
                 c["unit"] += p["u"] == s["u"]
                 c["static"] += p["static"] == s["static"]
                 c["height"] += p["height"] == s["height"]
-            ok_tr = simulate(r) == [s["lex"] for s in r["sel"]]
-            ok_pr = simulate(dict(sel=list(pr.values())), breaks=True) == [s["lex"] for s in r["sel"]]
+            ok_tr = simulate(r, model=model) == [s["lex"] for s in r["sel"]]
+            ok_pr = simulate(dict(sel=list(pr.values())), breaks=True, model=model) == [s["lex"] for s in r["sel"]]
             c["order traced dag"] += ok_tr
             c["order predicted dag"] += ok_pr
             if te != pe or ok_tr != ok_pr:

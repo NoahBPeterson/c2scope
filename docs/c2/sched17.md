@@ -34,7 +34,7 @@ waiting on a breakable producer, and whose earliest cycle is <= cycle + busy[uni
 | gate 2 | `SchmdFuncNeedSchedule` 0x101a4330 | returns `TLS+0x1073c != 1` **[C]**. 0x1073c is the PGO mode (2 = optimize, ncolor.md); 1 = instrumenting **[I]**. The `int` argument of `Schedule` is not read anywhere **[C]** |
 | pre-scheduling | TLS+0x11450 (`preSched`) | **never on**: the only store to TLS+0x11450 in .text is `mov [edi+0x11450], 0` at 0x100bf80c in `Schedule` (`xref.py 11450`: 1 write, 7 reads) **[C]**. So `SchmdBlockNeedPreSchedule` 0x10253980, `SchmdBlockTailForPreSched` 0x10253a70, the second weight table (0x10021cac) and the pre-sched branch of `SchmdComputeDynamicPriority` (cold 0x102df604) are dead. There is only the post-register-allocation pass |
 | model | `SchmdInitialize` 0x10191ec0 | model index TLS+0x11c48 (word) = 1 if `MOD+0x398 & 0x40`, else 0 **[C]**. 0 = K8: table `OpSchedInfoK8` 0x10012788, unit function `SchmdGetK8FuncUnit` 0x100e5950. 1 = Atom: `OpSchedInfoAtom` 0x10023ac0, `SchAtomGetFuncUnit` 0x10226000 (cold 0x102df82a, 0x102df846) **[C]** |
-| how chosen | `MscProcessSwitches` 0x100f91e9, `ModSetModuleFlags` 0x100fdeb4 | `MainMod+0x398` bit 6 = low bit of the switch variable 0x103e814c, which is zeroed at 0x100f8f1f and appears in exactly one switch-table entry: `L"-atom"` (rows of string, variable, type: 0x102f9f58 = string 0x10018130, 0x102f9f5c = variable 0x103e814c, 0x102f9f60 = type 0x101; the next row is `-NoPrefetch` with the public `NoPrefetch`, which fixes the row layout) **[C]**. So **at /O2 the model is K8** unless c2 gets `-atom`; that cl's `/favor:ATOM` is what passes it is **[I]** |
+| how chosen | `MscProcessSwitches` 0x100f91e9, `ModSetModuleFlags` 0x100fdeb4 | `MainMod+0x398` bit 6 = low bit of the switch variable 0x103e814c, which is zeroed at 0x100f8f1f and appears in exactly one switch-table entry: `L"-atom"` (rows of string, variable, type: 0x102f9f58 = string 0x10018130, 0x102f9f5c = variable 0x103e814c, 0x102f9f60 = type 0x101; the next row is `-NoPrefetch` with the public `NoPrefetch`, which fixes the row layout) **[C]**. So **at /O2 the model is K8** unless c2 gets `-atom`; cl's `/favor:ATOM` passes it (traced: MOD+0x398 = 0xa040 with it, 0xa000 without; section 7) |
 
 ### 1.2 `Schedule` 0x100bf7e0 (ecx = FUNC)
 
@@ -234,7 +234,7 @@ issuable ready node is of the same "vector or not" class; +8 outranks the critic
 (1) and never reaches the height field (32). Only one B is tried per A, and B's +8 is overwritten when the outer
 loop reaches B itself (when B is later in the list) or stays (when B was earlier, or is a not-yet-ready successor).
 
-Atom path: `SchAtomPairing(readyHead, cycle)` 0x10226160 (cold 0x102df5f8), **not read**.
+Atom path: `SchAtomPairing(readyHead, cycle)` 0x10226160 (cold 0x102df5f8): section 7.2.
 
 ### 1.8 `SchmdShouldDelayForMacroFusion(node)` 0x100e5a30 (K8 only; Atom returns 0) **[C]**
 
@@ -337,7 +337,8 @@ The other callback cases (bt*, bsr, the SSE moves through the jump table 0x100e4
 **Atom** (`optab.py atom ...`): +0 latency (same decoding, callback cold 0x102df85b), +4 throughput
 (`SchmdDagThroughput` 0x10253be0: bit 16 callback `SchmdThroughputCallbacks`, else byte 0 + 1 + byte 1 if memory),
 +8 port/pairing word (`SchmdDagIssuePort` 0x10253ab0: bit 17 callback `SchmdPortCallbacks`; `& 0xf0`, or
-`(>> 8) & 0xf0` for a memory form when bits 12..15 are set); unit masks M = {2, 1, 4, 0, 0}.
+`(>> 8) & 0xf0` for a memory form when bits 12..15 are set); unit masks M = {2, 1, 4, 0, 0}. Callbacks and
+values: section 7.1.
 
 ### 2.5 Small model tables (unnamed data, indexed by model 0 = K8, 1 = Atom) **[C]**
 
@@ -494,8 +495,9 @@ script reads globals by address; here every one of them is `TLS + offset`.
   add/dec/inc/lea/sub for anti edges, displacement range test at 0x100e6c84, favor-speed test) and
   `SchmdBreakDep` per kind.
 - `SchmdAdjustProEpi` / `SchmdRestoreProEpi` in full; `SchmdUpdateProLogList`, `SchmdProLogListIndex`.
-- The Atom model: `SchAtomPairing`, `SchAtomGetFuncUnit`, `SchAtomCanBePaired`, the three `SchAtom*Stall`
-  functions, the cold halves of the callbacks (0x102df85b..).
+- The Atom model: read in section 7 (`SchAtomPairing`, `SchAtomGetFuncUnit`, `SchAtomCanBePaired`, the three
+  `SchAtom*Stall` functions, the Atom latency / throughput / port callbacks); open there: two break cases and the
+  earlier-phase Atom tests.
 - The meaning of tuple flag +0xd bit 2, cleared for instructions issued in groups of 2 or 3 and on both ends of a
   broken dependence.
 - Names of pseudo-opcodes 0x595, 0x597, 0x577, 0x51b, 0x58f, 0x59e and of the FUNC / MOD flag bits in gate 1.
@@ -532,8 +534,8 @@ On zlib at /O2 (12 files): **1152 of 1173 regions in exactly the traced order** 
 only): 1125.
 
 Not done: breakable dependences and lea
-folding (SchmdBreakDep), DAG construction itself (memory disambiguation: the edges are read from the trace), the
-Atom path.
+folding (SchmdBreakDep), DAG construction itself (memory disambiguation: the edges are read from the trace). The
+Atom path: section 7.
 
 ### 6.1 Predicted DAG: the region's DAG and static priorities from its IL (`c2sched17.py --predict`, 2026-11-21)
 
@@ -655,8 +657,195 @@ breakable edge the traced order broke is not in the trace and is not counted aga
 from the trace with `--predict`: the alias facts (the IL-only line shows their weight); every other input of the
 DAG, its latencies, units, heights and priorities comes from the IL and the DLL's tables.
 
-Not done: the Atom path; break kinds 9 (a lea folded into an index; not taken in zlib's traces) and the lea split's
+Not done: break kinds 9 (a lea folded into an index; not taken in zlib's K8 traces; on Atom: section 7.3) and the lea split's
 issue-time folding (SchmdHasFoldableAGI); `SchmdBreakDep`'s operand rewrites and producer removal (bit 5: never set
 by the cases above); a switch's case edges and opcode 0x51b / the CurFunc+0x58 register / int, cli, sti control
 points (not reached by zlib); `ItfStackLocIsMemberOfPas` (TLS+0xebdc never seen set). Offline test:
 `sched17_predict_tests` (tests/data/sched17/il/*.json: c1, c2, sum, adler32, compress, uncompr, zutil, inftrees).
+
+---------------------------------------------------------------------------------------------------
+
+## 7. The Atom model (`/favor:ATOM`, 2026-11-21)
+
+**Selection** **[C, traced]**: with `/favor:ATOM` on the cl command line, `MOD+0x398` reads 0xa040 at `Schedule`'s
+entry (0xa000 without it), so bit 6 is set and `SchmdInitialize` picks model 1; every traced dynamic priority is
+static + 2^25 or static, never + 8, and no cycle issues more than two nodes. `c2sched17.py`'s function probe logs
+`[[TLS+0x850]+0x398]` (`t850>0>0x398`) and the replay picks the model from it per function; K8 stays the default
+when the field is missing (older exports). The flag also changes earlier phases (`PpSsaALUToLea`,
+`PpSsaMovIndir`, `PpSsaIsAGUOperationCandidate`, `AddrModes`, `LgoEvaluateZero`, `MscAvoidStoreForwardStalls`,
+`SzoWidenImmediates`, `MdmCanReplaceRegWithImmed`, ...: `xref.py 398`), so the IL the scheduler sees is not the K8
+IL; those were not read.
+
+Every model test in the scheduler (`xref.py 398` / `11c48`) **[C]**:
+
+| where | K8 | Atom |
+|---|---|---|
+| `SchmdInitialize` | issue rate 3, 5 units, `SchmdGetK8FuncUnit`, OpSchedInfoK8 | issue rate 2, 3 units with caps 1, 5, 1, `SchAtomGetFuncUnit` 0x10226000, OpSchedInfoAtom 0x10023ac0 (2.5) |
+| `SchmdComputeDynamicPriority` 0x100e5c03 | 1.7 | `SchAtomPairing(readyHead, cycle)` (cold 0x102df5f8), then return (7.2) |
+| `SchmdShouldDelayForMacroFusion` 0x100e5a4b | 1.8 | 0 (no hold) |
+| `SchmdTupRequiresSeparaterResource` 0x100e59e5 | bswap rcl rcr rol ror | 0 (so no +2^30 and no spacing) |
+| `SchSchedGraph` 0x100e5586 | busy = max(busy, 0) + latency | busy = max(busy, `SchmdDagThroughput(node)`) (cold 0x102d3a92; signed compare, no clamp) |
+| `SchmdInstrFuncUnitID` (masks by model index) | {2, 1, 4, 8, 0x10} on +8 | {2, 1, 4, 0, 0} on the port word +8: unit 0 integer, 1 multiply, 2 SSE |
+| `SchmdDagLatency` (table TLS+0x11cb4) | OpSchedInfoK8 +0 | OpSchedInfoAtom +0, same decoding; bit 16: `SchmdLatencyCallbacks`' Atom half (cold 0x102df85b, 7.4) |
+| true register edge (`DagBuildGraph` 0x100e2dc9 inline, `SchmdAdjustRegTrueDepStall` 0x10253923) | producer latency + `SchmdAgiStall` | producer latency + `SchAtomLoadToUseStall` + `SchAtomCCFlagStall` + `SchAtomAgiStall` (7.3) |
+| output edge (`DagBuildGraph` 0x100e342a / 0x100e3a2c, `SchmdAdjustRegOutputDepStall`) | max(lat, 0) | max(lat, 1) |
+| `SchmdDepIsBreakable` 0x100e6803 (anti edge) | consumer add / sub / inc / dec / lea | consumer lea only (cold 0x102df7b1) |
+| `SchmdDepIsBreakable` 0x100e6e64 (a broken true edge's consumer inherits the producer's true predecessors) | new edge latency = the broken edge's | new edge latency 1 (cold 0x102df7a5) |
+| weights W (0x10006194 + 18) | W[4] = 3 | W[4] = 25; the static terms are the same |
+
+`SchSelectInstrs` itself has no model test: the skip rules of 1.6 step 3 hold, with `SchAtomGetFuncUnit` through
+the pointer TLS+0x11c44, `d = max(busy[unit], 0)` of the node's own unit, and the macro-fusion test always false.
+
+### 7.1 OPSCHEDINFO Atom: latency, throughput, port **[C]**
+
+Same 12-byte rows (`optab.py atom`), read by three functions, each returning a fixed value without a tuple (entry
+/ exit node: latency 0, throughput 0, port 0x30) and reading 0 for opcode 0 or >= 0x4f5. "memory" =
+`SchmdHasMemoryAccesses(t, dst, src)` 0x100e4d10: a leaf of kind 6, 3, 4 or 2 among the destinations (edx) /
+sources (stack argument).
+
+- **latency** +0 (`SchmdDagLatency`): bit 16 -> callback + 1, else `s8(byte 0) + 1 + (memory ? s8(byte 1) : 0)`.
+  For integer code almost every row is 0: **node latency 1** for add, and, cmp, test, xor, inc, dec, sub, mov,
+  `_emov`, lea, `_jcc`, shl, rol, movsxd, with or without memory (traced: 8394 of 8394 nodes predicted); push
+  0x100: 1, 2 with memory; pop 0x200: 1, 3 with memory; imul 0xf4 0x205: 6, 8 with memory.
+- **throughput** +4 (`SchmdDagThroughput` 0x10253be0): bit 16 -> `SchmdThroughputCallbacks` 0x10253dc0 + 1, else
+  `s8(byte 0) + 1 + (memory ? s8(byte 1) : 0)`. 1 for the integer rows above and push, pop 1 (2 with memory),
+  imul 0xf4 5 (7).
+- **port** +8 (`SchmdDagIssuePort` 0x10253ab0): 0 -> 0x30; bit 17 -> `SchmdPortCallbacks` 0x10253cd0; with memory
+  and bits 12..15 set: `(word >> 8) & 0xf0`; else `word & 0xf0`. Values: **0x40** either port (add, and, cmp,
+  test, xor, sub, inc, dec, or, mov, `_emov`: word 0x1042, so with a memory operand **0x10**), **0x10** port 0
+  only (shl, rol, ror, movsxd, movzx, movsx, `_imul2/3` of 32 bits), **0x20** port 1 only (lea, `_jcc`, jmp to a
+  register / address), **0x30** not pairable (call, ret, push, pop, `_epush`, div, idiv, mul, imul 0xf4 (0x31),
+  shld, shrd, lock forms). That 0x10 / 0x20 are Atom's ports 0 / 1 is **[I]** (names; the code only uses them as
+  a pairing relation). The low nibble is the unit mask (7.2).
+
+Callbacks (value before the + 1 of latency / throughput; m_s / m_d = a memory source / destination; size = tuple
++0x10 & 0xfff, s0 / s1 / d0 = first / second source, first destination; "imm-like" = s1 is kind 7 or 4, or kind 3
+with +8 != 0x4fc, or kind 5 with +8 0x502 / 0x503):
+
+| opcode | latency (cold 0x102df85b) | throughput | port |
+|---|---|---|---|
+| call 0x18, jmp 0x103 | 0 if s0 is kind 4 or 1, else 1 | call: the same | jmp: 0x20 if s0 kind 4 / 1, else 0x30 |
+| movzx 0x160, movsx 0x15b | m_s + 1 for a 16-bit tuple, else 0 | table | table (0x10) |
+| `_imul2` 0xf5, `_imul3` 0xf6 | 16 bits: m_s + 5; 32: 4; else 0xd if s1 imm-like, else 0xa | 16: m_s + 4; 32: 0; else 0xc / 9 | 32 bits 0x10, else 0x30 |
+| mul 0x163 | s0 of 8 bytes 0xb, else m_s + 5 | 10, else m_s + 4 | table |
+| div 0x76, idiv 0xf3 | s0 size 1 / 2 / 4 / 8: 0x20 / 0x29 / 0x38 / 0xc4 | 0x1f / 0x28 / 0x37 / 0xc3 | table |
+| bt 0x12 | m_s: (s0 16-bit) + (s1 register ? 8 : 0), else 0 | m_s and s1 register: 7, else 0 | register 0x20; memory: s1 register 0x30, else 0x40 |
+| btc btr bts 0x13..0x15 | m_s: (16-bit) + (s1 register ? 0xa : 1), else 0 | m_d: s1 register 9 + (16-bit), else 1; else 0 | table |
+| shld 0x289 / shrd 0x28b | 32 bits: (m_d ? 2 : 0) + 1; else 0xa / 8 | 32 bits: m_d ? 2 : 0; else 9 / 7 | table |
+| rcl 0x200 | by 1: 0, else 0xd | by 1: 0, else 0xc | by 1: 0x10, else 0x30 |
+| rcr 0x203 | by 1: m_d ? 6 : 4, else 0xb | by 1: m_d ? 5 : 3, else 10 | table |
+| cvtsi2sd 0x66 / cvtsi2ss 0x67 | m_s: 4 / 6; else (s0 32-bit) / (s0 not 32-bit) | table | table |
+| cvtss2si 0x69, cvttss2si 0x6f | (d0 not 32-bit) + 7 + m_s | (d0 not 32-bit) + 6 + m_s | table |
+| movd 0x13e | 2 when d0 is an integer register, else 0 | table | table |
+| movdqu 0x143, movupd 0x15e / movups 0x15f | m_s 2, else m_d 1, else 0 / m_d 1, else m_s 2, else 0 | table | table |
+| psll* / psr* 0x1e2..0x1eb | 0 if s1 imm-like, else m_s + 1 | psrad / psraw: 0 if imm-like, else m_s | 0x10 if imm-like, else 0x30 |
+
+### 7.2 Pairing, units, busy **[C]**
+
+`SchAtomCanBePaired(a, b)` 0x10225fb0 on the two ports: a 0x10 pairs with 0x20 / 0x40, a 0x20 with 0x10 / 0x40, a
+0x30 with nothing, anything else (0x40) with 0x10 / 0x20 / 0x40.
+
+`SchAtomPairing(readyHead, cycle)` 0x10226160 (returns at once when preSched, fewer than two ready nodes or W[4]
+< 0), over the ready list in its current (sorted) order:
+
+    A = first ready node with a tuple and est <= cycle;  if none or port(A) == 0x30: return
+    B = none
+    for X after A with a tuple, est <= cycle and CanBePaired(A, X):
+        if port(A) == 0x40 and port(X) == 0x20: B = X unless B is already a 0x20; continue
+        if port(X) is the exact complement (A 0x40 -> X 0x10, A 0x10 -> X 0x20, else X 0x10): B = X; break
+        if no B yet and port(X) == 0x40: B = X
+    if no B: B = first successor S of A (edge order) with S.npred == 1, edge latency 0, a tuple, est <= cycle and
+             CanBePaired(A, S)
+    if B: A.dyn = A.static + 2^25;  B.dyn = B.static + 2^25          // SchHeurVal(1, W[4]), W[4] = 25
+
+Differences from K8's 1.7: **one** pair per cycle (only the first issuable node looks for a partner), the bonus
+2^25 outranks everything in the static priority including B (2^23), and **no reset**: dyn is assigned only here,
+so a node keeps static + 2^25 until it issues, also when it was paired as a not yet ready successor (it then enters
+the ready list with the bonus). The re-sort of 1.6 step 2 follows as on K8.
+
+`SchAtomGetFuncUnit(node, issueArray, n)` 0x10226000, u = node+0x3e, avail(k) = busy[k] < cap[k] (caps 1, 5, 1;
+`SchmdFuncUnitAvailable` 0x10253ca0):
+
+- -1 unless avail(u);
+- u = 0 (integer): -1 when busy[1] > 0 (a multiply in flight), and -1 when !avail(2) and the node's latency byte >
+  1; u = 1: needs avail(0) and avail(2); u = 2: needs avail(0) and avail(1);
+- slot n > 0: -1 unless `SchAtomCanBePaired(issueArray[0], node)`;
+- else u (the node keeps its own unit).
+
+Busy (cold 0x102d3a92): after the cycle, for each issued node with 0 < opcode < 0x4f5, `busy[u] = max(busy[u],
+throughput)`; then every busy count drops by 1. With throughput 1 an integer node frees its unit for the next
+cycle, so the cap of 1 does not stop two integer nodes in one cycle (busy is charged after the cycle); a multiply
+(throughput 5, unit 1, cap 5 never reached) blocks integer issue for 4 cycles by the busy[1] > 0 rule.
+
+### 7.3 True-edge latency on Atom **[C]**
+
+`lat = max(lat, producer.latency + LoadToUse + CCFlag + Agi)` (0 from OPPAREN 0x517), with the edge's register
+symbol r:
+
+- `SchAtomAgiStall` 0x10225d80: **3** when the consumer reaches memory through r (any memory leaf of kind 5 / 6
+  among its sources and destinations, r as base (a REG leaf) or index), or reads r implicitly: cvtsi2sd, cvtsi2ss,
+  movd, movq, pinsrw (an integer register: SYM byte +8 == 1, type class 1..4), maskmovdqu, maskmovq, stos (rdi),
+  movs (rsi, rdi). **0** when the producer is a lea (its result reaches the address unit directly **[I]**), and for
+  rsp when the producer updates rsp implicitly (`SchAtomHasImplicitSPUpdate` 0x102260a0: call, `_epop`, `_epush`,
+  `_eret`, leave, pop, push, pushf, ret, fatret, retf). Without an address use: 3 only for rsp into an implicit
+  rsp user from a producer that is neither an implicit user nor a lea.
+- `SchAtomLoadToUseStall` 0x102260f0: **-1** when the producer is a 32-bit `mov` (opcode 0x13b, tuple size 4) whose
+  first source is memory (kind 5, 6 or 2) and the Agi stall is 0 (a test of a consumer tuple of kind 2, never an
+  instruction, was not followed).
+- `SchAtomCCFlagStall` 0x10225f70: **+1** when r is in the flags family (cc, SYM 353) and the consumer is not a
+  branch (tuple kind 0x11): setcc, cmovcc, adc, sbb.
+
+So on Atom the typical true edges are 1 (ALU -> ALU, lea -> address), 4 (ALU or load -> address), 2 (flags ->
+cmov / setcc), 0 (32-bit load -> ALU), and heights grow by 2 per ALU link. Traced true edges on zlib (5756 between
+issued nodes): latency 1: 4238, 4: 981, 0: 249, 5: 147, 2: 106, 6: 23, others 12.
+
+Breakable edges on Atom (`SchmdDepIsBreakable` as in 6.1, with the two model tests of the table) **[C]**, two cases
+the K8 replay did not need: **kind 9** (0x100e6db1), the register is the consumer's index and the lea's address
+is base + disp, or base + index with the two scales adding up to <= 3 (gzerror, inflate_fast: the consumer goes
+first); an M of the form [b + i*1] goes the kind-5 way (0x102df770), which the replay does not distinguish; and
+**kind 0x14** (0x100e6e76) for an anti edge whose register is the producer's index (0x13: its base). When a true
+edge is marked, the consumer inherits the producer's true predecessors with the broken edge's latency, and on
+Atom the producer's own predecessor edge is then set to 1 (cold 0x102df7a5 writes the loop's edge, not the new
+one: compress_block, a movsxd -> lea index edge traced at 1 instead of 4). Kind 9 is enabled for the Atom
+model only in the tool (the code is shared; on K8 it was never taken in the traces and is left out so the K8
+numbers stay as measured).
+
+### 7.4 Replay and prediction (`c2sched17.py`, model "atom")
+
+`simulate(region, model="atom")`: issue rate 2, `SchAtomPairing` at the start of each cycle (dyn never reset), the
+unit test of `SchAtomGetFuncUnit` including the pairing test for slot 1, no macro-fusion hold, busy = max(busy,
+throughput) for real opcodes; ports and throughputs from OpSchedInfoAtom and the callbacks (`atom_port`,
+`atom_throughput`, `atom_latency`, from a tuple view: the issue probe now also logs the tuple's type word and the
+type / value words of its first four sources and two destinations, fields 17..20). `predict_dag(region,
+model="atom")`: the Atom latencies, units, true / output edge latencies and breakable cases of the table above;
+the rest of 6.1 unchanged. Exports of Atom traces carry `model`, `port` and `thr`, so the offline test needs no DLL.
+
+**Measured** (zlib 1.2.1, 12 files at /O2 /favor:ATOM /I zlib, 1162 regions, 8394 nodes; tests/data/ncol's four
+sources in brackets, 72 regions, 762 nodes):
+
+| | |
+|---|---|
+| replay from the traced DAG (`--check`), regions in exactly the traced order | **1151 of 1162** [72 of 72] |
+| the same with breakable edges (`simulate(..., breaks=True)`) | **1162 of 1162** [72] |
+| K8 rules (`simulate(r)`) on the same Atom traces | 662 of 1162 |
+| predicted DAG (`--predict`, IL + alias facts): traced edges reproduced, type and latency equal | 20014 of 20028 [2482 of 2485], 20014 predicted [2482] |
+| DAG exact | 1148 [69] |
+| node latency, unit, height, static priority | 8394 / 8394 / 8394 / 8394 of 8394 [762 each] |
+| regions in exactly the traced order with the predicted DAG | **1161 of 1162** [72] |
+| IL only (PAS guess): edges, static priority, issue order | 19907, 8194, 1124 [2479, 692, 70] |
+
+The 11 regions the plain replay misses (crc32 3, gzio 3, inffast 4, inftrees 1) all need the breakable edges (a
+consumer issued before its lea / add / inc producer). The 14 traced edges not predicted are, as on K8, control
+edges SchmdBreakDep adds while scheduling. The one region off with the predicted DAG is gen_codes region 1: a lea
+`rax <- [r8 + r10*2]` feeding `add r9w, [rax*1+0]` is predicted kind 9 but the trace has no break (a check not
+found; that an index-only address takes another path is the guess). Also open there: gen_bitlen region 18, a lea
+split (kind 6) the trace does not mark (no effect on the order). The Atom regions differ from the K8 ones (1162 vs
+1173) because the earlier `0x398 & 0x40` tests change the IL.
+
+Offline test: `sched17_atom_tests` (tests/data/sched17/atom/*.json: `--il --export` of c1, c2, sum, adler32,
+compress, uncompr, zutil, inftrees, inffast under /O2 /favor:ATOM: replay 127 / 132 (132 with breaks, 81 with K8
+rules), predicted DAG 1836 of 1840 edges, 877 of 877 nodes, order 132 of 132).
+
+Not read on the Atom path: `SchmdBreakDep`'s per-kind rewrites (as on K8), the 0x2c / +8 fields of a memory leaf
+the break and callback tests read (+8 = 0x4fe / 0x501 / 0x502 / 0x503 look like address-form codes **[I]**), and
+the earlier-phase Atom tests listed at the top.
