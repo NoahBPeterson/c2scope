@@ -1,15 +1,28 @@
 # c2scope: see inside the MSVC back end while it compiles
 
 Tools that look inside Microsoft's C++ back end (`c2.dll`) while it compiles your source, so that matching a
-decompiled function becomes prediction instead of guessing. Five compilers are supported:
+decompiled function becomes prediction instead of guessing. Five compilers are supported, each as one exact build
+of `c2.dll` (setup checks its SHA-256):
 
-| compiler | used by | option |
-|---|---|---|
-| VS2005 SP1, 14.00.50727.762 | Fallout 3 | default |
-| VC6 + Processor Pack 5 (c2 13.00.9044) | VC6-era targets | `--c2 9044` |
-| VS .NET 2003, 13.10.3077 and 13.10.3052 | Mount & Blade | `--c2 13.10`, `--c2 13.10.3052` |
-| VS2008 SP1, 15.00.30729.1 | Spore | `--c2 15.00` |
-| VS2012 Update 4, 17.00.61030 (x86_amd64: 64-bit code) | x64 targets | `--c2 17.00` |
+| product | also called | `cl.exe` | `c2.dll` | option | used by |
+|---|---|---|---|---|---|
+| Visual C++ 6.0 SP5/SP6 **with Processor Pack 5** | VC6 + PP | 12.00.8804 | 13.00.9044 | `--c2 9044` | VC6-era targets (Vampire: Bloodlines) |
+| Visual Studio .NET 2003 | VC7.1, MSVC 2003 | 13.10.3077 / 13.10.3052 | the same | `--c2 13.10` / `--c2 13.10.3052` | Mount & Blade |
+| Visual Studio 2005 SP1 | VC8, MSVC 2005 | 14.00.50727.762 | the same | default | Fallout 3 |
+| Visual Studio 2008 SP1 | VC9, MSVC 2008 | 15.00.30729.1 | the same | `--c2 15.00` | Spore |
+| Visual Studio 2012 Update 4, x86_amd64 (64-bit code) | VC11, MSVC 2012 | 17.00.61030 | the same | `--c2 17.00` | x64 targets |
+
+**Looking for "VC7"?** VC7.1 (Visual Studio .NET 2003) is supported: use `--c2 13.10`. Not supported, because their
+`c2.dll` is a different build (setup refuses it):
+- **VC7.0, Visual Studio .NET 2002** (`cl` 13.00.9466). Its version also starts with 13.00, like the VC6 Processor
+  Pack back end above, but it is a different compiler.
+- **Plain VC6 without the Processor Pack** (`c2.dll` 12.00.8168 and the later 12.00 builds of the service packs).
+  The Processor Pack replaces VC6's `c2.dll` with 13.00.9044.
+- Other service packs or updates of the products in the table, e.g. VS2005 RTM, VS2008 RTM or VS .NET 2003 SP1
+  (13.10.6030).
+
+Which compiler built a binary: its Rich header (when the linker wrote one) lists the build of every object, e.g.
+build 9044 for VC6 + Processor Pack 5; otherwise compare its code with test compiles.
 
 They trace c2's own decisions (which values get registers and in what order, which register each temporary gets,
 the IL at every pass, the scheduler's choices), model the register allocator well enough to answer "what source
@@ -18,7 +31,8 @@ allocation without changing any code.
 
 The specs in `docs/c2/` describe what the compiler does (front end, optimiser, instruction selection, register
 allocation, scheduler, inliner, block layout, x87, stack frame, IL) with each rule marked confirmed or inferred
-and backed by probe compiles. `docs/c2/port-1310.md` and `port-1500.md` cover the other two compilers.
+and backed by probe compiles. VS2005 is the reference; `docs/c2/port-1300.md` (VC6 + Processor Pack), `port-1310.md` (VS .NET 2003),
+`port-1500.md` (VS2008) and `port-1700.md` (VS2012 x64) cover the others.
 
 No Microsoft code or binaries are included. You need your own copy of each toolchain. Setup patches a private
 copy of `c2.dll` in this directory (an entry-point hook that loads the tracer DLL); your toolchain is never

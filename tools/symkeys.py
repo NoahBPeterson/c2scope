@@ -166,6 +166,7 @@ class Func:
         self.optidx = None    # event index of the first OptFuncExpr
         self.line0 = 0        # source line of the function (FUNC+0x44): line offsets are relative to it
         self.imms = []        # --imm (13.00.9044): ('imm', ...) ('walk', ...) ('gr', ...) events of the immediate table
+        self.orders = []      # role "order" (13.00.9044): OptRebuildTuples' evaluation order of a binary node
 
 
 def _vals(rest):
@@ -339,6 +340,8 @@ def _parse(lines, img):
             ev.append(("mark", "GC"))
         elif hk in IMM_ROLES:
             _parse_imm(f, hk, ent, v)
+        elif hk == "order":
+            _parse_order(f, nopt, v, bykey)
         elif hk in ("hshwalk", "hshasg"):
             j = 0 if hk == "hshwalk" else 1
             hsh[j] = max(0, hsh[j] + (1 if ent else -1))
@@ -436,6 +439,81 @@ def _parse(lines, img):
     for f in funcs:
         name_syms(f)
     return funcs
+
+
+def _parse_order(f, nopt, v, bykey):
+    """role "order" (13.00.9044, a probe in OptRebuildTuples before its OptCmpHashVal call): a binary node (TupIsBinary:
+    OPADD..OPSHR, OPCMP, OPEQ..OPGE) being turned back into tuples.  Its second operand's subtree is emitted (evaluated)
+    first when weight(src0) < weight(src1), unsigned, and the node's type class is not float (0x4000); the operand
+    order of the node itself is kept.  Logged: opcode, line, type word, then per operand kind, weight, leaf key and
+    the opcode of the leaf's single definition (the subtree a temporary stands for)."""
+    def num(x):
+        return int(x, 16) if x not in ("?", None) else None
+    vals = [num(x) for x in v] + [None] * 12
+    op, line, ty = vals[0], vals[1], vals[2]
+    ops = []
+    for kind, w, key, dop in (vals[3:7], vals[7:11]):
+        kind = tkind(kind & 0xff) if kind is not None else None
+        leaf = key if kind in (1, 2) else None
+        ops.append(dict(kind=kind, w=w, key=leaf, sym=bykey.get(leaf) if leaf is not None else None,
+                        dop=OPNAMES.get("%x" % dop) if dop is not None else None))
+    for j, o in enumerate(ops):          # D's 2nd / 3rd sources (13.00.9044 logs them after the 11 fields above)
+        srcs = []
+        for k in range(2):
+            sk, key, sk2, key2 = vals[11 + 8 * j + 4 * k: 15 + 8 * j + 4 * k]
+            sk = tkind(sk & 0xff) if sk is not None else None
+            sk2 = tkind(sk2 & 0xff) if sk2 is not None else None
+            if sk in (1, 2) and key is not None and sk2 in (1, 2, 3) and key2 is not None and o["dop"]:
+                srcs.append([sk2, key2, bykey.get(key2)])     # a temporary defined by OPARG x / OPASSIGN x: x
+            elif sk in (1, 2, 3) and key is not None:
+                srcs.append([sk, key, bykey.get(key)])
+            else:
+                srcs.append([sk, None, None])
+        o["srcs"] = srcs
+    if len(ops) < 2 or ops[0]["w"] is None or ops[1]["w"] is None:
+        return
+    swap = (ty or 0) & 0xf000 != 0x4000 and ops[0]["w"] < ops[1]["w"]
+    f.orders.append(dict(npass=nopt, op=OPNAMES.get("%x" % (op or 0)) or "op%x" % (op or 0), line=(line or 0) & 0xffff,
+                         ops=ops, swap=swap))
+
+
+def orddesc(o):
+    w = o["w"] or 0
+    s = o["sym"]
+    what = ("%s (key %d)" % (label(s), s.key) if s is not None and s.cls != "tmp" else
+            "t%d" % o["key"] if o["key"] is not None else LEAFKIND.get(o["kind"], "kind%s" % o["kind"]))
+    if o.get("dop"):
+        args = []
+        for sk, key, sy in o.get("srcs") or []:
+            if key is None:
+                args.append(LEAFKIND.get(sk, "kind%s" % sk) if sk is not None else "?")
+                continue
+            t = "%s(key %d)" % (label(sy), key) if sy is not None and sy.cls != "tmp" else "t%d" % key
+            # the hash such a leaf contributes (11.3): &x its folded key, a named symbol 32*key folded, a temporary
+            # with several definitions 64*key (one with a single definition hashes by it: not modelled here)
+            hh = (key & 0xffff) ^ (key >> 16) if sk == 3 else shash(sy, key)
+            args.append("%s%s h%04x" % ("&" if sk == 3 else "", t, hh))
+        what += " = %s(%s)" % (o["dop"], ", ".join(args)) if args else " = %s(..)" % o["dop"]
+    return "%-40s SU%d n%d h%04x" % (what, w >> 24, (w >> 16) & 0xff, w & 0xffff)
+
+
+def print_orders(f, a, lo, hi):
+    """sites (13.00.9044, role "order"): the binary nodes whose two operands are both subtrees (count >= 2), with
+    the operand OptRebuildTuples evaluates first.  Lines with only leaves or constants on one side are left out
+    (their order does not move code)."""
+    rows = [e for e in f.orders if lo <= e["line"] <= hi and (not a.pass_ or e["npass"] == a.pass_)
+            and all(((o["w"] or 0) >> 16) & 0xff >= 2 for o in e["ops"])]
+    if not rows:
+        return
+    print("#### %s: evaluation order of binary nodes (OptRebuildTuples: the 2nd operand's subtree first when its "
+          "weight is larger)" % f.name)
+    for e in rows:
+        o0, o1 = e["ops"]
+        first, second = (o1, o0) if e["swap"] else (o0, o1)
+        print("pass %d line %4d %-10s first  %s%s" % (e["npass"], e["line"], e["op"], orddesc(first),
+                                                    "   (2nd operand, heavier)" if e["swap"] else
+                                                    "   (1st operand%s)" % (", tie" if o0["w"] == o1["w"] else "")))
+        print("%31s then   %s" % ("", orddesc(second)))
 
 
 def _parse_imm(f, hk, ent, v):
@@ -865,6 +943,10 @@ def print_events(f):
             print("%6d %s end" % (i, "read inlinee" if e[0] == "inl-" else "splice"))
         else:
             print("%6d -- %s" % (i, e[1]))
+    for e in f.orders:      # role "order" (13.00.9044): not part of the key stream, printed after it
+        o0, o1 = e["ops"]
+        print("order pass %d line %d %s: first %s | then %s" % (e["npass"], e["line"], e["op"],
+              orddesc(o1 if e["swap"] else o0).strip(), orddesc(o0 if e["swap"] else o1).strip()))
 
 
 LEAFKIND = {1: "reg", 2: "sym", 3: "&", 4: "code", 5: "ea", 6: "mem", 7: "iconst", 8: "iconst", 9: "fconst"}
@@ -924,6 +1006,7 @@ def print_sites(f, a):
             print("%31s %s %s%s" % ("", ("2nd", "3rd", "4th", "5th")[min(k, 3)], opdesc(o) if o["w"] is not None else
                                     "%s (5th or later: not logged)" % LEAFKIND.get(o["kind"], "kind%d" % o["kind"]),
                                     "   (tie: source order)" if tie and k == 0 else ""))
+    print_orders(f, a, lo, hi)
 
 
 # ---------------------------------------------------------------- what-if
@@ -1757,7 +1840,11 @@ def to_json(funcs):
             return o
         evs = [["alloc", idx[id(e[1])]] if e[0] == "alloc" else
                ["sort", e[1], e[2], e[3], [sop(o) for o in e[4]]] if e[0] == "sort" else list(e) for e in f.events]
-        out.append(dict(name=f.name, optidx=f.optidx, line0=f.line0, syms=syms, events=evs, imms=f.imms))
+        ix = lambda y: idx.get(id(y)) if y is not None else None
+        ords = [dict(e, ops=[dict(o, sym=ix(o["sym"]), srcs=[[a, b, ix(c)] for a, b, c in o.get("srcs", [])])
+                             for o in e["ops"]]) for e in f.orders]
+        out.append(dict(name=f.name, optidx=f.optidx, line0=f.line0, syms=syms, events=evs, imms=f.imms,
+                        orders=ords))
     return out
 
 
@@ -1767,6 +1854,7 @@ def from_json(data):
         f = Func()
         f.name, f.optidx, f.line0 = d["name"], d["optidx"], d.get("line0", 0)
         f.imms = d.get("imms", [])
+        f.orders = d.get("orders", [])
         f.syms = [Sym(**{k: v for k, v in s.items() if k != "base"}) for s in d["syms"]]
         for s, sd in zip(f.syms, d["syms"]):
             s.base = f.syms[sd["base"]] if sd["base"] is not None else None
@@ -1789,6 +1877,10 @@ def from_json(data):
         f.events = [("alloc", f.syms[e[1]]) if e[0] == "alloc" else
                     ("sort", e[1], e[2], e[3], [lop(o) for o in e[4]]) if e[0] == "sort" else tuple(e)
                     for e in d["events"]]
+        for e in f.orders:
+            for o in e["ops"]:
+                o["sym"] = f.syms[o["sym"]] if o["sym"] is not None else None
+                o["srcs"] = [[a, b, f.syms[c] if c is not None else None] for a, b, c in o.get("srcs", [])]
         funcs.append(f)
     return funcs
 

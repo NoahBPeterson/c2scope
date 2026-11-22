@@ -751,6 +751,22 @@ does, which restores the relative order of the two numbers the tied -1 / 1 piece
 table has 64 buckets. The peer's list (game order at 8 20 32 72 80 81 96, swapped at 0 7 33 71 97 103 104) fits 8..32
 mod 64.
 
+**Which nodes the operand sort reorders (9044).** OptLeftWeightTree's commutativity test (1071ee5d: `opcode -
+0x26e`, byte table 10726e0c) accepts OPADD, OPMUL, OPAND, OPOR, OPXOR, OPEQ and OPNE only. A compare used as a
+condition (`if (a == b)`) reaches it as OPCMP feeding the branch, which is not sorted: its operand order is kept. Which
+of two call operands is *evaluated* first is decided right after, by weight, when the trees become tuples again
+(OptRebuildTuples, 11.7); `sites` lists that decision in its own section. A value compare (`bool t = (a == b);`) is an
+OPEQ and is sorted by key / hash. **[C]**
+
+**Only symbols the front end makes after the inserted declarations shift.** N moves c1 numbers by N only for
+symbols created after the dial's declarations (the function's own string literals, statics, later externs); an
+address whose symbol was made earlier in the unit (e.g. a class's vtable, emitted with the class definition)
+keeps its c1 number and its bucket at every N. Predict the edges from the movable immediates only: on four more
+game functions of the same kind, the edges predicted from `keys --imm` at N = 0 with this rule were 23 of 23
+compiles (one window predicted 44..54 without it, 44..53 with it). In three of them the swapped pair was two
+enterloads at a join (`mov edi,_this; mov ebp,_src` in piece-number order); within one bucket the record
+inserted later is walked first.
+
 Reproduced on `work/port1300/dial9044.cpp` (r2: a loop with eight `gp(&gvK)` calls whose addresses are used once, and
 -1 / 1 / 0 / 32 held in registers or split; the tied pair there is the pieces of 0 and 32, prio 0, def 0, benefit -1
 and -2; both stay in memory, so the code does not change, only Color's pop order): `uv run python
@@ -775,3 +791,97 @@ trace is unchanged).
 - `--imm` is not followed by whatif / compare: an edit that adds or removes an address immediate or changes its c1
   number is predicted only by the rule above, not by the replay.
 - The rule probes of tests/data/rules (`RX_*`, R310, R480) have no 9044 run here.
+- `whatif` / `compare` do not predict the evaluation order of 11.7 (only the commutative sorts); read the keys off
+  `sites` and apply the formula there by hand.
+
+### 11.7 Which of two calls feeding a compare is evaluated first (OptRebuildTuples)
+
+Question: two calls of one member function through the same object feed an `if` compare
+(`L.Lookup(&elem[i]) == L.Lookup(&h)`, typically an inlined `operator==` inside an inlined find loop). With dead code
+added before or after (dead `{ int dN = c * k + 1; }` blocks), the code calls the element's lookup first in one
+variant and the handle's in the other. Which decision is that? **[C: code read, traced on
+`work/port1300/evalorder9044.py`]**
+
+**Where.** In OptFuncExpr pass 2: the IL at `plgo.SymGarbageCollection` still has the reader's order, at
+`plgo.OptFuncExpr2` (and Codegen) the moved one. OptExpr (1071d4a0) takes the compare: OptPureExpr builds its tree
+(a temporary with a single definition is replaced by that definition's tree, so both OPCALLs and their OPARGs become
+part of the OPCMP's tree), OptLeftWeightTree weights every node (and sorts nothing here: OPCMP is not commutative),
+then **OptRebuildTuples** (1071feec) makes tuples again, subtree by subtree, in front of the compare. For a binary
+node (TupIsBinary 10720358: OPADD..OPSHR, OPCMP, OPEQ..OPGE, i.e. 0x26e..0x284 except OPMULHI and 0x27a..0x27d) it
+calls `OptCmpHashVal(src0, src1)` at 10720133 (10724175: 1 when weight(src0) < weight(src1), unsigned, 0 equal,
+-1 above), and when that is positive and the node's type class is not float (`ty & 0xf000 != 0x4000`) it rebuilds
+the **second operand's subtree first** (10720160..1072018c), then appends the two operands in their old order.
+Otherwise (equal or src0 heavier) the operands are rebuilt in order. Not copy propagation, not code motion: the
+compare's operands stay `OPCMP t_elem t_h` in both variants; only the emission order of the two call trees changes.
+After register allocation the first call's result waits in a callee-saved register, so the `cmp` operands read the
+other way round (`cmp ebp, eax` / `cmp eax, ebp`). The same test sits in the tuple-kind 0xe/0x12 path at 107869ff
+(not probed).
+
+**Formula.** The weight is `SU << 24 | count << 16 | hash` (11.3). Two calls of the same shape (one object, one
+argument each) have equal SU and count, so the 16-bit hash decides. An OPCALL's hash is
+`Σ hash(src_i) << i + (0x286 - 0x247)` over code address (i = 0), `this` (i = 1) and the arguments (i = 2..), an
+OPARG's `hash(x) + 0x15`, all mod 0x10000. Everything but the argument is common, so with
+`C` = the common part:
+
+    hash(call) = C + 4 * (hash(arg) + 0x15)  (mod 0x10000)
+    the handle's call is evaluated first  <=>  hash(call(element)) < hash(call(handle))   (the element written first)
+
+with `hash(arg)` as 11.3: a named variable or parameter of key k `32k` (folded), a temporary with several
+definitions (a strength-reduced loop pointer `$o..`) `64k`, `&x` the folded key itself, a single-definition temporary
+its definition's hash. The shift by 2 drops the top bits: a loop pointer counts only by `k mod 256`
+(`(k << 8) & 0xffff`), a named pointer by `k mod 512`. In the probe (element argument: the loop pointer, handle
+argument: the pointer variable `hp`): **element first iff `2 * (k_iv mod 256) >= k_hp mod 512`** (up to the wrap of
+`C + ...` past 0xffff). The order flips when either key crosses that line, i.e. when a 32-key block boundary moves one
+of them: the loop pointer is an optimiser temporary of the tmp class, so dead code before *or after* the loop moves
+it by whole blocks (`+32`), while `hp`'s frame key moves by one per dead local before it.
+
+Measured (`evalorder9044.py K1 K2`, `/O2 /GR`; `C` = 0x1b5 there):
+
+| K1 (before) | K2 (after) | loop pointer key | hp key | weights element / handle | evaluated first |
+|---|---|---|---|---|---|
+| 0 | 0 | 156 | 4 | | element |
+| 1..16 / 17 / 18..32 | 0 | 188 / 220 / 252 | 5..20 / 21 / 22..164 | K1 = 32: hfe09 / h5409 | element (every K1) |
+| 33..40 | 0 | 284 | 165..172 | K1 = 33: h1e09 / h5489 | handle |
+| 32 | 4, 16 | 284 | 164 | h1e09 / h5409 | handle |
+| 32 | 40 | 380 | 164 | h7e09 / h5409 | element |
+
+All 41 + 3 compiles agree with the formula (2·252 = 504 >= 164; 2·28 = 56 < 165; 2·124 = 248 >= 164). The machine
+code follows: `push ebx (pointer); call; push eax (hp); call; cmp ebp, eax` at K1 = 32, `push eax (hp); call;
+push ebx; call; cmp eax, ebp` at 33.
+
+**What it needs.** Both compare operands must be single-definition temporaries when pass 2 runs, i.e. the calls are
+compared directly. A result stored first (`int x = L.Lookup(&h); if (L.Lookup(&e[i]) == x)`, or an inline `Get()`
+returning through a c1 temporary `$T`, `return Get() == o.Get();`) stays a separate statement in front of the
+element's call at every key on this build (61 compiles, K1 = 0..60: the variable is never propagated;
+GoptLocalForwardCopyPropagation 10725e17 folds a single-definition destination only into the next instruction of its
+block). If the IL at `@dop2_PreLowerGlobalOpts@4` shows such a variable and the Codegen IL compares the call result
+directly, look at `plgo.GlobalOptimize` for the pass that removed it **[I: not reproduced]**; the order itself is
+still this decision. Before pass 2 the element's argument is the address arithmetic (`i * 4 + base`: SU 9, count 10)
+and outweighs the handle's call whatever the keys; it becomes a single loop pointer (same SU and count) only after
+GlobalOptimize's strength reduction, which is why only pass 2 is key-driven here.
+
+**Seeing it on your own source.**
+
+```sh
+# the IL after each sub-pass of dop2_PreLowerGlobalOpts (probes plgo.GlobalOptimize, plgo.SymGarbageCollection,
+# plgo.OptFuncExpr2, plgo.Half (only when Half runs), plgo.GrgIdentifyCandidates, plgo.2812f, plgo.SizeOpt,
+# plgo.28d53, plgo.28eed; table key hooks.il_plgo)
+C2_BUILD=13.00.9044 C2TRACE_REMOTE=0 uv run tools/c2trace.py il SRC --func F \
+    --at @dop2_PreLowerGlobalOpts@4,plgo.GlobalOptimize,plgo.SymGarbageCollection,plgo.OptFuncExpr2,@dop2_Codegen@4 \
+    --grep 'OPCALL|OPARG|OPCMP' -- /O2 /GR
+# the decision with both weights and the argument keys that set them (role `order` of hooks.symkeys, 9044 only)
+C2_BUILD=13.00.9044 C2TRACE_REMOTE=0 uv run tools/symkeys.py sites SRC --func F --pass 2 -- /O2 /GR
+C2_BUILD=13.00.9044 C2TRACE_REMOTE=0 uv run tools/symkeys.py events SRC --func F -- /O2 /GR | rg '^order'
+```
+
+`sites` prints, after the commutative sorts, every binary node of the pass whose two operands are both subtrees
+(count >= 2), the one evaluated first on top:
+
+```text
+pass 2 line   37 OPCMP      first  t218 = OPCALL(&?g_ents..(key 33) h0021, _hp(key 165) h14a0) SU8 n7 h5489   (2nd operand, heavier)
+                                then   t205 = OPCALL(&?g_ents..(key 33) h0021, $o240(key 284) h4700) SU8 n7 h1e09
+```
+
+The argument column is the leaf behind each source of the call (an OPARG's operand) and its hash. To move the order,
+move the key of one argument across the line above (`keys` / `whatif` for frame and tmp keys: a dead local before
+the variable's first reference moves it by 1, an optimiser temporary moves by 32 per tmp block taken before it).
