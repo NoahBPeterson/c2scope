@@ -849,13 +849,13 @@ Fixtures: replay 52 / 54 and 9 / 9, sim 60 / 63 (traced inputs: 53 / 54, 9 / 9, 
 61 / 63. What the fitted path lacked (the preference lists, the clobber set of a call to a function of the same unit,
 the xmm availability banks) is read in 12.4; what still remains is listed there.
 
-### 12.1 The list lever (T20 0x1400bd4f0)
+### 12.1 The list lever: a one-member struct is allocated before every int candidate
 
 tests/data/ncol/bucket/scope.cpp (our own source, /O2 /GS- /EHsc, throw() callees): `plain` saves a TLS mode word in
 `int saved`, does work on a pointer p across calls and restores it; saved is an int global of low priority (78 against
 p's 544 and r's 251) and gets the fourth callee-saved register, rbp. In `boxed` the same value is held in `struct Saved
 { int v; } s`, in `scoped` in a scope object (constructor saves and sets, destructor restores): **s is class 6, list 1**,
-processed first, rbx; p moves to rdi, r to rsi, the code is otherwise the same. (Not, as the T20 note guessed, the
+processed first, rbx; p moves to rdi, r to rsi, the code is otherwise the same. (Not, as an earlier guess had it, the
 int-local list: by priority alone s would come last.) The scope object is not needed; a one-member struct does it.
 
 - `ncolsim.py whatif EXPORT --func F bucket:V=aggr|local|global|const|N`: V moved to another list (local / global keep
