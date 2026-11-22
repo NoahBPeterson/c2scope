@@ -206,12 +206,97 @@ tuple "requires a separate resource", TLS+0x11c4c != 0, `(issuedCount + n - TLS+
 0x11, rcl 0x200, rcr 0x203, rol 0x215 or ror 0x216. In words: after one of these five is issued as the k-th
 instruction of the region, the next one may only be issued as instruction k+3, k+7, ... (or 100 cycles later).
 
-`SchmdBreakDep` (head read) **[C]**: rewrites the displacement (+0x38) of the memory leaf of the consumer (break
-kind < 0x10) or of the producer (kind >= 0x10), removes the edge (`DagRemoveDep`), and when edge+0x16 bit 5 is set
-removes the producer from the DAG (`SchRemoveDag` 0x102262d0: TLS+0x11448++, its successors are resolved with
-`SchResolveDep` 0x10226320, which can call `SchAddToReadyList`); it clears tuple+0xd bit 2 on both tuples. So a
-break can change operands and can delete an instruction. The per-kind cases (jump table 0x100e6408) were not
-decoded.
+`SchmdBreakDep` 0x100e5fa0 and the tests that mark an edge breakable: 1.6.1.
+
+### 1.6.1 `SchmdDepIsBreakable(edge)` 0x100e67b0 and `SchmdBreakDep(edge)` 0x100e5fa0, every kind **[C]**
+
+A breakable edge links an instruction that moves an address register r by a constant and a memory access through
+r; it can be broken (the consumer issued first) by rewriting the access. The break kind is edge+0x16 bits 0..4
+(the latency word's bits 16..20); bit 5 (producer removable) is cleared by every case, so `SchRemoveDag` is never
+reached from here. Both share the code for both models; the model tests are only the two of 7 (Atom: an anti edge
+needs a lea consumer; the inherited edge's latency).
+
+**Memory / address leaf** (kind 6 memory, kind 5 a lea's address) **[C as read; names I]**: +8 the form, +0x30 the
+base leaf, +0x34 the index leaf, +0x1c & 0xf the scale as log2, +0x38 the displacement, +0x2c a symbol that is part
+of the address (seen: the local array `next_code` addressed as [S + i*2] in gen_codes, a static array as [b + i*1 +
+S] in _tr_tally; the IL dump prints neither +8 nor +0x2c, so the `--il` probe now logs both, fields 15 / 16).
+Forms, from zlib: **0x4fe** [b + d], **0x4ff** [b + i*s + d], **0x500** [S + i*s + d] (no base, +0x2c set),
+**0x501** [i*s + d]; `MapOpcode` maps one form to another when a fold changes the shape.
+
+`SchmdDepIsBreakable`: no end a control point (node+0x40 bit 5). m = the access found by `SchmdFindAGI(writer of
+r, reader)` (r = the writer's first register destination, not the flags; m = the reader's first memory source,
+else first memory destination, with r as base or index; not when the reader reads the flags or has r's family as
+first source). P = producer tuple, C = consumer, imm = P's (or C's) second source when it is an ICONST.
+
+True edge (edge type bit 0), by P's opcode (0x100e684b); delta = the constant r moves by:
+
+| P | kind | conditions | delta |
+|---|---|---|---|
+| `add r, imm` 3 | 1 | | imm |
+| `add r, r2` 3 | 2 | m is [b + d] or [i*1 + d]; **always undone** at 0x100e6c52 (kind 2 is cleared and 0 returned) | 0 |
+| `sub r, imm` 0x29e | 3 | r is not rsp (dst0's register number +0x20 == 5) | -imm |
+| `mul r, c` 0x163 | 4 | c an ICONST; m = [r + d] (no index) with c in 1/2/4/8, or m = [r*s + d] (no base) with c << s in 1/2/4/8 (otherwise, with no base, the code goes on with no kind written: not modelled; not seen) | 0 |
+| `inc r` 0xf7 | 0xb | (no rsp test on this path) | 1 |
+| `dec r` 0x75 | 0xc | r not rsp | -1 |
+| `lea r, A` 0x114 | 5 / 7 / 9 | see below | A.disp |
+
+lea (0x100e68ce): refused when **m+0x2c != 0** (m has a symbol part), when P has no kind-5 source A, when the speed
+flag TLS+0xdd08 is 0, and when A = [rsp + d]. Then by m's form:
+
+- m = [b + d] (0x4fe) or [i*1 + d] (0x501, scale 0; cold 0x102df770): **kind 5**, A replaces r; refused when
+  (|m.disp| < 0x80 or |A.disp| < 0x80) and |m.disp + A.disp| > 0x80;
+- else r is m's base: **kind 7**, A must be [b + d] or [i*1 + d] (one register; A = [b + i*s + d] refused);
+- else (r is m's index; 0x100e6db1): **kind 9**, s' = 0 for A = [b + d], A's scale for A = [i*s' + d], 99 for
+  any other A (so refused); needs s' + m.scale <= 3.
+
+Common tail of the true kinds (0x100e6c4b): kind 2 undone; without the speed flag, an access with m.disp = 0 and no
+symbol may not get a displacement (delta != 0: refused); refused when |m.disp| < 0x80 and |m.disp + delta| >= 0x80.
+If the edge is also anti / output (type & 6): only a lea, and only when r is neither A's base nor its index
+(0x100e6f0a): `DagMakeDep(P, C, type & ~1)` (latency 1 if it has the output bit), the edge becomes a pure true edge
+of kind + 1 (**6, 8, 10**: folded at issue time, 1.6 step 4), C.nbreak++, no inheritance. Otherwise each predecessor
+edge pe of P: a true one whose producer has no edge into C yet (`DagBackwardDep`, any type) gives a new true edge
+pe.from -> C with the broken edge's latency (Atom: cold 0x102df7a5 then sets **pe**'s latency to 1); a true one
+already there is left as it is; a control bit (0x80000) is copied with `DagMakeOrUpdateDep`. C.nbreak++.
+
+Anti edge (type bit 1, not bit 0), by C's opcode (0x100e6810; on Atom only lea, cold 0x102df7b1); m = the access in
+P through the register C moves (`SchmdFindAGI(C, P)`); delta = what P's displacement must change by:
+
+| C | kind | conditions | delta |
+|---|---|---|---|
+| `add r, imm` | 0x10 | r not rsp | -imm |
+| `sub r, imm` | 0x11 | (no rsp test) | imm |
+| `inc r` | 0x15 | r not rsp | -1 |
+| `dec r` | 0x16 | | 1 |
+| `lea r, A` | 0x13 / 0x14 | A has no symbol (+0x2c) and is [r + d] (0x4fe) or [r*1 + d] (0x501, scale 0); 0x13 when r is m's base and m.disp - A.disp fits in int32, 0x14 when r is m's index and m.disp - (A.disp << m.scale) fits | -A.disp |
+
+Tail (0x100e6a5f): through rsp (the register itself) only when m.disp + delta >= 0; without the speed flag kind 0x12
+(never set) is refused and a zero displacement may not become non-zero; refused when the edge is also an output
+edge; C.nbreak++. There is no short / long displacement test on this path.
+
+`SchmdBreakDep(edge)` (when the consumer issues first, or at issue time for 6 / 8 / 10): M = the first memory source
+of C (kind < 0x10) or of P (kind >= 0x10), else its first memory destination; r = P's (C's) first destination; the
+jump table 0x100e6408 (index kind - 1; 0xd..0xf empty):
+
+| kind | rewrite of M |
+|---|---|
+| 1 / 3 | disp += imm / -= imm if r is M's base; += / -= imm << scale if it is M's index |
+| 0xb / 0xc | the same with 1 / -1 |
+| 2 (cold 0x102df4e5) | a copy of r2 appended as C's source, becomes M's base (or its index, scale 0, when M had none); form 0x4ff |
+| 4 (cold 0x102df536) | M = [r + d] -> [r*c + d] (scale log2 c), M = [r*s + d] -> scale log2(c << s); then continues in the kind-5 code, which needs a kind-5 source in P |
+| 5 / 6 | M's base and index are unlinked and freed; copies of A's base / index become M's (flagged +0x1c 0x80, then 0x40, appended as C's sources); form = `MapOpcode(A's form)`, scale = A's, +0x2c = A's, disp += A.disp |
+| 7 / 8 | M's base leaf is renamed in place (+0x24, +0x28) to A's base (A = [i*1 + d]: A's index); +0x2c = A's; disp += A.disp |
+| 9 / 10 | +0x2c = A's; disp += A.disp << M.scale; M's index renamed to A's base, or to A's index with scale += A's scale |
+| 0x10 / 0x11 | disp -= imm / += imm (base), the same << scale (index) |
+| 0x12 (cold 0x102df4f6) | the anti form of 2: C's r2 into P (never set) |
+| 0x13 / 0x14 | disp -= A.disp / -= A.disp << M.scale |
+| 0x15 / 0x16 | disp -1 / +1 (base), -(1 << scale) / +(1 << scale) (index) |
+
+Then `DagRemoveDep(edge)`; edge bit 5: `SchRemoveDag(producer)` 0x102262d0 (TLS+0x11448++, its successors
+resolved with `SchResolveDep` 0x10226320, which can call `SchAddToReadyList`; never set, above), else when the producer has no
+successor left (+0x26 == 0) `DagMakeForwardControlDep(producer)`; `SchmdUpdateProLogList(P, C)`; tuple+0xd bit 2
+cleared on both. So a broken break changes operands only; the producing instruction stays (for kinds 6 / 8 / 10
+folded at issue time the producer has already issued: gen_bitlen's `lea r10, [rsi+rax*4]` stays in the listing and
+the `movzx eax, [r10+2]` it fed is emitted as `movzx eax, [rsi+rax*4+2]`).
 
 ### 1.7 `SchmdComputeDynamicPriority(readyHead, cycle)` 0x100e5be0, K8 path **[C]**
 
@@ -491,9 +576,8 @@ script reads globals by address; here every one of them is `TLS + offset`.
 - `DagBuildGraph` beyond node creation, the true-edge latency code and the call sites listed in 1.4;
   `DagMakeControlPoint`, `DagChkSymDefs/Refs`, `DagChkMemrefDefs/Refs`, `DagMakeAntiOutputDeps`,
   `SchmdPseudoCCDef` bodies; the interference functions. Which tuple kinds 0xf..0x1a are (calls, returns, ...).
-- `SchmdDepIsBreakable` case table (producers add/dec/inc/lea/mul?/sub for true edges, consumers
-  add/dec/inc/lea/sub for anti edges, displacement range test at 0x100e6c84, favor-speed test) and
-  `SchmdBreakDep` per kind.
+- (read since: `SchmdDepIsBreakable` and `SchmdBreakDep` per kind, 1.6.1.) Still open there: the memory-leaf
+  forms other than 0x4fe..0x501, `MapOpcode`, `SchmdUpdateProLogList`.
 - `SchmdAdjustProEpi` / `SchmdRestoreProEpi` in full; `SchmdUpdateProLogList`, `SchmdProLogListIndex`.
 - The Atom model: read in section 7 (`SchAtomPairing`, `SchAtomGetFuncUnit`, `SchAtomCanBePaired`, the three
   `SchAtom*Stall` functions, the Atom latency / throughput / port callbacks); open there: two break cases and the
@@ -613,20 +697,22 @@ asked (`alias` per region: (pas, pas, answer), (sym, pas, answer)); without them
 variable without an index; a variable is in 7, 10, 13, 15.
 
 **Breakable edges** (`SchmdDepIsBreakable`, called per successor edge in the forward pass before the node's
-priority) **[C for the cases implemented]**: neither end a control point.
+priority) **[C]**, every case in 1.6.1 and in `dep_is_breakable` (both models; the address forms from the IL probe's
++8 / +0x2c fields, fields 15 / 16, or for older exports the issue probe's, else from the IL text, an index-only
+address taken as [i*s + d] without a symbol):
 
-- True edge, producer `add r, imm` (kind 1), `sub r, imm` (3, not rsp), `inc` (0xb), `dec` (0xc, not rsp), `lea`
-  (5: the consumer's leaf has no index; 7: the register is its base, the lea's address without index or x1), the
-  consumer reaching memory through exactly that register (SchmdFindAGI: the producer's first register
-  destination; the consumer's first memory leaf, sources before destinations, by base or index; not when the
-  consumer reads the flags or names the register as its first source): breakable unless the displacement is short
-  and would become long (|d| < 0x80, |d + delta| >= 0x80). The consumer then gets the producer's true and control
-  predecessors (true ones with the broken edge's latency). If the edge is also anti / output: only for a lea whose
-  address does not use its own destination, split into a true edge of kind + 1 (6, 8: folded at issue time by
+- True edge, producer `add r, imm` (kind 1), `sub r, imm` (3, not rsp), `mul r, c` (4), `inc` (0xb), `dec` (0xc,
+  not rsp), `lea` (5 / 7 / 9; never when the consumer's address has a symbol part), the consumer reaching memory
+  through exactly that register (SchmdFindAGI: the producer's first register destination; the consumer's first
+  memory leaf, sources before destinations, by base or index; not when the consumer reads the flags or names the
+  register as its first source): breakable unless the displacement is short and would become long (|d| < 0x80,
+  |d + delta| >= 0x80). The consumer then gets the producer's true predecessors it has no edge from yet (with the
+  broken edge's latency) and its control bits. If the edge is also anti / output: only for a lea whose address does
+  not use its own destination, split into a true edge of kind + 1 (6, 8, 10: folded at issue time by
   SchmdHasFoldableAGI) and a new plain edge with the other bits.
-- Anti edge (no output bit), consumer `add r, imm` (0x10), `sub` (0x11), `inc` (0x15), `dec` (0x16), `lea` (0x13,
-  displacement - delta within int32) moving the register the producer addresses memory through; not rsp; needs
-  favor-speed.
+- Anti edge (no output bit), consumer `add r, imm` (0x10, not rsp), `sub` (0x11), `inc` (0x15, not rsp), `dec`
+  (0x16), `lea r, [r + d]` / `[r*1 + d]` (0x13 / 0x14, the new displacement within int32) moving the register the
+  producer addresses memory through; through rsp only when the new displacement stays >= 0.
 
 Each marks the edge's kind (latency word bits 16..20) and counts it in the consumer's `nbreak`; a node whose
 predecessors are all breakable gets `DagMakeBackwardControlDep` (0x80000 from the nearest earlier control point).
@@ -657,10 +743,10 @@ breakable edge the traced order broke is not in the trace and is not counted aga
 from the trace with `--predict`: the alias facts (the IL-only line shows their weight); every other input of the
 DAG, its latencies, units, heights and priorities comes from the IL and the DLL's tables.
 
-Not done: break kinds 9 (a lea folded into an index; not taken in zlib's K8 traces; on Atom: section 7.3) and the lea split's
-issue-time folding (SchmdHasFoldableAGI); `SchmdBreakDep`'s operand rewrites and producer removal (bit 5: never set
-by the cases above); a switch's case edges and opcode 0x51b / the CurFunc+0x58 register / int, cli, sti control
-points (not reached by zlib); `ItfStackLocIsMemberOfPas` (TLS+0xebdc never seen set). Offline test:
+Not done: the lea split's issue-time folding (SchmdHasFoldableAGI; it changes operands, not the order) and
+`SchmdBreakDep`'s operand rewrites (1.6.1; the replay only removes the edge), the kind-4 case that writes no kind;
+kind 9 is predicted on K8 too now (none in zlib's K8 DAGs; on Atom 3, all broken); a switch's case edges and
+opcode 0x51b / the CurFunc+0x58 register / int, cli, sti control points (not reached by zlib); `ItfStackLocIsMemberOfPas` (TLS+0xebdc never seen set). Offline test:
 `sched17_predict_tests` (tests/data/sched17/il/*.json: c1, c2, sum, adler32, compress, uncompr, zutil, inftrees).
 
 ---------------------------------------------------------------------------------------------------
@@ -690,7 +776,7 @@ Every model test in the scheduler (`xref.py 398` / `11c48`) **[C]**:
 | true register edge (`DagBuildGraph` 0x100e2dc9 inline, `SchmdAdjustRegTrueDepStall` 0x10253923) | producer latency + `SchmdAgiStall` | producer latency + `SchAtomLoadToUseStall` + `SchAtomCCFlagStall` + `SchAtomAgiStall` (7.3) |
 | output edge (`DagBuildGraph` 0x100e342a / 0x100e3a2c, `SchmdAdjustRegOutputDepStall`) | max(lat, 0) | max(lat, 1) |
 | `SchmdDepIsBreakable` 0x100e6803 (anti edge) | consumer add / sub / inc / dec / lea | consumer lea only (cold 0x102df7b1) |
-| `SchmdDepIsBreakable` 0x100e6e64 (a broken true edge's consumer inherits the producer's true predecessors) | new edge latency = the broken edge's | new edge latency 1 (cold 0x102df7a5) |
+| `SchmdDepIsBreakable` 0x100e6e64 (a broken true edge's consumer inherits the producer's true predecessors) | new edge latency = the broken edge's | the same, and the producer's own predecessor edge set to 1 (cold 0x102df7a5) |
 | weights W (0x10006194 + 18) | W[4] = 3 | W[4] = 25; the static terms are the same |
 
 `SchSelectInstrs` itself has no model test: the skip rules of 1.6 step 3 hold, with `SchAtomGetFuncUnit` through
@@ -799,16 +885,33 @@ So on Atom the typical true edges are 1 (ALU -> ALU, lea -> address), 4 (ALU or 
 cmov / setcc), 0 (32-bit load -> ALU), and heights grow by 2 per ALU link. Traced true edges on zlib (5756 between
 issued nodes): latency 1: 4238, 4: 981, 0: 249, 5: 147, 2: 106, 6: 23, others 12.
 
-Breakable edges on Atom (`SchmdDepIsBreakable` as in 6.1, with the two model tests of the table) **[C]**, two cases
-the K8 replay did not need: **kind 9** (0x100e6db1), the register is the consumer's index and the lea's address
-is base + disp, or base + index with the two scales adding up to <= 3 (gzerror, inflate_fast: the consumer goes
-first); an M of the form [b + i*1] goes the kind-5 way (0x102df770), which the replay does not distinguish; and
-**kind 0x14** (0x100e6e76) for an anti edge whose register is the producer's index (0x13: its base). When a true
-edge is marked, the consumer inherits the producer's true predecessors with the broken edge's latency, and on
-Atom the producer's own predecessor edge is then set to 1 (cold 0x102df7a5 writes the loop's edge, not the new
-one: compress_block, a movsxd -> lea index edge traced at 1 instead of 4). Kind 9 is enabled for the Atom
-model only in the tool (the code is shared; on K8 it was never taken in the traces and is left out so the K8
-numbers stay as measured).
+Breakable edges on Atom (`SchmdDepIsBreakable`, 1.6.1, with the two model tests of the table) **[C]**: two cases
+the K8 traces did not need, **kind 9** (0x100e6db1: the register is the consumer's index, the lea's address [b + d]
+or [i*s' + d] with s' + the consumer's scale <= 3; gzerror, inflate_fast: the consumer goes first) and **kind 0x14**
+(0x100e6e76: an anti edge whose register is the producer's index; 0x13: its base). An earlier reading here (A = [b
++ i*s] allowed for kind 9, M = [b + i*1] taken the kind-5 way) was wrong: A with both a base and an index is never
+folded into a base or an index (kind 7 / 9), and the kind-5 way is M = [i*1 + d], no base. When a true edge is
+marked, the consumer inherits the producer's true predecessors it has no edge from with the broken edge's latency,
+and on Atom the producer's own predecessor edge is then set to 1 (cold 0x102df7a5 writes the loop's edge, not the
+new one: compress_block, a movsxd -> lea index edge traced at 1 instead of 4). The code is the same for K8, and the
+tool now runs every case for both models (K8 numbers unchanged, 6.1).
+
+**gen_codes region 1** (the last region the predicted DAG got wrong) **[C, traced]**: `lea rax, [r8 + r10*2]` feeds
+`add r9w, [rax*1 + 0]`. The add's memory leaf is form 0x500 with +0x2c = a SYM (the local array `next_code`, whose
+frame address is part of the access: [next_code + rax*1]); the IL dump prints it as `[rax=t425:1008*1+0]`, and the
+model took it for [i*1 + d] (kind 9 at the time). SchmdDepIsBreakable refuses every lea fold into an address with a
+symbol part (0x100e68e5: `cmp [m+0x2c], 0; jne` return 0), independent of the 16-bit operand size or the scale; the
+lea's address [b + i*2] would also have been refused for a fold into an index. Without the +0x2c field the leaf
+reads as [i*1 + d] and the edge as a kind-5 fold, so the IL probe logs (+0x2c, +8) of every leaf now (fields 15 /
+16; older exports: the issue probe's (+0x2c, +8) of the first four sources).
+
+**gen_bitlen region 18** **[C, traced]**: `lea r10, [rsi + rax*4]` -> `movzx eax, word [r10 + 2]` is a true + anti
+edge (the movzx writes eax, the lea reads rax) and is split: the trace logs it as 1 -> 2 with latency word 0x60001
+(kind 6) plus a plain anti edge, exactly as predicted (an earlier note said the trace did not mark it; it does, and
+every unbroken breakable edge of the 12 files has the predicted kind on both models). The lea issues first, then
+`SchmdHasFoldableAGI` folds its address into the movzx at the movzx's issue: the listing has `lea r10, [rsi+rax*4]`
+followed by `movzx eax, WORD PTR [rsi+rax*4+2]` (r10 is used later). The order does not change, and the replay
+does not apply the operand rewrite.
 
 ### 7.4 Replay and prediction (`c2sched17.py`, model "atom")
 
@@ -831,21 +934,21 @@ sources in brackets, 72 regions, 762 nodes):
 | predicted DAG (`--predict`, IL + alias facts): traced edges reproduced, type and latency equal | 20014 of 20028 [2482 of 2485], 20014 predicted [2482] |
 | DAG exact | 1148 [69] |
 | node latency, unit, height, static priority | 8394 / 8394 / 8394 / 8394 of 8394 [762 each] |
-| regions in exactly the traced order with the predicted DAG | **1161 of 1162** [72] |
-| IL only (PAS guess): edges, static priority, issue order | 19907, 8194, 1124 [2479, 692, 70] |
+| regions in exactly the traced order with the predicted DAG | **1162 of 1162** [72] |
+| IL only (PAS guess): edges, static priority, issue order | 19907, 8194, 1125 [2479, 692, 70] |
 
 The 11 regions the plain replay misses (crc32 3, gzio 3, inffast 4, inftrees 1) all need the breakable edges (a
 consumer issued before its lea / add / inc producer). The 14 traced edges not predicted are, as on K8, control
-edges SchmdBreakDep adds while scheduling. The one region off with the predicted DAG is gen_codes region 1: a lea
-`rax <- [r8 + r10*2]` feeding `add r9w, [rax*1+0]` is predicted kind 9 but the trace has no break (a check not
-found; that an index-only address takes another path is the guess). Also open there: gen_bitlen region 18, a lea
-split (kind 6) the trace does not mark (no effect on the order). The Atom regions differ from the K8 ones (1162 vs
-1173) because the earlier `0x398 & 0x40` tests change the IL.
+edges SchmdBreakDep adds while scheduling. With the predicted DAG every region is in the traced order since the
+lea-fold refusal for an address with a symbol part (gen_codes region 1, 7.3; 1161 before). The Atom regions differ
+from the K8 ones (1162 vs 1173) because the earlier `0x398 & 0x40` tests change the IL.
 
 Offline test: `sched17_atom_tests` (tests/data/sched17/atom/*.json: `--il --export` of c1, c2, sum, adler32,
 compress, uncompr, zutil, inftrees, inffast under /O2 /favor:ATOM: replay 127 / 132 (132 with breaks, 81 with K8
-rules), predicted DAG 1836 of 1840 edges, 877 of 877 nodes, order 132 of 132).
+rules), predicted DAG 1836 of 1840 edges, 877 of 877 nodes, order 132 of 132), and `sched17_atom_break_tests`
+(tests/data/sched17/atom/breaks/trees.json: gen_codes and gen_bitlen traced with the (+0x2c, +8) probe fields:
+28 regions in order with the predicted DAG; the gen_codes lea -> add edge not breakable, a kind-5 fold when the
++0x2c field is removed; gen_bitlen region 18's kind-6 split).
 
-Not read on the Atom path: `SchmdBreakDep`'s per-kind rewrites (as on K8), the 0x2c / +8 fields of a memory leaf
-the break and callback tests read (+8 = 0x4fe / 0x501 / 0x502 / 0x503 look like address-form codes **[I]**), and
-the earlier-phase Atom tests listed at the top.
+Not read on the Atom path: the +8 forms other than 0x4fe..0x501 (the callbacks' 0x502 / 0x503 **[I]**: other
+address forms), and the earlier-phase Atom tests listed at the top.

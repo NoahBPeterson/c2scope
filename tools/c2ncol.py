@@ -24,7 +24,7 @@ import c2build   # noqa: E402  (--c2 is taken out of argv here)
 import c2trace   # noqa: E402
 
 # event kinds in hooks.ncol order; --why adds STATE (hooks.ncol_state: the liveness arrays after prioritization)
-CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF, PRE, REGSET = range(10)
+CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF, PRE, REGSET, PERFUNC = range(11)
 # --il: the IL also at NColSubsumption's entry (0x1009ab40, after NColInitializeSyms / NColBuildInfo, before the copies
 # are coalesced and NColFoldTooCheap folds: the stream the lifetime indices, live counts and availability come from)
 PRE_HOOK = "1009ab40=tdccc>0>0>4$,tdccc>0>8>0>0x1c%"
@@ -33,6 +33,11 @@ PRE_HOOK = "1009ab40=tdccc>0>0>4$,tdccc>0>8>0>0x1c%"
 # the IL dump prints as `regset:0`. A call's clobber set: the Win64 volatiles, or for a callee of the same unit compiled
 # before, the registers it uses (interprocedural register usage). Sparse BV nodes {+0 base, +4 low, +8 high, +0xc next}.
 REGSET_HOOK = "100d7b53=s7,s3,esi>0x24>0*16:0:4:12,esi>0x24>0*16:8:8:12"
+# --il: NColMdPerFuncInit's entry (0x100925b0, ecx = FUNC; after NColCanon): the words its rbp reservation reads
+# (0x10092733..0x1009279b): FUNC+0xe4 (0x80 floating point, 0x4801000 EH), FUNC+0xe8, the frame-reference score
+# NColCanon summed (TLS+0x1196c, rbp is reserved at 6 * 24 when favoring speed) and TLS+0x1073c (docs/c2/ncolor.md 12.5)
+PERFUNC_HOOK = "100925b0=ecx>0xe4,ecx>0xe8,t1196c>0,t1073c>0"
+FN_FLAGS = ",ecx>0xe4"   # NColor's entry (ecx = FUNC): FUNC+0xe4, whose bit 0x80 stops NColMdAdjustPriority
 NAVAIL = 80          # nodes of each register's initial availability list (--export)
 # register numbers of _RegName whose lists are exported: rax..r15; fxmm0l..15l (doubles), fxmm0s..15s (floats);
 # preference windows are kept per master: rax..r15 and ymm0..15 (the xmm family's master, docs/c2/ncolor.md 9)
@@ -82,7 +87,7 @@ def parse(text):
     return f["cands"], f["given"], f["state"]
 
 
-def parse_all(text):
+def parse_all(text, fn_flags=False):
     """Events -> one record per NColor run: {func, cands, given, state} (state and per-candidate apps / ranges /
     avail only with --why / --export). c2 17.00 compiles functions on worker threads: the log's "# thread N" lines
     say whose events follow, and each thread has its own current function and candidate."""
@@ -117,6 +122,8 @@ def parse_all(text):
         if kind == FN:
             c = ctx.setdefault(th, {"fn": None, "cur": None})
             c["fn"] = dict(func=v[0].strip('"') if v else "?", cands=[], given=[], state=None)
+            if fn_flags and len(v) > 1 and v[-1] not in ("?", ""):
+                c["fn"]["fflags"] = hx(v[-1])          # FUNC+0xe4 at NColor's entry (FN_FLAGS, the last spec)
             c["cur"] = None
             fns.append(c["fn"])
             continue
@@ -124,6 +131,11 @@ def parse_all(text):
         rec, cur = c["fn"], c["cur"]
         if kind == PRE:
             ilrec[th] = (rec, "il_pre")    # --il: the IL before NColSubsumption (T lines follow)
+            continue
+        if kind == PERFUNC:                # --il: NColMdPerFuncInit's inputs (PERFUNC_HOOK)
+            g = lambda x: hx(x) if x not in ("?", "") else None
+            if len(v) >= 4:
+                rec["perfunc"] = dict(e4=g(v[0]), e8=g(v[1]), rbpscore=g(v[2]), m1073c=g(v[3]))
             continue
         if kind == REGSET:                 # --il: a REGSET leaf's registers (NColBuildInfo, before il_pre)
             if len(v) >= 4 and v[2].startswith("[") and v[3].startswith("["):
@@ -277,11 +289,12 @@ def main(argv):
                 os.environ.setdefault("C2TRACE_ILSYMW", "11")    # each leaf's symbol: +0xc root, +0x24 / +0x28
                 os.environ.setdefault("C2TRACE_ILPAS", "28")
         hk.append(st)
-        hk.append(c2build.hooks("ncol_fn", None))
+        hk.append(c2build.hooks("ncol_fn", None) + (FN_FLAGS if a.export and a.il else ""))
         hk.append(c2build.hooks("ncol_pref", None))
         if a.export and a.il and c2build.name().startswith("17.00"):
             hk.append(PRE_HOOK)
             hk.append(REGSET_HOOK)
+            hk.append(PERFUNC_HOOK)
     img, hk, rc, out, text = c2trace.run_trace(a.src, hk, cl or ["/O2"], keep=a.keep,
                                                func=a.func if a.func else (False if a.export else None))
     if rc:
@@ -292,7 +305,7 @@ def main(argv):
         return 0
     if a.export:
         import json
-        fns = [f for f in parse_all(text) if f["cands"]]
+        fns = [f for f in parse_all(text, fn_flags=a.il) if f["cands"]]
         if a.il:
             for f in fns:                     # the REGSET probe ran: a function without an event has no such leaf
                 f.setdefault("regsets", [])

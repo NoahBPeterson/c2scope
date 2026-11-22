@@ -57,7 +57,10 @@ def hooks(ready, il=False):
         # +0xc root, +0x24 size, +0x28 offset)
         h.append("100e2bfa=edi>8,edi>0xc,edi>0x10,ebx,ebx>0x3a,edi>0x30*8:0xc:0x1c:4,edi>0x34*8:0xc:0x1c:4,edi!,"
                  "edi>0x30*8:0x24:0x28:4,edi>0x34*8:0x24:0x28:4,edi>0x30>0x24#11,edi>0x30>4>0x24#11,"
-                 "edi>0x30>4>4>0x24#11,edi>0x34>0x24#11,edi>0x34>4>0x24#11")
+                 "edi>0x30>4>4>0x24#11,edi>0x34>0x24#11,edi>0x34>4>0x24#11,"
+                 # 15, 16: (+0x2c, +8) of each src / dst leaf: a memory leaf's symbol part and address form
+                 # (SchmdDepIsBreakable's tests; the IL line prints neither)
+                 "edi>0x30*8:0x2c:8:4,edi>0x34*8:0x2c:8:4")
         # 6, 7: the alias facts the DAG builder asks for (ItfPasInterf(pas, pas), ItfIsMemberOfPas(sym, pas)):
         # kept per region from the scheduler's own DagBuildGraph call (sched17.md 6.x)
         h.append("100de4f0=ecx,edx/xeax")
@@ -162,6 +165,9 @@ def parse(text):
                 lastnode[th]["dst2"] = pairs(v[9])
                 lastnode[th]["symw"] = [[hq(w) for w in x.strip("[]").split()] if x.startswith("[") else None
                                         for x in v[10:15]]
+            if len(v) > 16 and v[15].startswith("["):     # leaf (+0x2c, +8) words: a memory leaf's form
+                lastnode[th]["src3"] = pairs(v[15])
+                lastnode[th]["dst3"] = pairs(v[16])
             graph[th]["nodes"].append(lastnode[th])
             continue
         if kind == FN:
@@ -985,6 +991,7 @@ def il_tuple(n):
         t[side] = [_leaf(x, kinds[i][0] if i < len(kinds) else None, kinds[i][1] if i < len(kinds) else 0)
                    for i, x in enumerate(toks)]
         w = n.get(side + "2") or []
+        w3 = n.get(side + "3") or []
         sw = n.get("symw") or [None] * 5
         sw = sw[:3] if side == "src" else sw[3:]
         for i, l in enumerate(t[side]):
@@ -994,6 +1001,8 @@ def il_tuple(n):
                     l["pas"] = w[i][0]          # a memory-set leaf: its PAS at +0x24
                 if l["kind"] == 2:
                     l["symid"] = w[i][0]
+            if i < len(w3) and l["kind"] in (5, 6):
+                l["w2c"], l["w8"] = w3[i]          # a memory / address leaf's symbol part and form (_aform)
             if l["kind"] == 2 and i < len(sw) and sw[i] and len(sw[i]) >= 11 and None not in \
                     (sw[i][2], sw[i][3], sw[i][9], sw[i][10]):
                 l["symkind"], l["addrtaken"] = sw[i][2] & 0xff, bool(sw[i][2] & 0x200)
@@ -1174,6 +1183,13 @@ def predict_dag(region, alias=True, model="k8"):
     latencies, units, ports and throughputs, the Atom true / output edge latencies and breakable cases (7)."""
     atom = model == "atom"
     tups = [il_tuple(n) for n in sorted(region["nodes"], key=lambda n: n["lex"])]
+    srcw = {s["lex"]: s.get("srcw") or [] for s in region.get("sel", [])}
+    for k, t in enumerate(tups):
+        # exports traced before the IL probe logged (+0x2c, +8): those of the first four sources from the issue
+        # probe (fields 18 / 19; the same tuple operands)
+        for i, l in enumerate(t["src"][:4]):
+            if l["kind"] in (5, 6) and "w8" not in l and i < len(srcw.get(k + 1, [])):
+                l["w2c"], l["w8"] = srcw[k + 1][i][2:4]
     N = len(tups)
     facts = None
     if alias and region.get("alias") is not None:
@@ -1482,80 +1498,109 @@ def _disp(m):
         return 0
 
 
+# memory / address leaf forms (leaf +8, sched17.md 1.6.1): [b + d], [b + i*s + d], [S + i*s + d] (a symbol at +0x2c,
+# not printed by the IL dump), [i*s + d]
+AF_BD, AF_BISD, AF_SISD, AF_ISD = 0x4fe, 0x4ff, 0x500, 0x501
+
+
+def _aform(l):
+    """A memory / address leaf's form code (+8): logged by the IL probe (field 15 / 16, w8), else from the text
+    (an index-only address is taken to be [i*s + d], i.e. no symbol at +0x2c)."""
+    if l.get("w8") in (AF_BD, AF_BISD, AF_SISD, AF_ISD):
+        return l["w8"]
+    if l.get("base") is not None:
+        return AF_BISD if l.get("index") is not None else AF_BD
+    return AF_ISD if l.get("index") is not None else None
+
+
 def dep_is_breakable(nodes, e, mk, model="k8"):
-    """SchmdDepIsBreakable 0x100e67b0 (K8), the add / sub / inc / dec / lea-with-own-base cases: an edge between
-    an instruction that moves an address register by a constant and a memory access through that register can be
-    broken by rewriting the access's displacement. Marks the edge's break kind (latency word bits 16..20; >= 0x10:
-    an anti edge, the consumer moves the register), counts it in the consumer's nbreak, and for a true edge gives
-    the consumer the producer's own true / control predecessors (it will read the register's older value)."""
+    """SchmdDepIsBreakable 0x100e67b0, every case (sched17.md 1.6.1): an edge between an instruction that moves an
+    address register by a constant (add / sub / inc / dec imm, mul by a scale, lea) and a memory access through
+    that register can be broken by rewriting the access's address. Marks the edge's break kind (latency word bits
+    16..20; >= 0x10: an anti edge, the consumer moves the register), counts it in the consumer's nbreak, and for a
+    true edge gives the consumer the producer's own true / control predecessors (it will read the register's older
+    value). The speed flag TLS+0xdd08 (set at /O2) is taken as set."""
     p, c = nodes[e["frm"]], nodes[e["to"]]
     if p["flags"] & 0x20 or c["flags"] & 0x20 or p["t"] is None or c["t"] is None:
         return False
     pt, ct = p["t"], c["t"]
 
-    def notrsp(t):
+    def isrsp(t):
         d0 = t["dst"][0] if t["dst"] else None
-        return not (d0 is not None and d0["kind"] == 1 and d0["reg"] == RSP)
+        return d0 is not None and d0["kind"] == 1 and d0["reg"] == RSP
 
-    def mover(t):
-        """The constant an instruction adds to its first register destination, or None."""
-        op, s1 = t["opc"], (t["src"][1] if len(t["src"]) > 1 else None)
-        if op == 3 and _imm(s1) is not None:
-            return _imm(s1)
-        if op == 0x29e and _imm(s1) is not None and notrsp(t):
-            return -_imm(s1)
-        if op == 0xf7 and notrsp(t):
-            return 1
-        if op == 0x75 and notrsp(t):
-            return -1
-        if op == 0x114 and t["src"] and t["src"][0]["kind"] == 5:
-            a = t["src"][0]
-            d0 = t["dst"][0]["reg"] if t["dst"] else None
-            if a.get("index") is None and a.get("base") is not None and a.get("base") == d0:
-                return _disp(a)
-        return None
+    def s1imm(t):
+        return _imm(t["src"][1]) if len(t["src"]) > 1 else None
+
     if e["type"] & 1:
+        # true edge: the switch on the producer's opcode (0x100e684b)
         m, sym = _find_agi(pt, ct)
         if m is None:
             return False
-        dp = _disp(m)
-        if pt["opc"] == 0x114:
-            # lea: its address is folded into the consumer's: kind 5 (the consumer's leaf has no index), 7 (the
-            # register is the leaf's base, the lea's address has no index or a x1 one), 9 (it is the leaf's index,
-            # the scales add up to <= 3)
+        op, fm = pt["opc"], _aform(m)
+        a = None
+        if op == 0x29e:                                   # sub r, imm: kind 3 (not rsp)
+            if isrsp(pt) or s1imm(pt) is None:
+                return False
+            kind, delta = 3, -s1imm(pt)
+        elif op == 3:                                     # add r, imm: kind 1; add r, r2: kind 2, always undone
+            if s1imm(pt) is None:                         # at 0x100e6c52
+                return False
+            kind, delta = 1, s1imm(pt)
+        elif op == 0xf7:                                  # inc: kind 0xb (no rsp test on this path)
+            kind, delta = 0xb, 1
+        elif op == 0x75:                                  # dec: kind 0xc (not rsp)
+            if isrsp(pt):
+                return False
+            kind, delta = 0xc, -1
+        elif op == 0x163:                                 # mul r, c (cold 0x102df6fe): kind 4, c a scale
+            cst = s1imm(pt)
+            if cst is None:
+                return False
+            if m.get("index") is None:
+                if cst not in (1, 2, 4, 8):
+                    return False                          # (m has a base: rejected at 0x102df743)
+            elif m.get("base") is not None or (cst << m.get("scale", 0)) not in (1, 2, 4, 8):
+                return False      # the last case reaches 0x100e6c4b with no kind written (not modelled)
+            kind, delta = 4, 0
+        elif op == 0x114:                                 # lea (0x100e68ce): kind 5, 7 or 9
+            if m.get("w2c"):                              # the consumer's address has a symbol part (+0x2c)
+                return False
             a = next((l for l in pt["src"] if l["kind"] == 5), None)
             if a is None or (a.get("base") == RSP and a.get("index") is None):
                 return False
-            delta = _disp(a)
-            if m.get("index") is None:
-                if abs(dp) < 0x80 and abs(dp + delta) > 0x80:
+            fa, ad, md = _aform(a), _disp(a), _disp(m)
+            if fm == AF_BD or (fm == AF_ISD and not m.get("scale", 0)):
+                # kind 5 (0x100e6c0b): the lea's address replaces the register; refused when a short
+                # displacement would become long, unless both are long already
+                if (abs(md) < 0x80 or abs(ad) < 0x80) and abs(md + ad) > 0x80:
                     return False
                 kind = 5
             elif m.get("base") == sym:
-                if a.get("index") is not None and a.get("scale", 0):
+                # kind 7: the register is the consumer's base; the lea's address is [b + d] or [i*1 + d]
+                if not (fa == AF_BD or (fa == AF_ISD and not a.get("scale", 0))):
                     return False
                 kind = 7
-            elif model == "atom":
-                # kind 9 (0x100e6db1): the register is the leaf's index; the lea's address is base + disp or
-                # base + index, and the two scales add up to <= 3 (seen on Atom only; K8 kept as measured)
-                if a.get("index") is not None and a.get("scale", 0) + m.get("scale", 0) > 3:
+            else:
+                # kind 9 (0x100e6db1): the register is the consumer's index; the lea's address is [b + d]
+                # (scale 0) or [i*s + d], and the two scales add up to <= 3 ([b + i*s + d]: 99, never)
+                sa = 0 if fa == AF_BD else a.get("scale", 0) if fa == AF_ISD else 99
+                if sa + m.get("scale", 0) > 3:
                     return False
                 kind = 9
-            else:
-                return False      # the register as the consumer's index (kind 9): not taken in zlib's traces
+            delta = ad
         else:
-            delta = mover(pt)
-            if delta is None:
-                return False
-            kind = {3: 1, 0x29e: 3, 0xf7: 0xb, 0x75: 0xc}[pt["opc"]]
+            return False
+        # 0x100e6c4b, every true kind
+        dp = _disp(m)
         if abs(dp) < 0x80 and abs(dp + delta) >= 0x80:
             return False
         if e["type"] & 6:
-            # a lea that the consumer also anti / output depends on (0x100e6f0a): unless the lea's address
-            # uses its own destination, the edge is split: a breakable true edge of kind + 1 (6, 8, 10: folded
-            # at issue time) and a new plain edge with the other bits
-            a = next((l for l in pt["src"] if l["kind"] == 5), None) if pt["opc"] == 0x114 else None
-            if a is None or sym in (a.get("base"), a.get("index")):
+            # also anti / output (0x100e6f0a): only for a lea whose address does not use its own destination; the
+            # edge is split into a breakable true edge of kind + 1 (6, 8, 10: folded at issue time by
+            # SchmdHasFoldableAGI) and a new plain edge with the other bits (latency 1 when it is an output edge)
+            a0 = pt["src"][0] if pt["src"] else None
+            if op != 0x114 or a0 is None or sym in (a0.get("base"), a0.get("index")):
                 return False
             ne = dict(frm=e["frm"], to=e["to"], type=e["type"] & ~1, lat=1 if e["type"] & 4 else 0)
             p["succ"].append(ne)
@@ -1565,33 +1610,67 @@ def dep_is_breakable(nodes, e, mk, model="k8"):
             return True
         e["brk"] = kind
         for pe in list(p["pred"]):
-            if pe["type"] & 1:
-                new = not any(x["frm"] == pe["frm"] for x in c["pred"])
-                ne = mk(pe["frm"], c["lex"], 1)
+            # 0x100e6cb9: a true predecessor of the producer that is not yet one of the consumer
+            # (DagBackwardDep: an edge of any type) becomes one with the broken edge's latency (on Atom, cold
+            # 0x102df7a5, the producer's own edge is then set to 1); a control bit is copied (DagMakeOrUpdateDep)
+            have = any(x["frm"] == pe["frm"] for x in c["pred"])
+            if pe["type"] & 1 and not have:
+                ne = mk(pe["frm"], c["lex"], 1, update=False)
+                ne["lat"] = e["lat"]
                 if model == "atom":
-                    if new:            # the new edge gets the broken edge's latency; cold 0x102df7a5 then sets
-                        ne["lat"] = e["lat"]       # the producer's own predecessor edge to 1
-                        pe["lat"] = 1
-                    continue
-                ne["lat"] = max(ne["lat"], e["lat"])
+                    pe["lat"] = 1
             elif pe["type"] & 0x80000:
                 mk(pe["frm"], c["lex"], 0x80000)
         c["nbreak"] += 1
         return True
     if e["type"] & 2:
-        if model == "atom" and ct["opc"] != 0x114:
-            return False       # cold 0x102df7b1: on Atom only a lea consumer breaks an anti edge
-        delta = mover(ct)
-        if delta is None:
+        # anti edge: the switch on the consumer's opcode (0x100e6810); on Atom only a lea (cold 0x102df7b1)
+        op = ct["opc"]
+        if model == "atom" and op != 0x114:
             return False
         m, sym = _find_agi(ct, pt)
-        if m is None or sym == RSP or e["type"] & 4:
+        if m is None:
             return False
-        if ct["opc"] == 0x114 and not -0x80000000 <= _disp(m) - delta <= 0x7fffffff:
+        if op == 3:                                       # add r, imm: kind 0x10 (not rsp)
+            if isrsp(ct) or s1imm(ct) is None:
+                return False
+            kind, delta = 0x10, -s1imm(ct)
+        elif op == 0x29e:                                 # sub r, imm: kind 0x11
+            if s1imm(ct) is None:
+                return False
+            kind, delta = 0x11, s1imm(ct)
+        elif op == 0xf7:                                  # inc: kind 0x15 (not rsp)
+            if isrsp(ct):
+                return False
+            kind, delta = 0x15, -1
+        elif op == 0x75:                                  # dec: kind 0x16
+            kind, delta = 0x16, 1
+        elif op == 0x114:
+            # lea r, [r + d] / [r*1 + d] with no symbol part (0x100e69ae): kind 0x13 when r is the producer's
+            # base, 0x14 when it is its index; the new displacement must fit in 32 bits
+            a = next((l for l in ct["src"] if l["kind"] == 5), None)
+            if a is None or a.get("w2c"):
+                return False
+            fa = _aform(a)
+            if not ((fa == AF_BD and a.get("base") == sym) or
+                    (fa == AF_ISD and a.get("index") == sym and not a.get("scale", 0))):
+                return False
+            ad, md = _disp(a), _disp(m)
+            if m.get("base") == sym:
+                kind, nd = 0x13, md - ad
+            elif m.get("index") == sym:
+                kind, nd = 0x14, md - (ad << m.get("scale", 0))
+            else:
+                return False
+            if not -0x80000000 <= nd <= 0x7fffffff:
+                return False
+            delta = -ad
+        else:
             return False
-        e["brk"] = {3: 0x10, 0x29e: 0x11, 0xf7: 0x15, 0x75: 0x16, 0x114: 0x13}[ct["opc"]]
-        if ct["opc"] == 0x114 and m.get("base") != sym and m.get("index") == sym:
-            e["brk"] = 0x14    # 0x100e6e76: the register is the producer's index (only kb >= 0x10 is replayed)
+        # 0x100e6a5f: through rsp only when the new displacement stays >= 0; not also an output edge
+        if (sym == RSP and _disp(m) + delta < 0) or e["type"] & 4:
+            return False
+        e["brk"] = kind
         c["nbreak"] += 1
         return True
     return False

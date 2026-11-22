@@ -1199,6 +1199,61 @@ def ncolsim_ilread_tests():
            ("try_float", False, True, True), ("try_int", True, False, True)])
 
 
+def ncolsim_fold_tests():
+    """ncolsim's NColor inputs read since ncolor.md 12.4 (IL_FOLD, docs/c2/ncolor.md 12.5), offline: the frame score
+    and FUNC+0xe4 from c2ncol's probes (`perfunc`, `fflags`), NColFoldTooCheap's folds (il_fold_too_cheap), the
+    processing-time folds by NColMdNoFoldBenefit's cost test in processing order (il_proc_folds, il_apply_folds), the
+    preference-window lists as linked (il_prefwin_lists); fixtures `c2ncol.py --export --il` (C2TRACE_ILRAW=16) of
+    tests/data/ncol/fold: fold.c, tests/data/tls17/fp.cpp, tests/data/ncol/flags/flags.cpp (/EHsc), tests/data/ncol/fp.cpp,
+    gzipped."""
+    import gzip, json, io, contextlib, ncolsim as N
+    gz = lambda n: json.loads(gzip.open(os.path.join(HERE, "tests", "data", "ncol", "fold", n)).read())["functions"]
+    fs = [f for n in ("fold.json.gz", "tlsfp.json.gz", "flags.json.gz", "fp.json.gz") for f in gz(n)]
+    short = lambda f: f["func"].split("@")[0].lstrip("?")
+    score = sum(N.il_rbp_score(N.il_parse(f["il_pre"]), "local") == f["perfunc"]["rbpscore"] for f in fs)
+    hidden = sorted(short(f) for f in fs if f["fflags"] & 0x80 and not N.il_uses_float(N.il_parse(f["il_pre"])))
+    check("ncolsim the frame score (unknown SYMs: OPLOCALSCALED leaves only) as read at NColMdPerFuncInit; the float "
+          "flag set by a float leaf NColor's IL no longer has", (score, len(fs), hidden), (26, 26, ["addr_fp", "init_c"]))
+    ft = fn = 0
+    for f in fs:
+        pre, post = N.il_parse(f["il_pre"]), N.il_parse(f["il"])
+        truth = {a["n"] for a, b in zip(pre, post) if a["kind"] == "I" and a["op"] == "lea" and b["op"] == "op577"}
+        k = 0 if f["fflags"] & 0x80 else 1
+        pred = {n for _T, d, _s in N.il_fold_too_cheap(pre, N.il_inputs(f, "il_pre"), k) for n in d}
+        ft += len(truth & pred)
+        fn += len(truth ^ pred)
+    check("ncolsim il_fold_too_cheap: the leas NColFoldTooCheap removes (found, wrong)", (ft, fn), (67, 0))
+    pw = sum(
+        {int(r): [tuple(w) for w in v] for r, v in f["state"]["prefwin"].items() if v} ==
+        {r: v for r, v in N.il_model_state(f, N.IL_USE + N.IL_MODEL + N.IL_READ + N.IL_FOLD)["state"]["prefwin"].items()
+         if v}
+        for f in fs)
+    check("ncolsim il_prefwin_lists: the preference-window lists as the state probe reads them", (pw, len(fs)),
+          (26, 26))
+    got = {}
+    for tag, use in (("read", N.IL_READ), ("fold", N.IL_READ + N.IL_FOLD)):
+        with contextlib.redirect_stdout(io.StringIO()):
+            c = N.cmd_ilmodel(fs, 0, use)
+        b = io.StringIO()
+        with contextlib.redirect_stdout(b):
+            N.cmd_ilfull(fs, 0, N.IL_USE + N.IL_MODEL + use)
+        got[tag] = (tuple(c[k] for k in ("tied same", "window same", "prefs same", "anti same")),
+                    [ln.split(":")[1].split("single")[0].strip() for ln in b.getvalue().splitlines()[1:]])
+    check("ncolsim ilmodel / ilfull on the fold fixtures (381 candidates): tied, window, preferences, anti; replay "
+          "(int, xmm) and sim, IL_READ / IL_READ + IL_FOLD", (got["read"], got["fold"]),
+          (((381, 380, 380, 379), ["209 of 219", "154 of 156", "360 of 375"]),
+           ((381, 381, 381, 381), ["212 of 219", "155 of 156", "363 of 375"])))
+    ap = rg = n = 0
+    for f in gz("fold.json.gz"):
+        g = N.il_model_state(f, N.IL_USE + N.IL_MODEL + N.IL_READ + N.IL_FOLD)
+        for c0, c1 in zip(f["cands"], g["cands"]):
+            if c0.get("ranges"):
+                n += 1
+                ap += sorted(c0["apps"]) == sorted(c1["apps"])
+                rg += [list(v) for v in c0["ranges"]] == [list(v) for v in c1["ranges"]]
+    check("ncolsim il_apply_folds: fold.c's lists as NColor holds them at processing (apps, ranges of 55)", (ap, rg, n),
+          (55, 54, 55))
+
 
 def sched17_predict_tests():
     """tools/c2sched17.py --predict offline: each region's DAG, latencies, units and static priorities built from
@@ -1267,6 +1322,35 @@ def sched17_atom_tests():
                          dstw=[[0x1004, 0]]))
     check("sched17 atom: _imul3 r32, r32, imm port / throughput / latency / unit",
           (S.atom_port(v), S.atom_throughput(v), S.atom_latency(v), S.atom_unit(v)), (0x10, 1, 5, 1))
+    sched17_atom_break_tests()
+
+
+def sched17_atom_break_tests():
+    """SchmdDepIsBreakable's address-form tests (docs/c2/sched17.md 1.6) on tests/data/sched17/atom/breaks/trees.json:
+    zlib's gen_codes and gen_bitlen (`c2sched17.py --il --export`, /O2 /favor:ATOM; the IL probe logs each memory
+    leaf's +0x2c / +8). gen_codes region 1: `lea rax, [r8 + r10*2]` feeds `add r9w, [rax*1 + 0]`, an address with a
+    symbol part (form 0x500, +0x2c = the local array next_code, not in the IL dump): not breakable; taken as
+    [rax*1 + 0] without it, it would be a kind-5 fold. gen_bitlen region 18: the lea -> movzx edge split (kind 6)."""
+    import c2sched17 as S
+    fns = S.load_export(os.path.join(HERE, "tests", "data", "sched17", "atom", "breaks", "trees.json"))
+    c, _ = S.compare_dag(fns)
+    check("sched17 atom breaks: gen_codes + gen_bitlen: regions, DAG exact, order with the predicted / traced DAG",
+          (c["regions"], c["dag exact"], c["order predicted dag"], c["order traced dag"]), (28, 27, 28, 28))
+    fn = {f["func"]: f for f in fns}
+    r = fn["gen_codes"]["regions"][1]
+
+    def kinds(r, lex):
+        return [(e["to"], e["type"], e.get("brk")) for e in S.predict_dag(r, True, "atom")[lex]["succ"]]
+    plain = kinds(r, 1)
+    for nd in r["nodes"]:
+        nd.pop("src3", None)
+        nd.pop("dst3", None)
+    for s in r["sel"]:
+        s.pop("srcw", None)
+    check("sched17 atom breaks: gen_codes lea -> add [S + rax*1]: not breakable; without +0x2c a kind-5 fold",
+          (plain, kinds(r, 1)), ([(2, 1, None), (5, 2, None)], [(2, 1, 5), (5, 2, None)]))
+    check("sched17 atom breaks: gen_bitlen region 18 lea -> movzx [r10 + 2]: split, kind 6 + a plain anti edge",
+          kinds(fn["gen_bitlen"]["regions"][18], 1), [(2, 1, 6), (2, 2, None)])
 
 
 def symkeys17_tests():
@@ -1454,6 +1538,7 @@ sched17_atom_tests()
 ncolsim_il_tests()
 ncolsim_ilmodel_tests()
 ncolsim_ilread_tests()
+ncolsim_fold_tests()
 symkeys17_tests()
 
 
