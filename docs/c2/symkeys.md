@@ -714,7 +714,7 @@ h0137 with p key 8), the case the model takes as fixed (section 5).
 
 ### 11.5 The typedef dial: constants held in registers, and why the window is 8..32 (mod 64)
 
-Question (asked by a decompilation of a VC6 /O2 game, docs/tickets/T18): in one of its functions the number N of
+Question (asked by a decompilation of a VC6 /O2 game): in one of its functions the number N of
 `typedef int dN;` lines in front decides the order of two tied immediate webs, -1 and 1 (`or ebx,-1` / `mov ebp,1`
 at a join swap), and the game's order holds exactly when N mod 64 is in 8..32. Which key decides it?
 

@@ -961,6 +961,11 @@ rbp / r13 and does not; scale 1 is the only feature that sets it apart, not read
 nothing to do with EH: flags.cpp's `try_int` (try, no float) has its global moved, `float_int` (float, no EH) not, f2 of
 c2.cpp has both. The fitted try rule got xmm.c / fp.cpp's float loops wrong (order 18 of 25 functions; 24 with the flag;
 sim xmm.c 78 -> 84 of 87, fp.cpp 195 -> 216 of 228 by the flag alone, 87 and 222 with all of IL_READ).
+The flag also
+changes NColFoldTooCheap's lea folds (NColMdNoFoldBenefit counts one register less in a function with floating point:
+a two-register `lea` used only as an address is folded into its uses; the x64 TLS address `[base+secrel]` in two
+registers, docs/c2/tls17.md), and it is set by float leaves the optimiser removes before NColor, which
+`il_uses_float` cannot see in NColor's IL **[C]**.
 
 **EH and rbp** **[C for the test, I for which constructs set the bits]**: NColMdPerFuncInit adds rbp (NColMdSetAvailReg(6),
 0x1009261f) and takes it out again (NColMdClrAvailReg(6), 0x1009286b) when FUNC+0xe4 & 0x4801000 or FUNC+0xe8 & 0x100.

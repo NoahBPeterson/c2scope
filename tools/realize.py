@@ -3060,6 +3060,8 @@ def x64_edit(s):
         return ["before:%s:%s" % (f[1], f[2])]
     if s.startswith("index:") or s.startswith("prio:") or s.startswith("bucket:"):
         return [s]
+    if s in ("fpflag", "fpflag:1"):
+        return ["fpflag:1"]
     return None
 
 
@@ -3122,6 +3124,8 @@ class X64Ctx:
                 out += list(self.eqif())
             if "box" in fams or not self.a.constructs:
                 out += list(self.box())
+            if "fpleaf" in fams or not self.a.constructs:
+                out += list(self.fpleaf())
             if "store" in fams or (not self.a.constructs and (self.a.cmd == "edit" and not (self.a.from_ncol or
                                                                 self.a.from_rasim) or self.a.with_store)):
                 out += list(self.store())
@@ -3181,6 +3185,21 @@ class X64Ctx:
             ed += [(B.toks[i][1], B.toks[i][2], "%s.rz_v" % v) for i in B.uses[v]]
             yield ("box", "%s held in a one-member struct (line %d)" % (v, self.line_of(B.toks[st][1])), ed)
 
+    def fpleaf(self):
+        """`float rz_f = 0.0f; (void)rz_f;` before the body's first statement: a float leaf that the optimiser
+        removes before code generation, but OtlScanFuncLeaves has already set FUNC+0xe4 & 0x80 ("uses floating
+        point"). With that flag NColMdNoFoldBenefit no longer counts its +1 when it weighs folding an `lea T <- [B +
+        I]` into T's address uses, so NColFoldTooCheap folds the lea away: B and I stay live in two registers and the
+        uses address [B+I] (a TLS variable: [base+secrel], the secrel in a callee-saved register;
+        docs/c2/tls17.md). The same flag stops NColMdAdjustPriority (ncolor.md 12.4). `(void)0.0f;` and other
+        statements without an assignment are dropped by the front end and do nothing; `if (0.0f) {}` works too."""
+        B = self.B
+        if not B.starts:
+            return
+        pos = B.toks[B.starts[0]][1]
+        yield ("fpleaf", "dead float local before line %d (FUNC+0xe4 & 0x80)" % self.line_of(pos),
+               [(pos, pos, "float rz_f = 0.0f; (void)rz_f; ")])
+
     def store(self):
         """`rz_keep(V);` (a store of V to a global) at every statement where V is in scope and assigned: exactly one
         appearance of V in that statement's block and nothing else at NColor when V is live there. One instruction
@@ -3229,6 +3248,8 @@ class X64Ctx:
         if f[0] == "bucket":                     # bucket:V=..: the box of V
             v = f[1].split("=")[0]
             return [c for c in self.constructs() if c[0] == "box" and c[1].split()[0] == v]
+        if f[0] == "fpflag":
+            return [c for c in self.constructs() if c[0] == "fpleaf"]
         return []
 
     def measure(self, tag, edits):
@@ -3238,6 +3259,14 @@ class X64Ctx:
         regs = adiff([tsweep._key(x) for x in r.instrs], self.keys0)
         return dict(r=r, path=p, d=d, shape=shape, regs=regs, got=self.N.regs_of(r.f),
                     sc=(tsweep.rdiff(r.instrs, self.orig), tsweep.bdiff(r.instrs, self.orig)) if self.orig is not None else None)
+
+
+def x64_lea_folds(f):
+    """The lea definitions NColFoldTooCheap folded into their uses: tuples that are an `lea` in the IL at
+    NColSubsumption's entry (il_pre) and the empty op577 in the IL after it (il), matched by position (NColTupRemove
+    puts a new tuple in the slot; the numbering is the same in both dumps)."""
+    ops = lambda k: [ln.split()[2] for ln in f.get(k) or [] if ln.startswith("I ") and len(ln.split()) > 2]
+    return sum(1 for a, b in zip(ops("il_pre"), ops("il")) if a == "lea" and b == "op577")
 
 
 def _x64_inited(B, decl):
@@ -3263,6 +3292,9 @@ def x64_verdict(req, m):
             order = [c["name"].split("$")[0] for c in sorted(m["r"].f["cands"], key=lambda c: c.get("index", 0))]
             ok = ok and x in order and y in order and order.index(x) < order.index(y)
             got = [g for g in got if not g.startswith("index:")]
+        elif e == "fpflag:1":
+            # measured by its effect: one more lea folded away by NColFoldTooCheap than in the base
+            ok = ok and x64_lea_folds(m["r"].f) > m.get("lea_folds0", 0)
         elif e.startswith("bucket:"):
             # requested by name (aggr / local / ..), measured as the variant's list number
             v = e[7:].split("=")[0]
@@ -3317,7 +3349,7 @@ def x64_cmd_edit(c, a):
         e = x64_edit(s)
         if e is None:
             sys.exit("realize (x64): %r is not an NColor edit (+app:V:B[:N], -app:V:B[:N], ref:V:B, unref:V:B, "
-                     "before:A:B, bucket:V=aggr|local|global|const|N)" % s)
+                     "before:A:B, bucket:V=aggr|local|global|const|N, fpflag:1)" % s)
         reqs.append((s, e))
     N = c.N
     print("base: registers %s" % " ".join("%s=%s" % kv for kv in c.breg.items() if N.named(kv[0])))
@@ -3347,6 +3379,7 @@ def x64_cmd_edit(c, a):
                 print("  %-8s failed: %s | %s" % (tag, str(ex)[-100:], k[1]))
                 continue
             m["want_list"] = {x: N.bucket_edit(c.base.f, N.lists_of(c.base.f), x)[1] for x in e if x.startswith("bucket:")}
+            m["lea_folds0"] = x64_lea_folds(c.base.f)
             v, also = x64_verdict(e, m)
             if v == "no" and not a.all_variants and m["regs"] == 0 and not m["d"]["edits"]:
                 continue
