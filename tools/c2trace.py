@@ -100,7 +100,9 @@ DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (
  *   ilmax <n>     cap on tuples per '%' IL dump (default 2000000; env C2TRACE_ILMAX on the Python side)
  *   set <name> <hex>  another c2 build (tools/c2build.py): base = preferred image base, regname / opname = the
  *                 _RegName / _TupOpcodeName tables, opcount = entries in the latter, blk / len / mem = tuple layout
- *                 (extended dump only: ext / labtup / brcc / ehop / ulabop, see dumpilx); fename 1 = the plain dump
+ *                 (extended dump only: ext / extin / labtup / labsym / brcc / casen / casenx / fcoff / fc64 / ehop /
+ *                 ulabop, see dumpilx; its tuple and leaf fields follow the plain dump's lop / lkind / lsrc ..);
+ *                 fename 1 = the plain dump
  *                 prints a CODEADDR leaf (call target) by the front-end name at sym+4 (13.10; logs "# fename 1")
  *   op <hex> <name>   name of an opcode the build's own table lacks (after `set opcount`)
  *   set ilpas <off>  memory leaves also print "@<hex word at leaf+off>" (the PAS index; loadcse.py); logs "# ilpas"
@@ -305,6 +307,7 @@ static void symname(DWORD x) {
     if (rd(x + SNAME) && rstr(rd(rd(x + SNAME) + SNSTR), c, sizeof c)) out("%s", c);
     else out("%c%d", k == 3 ? 't' : k == 0xd ? 'k' : 's', rd(x + SNUM));
 }
+static int LEXT = 0x30, LLABT = 0x33, LBRCC = 0x0a, LFC = 0x18, FCDBG = 0;   /* extended dump layout, below */
 static int FENAME = 0;         /* `set fename 1` (13.10): CODEADDR leaves print the front-end symbol's name at sym+4 */
 static int ILPAS = 0;          /* `set ilpas <off>` (env C2TRACE_ILPAS): memory leaves also print "@<word at leaf+off>",
                                 * the INDIR points-at-set index (14.00: +0x1c); 0 = off, the dump is unchanged */
@@ -312,8 +315,8 @@ static int cdname(DWORD s) {   /* a call / tail-jump target: its symbol is the f
                                 * is not a name record there: 13.10 printed another symbol's name or s0) */
     char c[80]; DWORD p, t;
     if (!s) return 0;
-    t = rd(s + 0x33);
-    if (t && rb(t + 8) == 27) return 0;                 /* a label (branch target): keep the old text */
+    t = rd(s + LLABT);
+    if (t && kindof(t) == 27) return 0;                 /* a label (branch target): keep the old text */
     p = rd(s + 4);
     if (!p || !rstr(p, c, sizeof c) || !(c[0] == '_' || c[0] == '?' || c[0] == '@' || isalpha((BYTE)c[0]))) return 0;
     out("%s", c); return 1;
@@ -391,9 +394,15 @@ static void dumpil(DWORD t, int max) {
  * tuples), T C <switch> <low> <high> L<label> (case list), T A <line> (unwind action of the preceding OPPUSHSTATE).
  * Layout (`set`): ext = per-kind word after the operand lists (QUESTION cc, SWITCH default, EH record; cases at
  * ext+4), labtup = label SSR -> its LABEL tuple, brcc = BRANCH condition-code nibble, ehop / ulabop = the
- * opcode numbers of OPPUSHSTATE and OPUSERLABEL. */
-static int LEXT = 0x30, LLABT = 0x33, LBRCC = 0x0a, LFC = 0x18, FCDBG = 0;
+ * opcode numbers of OPPUSHSTATE and OPUSERLABEL; the tuple / leaf fields, kind numbers (`kind` lines) and the
+ * next links are the plain dump's (lop, lkind, lflg, lline, lsrc, ldst, lnext, lpay): defaults = 14.00, so the
+ * x86 builds print what they printed. cl 17.00 x64 also sets extin, labsym, casen / casenx, fcoff / fc64. */
+static int LEXTI = -1;         /* `set extin`: INTRINSIC's number when it is not at `ext` (cl 17.00 x64: 0x48); -1 = LEXT */
+static int LLABS = 0x24, LCASE = 0x0c, LCASEN = 0, FC64 = 0;  /* `set labsym`: LABEL tuple -> its symbol; `set casen`
+                               * / `set casenx`: CASE node low (high +4, label +8) / next; `set fc64 1`: FCONST holds a
+                               * double at fcoff (cl 17.00 x64), not an 80-bit x87 value */
 static DWORD OPEH = 0x2db, OPULAB = 0x300;   /* opcode numbers: OPPUSHSTATE (.. OPSETSTATE = +9), OPUSERLABEL */
+#define XI (LEXTI < 0 ? LEXT : LEXTI)
 static int xdepth;
 static const char *ccname[17] = { "0", "e", "ne", "l", "g", "le", "ge", "b", "a", "be", "ae", "s", "ns", "p", "np", "o", "no" };
 static void xopname(DWORD op, char *c, int max) {
@@ -405,11 +414,14 @@ static int ssrname(DWORD s, const char *pre) {   /* front-end symbol (CODEADDR l
     if (p && rstr(p, c, sizeof c)) { out("%s%s", pre, c); return 1; }
     return 0;
 }
-static DWORD labtup(DWORD s) { DWORD l = s ? rd(s + LLABT) : 0; return l && rb(l + 8) == 27 ? l : 0; }
+static DWORD labtup(DWORD s) { DWORD l = s ? rd(s + LLABT) : 0; return l && kindof(l) == 27 ? l : 0; }
 static void xfconst(DWORD l) {         /* FCONST leaf: 80-bit x87 value at +LFC (`set fcoff`; 14.00: 0x18) */
     DWORD w[3]; double d; int i;
     if (FCDBG) { out("raw["); for (i = 0; i < 12; i++) out(i ? " %x" : "%x", rd(l + 4 * i)); out("]"); }
-    if (!readd(l + LFC, &w[0]) || !readd(l + LFC + 4, &w[1]) || !readd(l + LFC + 8, &w[2])) { out("?"); return; }
+    if (!readd(l + LFC, &w[0]) || !readd(l + LFC + 4, &w[1]) || (!FC64 && !readd(l + LFC + 8, &w[2]))) {
+        out("?"); return;
+    }
+    if (FC64) { memcpy(&d, w, 8); out("%.17g", d); return; }
     __asm fld tbyte ptr w
     __asm fstp qword ptr d
     out("%.17g", d);                  /* exact double; c2il.py prints the shortest spelling (and the f form) */
@@ -423,19 +435,19 @@ static void xnotes(DWORD t, BYTE k, DWORD op) {
 #define NOTE (any++ ? out(" ") : out(" ; "))
     if (k == 18 && (rb(t + LBRCC) & 0xf)) { NOTE; out("cc=%s", ccname[rb(t + LBRCC) & 0xf]); }
     if (k == 17 && rb(t + LEXT) <= 16) { NOTE; out("cc=%s", ccname[rb(t + LEXT)]); }
-    if (k == 19) { NOTE; out("intrin=%d", rd(t + LEXT) & 0xffff); }
+    if (k == 19) { NOTE; out("intrin=%d", rd(t + XI) & 0xffff); }
     for (side = 0; side < 2; side++)
-        for (i = 0, l = rd(t + (side ? 0x2c : 0x28)); l && i < 16; i++, l = rd(l)) {
-            BYTE lk = rb(l + 8);
+        for (i = 0, l = rd(t + (side ? LDST : LSRC)); l && i < 16; i++, l = rd(l + LNEXT)) {
+            BYTE lk = kindof(l);
             if (lk != 3 && lk != 4 && lk != 5 && lk != 9) continue;
             NOTE; out("%c%d=", side ? 'd' : 's', i);
             if (lk == 9) xfconst(l);
             else if (lk != 4) out("&");
-            else if ((s = labtup(rd(l + 0x18))) != 0) out("L%x", s);
-            else if (!ssrname(rd(l + 0x18), "")) out("?");
+            else if ((s = labtup(rd(l + LPAY))) != 0) out("L%x", s);
+            else if (!ssrname(rd(l + LPAY), "")) out("?");
         }
     if (k == 20) {
-        for (i = 0, l = rd(t + LEXT + 4); l && i < 100000; i++) l = rd(l);
+        for (i = 0, l = rd(t + LEXT + 4); l && i < 100000; i++) l = rd(l + LCASEN);
         NOTE; out("default=L%x cases=%d", rd(t + LEXT), i);
     }
     if (k == 21 && (op >= OPEH && op <= OPEH + 9) && (r = rd(t + LEXT)) != 0) {
@@ -460,20 +472,20 @@ static void xnotes(DWORD t, BYTE k, DWORD op) {
 static void dumpilx(DWORD t, int max, const char *pf) {
     int n = 0, i; char c[48]; DWORD l, r, e;
     while (t && n++ < max) {
-        BYTE k = rb(t + 8), f = rb(t + 9);
-        DWORD op = rd(t + 4);
+        BYTE k = kindof(t), f = rb(t + LFLG);
+        DWORD op = rd(t + LOP);
         if (k == 26) out("%sB %x\n", pf, rd(t + LBLK));
-        else if (k == 27) { out("%sL %x", pf, t); ssrname(rd(t + 0x24), " "); out("\n"); }
+        else if (k == 27) { out("%sL %x", pf, t); ssrname(rd(t + LLABS), " "); out("\n"); }
         else if (f & 1) {
             xopname(op, c, sizeof c);
-            out("%sI %x %s %d %d |", pf, t, c, rd(t + 0x14) & 0xffff, rb(t + LLEN));
-            oplist(rd(t + 0x2c)); out(" <-"); oplist(rd(t + 0x28));
-            if (k == 18 && rb(rd(t + 0x28) + 8) == 4) { out(" ->"); }
+            out("%sI %x %s %d %d |", pf, t, c, rd(t + LLINE) & 0xffff, rb(t + LLEN));
+            oplist(rd(t + LDST)); out(" <-"); oplist(rd(t + LSRC));
+            if (k == 18 && kindof(rd(t + LSRC)) == 4) { out(" ->"); }
             xnotes(t, k, op);
             out("\n");
             if (k == 20)
-                for (i = 0, l = rd(t + LEXT + 4); l && i < 4096; i++, l = rd(l)) {
-                    out("%sC %x %d %d L%x\n", pf, t, rd(l + 0xc), rd(l + 0x10), rd(l + 0x14));
+                for (i = 0, l = rd(t + LEXT + 4); l && i < 4096; i++, l = rd(l + LCASEN)) {
+                    out("%sC %x %d %d L%x\n", pf, t, rd(l + LCASE), rd(l + LCASE + 4), rd(l + LCASE + 8));
                     if (blen > (int)sizeof buf - 1024) flush();
                 }
             if (k == 21 && op == OPEH && !xdepth && (r = rd(t + LEXT)) != 0) {
@@ -489,7 +501,7 @@ static void dumpilx(DWORD t, int max, const char *pf) {
             out("\n");
         }
         if (blen > (int)sizeof buf - 1024) flush();
-        t = rd(t);
+        t = rd(t + LNEXT);
     }
 }
 
@@ -802,6 +814,11 @@ static void setvar(const char *nm, DWORD v) {
     else if (!strcmp(nm, "fcoff")) LFC = (int)v;
     else if (!strcmp(nm, "fcdbg")) FCDBG = (int)v;
     else if (!strcmp(nm, "brcc")) LBRCC = (int)v;
+    else if (!strcmp(nm, "extin")) LEXTI = (int)v;
+    else if (!strcmp(nm, "labsym")) LLABS = (int)v;
+    else if (!strcmp(nm, "casen")) LCASE = (int)v;
+    else if (!strcmp(nm, "casenx")) LCASEN = (int)v;
+    else if (!strcmp(nm, "fc64")) FC64 = (int)v;
     else if (!strcmp(nm, "ehop")) OPEH = v;
     else if (!strcmp(nm, "ulabop")) OPULAB = v;
     else if (!strcmp(nm, "fename")) { FENAME = (int)v; out("# fename %d\n", FENAME); }  /* marker: this DLL knows it */

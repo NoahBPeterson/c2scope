@@ -121,6 +121,9 @@ FREE_MAP = {int(k): v for k, v in (c2trace.c2build.get("symkeys_free_map", {}) o
 FREE_DEFAULT = c2trace.c2build.get("symkeys_free_default", "frame")
 # tuple kinds: [K, d] = raw kinds >= K are logged d lower than 14.00's (17.00 x64: an instruction operand is 12)
 KIND_SHIFT = c2trace.c2build.get("symkeys_kind_shift")
+# a memory leaf's base sits at the source-list offset, so a sort's "first source" fields are its base (17.00 x64;
+# 13.00.9044 shifts kinds too but keeps the base at its own offset, logged by the sort's entry fields)
+MEM_SRC = c2trace.c2build.get("symkeys_mem_src", bool(KIND_SHIFT))
 # the sort exit logs the two operands' displacements after the 12 x86 values (17.00 x64)
 SORT_DISP = c2trace.c2build.get("symkeys_sort_disp", False)
 # the equiv entry's offset is absolute; a 4th value is the root's offset, subtracted (17.00 x64)
@@ -162,6 +165,7 @@ class Func:
         self.syms = []        # ('inl-',) ('mark', what)
         self.optidx = None    # event index of the first OptFuncExpr
         self.line0 = 0        # source line of the function (FUNC+0x44): line offsets are relative to it
+        self.imms = []        # --imm (13.00.9044): ('imm', ...) ('walk', ...) ('gr', ...) events of the immediate table
 
 
 def _vals(rest):
@@ -309,6 +313,8 @@ def _parse(lines, img):
             sm = live.get(v[0])
             if sm is not None and sm.base is None:
                 sm.base, sm.off = live.get(v[1]), int(v[2], 16) if v[2] != "?" else 0
+                if len(v) > 4 and v[3] != "?" and v[4] != "?":
+                    sm.fe = "%x/%d" % (int(v[3], 16) & 0xffff, int(v[4], 16))   # type word, size (13.00.9044)
         elif hk in ("splice", "getinl"):
             if ent:
                 nm = _str(v[0]) or "?"
@@ -331,6 +337,8 @@ def _parse(lines, img):
             ev.append(("mark", "OptFuncExpr"))
         elif hk == "gc":
             ev.append(("mark", "GC"))
+        elif hk in IMM_ROLES:
+            _parse_imm(f, hk, ent, v)
         elif hk in ("hshwalk", "hshasg"):
             j = 0 if hk == "hshwalk" else 1
             hsh[j] = max(0, hsh[j] + (1 if ent else -1))
@@ -362,7 +370,7 @@ def _parse(lines, img):
                     ops.append(dict(kind=kind, w=w, key=leaf, dkey=sub, op=None,
                                     sym=bykey.get(leaf) if leaf is not None else None,
                                     dsym=bykey.get(sub) if sub is not None else None))
-                    if KIND_SHIFT and kind == 6 and skind in (1, 2) and skey is not None:
+                    if MEM_SRC and kind == 6 and skind in (1, 2) and skey is not None:
                         # 17.00 x64: a memory leaf's base is at the source-list offset (+0x30), so the "first
                         # source" fields are its base leaf (the displacement is not logged here)
                         dv = num(v[12 + len(ops) - 1]) if SORT_DISP and len(v) > 13 else None
@@ -430,7 +438,45 @@ def _parse(lines, img):
     return funcs
 
 
+def _parse_imm(f, hk, ent, v):
+    """--imm (13.00.9044): the immediate table of Globregs (GrgRewriteImmedAsReg, its 64 buckets, the walk that frees
+    the unused ones) and every globreg number GrgNewGlobreg hands out (a freed record keeps its number)."""
+    def num(x):
+        return int(x, 16) if x not in ("?", None) else None
+    if hk == "immnew":
+        kind, val = num(v[0]), num(v[1])
+        kind = kind & 0xff if kind is not None else None
+        name, fe = (_str(v[2]), num(v[3])) if kind == 3 else (_str(v[4]), num(v[5])) if kind == 4 else (None, None)
+        if kind == 7 and val is not None:
+            what, bucket = "%d" % (val - (1 << 32) if val >= 1 << 31 else val), val & 0x3f
+        else:
+            what, bucket = ("&" if kind == 3 else "") + (name or "?"), fe & 0x3f if fe is not None else None
+        f.imms.append(dict(ev="imm", kind=kind, what=what, fe=fe if kind in (3, 4) else None, bucket=bucket, gr=None))
+    elif hk == "immwalk":
+        f.imms.append(dict(ev="walk", sym=v[0], bucket=(num(v[1]) or 0) // 4, refs=num(v[2])))
+    elif hk == "immfree":
+        f.imms.append(dict(ev="free", gr=num(v[0])))
+    elif hk == "newgr":
+        if ent:
+            f._grpend = dict(ev="gr", sym=v[0], kind=num(v[1]), ikind=num(v[2]), val=num(v[3]), name=_str(v[4]),
+                             top=num(v[5]))
+            return
+        g, f._grpend = getattr(f, "_grpend", None), None
+        if g is None:
+            return
+        g["gr"] = num(v[0])
+        g["reused"] = g["top"] is not None and g["top"] == g["gr"]
+        walked = any(x["ev"] == "walk" for x in f.imms)
+        if not walked:
+            # before the walk: only an immediate's own web, made at its first reference, is of interest
+            if (g["kind"] or 0) & 0xff == 0xd and f.imms and f.imms[-1]["ev"] == "imm" and f.imms[-1]["gr"] is None:
+                f.imms[-1]["gr"] = g["gr"]
+            return
+        f.imms.append(g)
+
 TYCLS = {1: "i", 2: "u", 3: "p", 4: "p", 5: "f", 6: "b", 7: "b"}
+# the TY word's class nibble per build (13.00.9044: 1 int, 2 unsigned, 3 pointer, 4 float, 5 block)
+TYCLS = {int(k): v for k, v in (c2trace.c2build.get("symkeys_tycls") or {}).items()} or TYCLS
 
 
 def tyname(ty):
@@ -748,6 +794,57 @@ def print_keys(f, a):
             " (optimiser)" if s.phase == "opt" else "")
         if rx is None or rx.search(line):
             print(line)
+    if getattr(a, "imm", False):
+        print_imms(f)
+
+
+def print_imms(f):
+    """--imm: the immediate table (13.00.9044, Globregs).  Integer constants and addresses held in registers are
+    SYMs of kind 0xd that GrgRewriteImmedAsReg makes with getmem, not SymAlloc: they have no key.  What orders their
+    webs is the globreg number: an immediate's own web is numbered at its first reference; webs made after the
+    table walk (variables' webs in 1073053e, Color's split pieces) take freed numbers first, the last freed first.
+    The walk frees unused immediates bucket by bucket (0..63): bucket = value & 63 for a constant, the c1 symbol
+    number (SSR +0x28) & 63 for an address, so a declaration before the function changes the order."""
+    if not f.imms:
+        print("# immediates: none traced (pass --imm; 13.00.9044 only)")
+        return
+    seen = {}
+    for x in f.imms:
+        if x["ev"] == "imm":
+            seen.setdefault((x["kind"], x["what"]), []).append(x)
+    imms = [v[0] for v in seen.values()]
+    for x in imms:
+        x["nref"] = len(seen[(x["kind"], x["what"])])
+    print("# immediates in first-reference order (GrgRewriteImmedAsReg; integer constants and addresses held in registers "
+          "are getmem'd SYMs of kind 0xd: no key): c1 number, bucket, references, web number")
+    print("%-28s %6s %6s %5s %6s %s" % ("immediate", "c1#", "bucket", "refs", "web", "fate"))
+    walk = [x for x in f.imms if x["ev"] in ("walk", "free")]
+    fate, last = {}, None
+    for x in walk:
+        if x["ev"] == "walk":
+            last = x
+        elif last is not None:
+            fate[x["gr"]] = "freed (refs %s)" % last["refs"]
+    order = [x["gr"] for x in walk if x["ev"] == "free"]
+    for x in imms:
+        print("%-28s %6s %6s %5d %6s %s" % (x["what"], x["fe"] if x["fe"] is not None else "", x["bucket"] if x["bucket"]
+                                             is not None else "?", x["nref"], x["gr"] if x["gr"] is not None else "-",
+                                             fate.get(x["gr"], "kept" if x["gr"] is not None else "not enregistered")))
+    if order:
+        print("# freed in bucket order (webs): %s; the free list hands them out last-freed first: %s" % (
+            " ".join(str(g) for g in order), " ".join(str(g) for g in reversed(order))))
+    later = [x for x in f.imms if x["ev"] == "gr"]
+    if later:
+        print("# webs numbered after the walk (variables' webs, Color's split pieces): number (reused = a freed one)")
+        for x in later:
+            k = (x["kind"] or 0) & 0xff
+            if k == 0xd:
+                v = x["val"]
+                what = "piece of %d" % (v - (1 << 32) if v >= 1 << 31 else v) if (x["ikind"] or 0) & 0xff == 7 and \
+                    v is not None else "piece of an address immediate"
+            else:
+                what = x["name"] or ("a temporary's web" if k == 3 else "sym %s (kind %d)" % (x["sym"], k))
+            print("   %-34s web %4s%s" % (what, x["gr"], "  (reused)" if x.get("reused") else ""))
 
 
 def print_events(f):
@@ -1627,8 +1724,11 @@ ROLE = {}
 OPNAMES = c2trace.c2build.get("opnames", {}) or {}
 
 
-def trace(src, cl):
-    roles = list(HOOKS)
+IMM_ROLES = ("immnew", "immwalk", "immfree", "newgr")    # keys --imm (a build table's optional roles)
+
+
+def trace(src, cl, imm=False):
+    roles = [r for r in HOOKS if imm or r not in IMM_ROLES]
     ROLE.clear()
     ROLE.update(enumerate(roles))
     img, hooks, rc, out, text = c2trace.run_trace(src, [HOOKS[r] for r in roles], cl, maxn=None,
@@ -1657,7 +1757,7 @@ def to_json(funcs):
             return o
         evs = [["alloc", idx[id(e[1])]] if e[0] == "alloc" else
                ["sort", e[1], e[2], e[3], [sop(o) for o in e[4]]] if e[0] == "sort" else list(e) for e in f.events]
-        out.append(dict(name=f.name, optidx=f.optidx, line0=f.line0, syms=syms, events=evs))
+        out.append(dict(name=f.name, optidx=f.optidx, line0=f.line0, syms=syms, events=evs, imms=f.imms))
     return out
 
 
@@ -1666,6 +1766,7 @@ def from_json(data):
     for d in data:
         f = Func()
         f.name, f.optidx, f.line0 = d["name"], d["optidx"], d.get("line0", 0)
+        f.imms = d.get("imms", [])
         f.syms = [Sym(**{k: v for k, v in s.items() if k != "base"}) for s in d["syms"]]
         for s, sd in zip(f.syms, d["syms"]):
             s.base = f.syms[sd["base"]] if sd["base"] is not None else None
@@ -1723,6 +1824,8 @@ def main(argv=None):
     ap.add_argument("--line")
     ap.add_argument("--pass", dest="pass_", type=int)
     ap.add_argument("--leaves", action="store_true")
+    ap.add_argument("--imm", action="store_true", help="keys (13.00.9044): also trace and print the immediate table "
+                    "(constants / addresses held in registers: no key; their bucket, c1 number and globreg numbers)")
     ap.add_argument("--n")
     ap.add_argument("--vs", help="compare: the traced variant (export JSON) to predict")
     ap.add_argument("--match", help="levers: rank edits by operand orders that differ from this export")
@@ -1744,7 +1847,9 @@ def main(argv=None):
     else:
         if not a.src:
             ap.error("need <src> or --from")
-        funcs = trace(a.src, cl)
+        if a.imm and not all(r in HOOKS for r in IMM_ROLES):
+            sys.exit("--imm: this build table has no immediate-table hooks (13.00.9044 only)")
+        funcs = trace(a.src, cl, imm=a.imm)
     sel = [f for f in funcs if f.name and c2trace.func_match(a.func, f.name)]
     if a.func and not sel:
         sys.exit("no function matching %s (compiled: %s)" % (a.func, ", ".join(f.name or "?" for f in funcs)))

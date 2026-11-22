@@ -358,6 +358,9 @@ def report(have, votes, where, agree, show_all, src=None, order=None, notes=None
 
 
 def main(argv):
+    if c2trace.c2build.get("arch") == "x64":     # x86 allocator only (docs/c2/port-1700.md, tool status)
+        sys.exit("c2trace.py regmap: votes for the x86 allocator's rasim; "
+                 "on %s use tools/c2ncol.py (NColor's registers) and tools/ncolsim.py whatif" % c2trace.c2build.name())
     ap = argparse.ArgumentParser(prog="c2trace.py regmap", usage=__doc__)
     ap.add_argument("--func", required=True)
     ap.add_argument("--asm-vs", required=True)

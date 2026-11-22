@@ -78,6 +78,9 @@ ILINE = re.compile(r"^I (\S+) (\S+) (\d+) (\d+) \|(.*?)(?: ; (.*))?$")
 
 def hooks_for(build):
     b = BUILDS.get(build)
+    if not b and c2build.get("arch") == "x64":
+        sys.exit("merges: not ported to %s (FgDoCommonTailMerge's walk / size probes are not mapped; the late flow "
+                 "optimiser's IL is visible with `c2trace.py il --at @dop2_FinalFlowOpts@4`)" % build)
     if not b:
         sys.exit("merges: c2 build %s not ported (14.00, 13.10.3077, 13.10.3052, 15.00.30729.1)" % build)
     h = dict(b)

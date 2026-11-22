@@ -40,6 +40,8 @@ def _va(img, plain):
 def hooks():
     b = c2trace.c2build.name()
     key = "15.00" if b.startswith("15.00") else "14.00" if b == c2trace.c2build.DEFAULT else None
+    if c2trace.c2build.get("arch") == "x64":
+        sys.exit("c2x87: not applicable to %s: x64 code uses SSE, there is no x87 stack" % b)
     if key is None:
         sys.exit("c2x87: cl 13.10 has no X87MapGFxToSTx (its x87 view is FPColor's: regs --all-classes)")
     img = Image("c2")

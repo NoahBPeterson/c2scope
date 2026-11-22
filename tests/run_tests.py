@@ -389,8 +389,9 @@ def symkeys_tests():
           int(ka.get("_tB", 99)) < int(ka.get("_tA", 0)), True)
     out = symkeys("keys", SK, *FLAGS)
     rep = re.findall(r"replay: (\d+)/(\d+) keys reproduced", out)
+    # (13.00.9044: VC6's front end emits no body for the unreferenced inline functions, so 6 functions, not 10)
     check("symkeys: the allocator replay reproduces every traced key (all functions)",
-          (len(rep) >= 8, all(a == b for a, b in rep)), (True, True))
+          (len(rep) >= (6 if BUILD == "13.00.9044" else 8), all(a == b for a, b in rep)), (True, True))
     out = symkeys("sites", SK, "--func", "kx87", "--pass", "2", *FLAGS)
     check("symkeys sites: [p+0] (p key 3: hash 0x6000+d) is loaded before s (key 1)",
           bool(re.search(r"1st .*h60[0-9a-f]{2}\n\s+2nd .*_s \(?key 1", out)), True)
@@ -513,15 +514,33 @@ def symkeys_hash_tests():
     d = {k: tuple(c.get(x, 0) - b.get(x, 0) for x in ("walk", "assign", "later")) for k, c in cnt.items()}
     check("symkeys hash: per construct (walk, assignment tail, later) against hb",
           [d.get(k) for k in ("hparen1", "hparen3", "hnoparen", "hleaf", "hcast", "hflag", "hdbl")],
-          [(1, 0, 0), (3, 0, 0), (-2, 0, 0), (0, 0, 0), (1, 0, 0), (1, 2, 1),
-           (3, 0, 0) if BUILD.startswith("13.10") else (1, 0, 0)])
-    check("symkeys hash: walk / assign / later counts of hb",
-          tuple(b.get(x, 0) for x in ("walk", "assign", "later")), (51, 4, 6) if BUILD.startswith("13.10") else (65, 4, 6))
+          [(1, 0, 0), (3, 0, 0), (-2, 0, 0), (1 if BUILD == "13.00.9044" else 0, 0, 0), (1, 0, 0), (1, 2, 1),
+           (3, 0, 0) if BUILD.startswith("13.10") or BUILD == "13.00.9044" else (1, 0, 0)])   # 9044: VC6's front
+    check("symkeys hash: walk / assign / later counts of hb",                                # end parenthesises a load
+          tuple(b.get(x, 0) for x in ("walk", "assign", "later")),
+          (51, 4, 6) if BUILD.startswith("13.10") or BUILD == "13.00.9044" else (65, 4, 6))
     ranks = [sorted(v) for v in hs.values() if v]
     check("symkeys hash: key mod 32 = rank among the function's hash temps (own blocks of 32, no reuse in class)",
           (len(ranks) >= 8, all(key % 32 == i % 32 for r in ranks for i, (_, key) in enumerate(r))), (True, True))
     check("symkeys hash: freed hash keys are handed out again as temporaries (temp free list)",
           all(len(tm[k] & {key for _, key in hs[k]}) > 0 for k in hs if hs[k]), True)
+    if BUILD == "13.00.9044":
+        # the immediate table (symkeys.md "cl 13.00.9044"): unused address immediates are freed bucket by bucket
+        # (c1 symbol number & 63) and their web numbers handed out again last-freed first, so 19 typedefs in front
+        # (gv3's number 301 + 19 = 320 wraps to bucket 0) swap the numbers of the tied pieces of 0 and 32
+        dial = open(os.path.join(HERE, "work", "port1300", "dial9044.cpp")).read()
+        got = {}
+        for n in (0, 19):
+            p = os.path.join(tempfile.mkdtemp(), "dial.cpp")
+            open(p, "w").write("".join("typedef int d%d;\n" % i for i in range(n)) + dial)
+            out = symkeys("keys", p, "--func", "r2", "--imm", "--", "/TP")
+            fr = re.findall(r"^&\S+\s+(\d+)\s+(\d+)\s+\d+\s+(\d+) freed", out, re.M)
+            m = re.search(r"^# freed in bucket order \(webs\): ([\d ]+);", out, re.M)
+            pc = dict(re.findall(r"^   piece of (\S+)\s+web\s+(\d+)", out, re.M))
+            got[n] = ([w for _, _, w in sorted(fr, key=lambda x: int(x[1]))] == (m.group(1).split() if m else None),
+                      int(pc.get("0", 0)) > int(pc.get("32", 0)))
+        check("symkeys 9044 --imm: address immediates freed in bucket order; 19 typedefs swap the tied pieces' numbers",
+              (got[0], got[19]), ((True, True), (True, False)))
 
 
 def fpcheck_tests():
@@ -1060,6 +1079,67 @@ def ncolsim_il_tests():
           (2, [1], [1], [0x30], (None, "r8d"), ("k$1", None)))
 
 
+def ncolsim_ilmodel_tests():
+    """ncolsim's remaining NColor inputs from the IL (docs/c2/ncolor.md 12): live counts, availability and lifetime
+    index from the IL before NColSubsumption (tests/data/ncol/ilpre: `c2ncol.py --export --il` of c1, c2, sum), the
+    tied register / window, preferences, useable / anti-preference sets and the lists; the list lever `bucket:` on
+    tests/data/ncol/bucket/scope.cpp; registers from a variant's own IL after equal-arms ifs and value copies
+    (tests/data/ncol/eqif, copies: levers.cpp variants, gzipped exports). No compile."""
+    import glob, gzip, io, json, contextlib, ncolsim as N
+    fs = N.load(sorted(glob.glob(os.path.join(HERE, "tests", "data", "ncol", "ilpre", "*.json"))))
+    lv = ix = av = nb = nc = na = 0
+    for f in fs:
+        tp, st = N.il_parse(f["il_pre"]), f["state"]
+        L, I, A = N.il_live(tp), N.il_index(tp), N.il_avail(tp, st["ntup"])
+        lv += sum(L[b] == st["live"][b] for b in range(len(L)))
+        nb += len(L)
+        ix += sum(I.get(c["sym"]) == c.get("index") for c in f["cands"])
+        nc += len(f["cands"])
+        av += sum([tuple(x) for x in st["avail"][str(r)]] == v for r, v in A.items())
+        na += len(A)
+    check("ncolsim il_pre: live counts per block / lifetime indices / integer availability lists as traced",
+          (lv, nb, ix, nc, av, na), (65, 65, 65, 65, 60, 60))
+    with contextlib.redirect_stdout(io.StringIO()):
+        c = N.cmd_ilmodel(fs, 0)
+    check("ncolsim ilmodel: order, tied register, window, preferences, useable, anti-preference (of 65 candidates)",
+          tuple(c[k] for k in ("order same", "tied same", "window same", "prefs same", "useable same", "anti same")),
+          (4, 65, 64, 63, 65, 64))
+    b = io.StringIO()
+    with contextlib.redirect_stdout(b):
+        N.cmd_ilfull(fs, 0)
+    check("ncolsim ilfull: replay (int, xmm) and sim with every input from the IL",
+          [ln.split(":")[1].split("single")[0].strip() for ln in b.getvalue().splitlines()[1:]],
+          ["52 of 54", "9 of 9", "60 of 63"])
+    bf = {f["func"].split("@")[0][1:]: f for f in N.load([os.path.join(HERE, "tests", "data", "ncol", "bucket",
+                                                                     "scope.json")])}
+    lists = lambda f: {N.short(k): v for k, v in N.lists_of(f).items() if N.named(N.short(k))}
+    check("ncolsim lists: a value held in a one-member struct or a scope object is class 6: list 1 (non-int "
+          "global), the plain int is list 3", (lists(bf["boxed"])["s"], lists(bf["scoped"])["s"],
+                                               lists(bf["plain"])["saved"]), (1, 1, 3))
+    pr, bx = N.predict(bf["plain"], ["bucket:saved=aggr"]), N.regs_of(bf["boxed"])
+    check("ncolsim whatif bucket:saved=aggr on plain = the registers of boxed (saved first: rbx, p rdi, r rsi)",
+          (pr["saved"], pr["p"], pr["r"], bx["s"], bx["p"], bx["r"], N.regs_of(bf["plain"])["saved"]),
+          ("rbx", "rdi", "rsi", "rbx", "rdi", "rsi", "rbp"))
+    for tag, want in (("eqif", (20, 20, 0)), ("copies", (12, 12, 2))):
+        d = json.loads(gzip.open(os.path.join(HERE, "tests", "data", "ncol", tag, tag + ".json.gz")).read())
+        fx = {f["func"].split("@")[0][1:]: f for f in d["functions"]}
+        ok = n = edits = 0
+        for name, base, _v, _line in d["variants"]:
+            fv, fb = fx[name], fx[base]
+            got = N.regs_of(fv)
+            names = [k for k in got if N.named(k) and "/" not in got[k]]
+            p = N.il_predict(fv)
+            n += 1
+            ok += all(p.get(k) == got[k] for k in names if k in p)
+            dl = N.run_delta(fb, fv)
+            if not dl["blocks"]:
+                pe = N.predict(fb, dl["edits"])
+                edits += all(pe.get(k) == got[k] for k in names if k in pe)
+        check("ncolsim il_predict: %s variants of levers.cpp with a register change, registers from the variant's "
+              "IL / from the base run's measured edits" % tag, (ok, n, edits), want)
+
+
+
 def sched17_predict_tests():
     """tools/c2sched17.py --predict offline: each region's DAG, latencies, units and static priorities built from
     its IL (tests/data/sched17/il/*.json: `c2sched17.py --il --export` of tests/data/ncol's c1 / c2 / sum and zlib's
@@ -1107,6 +1187,61 @@ def symkeys17_tests():
     m = re.search(r"^\?kparams@\S*\s+(.*?)\s+\[", r.stdout, re.M)
     check("symkeys17: parameters in reverse, locals by first reference; two dummy globals",
           " ".join(m.group(1).split()[1:8]) if m else "", "c:1 b:2 a:3 r:4 q:5 DummyGlobal:32 DummySafeGlobal:33")
+
+
+def slots17_frames_tests():
+    """x64 frame kinds (docs/c2/slots.md 6.1) from exports, no compile: tests/data/slots17/snap/*.json are `c2trace.py
+    slots --all --export` of tests/data/slots17/{frames,frames2,tr}.cpp under --c2 17.00 /TP /O2 /GS. Dynamic
+    alignment (locals from the aligned rbp), alloca (rbp = rsp + B, B = min(A, 0xf0)), the argument area removed by
+    TryRemoveArgumentAreaFromStackFrame (homes - F): the model's decisions and the final offsets against the listing."""
+    import glob, c2slots as C
+    n = ok = agree = named = 0
+    kinds = dict(alloca=0, dyn=0, removed=0, b_below_a=0)
+    for p in sorted(glob.glob(os.path.join(HERE, "tests", "data", "slots17", "snap", "*.json"))):
+        s = C.load(p)
+        res = C.model_of(s).run(C.base_order(s), record=True)
+        a, b, _miss = C.listing_agree(s, C.final_offsets(s, res))
+        fr = s["fn"]["frame"]
+        kinds["alloca"] += bool(fr.get("alloca"))
+        kinds["dyn"] += bool(fr.get("dyn"))
+        kinds["removed"] += fr.get("Fend") == 0 and fr["F"] != 0
+        kinds["b_below_a"] += fr["B"] < fr["A"]
+        n, ok, agree, named = n + 1, ok + (not C.check(s, res)), agree + a, named + b
+    check("slots17: model exact on the 15 frame fixtures; listing offsets reproduced", (n, ok, agree, named),
+          (15, 15, 56, 56))
+    check("slots17: fixture frame kinds (alloca, dynamic alignment, argument area removed, B < A)",
+          tuple(kinds.values()), (7, 6, 2, 3))
+    fr = dict(A=32, F=64, pushed=8, B=32)
+    check("slots17: frame_deltas: rsp frame / alloca (rbp = rsp + B) / dynamic alignment / argument area removed",
+          (C.frame_deltas(fr), C.frame_deltas(dict(fr, lrsp=False, prsp=False)), C.frame_deltas(dict(fr, lrsp=False)),
+           C.frame_deltas(dict(A=32, F=40, pushed=0, B=32, Fend=0))), ((32, 72), (0, 40), (0, 72), (32, 0)))
+
+
+slots17_frames_tests()
+
+
+def x64_refusal_tests():
+    """Tools without an x64 version refuse under --c2 17.00 with one line naming the replacement (docs/c2/port-1700.md,
+    tool status); no compile runs (each exits before it)."""
+    env = dict(os.environ, C2_BUILD="17.00")
+    src = os.path.join(HERE, "tests", "data", "tailmerge.c")
+    runs = {"regs": ["c2trace.py", "regs", src, "--func", "c1"], "scratch": ["c2trace.py", "scratch", src, "--func", "c1"],
+            "regmap": ["c2trace.py", "regmap", src, "--func", "c1", "--asm-vs", "x", "--asm-func", "y"],
+            "merges": ["c2trace.py", "merges", src, "--func", "c1"], "x87": ["c2x87.py", src, "--func", "c1"],
+            "judge": ["judge.py", src, "--func", "c1", "--asm-vs", "x"], "ltcgstub": ["ltcgstub.py", "facts", "x.exe", "1"]}
+    want = {"regs": "c2ncol.py", "scratch": "c2ncol.py", "regmap": "c2ncol.py", "merges": "not ported",
+            "x87": "uses SSE", "judge": "x86-only", "ltcgstub": "c2ltcg.py"}
+    got = {}
+    for k, argv in runs.items():
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", argv[0])] + argv[1:], capture_output=True,
+                           text=True, cwd=HERE, env=env)
+        last = (r.stderr.strip().splitlines() or [""])[-1]
+        got[k] = r.returncode != 0 and want[k] in last
+    check("x64 refusals: regs, scratch, regmap, merges, c2x87, judge, ltcgstub name their replacement",
+          sorted(k for k, v in got.items() if not v), [])
+
+
+x64_refusal_tests()
 
 
 def judge_tests():
@@ -1219,6 +1354,7 @@ ncol_levers_tests()
 sched17_tests()
 sched17_predict_tests()
 ncolsim_il_tests()
+ncolsim_ilmodel_tests()
 symkeys17_tests()
 
 

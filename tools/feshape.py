@@ -19,6 +19,7 @@ measured map from source mutations to front-end IL; icount's `structure` verdict
 import argparse, collections, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c2trace
+X64 = c2trace.c2build.get("arch") == "x64"
 
 STAGES = (("reader", ("MscRVO", "Inline")), ("inlined", ("FgSimpleFoldCmps",)))   # 15.00 / 13.10: no MscRVO hook
 IMPLICIT = re.compile(r"^(cc|fcc|esp|ebp|regset|fcw|cc_\w+|st|mem)\b")
@@ -78,11 +79,22 @@ def shape(line):
     cc = re.search(r"(?:^| )cc=(\w+)", nt)
     d, _, sr = rest.partition("<-")
     ks = lambda t: [k for k in (kind(x, notes) for x in t.split()) if k]
+    if X64:     # a code address prints as its symbol number (s8192), not s0: its note is the one of its position
+        ks = lambda t, side: [k for k in (kind(x, {x.split(":")[0]: notes.get("%s%d" % (side, i))} if
+                                               re.match(r"^s\d+:", x) else notes) for i, x in enumerate(t.split())) if k]
+        return "%s%s(%s<-%s)" % (op, "[%s]" % cc.group(1) if cc else "", ",".join(ks(d, "d")), ",".join(ks(sr, "s")))
     return "%s%s(%s<-%s)" % (op, "[%s]" % cc.group(1) if cc else "", ",".join(ks(d)), ",".join(ks(sr)))
 
 
 def shapes(lines):
     return collections.Counter(s for s in (shape(l) for l in lines) if s)
+
+
+def x64plus(spec):
+    """'+' when the build is x64 and its il_spec is the plain dump: the shapes read the extended dump's notes (cl 17.00
+    keeps il_spec plain for c2ncol / c2sched17 --il, whose parsers take the plain lines)."""
+    import c2build
+    return "+" if c2build.get("arch") == "x64" and spec.endswith("%") else ""
 
 
 def collect(path, func, cl, keep=None):
@@ -95,7 +107,7 @@ def collect(path, func, cl, keep=None):
     for st, ps in STAGES:
         p = next((p for p in ps if p in got), None)
         if p is not None and got[p] not in [va for _s, va in names]:
-            texts.append("%x%s" % (got[p], c2il.SPEC))
+            texts.append("%x%s" % (got[p], c2il.SPEC + x64plus(c2il.SPEC)))
             names.append((st, got[p]))
     if not texts:
         raise RuntimeError("no front-end passes on this build")

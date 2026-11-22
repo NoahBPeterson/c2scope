@@ -36,7 +36,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 ROLES = ["start", "pnew", "pnew_lod", "ptry", "pjoin", "pjoin_lod", "elem", "ctry", "cjoin", "cjoin_lod",
          "cnew_lod", "gs_join", "gs_new", "done", "redo", "sorted", "col", "mem"]
-ROLES_EXTRA = ["frame"]      # optional: the frame decision (name, argument area A, F, pushed bytes, B)
+ROLES_EXTRA = ["frame", "fend"]   # optional: the frame decision (name, argument area A, F, pushed bytes, B, ..) and
+                                  # F at encoding (name, FUNC+0x70: 0 once TryRemoveArgumentAreaFromStackFrame ran)
 # {SYM:x}: sym, index, size, uses, kind|fl5|fl6|fl7, key, name, alignCode, ty, SSR+0x28 ($T number)     {LOD:x}: 12 nodes of the SBV at x
 SYM9 = "{x},{x}>0x3c,{x}>0x20,{x}>0x38,{x}>4,{x}>0x1c,{x}>0>4$,{x}>0x2c,{x}>0x10,{x}>0>0x28"
 # 14.00.50727.762 (addresses: docs/c2/slots.md section 2; frame.md section 4)
@@ -180,6 +181,14 @@ def parse(log, info):
         if role == "frame":
             if v[0] == F["name"] and F["frame"] is None:
                 F["frame"] = dict(A=s32(v[1]), F=s32(v[2]), pushed=s32(v[3]), B=s32(v[4]))
+                if len(v) >= 12:     # + FUNC+0x74 / +0x78 (frame registers of locals / params), RegSym[5] = rsp, the
+                    rsp = (v[7] + 5 * 0x64) & 0xffffffff        # dynamic-alignment bit and cap, FUNC+0xe4 / +0xe8
+                    F["frame"].update(lrsp=v[5] == rsp, prsp=v[6] == rsp, dyn=v[8] & 1, cap=v[9],
+                                      alloca=bool(v[10] & 0x1000 or v[11] & 0x100))
+            continue
+        if role == "fend":
+            if v[0] == F["name"] and F["frame"] is not None and "Fend" not in F["frame"]:
+                F["frame"]["Fend"] = s32(v[1])
             continue
         run = F["runs"][-1]
         if role == "pnew":
@@ -688,16 +697,29 @@ def listing_slots(asm, func):
     return syms
 
 
+def frame_deltas(fr):
+    """(locals, parameter homes): what MdmInsertEntryExit and the listing add to a packed offset / a home (8 + 8i).
+    Locals: + A when their frame register (FUNC+0x74) is rsp and B == A, else + A - B (alloca frames: rbp = rsp + B;
+    dynamic alignment: the aligned rbp, so + 0). Homes: + F + pushed bytes, - B when the parameters' frame register
+    (FUNC+0x78) is not rsp (alloca: rbp, or r13 next to a dynamically aligned rbp), - F when
+    TryRemoveArgumentAreaFromStackFrame deleted the `sub rsp, F` (F = 0 at encoding: role `fend`). Frame records
+    without the registers: the rsp rule."""
+    lrsp, prsp = fr.get("lrsp", True), fr.get("prsp", True)
+    gone = fr["F"] if fr.get("Fend") == 0 and fr["F"] else 0     # the argument area removed: homes - F
+    return (fr["A"] if lrsp and fr["B"] == fr["A"] else fr["A"] - fr["B"],
+            fr["F"] + fr["pushed"] - (0 if prsp else fr["B"]) - gone)
+
+
 def attach_listing(F, syms):
     """{element idx: dict(lname, loff, lsize, lrefs, line)} by name stem (or tv<key>) and final offset."""
     offs = {}
     fr = F.get("frame")                     # x64: the listing gives [rsp+N], i.e. packed + A (homes: + F + pushed)
+                                            # (alloca / dynamic alignment: frame_deltas)
     for c in F["cols"]:
         for i, off in c["members"]:
             offs[i] = off
             if fr and off is not None:
-                offs[i] = off + (fr["F"] + fr["pushed"] if c["c"] < len(F["params"]) else
-                                 (fr["A"] if fr["B"] == fr["A"] else fr["A"] - fr["B"]))
+                offs[i] = off + frame_deltas(fr)[1 if c["c"] < len(F["params"]) else 0]
     used, out = set(), {}
     by = collections.defaultdict(list)
     for n, s in syms.items():
@@ -746,6 +768,13 @@ def report(s, res, bad, tried_max=8, out=sys.stdout):
     fr = fn.get("frame")
     if fn.get("argarea"):
         kind = "rsp frame, A=%s F=%s pushed=%s" % ((fr["A"], fr["F"], fr["pushed"]) if fr else ("?", "?", "?"))
+        if fr and fr.get("Fend") == 0 and fr["F"]:
+            kind += ", argument area removed (no sub rsp; homes - F)"
+        if fr and (fr.get("alloca") or fr.get("dyn")):
+            kind = kind[4:] + ", B=%d%s%s; locals from %s, homes from %s" % (
+                fr["B"], ", alloca" if fr.get("alloca") else "", ", dynamic alignment %d" % fr["cap"] if fr.get("dyn")
+                else "", "rsp" if fr.get("lrsp") else "the frame register", "rsp" if fr.get("prsp") else
+                "the frame register")
     else:
         kind = "%s frame" % ("EBP" if fn.get("ebp") else "ESP")
     w("# %d elements (%d params), %d colours, T=%d%s, %s%s%s\n" % (
@@ -813,15 +842,15 @@ def final_offsets(s, res):
     fr = fn.get("frame")
     if not fn.get("argarea") or not fr:
         return None
-    d = fr["A"] if fr["B"] == fr["A"] else fr["A"] - fr["B"]
+    d, dp = frame_deltas(fr)
     out = {}
     for k, C in enumerate(res["cols"]):
         for m in C["members"]:
             if res["offs"].get(m) is not None:
-                out[m] = res["offs"][m] + (fr["F"] + fr["pushed"] if k < res["nfixed"] else d)
+                out[m] = res["offs"][m] + (dp if k < res["nfixed"] else d)
     for p in s["params"]:
         if p not in out and res["offs"].get(p) is not None:
-            out[p] = res["offs"][p] + fr["F"] + fr["pushed"]
+            out[p] = res["offs"][p] + dp
     return out
 
 
@@ -1054,6 +1083,15 @@ def _prologue(ins, m0=None):
             break
         other = True                        # an instruction the scheduler moved in: stepped over
     return out
+
+
+def orig_x86():
+    """Exit on an x64 build: the original's frame walk (orig_slots) is the 32-bit one (esp/ebp, push depth)."""
+    import c2build
+    if c2build.get("arch") == "x64":
+        sys.exit("c2slots --orig / --search / orig, framefields: 32-bit code only (esp/ebp push depth); not ported to "
+                 "%s: compare the `final` column of `c2trace.py slots` with the original's [rsp+N] by hand"
+                 % c2build.name())
 
 
 def orig_slots(ins, callee_pop=None):
@@ -1360,6 +1398,7 @@ def run_one(F, info, asm, a):
         print()
         what(s, a.what)
     if a.orig or a.image:
+        orig_x86()
         ins = read_orig(a.orig, a.image, int(a.va, 16) if a.va else None)
         om, oi = orig_map(s, asm, ins, image_callee_pop(a.image) if a.image else None)
         print("\n# original: %d instructions, %d reached (%d depth conflicts), %d aligned with ours, shift %d (locals) %d (params)"
@@ -1381,6 +1420,8 @@ def offline(argv):
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--limit", type=int, default=800)
     a = ap.parse_args(argv[1:])
+    if argv[0] in ("orig", "search"):
+        orig_x86()
     if argv[0] == "orig":
         ins = read_orig(a.orig, a.image, int(a.va, 16) if a.va else None)
         slots, info = orig_slots(ins)

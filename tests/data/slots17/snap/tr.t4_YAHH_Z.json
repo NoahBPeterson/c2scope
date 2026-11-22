@@ -1,0 +1,142 @@
+{
+"build": "17.00.61030-x64",
+"func": "?t4@@YAHH@Z",
+"nstack": 2,
+"params": [
+0
+],
+"elems": {
+"0": {
+"idx": 0,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 0,
+"key": 2,
+"name": "a",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 8,
+"lod": [],
+"lodtrunc": false,
+"tnum": 2575,
+"never": false,
+"gs": 0
+},
+"1": {
+"idx": 1,
+"size": 16,
+"uses": 5,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 3,
+"name": "k",
+"align": 4,
+"ty": 24592,
+"ssize": null,
+"poff": null,
+"lod": [
+1
+],
+"lodtrunc": false,
+"tnum": 2578,
+"never": false,
+"gs": 4
+}
+},
+"fn": {
+"npc": 0,
+"ebp": 0,
+"nparams": 1,
+"gs": true,
+"gscopies": true,
+"alloc": 0,
+"cap": 16,
+"dalign": null,
+"ebpadj": 0,
+"v13": false,
+"T": 16,
+"ncol": 2,
+"tround": 16,
+"undo": false,
+"up": true,
+"palign": true,
+"capdef": 16,
+"argarea": true,
+"frame": {
+"A": 32,
+"F": 72,
+"pushed": 0,
+"B": 32,
+"lrsp": true,
+"prsp": true,
+"dyn": 0,
+"cap": 16,
+"alloca": false,
+"Fend": 72
+}
+},
+"obs": {
+"run": [
+{
+"idx": 1,
+"tries": [],
+"res": [
+"c",
+1
+],
+"ncol": 1
+}
+],
+"undo": false,
+"cols": [
+{
+"c": 0,
+"base": 8,
+"members": [
+[
+0,
+8
+]
+]
+},
+{
+"c": 1,
+"base": 0,
+"members": [
+[
+1,
+0
+]
+]
+}
+],
+"done": {
+"T": 16,
+"npc": 0,
+"ebp": null,
+"joins": null
+}
+},
+"listing": {
+"0": {
+"lname": "a$",
+"loff": 80,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"1": {
+"lname": "k$",
+"loff": 32,
+"lsize": null,
+"lrefs": 5,
+"line": 6
+}
+}
+}

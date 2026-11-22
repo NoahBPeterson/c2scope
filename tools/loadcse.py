@@ -42,6 +42,9 @@ import c2trace, c2il  # noqa: E402
 
 PASSES = [("V", "@GdfInsertArtificialAssigns@4"), ("S2", "@GoptLocalCopyPropagation@4"), ("O", "@Opeq@4"),
           ("C", "@Color@4"), ("E", "@EncEmitFunc@4")]
+X64 = c2trace.c2build.get("arch") == "x64"
+if X64:    # cl 17.00 x64: NColor allocates (no Color); the plain dump has no notes, so take the extended one (`%+`)
+    PASSES[3] = ("C", "@NColor@4")
 RMW_OPS = {"OPADD": "add", "OPSUB": "sub", "OPAND": "and", "OPOR": "or", "OPXOR": "xor", "OPSHL": "shl",
            "OPSHR": "shr", "OPSAR": "sar"}
 NO_RMW = {"OPMUL", "OPDIV", "OPMOD", "OPNEG", "OPNOT", "OPUDIV", "OPUMOD", "OPROL", "OPROR"}
@@ -300,7 +303,7 @@ class Stage:
 
 def run(src, func, cl, keep=None):
     hk_texts = [p for _, p in PASSES]
-    spec = c2il.SPEC
+    spec = c2il.SPEC + ("+" if X64 and c2il.SPEC.endswith("%") else "")
     os.environ["C2TRACE_ILPAS"] = "1"
     img, hk, rc, out, log = c2trace.run_trace(src, [p + spec for p in hk_texts], cl, keep=keep)
     if rc:

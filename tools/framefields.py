@@ -131,6 +131,7 @@ def main(argv):
         k = argv.index("--")
         argv, cl = argv[:k], argv[k + 1:]
     a = ap.parse_args(argv)
+    c2slots.orig_x86()
     info, funcs, asm, d = c2slots.trace(a.src, a.func, cl)
     if not funcs:
         sys.exit("no frame elements for %r (or the compile failed)" % a.func)

@@ -2281,6 +2281,10 @@ def main():
     cmd = argv.pop(0)
     if cmd == "_loads":
         return _loads_child(argv, cl)
+    if cmd in ("mine", "query") and c2trace.c2build.get("arch") == "x64":
+        sys.exit("effectmine %s: every variant is observed through the x86 allocator's trace (Color: realize.Trace); "
+                 "not on %s: for x64 levers use realize.py / rwsweep.py (NColor, predicted with ncolsim)"
+                 % (cmd, c2trace.c2build.name()))
     ap = argparse.ArgumentParser(prog="effectmine.py " + cmd, usage=__doc__)
     if cmd in ("mine", "query"):
         ap.add_argument("src")

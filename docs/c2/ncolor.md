@@ -193,7 +193,8 @@ Args: ecx = R, edx = SYM*, [ebp+8] = &prefListHead (out), [ebp+0xc] = &conflictT
   type class and byte size (TLS+0x11970 qword int, 0x11974 dword, 0x11978 word, 0x1197c byte,
   0x11984.. xmm variants, 0x119ac/0x119b0 float 4/8).
 * For every def tuple of R: `NColMdTrimUseableRegisters(BV, tuple, dstOperand)` (only acts when
-  FUNC+0x84 != FUNC+0x80, i.e. EH funclets: removes r13/r13d/r13w/r13b there, cold 0x102d13a5);
+  FUNC+0x84 != FUNC+0x80, which is a dynamically aligned frame (FUNC+0x5c bit 0), not EH in general: removes
+  r13/r13d/r13w/r13b in funclets or with FUNC+0xe4 & 0x80000, cold 0x102d13a5);
   if BV becomes empty: *conflictTup = tup#, return. Then `NColMdAddToPreferences(operand, tuple,
   BV)`.
 * Same for every use tuple (source operand found by symbol or by overlap).
@@ -704,7 +705,9 @@ realises it with one instruction and is the diagnosis (the original references V
 
 ### 10.4 Not covered
 
-- Edits that change the block structure (eqif, cflow, tail duplication) are not predicted; nor are moved ranges
+- (Section 12.2 / 12.3: a variant's registers are now computed from its own IL, which covers block-structure changes,
+  moved ranges and copies when the variant is compiled.) Edits that change the block structure (eqif, cflow, tail
+  duplication) are not predicted from the base run; nor are moved ranges
   (a statement swap that lengthens a global, a use moved past a call), new copy partners and their preferences
   (an `alias val` copy: NColSubsumption is not modelled), or a new candidate's own register.
 - need() proposes `+app` / `-app` / `before` only, not liveness or range edits; it searches singles and pairs.
@@ -790,3 +793,101 @@ register) plus the call clobber sets are the obvious input, not yet compared wit
 Commands: `ncolsim.py ilin EXPORT..` (the inputs against the trace), `ilprio` / `ilprio+live`, `ilsim` (replay
 and sim on the IL's inputs); `prio`, `replay`, `sim` and `whatif` are unchanged (an `--il` export also
 carries everything they read).
+
+The rest of these inputs: section 12.
+
+---------------------------------------------------------------------------------------------------
+
+## 12. All of NColor's inputs from the IL (ncolsim.py ilmodel / ilfull, il_predict; T17 1, 6, 7; 2026-11-21)
+
+`c2ncol.py --export --il` now also dumps the IL at **NColSubsumption's entry** (0x1009ab40, `c2ncol.PRE_HOOK`; the
+record's `il_pre`). That is the stream NColInitializeSyms and NColBuildInfo saw: the IL of section 11 is read after
+NColSubsumption and NColFoldTooCheap, which replace each removed copy / folded definition by an empty `op577` in the
+same slot (NColTupRemove 0x100b98f0) and rename the absorbed lifetime's leaves to views of the survivor
+(NColCombineLifetimes). The tuple numbering is the same in both dumps. Read statically (work/port1700 helpers),
+measured on zlib 1.2.1 at /O2 (97 functions, 3189 candidates, re-exported with `il_pre`) and on tests/data/ncol/ilpre
+(c1, c2, sum; `ncolsim_ilmodel_tests`).
+
+| input | rule **[C] unless marked** | zlib | fixtures |
+|---|---|---|---|
+| lifetime index (`il_index`) | NColInitializeSyms 0x1017a350: tuples forward, destinations then sources, REG leaves by root; an untied leaf numbers its root as a candidate, a tied one (preassigned register, root not a physreg) in the nPhys sequence, in the same field SYM+0x38: first role seen wins. The gaps of the traced indices are lifetimes absorbed later | 3189 / 3189 | 65 / 65 |
+| live count per block, maxLive (`il_live`) | NColBuildInfo 0x100d7220, backward: liveness of the *global* lifetimes only (candidates and tied lifetimes whose first and last appearance are in different blocks), pruned by NColDoLiveness' second fixpoint (in = live-in & U pred out; out = live-out & (appears \| in - defs)); per block the count starts at \|out\| and adds one per source whose bit is not set (a birth: a value used again after it died counts twice); a definition never adds (sets, then clears the bit unless the tuple reads it or it is a partial view); block 0 stores 0 | 2528 / 2528 blocks | 65 / 65 |
+| integer availability (`il_avail`) | NColInitializeAvailability / NColStartAvailability / NColTerminateAvailability, backward: a register is available at a defining tuple and at the last use of the value defined there, busy strictly between; a def or clobber with no tied use later splits `[.., t] / [t+1, ..]`; a register the clobbering tuple reads is not cut; calls clobber rax rcx rdx r8..r11 **[I]**; `[0,0]` / `[n,n]` are sentinels | 1442 / 1455 lists (92 of 97 functions all exact) | 60 / 60 |
+| tied register, window (`il_tied_pre`) | set in NColBuildInfo by both sites as overwrites in a backward walk: the qualifying copy with the smallest tuple number; `mov x <- phys` (any def) or `mov phys <- x` where the use ends one of x's ranges; NColMdIsCopyInstr: mov, movaps / movapd / movdqa / movdqu, movsd / movss (scalar float types); never movzx / movsx / lea. NColCombineLifetimes gives the survivor the absorbed tie if it has none; the window is the range that begins (or ends) at the copy, clipped to 15 tuples | 3182 / 3181 of 3189 | 65 / 64 |
+| region preference list (`il_pref_sources`) | the destination of a mov at the last use, then the source of every mov defining the candidate, each at the head; partners resolved with the registers given so far (simulate's `prefs_of`). Adding loads at the last use or NColMdLeaPref's lea base measured worse | 3042 / 3189 | 63 / 65 |
+| useable set (`il_useable`) | NColMdGetInitialRegisters: every integer register but rsp (the masters lack rbp; NColMdPerFuncInit adds it back unless a frame register or a reservation needs it); rbp out when the function has a try block (OPEHTRY) **[I]** or NColMdPerFuncInit reserves it as a frame base (0x1009271d: TLS+0x1196c >= 6 * 24 when favoring speed; the score NColCanon accumulates, fitted as 6 per stack-symbol leaf + 1 per kind-5 memory operand **[I]**: inflate, inflateBack, inflate_table) | 3189 / 3189 | 65 / 65 |
+| anti-preference (`il_anti`) | NColMdAddToPreferences 0x10069010: the memory operand of a mov (first destination, else first source) or an lea source whose base is the candidate: no index -> r12, no displacement -> rbp / r13, both -> all three; a union over the appearances | 3147 / 3189 | 64 / 65 |
+| lists and order (`il_lists`, `order_of`) | below | 97 / 97 functions | 4 / 4 |
+
+**Lists [C].** class = (SYM type >> 12) & 0x1f from the IL's `T S` line of the candidate's root; int when `(1 << class)
+& 0x1e`. **Class 6** (a small struct held whole in an integer register: type 0x6004 / 0x6008) gets integer registers
+(NColMdGetRegOrder) but is *not* int for the lists: it is in list 0 / 1 with the xmm candidates, processed before every
+integer candidate. Local / global from the IL lifetime at prioritization (the traced first / last are read later, after
+coalescing grew some). Lists 4 / 5: one definition whose sources are all constants, symbol or code addresses (leaf kinds
+7, 3, 4: `NColUsesOnlyConsts`). NColMdAdjustPriority: with a loop in the function the int-global of highest priority
+above 16 * max(1, highest int-local priority) goes to the head of list 2; list 3 is built by pushing on its head and
+scanned with `>`, so a tie goes to the *higher* lifetime index; not in a function with a try block (c2.cpp's f2: FUNC+0xe4
+& 0x80 **[I]**). With traced priorities and indices this gives the traced order of every zlib function.
+
+**Numbers** (`ncolsim.py ilfull`: every input above from the IL, xmm availability still traced):
+
+| | priorities | replay int | replay xmm | sim |
+|---|---|---|---|---|
+| traced inputs (section 9) | 3159 / 3189 | 2585 / 2669 | 21 / 21 | 2549 / 2690 |
+| section 11 (appearances, ranges, blocks, depth from the IL) | 3182 | 2567 | 21 | 2520 |
+| all from the IL (`ilfull`) | 3182 | 2547 | 21 | 2498 |
+| the same with the traced preference lists | 3182 | 2563 | 21 | 2514 |
+| the same, lifetimes coalesced by the model from `il_pre` (`subsume`) | 3099 | 2538 | 21 | 2366 |
+
+Fixtures: replay 52 / 54 and 9 / 9, sim 60 / 63 (traced inputs: 53 / 54, 9 / 9, 61 / 63). What the trace-free path
+still lacks: the preference lists (16 replay cases of zlib), the clobber set of a call to a function of the same unit
+compiled before (interprocedural register usage: `_tr_init -> init_block` keeps rcx and r9..r11; the dump shows only
+`regset:0`), and the xmm availability banks.
+
+### 12.1 The list lever (T20 0x1400bd4f0)
+
+tests/data/ncol/bucket/scope.cpp (our own source, /O2 /GS- /EHsc, throw() callees): `plain` saves a TLS mode word in
+`int saved`, does work on a pointer p across calls and restores it; saved is an int global of low priority (78 against
+p's 544 and r's 251) and gets the fourth callee-saved register, rbp. In `boxed` the same value is held in `struct Saved
+{ int v; } s`, in `scoped` in a scope object (constructor saves and sets, destructor restores): **s is class 6, list 1**,
+processed first, rbx; p moves to rdi, r to rsi, the code is otherwise the same. (Not, as the T20 note guessed, the
+int-local list: by priority alone s would come last.) The scope object is not needed; a one-member struct does it.
+
+- `ncolsim.py whatif EXPORT --func F bucket:V=aggr|local|global|const|N`: V moved to another list (local / global keep
+  the class, aggr = list 0 / 1 by V's locality, const 4 / 5; `local` on a global also takes the local priority). On
+  plain, `bucket:saved=aggr` predicts exactly boxed's traced registers (every candidate).
+- `lists_of(f)`: from the IL; for realize's runs (NRun now keeps the IL of NColor's entry, `il_fn`) the type by SYM
+  and, as NColCanon may give a candidate a new SYM, by name. `run_delta` reports a list change as `bucket:V=N`.
+- realize (x64) construct **box**: `T V = E;` -> `struct { T rz_v; } V = { E };`, every use `V.rz_v`, selected for
+  `bucket:` requests. `realize.py edit scope.cpp --func plain bucket:saved=aggr`: verdict exact, the registers as
+  predicted, the same instructions with other registers.
+
+### 12.2 Edits that change the block structure (T17 6)
+
+`il_predict(f)`: the registers from a compile's own IL (il_model_state + simulate). Instead of editing the base run's
+inputs, NColor's inputs are recomputed for the edited block graph. realize / rwsweep runs now carry `il` and `il_pre`
+(`trace_hooks`), so a variant whose blocks changed is judged too (`x64_inputs`: "the block structure (ncolsim from the
+variant's IL: as traced)"; `realize --from-ncol levers.cpp --func swap2 --want-regs s=rbx`: FOUND with `eqif s`, as
+traced). Measured on equal-arms ifs `if ((__int64)(V) & 1) { S } else { S }` around every `g(..);` after each local's
+definition in tests/data/ncol_levers/levers.cpp (57 variants in one compile, all with a changed block structure, 38 with
+a register change): **57 of 57** from the variant's IL (56 with the `subsume` model); from the base run's edits: none
+(the block structure differs). Fixture tests/data/ncol/eqif (20 variants with a register change, gzipped). Not done:
+predicting the new graph from the base's IL without compiling the variant.
+
+### 12.3 Copy coalescing (T17 7)
+
+NColSubsumption 0x1009ab40 [C, read statically]: lifetimes in index order; for each def that is a copy `mov L <- S`
+(NColMdIsCopyInstr) writing the whole L from an untied S at offset 0 with equal L+0x50: rejected when L is defined inside
+S's ranges (NColCandModifiedInLife: a def at a range end is harmless when it is the copy L <- S itself or a tuple that
+reads S where S dies) or S inside L's (unless S has one use and one def in the copy's block and L is not used inside
+S); the wider survives, at equal size S when its leaf is a view or L is a temporary (SYM+8 == 3, +0x18 == 0) and S is
+not, else L; the copy is removed, NColCombineLifetimes merges uses / defs / appearances (duplicates kept), unions the
+ranges (adjacent ones joined in one block or across a successor edge), carries the tie, and zeroes the dead lifetime
+(empty appearance list: NColPrioritizeCandidates skips it); when L survives its defs are scanned again. `il_subsume`
+models it on `il_pre`: of the 3189 surviving zlib candidates 3102 get the traced appearances and 3137 the IL's ranges
+(564 changed by coalescing).
+
+Measured on the rwsweep miss class of 10.3 (value copies): `T V_a = V;` before each top-level statement that still
+uses V, later uses renamed (levers.cpp, 62 variants in one compile; 20 moved a range or added / removed a candidate, 10
+changed a register): from the base run's measured edits 52 of 62 (10 of the 20); from the variant's IL **62 of 62** (56
+with `subsume`). Fixture tests/data/ncol/copies (12 variants).

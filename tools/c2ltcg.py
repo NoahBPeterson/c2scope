@@ -34,13 +34,19 @@ MODS = {"regs": "c2regs", "scratch": "c2scratch", "il": "c2il", "regmap": "regma
         "rwsweep": "rwsweep", "helpersweep": "helpersweep"}
 
 
+def _mode():
+    """capstone mode of the image: 64-bit for an x64 build table (cl 17.00 x86_amd64), else 32-bit."""
+    import capstone, c2build
+    return capstone.CS_MODE_64 if c2build.get("arch") == "x64" else capstone.CS_MODE_32
+
+
 def read_map(path):
     """[(name, va, obj)] for the functions of a link map (publics and statics with the `f` flag), by address."""
     out = []
     if not os.path.exists(path):
         return out
     for line in open(path, encoding="latin-1"):
-        m = re.match(r"\s*([0-9a-f]{4}):([0-9a-f]{8})\s+(\S+)\s+([0-9a-f]{8})\s+f\s+(?:i\s+)?(\S+)", line)
+        m = re.match(r"\s*([0-9a-f]{4}):([0-9a-f]{8})\s+(\S+)\s+([0-9a-f]{16}|[0-9a-f]{8})\s+f\s+(?:i\s+)?(\S+)", line)
         if m and m.group(3) not in [n for n, _, _ in out]:
             out.append((m.group(3), int(m.group(4), 16), m.group(5)))
     return sorted(out, key=lambda t: t[1])
@@ -70,7 +76,7 @@ def trim(code):
     (cc) or zero bytes (`add byte ptr [eax], al` = 00 00) are dropped. Bytes are never cut inside an instruction
     (a `jmp rel32` or `ret 4` often ends in 00)."""
     import capstone
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    md = capstone.Cs(capstone.CS_ARCH_X86, _mode())
     ends = [(i.address, i.address + i.size, i.bytes) for i in md.disasm(code, 0)]
     n = ends[-1][1] if ends else len(code)
     while ends and (set(ends[-1][2]) <= {0xcc} or set(ends[-1][2]) <= {0}):
@@ -83,7 +89,7 @@ def trim(code):
 def write_listing(dll, mp, asm, s_dir=None):
     """Write the /FAsc-format listing of every function in the image (and per-function .s files into s_dir)."""
     import capstone
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    md = capstone.Cs(capstone.CS_ARCH_X86, _mode())
     funcs = image_functions(dll, mp)
     names = {va: n for n, va, _, _ in funcs}
     lines = ["; listing made by tools/c2ltcg.py from %s (link /LTCG)\n" % os.path.basename(dll)]

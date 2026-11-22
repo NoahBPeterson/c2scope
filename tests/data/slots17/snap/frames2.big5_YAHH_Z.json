@@ -1,0 +1,261 @@
+{
+"build": "17.00.61030-x64",
+"func": "?big5@@YAHH@Z",
+"nstack": 4,
+"params": [
+1
+],
+"elems": {
+"1": {
+"idx": 1,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 0,
+"key": 2,
+"name": "n",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 8,
+"lod": [],
+"lodtrunc": false,
+"tnum": 2801,
+"never": false,
+"gs": 0
+},
+"0": {
+"idx": 0,
+"size": 4,
+"uses": 4,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 3,
+"name": "k",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+2,
+3
+],
+"lodtrunc": false,
+"tnum": 2806,
+"never": false,
+"gs": 0
+},
+"2": {
+"idx": 2,
+"size": 50,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 5,
+"name": "s1",
+"align": 4,
+"ty": 24626,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+2,
+3
+],
+"lodtrunc": false,
+"tnum": 2804,
+"never": false,
+"gs": 5
+},
+"3": {
+"idx": 3,
+"size": 70,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 6,
+"name": "s2",
+"align": 5,
+"ty": 24646,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+2,
+3
+],
+"lodtrunc": false,
+"tnum": 2805,
+"never": false,
+"gs": 5
+}
+},
+"fn": {
+"npc": 0,
+"ebp": 0,
+"nparams": 1,
+"gs": true,
+"gscopies": true,
+"alloc": 0,
+"cap": 16,
+"dalign": null,
+"ebpadj": 0,
+"v13": false,
+"T": 160,
+"ncol": 4,
+"tround": 16,
+"undo": false,
+"up": true,
+"palign": true,
+"capdef": 16,
+"argarea": true,
+"frame": {
+"A": 32,
+"F": 192,
+"pushed": 8,
+"B": 32,
+"lrsp": false,
+"prsp": false,
+"dyn": 0,
+"cap": 16,
+"alloca": true,
+"Fend": 192
+}
+},
+"obs": {
+"run": [
+{
+"idx": 0,
+"tries": [],
+"res": [
+"c",
+1
+],
+"ncol": 1
+},
+{
+"idx": 2,
+"tries": [
+[
+"c",
+1,
+4
+]
+],
+"res": [
+"c",
+2
+],
+"ncol": 2
+},
+{
+"idx": 3,
+"tries": [
+[
+"c",
+2,
+50
+],
+[
+"c",
+1,
+4
+]
+],
+"res": [
+"c",
+3
+],
+"ncol": 3
+}
+],
+"undo": false,
+"cols": [
+{
+"c": 0,
+"base": 8,
+"members": [
+[
+1,
+8
+]
+]
+},
+{
+"c": 1,
+"base": 0,
+"members": [
+[
+0,
+0
+]
+]
+},
+{
+"c": 2,
+"base": 8,
+"members": [
+[
+2,
+8
+]
+]
+},
+{
+"c": 3,
+"base": 64,
+"members": [
+[
+3,
+64
+]
+]
+}
+],
+"done": {
+"T": 160,
+"npc": 0,
+"ebp": null,
+"joins": null
+}
+},
+"listing": {
+"1": {
+"lname": "n$",
+"loff": 176,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"0": {
+"lname": "k$",
+"loff": 0,
+"lsize": null,
+"lrefs": 4,
+"line": 14
+},
+"2": {
+"lname": "s1$",
+"loff": 8,
+"lsize": null,
+"lrefs": 3,
+"line": 14
+},
+"3": {
+"lname": "s2$",
+"loff": 64,
+"lsize": null,
+"lrefs": 3,
+"line": 14
+}
+}
+}

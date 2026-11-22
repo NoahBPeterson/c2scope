@@ -12,9 +12,15 @@ usage: ncolsim.py prio   EXPORT.json [EXPORT.json ..]      the priority formula 
                                                            live counts, zone depth) against the traced ones
        ncolsim.py ilprio | ilprio+live | ilsim EXPORT.json [..]  priorities / replay + sim on the IL's inputs
                                                            (ilprio+live: the live counts too; docs/c2/ncolor.md 11)
+       ncolsim.py ilmodel | ilfull EXPORT.json [..]        the other inputs from the IL (tied register and window,
+                                                           preferences, useable / anti-preference sets, lists, and
+                                                           from the IL before NColSubsumption live counts,
+                                                           availability, lifetime index) against the trace; replay +
+                                                           sim on all of them (docs/c2/ncolor.md 12)
        ncolsim.py whatif EXPORT.json --func F EDIT [EDIT..] the registers after an edit, against the unedited run:
                                                            +app:VAR:B[:N] / -app:VAR:B[:N] (N more / fewer
-                                                           appearances of VAR in block B), prio:VAR=P
+                                                           appearances of VAR in block B), prio:VAR=P,
+                                                           bucket:VAR=local|global|aggr|const|N (another list)
 
 EXPORT.json: `tools/c2ncol.py SRC --export FILE -- FLAGS` (candidates with appearances and ranges, the liveness
 arrays, the initial availability lists of rax..r15).
@@ -292,6 +298,8 @@ def cmd_replay(fns, show=10):
             continue
         av = avail_of(st)
         pw = {int(r): [tuple(x) for x in v] for r, v in (st.get("prefwin") or {}).items()} if st.get("prefwin") else None
+        pof = il_prefs_of(f, f["prefs_src"]) if f.get("prefs_src") is not None else None
+        given = {}                            # name -> the traced register (the partners of the IL's preferences)
         for c in f["cands"]:
             regs = c["regions"]
             if not regs or not c.get("ranges"):
@@ -300,7 +308,7 @@ def cmd_replay(fns, show=10):
             got = ALIAS.get(regs[0]["reg"])
             if len(regs) == 1 and got in NUM and NUM[got] in av:
                 n += 1
-                prefs = [regname(n) for n, _t in (c.get("prefs") or [[]])[0]]
+                prefs = pof(c, given) if pof else [regname(n) for n, _t in (c.get("prefs") or [[]])[0]]
                 u = useable(c)
                 model = next((r for r in prefs if r in NUM and NUM[r] in av and (u is None or r in u) and
                               covers(av[NUM[r]], c["ranges"])), None) or \
@@ -317,6 +325,8 @@ def cmd_replay(fns, show=10):
                     if own in pw[r]:
                         pw[r] = [x for x in pw[r] if x != own]
                         break
+            if regs:
+                given[c["name"]] = ALIAS.get(regs[0]["reg"])
             for r in regs:                        # what the trace did is what the next candidates see
                 g = ALIAS.get(r["reg"])
                 if g in NUM and NUM[g] in av:
@@ -345,14 +355,15 @@ def buckets(cands):
     return out
 
 
-def simulate(f, prio_of=None):
+def simulate(f, prio_of=None, lists=None, prefs_of=None):
     """Allocate a function's integer single-range-set candidates with the model only: the order from the model's
     priorities within the traced buckets (ties by the traced position), each by preferences then the order walk,
-    availability updated by the model's own choices. -> {candidate name: register or None}."""
+    availability updated by the model's own choices. -> {candidate name: register or None}.
+    lists ({name: 0..5}): the model's lists instead of the traced buckets (order_of); prefs_of(c, got): the region's
+    preference list computed from the registers given so far (il_prefs) instead of the traced one."""
     st = f["state"]
     av = avail_of(st)
     pw = {int(r): [tuple(x) for x in v] for r, v in (st.get("prefwin") or {}).items()}
-    bk = buckets(f["cands"])
     pr = []
     for i, c in enumerate(f["cands"]):
         p = (prio_of or {}).get(c["name"])
@@ -361,7 +372,11 @@ def simulate(f, prio_of=None):
         if p is None:
             p = c["prio"] - (1 << 32) if c["prio"] & 0x80000000 else c["prio"]
         pr.append(p)
-    order = sorted(range(len(f["cands"])), key=lambda i: (bk[i], -pr[i], f["cands"][i].get("index", i)))
+    if lists is not None:
+        order = order_of(f, pr, lists)
+    else:
+        bk = buckets(f["cands"])
+        order = sorted(range(len(f["cands"])), key=lambda i: (bk[i], -pr[i], f["cands"][i].get("index", i)))
     got = {}
     for i in order:
         c = f["cands"][i]
@@ -374,7 +389,7 @@ def simulate(f, prio_of=None):
                     av[NUM[g]] = cut(av[NUM[g]], [(r["first"], r["last"])])
             continue
         u = useable(c)
-        prefs = [regname(n) for n, _t in (c.get("prefs") or [[]])[0]]
+        prefs = prefs_of(c, got) if prefs_of is not None else [regname(n) for n, _t in (c.get("prefs") or [[]])[0]]
         r = next((x for x in prefs if x in NUM and NUM[x] in av and (u is None or x in u) and
                   covers(av[NUM[x]], c["ranges"])), None) or order_walk(av, c["ranges"], **walk_args(c, st, pw))
         got[c["name"]] = r
@@ -395,7 +410,8 @@ def cmd_sim(fns, show=10):
     for f in fns:
         if not f.get("state") or "avail" not in f["state"]:
             continue
-        got = simulate(f)
+        got = simulate(f, lists=f.get("lists"),
+                       prefs_of=il_prefs_of(f, f["prefs_src"]) if f.get("prefs_src") is not None else None)
         for c in f["cands"]:
             if c["name"] not in got or len(c["regions"]) != 1:
                 continue
@@ -422,6 +438,8 @@ def edited_prio(f, edits):
             v, _, p = e[5:].partition("=")
             out[byname[v]["name"]] = int(p)
             continue
+        if e.startswith("bucket:"):
+            continue                     # lists_after
         sign, rest = e[0], e[1:]
         kind, v, b, *n = rest.split(":")
         c = dict(byname[v])
@@ -448,8 +466,10 @@ def cmd_whatif(fns, func, edits):
     if not fs:
         sys.exit("whatif: no function %s" % func)
     f = fs[0]
-    base, new = simulate(f), simulate(f, edited_prio(f, edits))
     np = edited_prio(f, edits)
+    lists, lp = lists_after(f, edits)
+    np.update(lp)
+    base, new = simulate(f), simulate(f, np, lists)
     for c in f["cands"]:
         if c["name"] not in base:
             continue
@@ -483,21 +503,26 @@ def short(name):
 
 def trace_hooks():
     """c2ncol --export's hook list, with the IL dump (il_spec's second spec) on the function-entry event."""
-    import c2build, c2ncol
+    import os, c2build, c2ncol
+    os.environ.setdefault("C2TRACE_ILRAW", "12")      # the IL of NColor's entry with each leaf's symbol (T S: the
+    os.environ.setdefault("C2TRACE_ILSYMW", "11")     # type word, for the lists: NRun's f['il_fn'])
     hk = list(c2ncol.hooks())
     hk[c2ncol.CAND] += "," + ",".join(c2ncol.why_specs())
     st = c2build.hooks("ncol_state", None) % dict(nblk=c2ncol.NBLK, ntup=c2ncol.NTUP, ninfo=13 * c2ncol.NBLK)
     st += "," + ",".join("tf65c>0>%d*%d" % (4 * r, c2ncol.NAVAIL) for r in c2ncol.AVAIL_REGS)
     st += "," + ",".join("tf6a0>0>%d*%d" % (4 * r, c2ncol.NAVAIL) for r in c2ncol.PREFWIN_REGS)
     st += ",t119c8>0,t119cc>0,t119d0>0"
+    st += ",tdccc>0>8>0>0x1c%"         # the IL after prioritization (f['il']) and before NColSubsumption (PRE_HOOK,
+    os.environ.setdefault("C2TRACE_ILPAS", "28")        # f['il_pre']): il_predict on a variant whose blocks changed
     hk.append(st)
     il = c2build.hooks("il_spec", None)
     hk.append(c2build.hooks("ncol_fn", None) + ("," + il.split(",", 1)[1] if il and "," in il else ""))
     hk.append(c2build.hooks("ncol_pref", None))
+    hk.append(c2ncol.PRE_HOOK)
     return hk
 
 
-def il_blocks(text, fn_kind=6):
+def il_line_blocks(text, fn_kind=6):
     """{function name: {NColor block: [line words]}} from the IL dumped at NColor's entry (T lines after the FN event):
     the `B` lines count the blocks as NColBlockInfo numbers them (block 0 the entry), `I` lines carry the line word
     (offset from the function's first line, plus 1)."""
@@ -526,6 +551,21 @@ def il_blocks(text, fn_kind=6):
     return out
 
 
+def il_fn_lines(text, func, fn_kind=6):
+    """The T lines dumped at NColor's entry event of `func` (trace_hooks' FN spec), without the `T ` prefix."""
+    out, cur = [], False
+    for ln in text.splitlines():
+        if ln.startswith("E "):
+            head, _, rest = ln.partition("|")
+            cur = int(head.split()[3]) == fn_kind and ('"%s"' % func) in rest
+            if cur:
+                out = []
+            continue
+        if cur and ln.startswith("T "):
+            out.append(ln[2:])
+    return out
+
+
 class NRun:
     """One traced 17.00 compile of `src`, function `func`: the export record (cands, state), the listing's
     instructions (tsweep.listing_instrs) and the block -> source line map. Raises RuntimeError when the function
@@ -540,13 +580,15 @@ class NRun:
             raise RuntimeError(("compile error: " + err) if err else "function %s not allocated by NColor" % func)
         self.f = fns[0]
         self.func = self.f["func"]
+        self.f["il_fn"] = il_fn_lines(text, self.func)
         asm = os.path.join(keep, os.path.splitext(os.path.basename(src))[0] + ".asm")
         self.asm = asm
         try:
             self.instrs = tsweep.listing_instrs(asm, func)
         except Exception:
             self.instrs = []
-        words = il_blocks(text).get(self.func) or next(iter(il_blocks(text).values()), {})
+        # (il_line_blocks: the IL section's il_blocks(tups) took this name over)
+        words = il_line_blocks(text).get(self.func) or next(iter(il_line_blocks(text).values()), {})
         line0 = None
         try:
             lt = open(asm, errors="replace").read()
@@ -664,6 +706,10 @@ def run_delta(fa, fb):
                 [blockof(sb, t) for r in b.get("ranges") or [] for t in r] or \
                 (blockof(sa, a["first"]) == blockof(sa, a["last"])) and (a["last"] - a["first"]) != (b["last"] - b["first"]):
             out["ranges"].append(v)
+    if fa.get("il_fn") and fb.get("il_fn"):          # a named candidate in another list (class or locality)
+        la, lb = lists_of(fa), lists_of(fb)
+        out["edits"] += ["bucket:%s=%d" % (v, lb[cb[v]["name"]]) for v in both
+                         if la.get(ca[v]["name"]) != lb.get(cb[v]["name"])]
     ia = sorted(both, key=lambda v: ca[v].get("index", 0))
     ib = sorted(both, key=lambda v: cb[v].get("index", 0))
     if ia != ib:
@@ -675,7 +721,25 @@ def run_delta(fa, fb):
 
 def whatif_edits(edits):
     """The subset of edits ncolsim's whatif takes."""
-    return [e for e in edits if e[:5] in ("+app:", "-app:") or e.startswith("prio:")]
+    return [e for e in edits if e[:5] in ("+app:", "-app:") or e.startswith(("prio:", "bucket:"))]
+
+
+def lists_after(f, edits):
+    """The lists after `bucket:V=..` edits ({name: list}, or None without such an edit: the traced buckets stay) and
+    the priorities they change ({name: prio}: a candidate made local takes the local formula nTuples - length)."""
+    bk = [e for e in edits if e.startswith("bucket:")]
+    if not bk:
+        return None, {}
+    lists = lists_of(f)
+    pr = {}
+    st = f["state"]
+    for e in bk:
+        nm, L = bucket_edit(f, lists, e)
+        lists[nm] = L
+        c = _cand(f, nm)
+        if L in (0, 2, 4) and blockof(st, c["first"]) != blockof(st, c["last"]) and "=local" in e:
+            pr[nm] = st["ntup"] - (c["last"] - c["first"])
+    return lists, pr
 
 
 def with_live(f, edits):
@@ -725,7 +789,11 @@ def predict(f, edits):
     before (lifetime-index order, the tie-break), from the traced start of `f` (simulate)."""
     w = whatif_edits(edits)
     g = with_live(with_index(f, edits), edits)
-    got = simulate(g, edited_prio(g, w) if w else None)
+    lists, lp = lists_after(g, w)
+    pm = edited_prio(g, w) if w else None
+    if lp:
+        pm = dict(pm or {}, **lp)
+    got = simulate(g, pm, lists)
     return {short(k): v for k, v in got.items()}
 
 
@@ -1014,10 +1082,10 @@ def _loop_depth(blocks):
     return [min(d, 5) for d in depth], [min(d, 5) for d in zone]
 
 
-def il_inputs(f):
-    """NColor's inputs computed from the function's IL (f['il']): dict(blk, ntup, blocks, depth, cands = {name:
-    dict(apps, defs, uses, ranges, first, last)}, live, maxlive)."""
-    tups = il_parse(f["il"])
+def il_inputs(f, key="il"):
+    """NColor's inputs computed from the function's IL (f['il'], or f[key]: 'il_pre' the IL before NColSubsumption):
+    dict(blk, ntup, blocks, depth, cands = {name: dict(apps, defs, uses, ranges, first, last)}, live, maxlive)."""
+    tups = il_parse(f[key])
     blocks = il_blocks(tups)
     ntup = tups[-1]["n"] if tups else 0
     blk = [0] * (ntup + 2)
@@ -1280,6 +1348,888 @@ def cmd_ilprio(fns, use=IL_USE):
     return ok, ok0, n
 
 
+# ------------------------------------------------------------------ the six lists (buckets) of NColPrioritizeCandidates
+#
+# docs/c2/ncolor.md 2 step 3 and 12: class = (SYM type >> 12) & 0x1f, int when (1 << class) & 0x1e (classes 1..4); a
+# class-6 symbol (a small struct held whole in an integer register, type 0x6004 / 0x6008) is *not* int there: it lands
+# in list 0 / 1 with the xmm candidates and is processed before every integer candidate, whatever its priority.
+
+LISTS = ("xlocal", "xglobal", "local", "global", "clocal", "cglobal")
+LIST_ALIAS = dict(aggr=None, struct=None, first=None, const=None)   # by the candidate's locality: 0/1, 4/5
+
+
+def il_types(tups):
+    """{root SYM: its type word} from the IL's T S lines (the SYM's +0)."""
+    out = {}
+    for t in tups:
+        for s in t.get("leafsym") or []:
+            if s and len(s) > 1 and (len(s) <= 4 or not s[4] or s[4] == s[0]):
+                out.setdefault(s[0], s[1])
+    return out
+
+
+def type_is_int(ty):
+    """NColPrioritizeCandidates' int test: (1 << ((type >> 12) & 0x1f)) & 0x1e."""
+    return bool((1 << ((ty >> 12) & 0x1f)) & 0x1e)
+
+
+def il_const_defs(tups):
+    """{root SYM: True} for candidates with exactly one definition whose sources are all constants (ICONST leaves:
+    symbol and code addresses, leaf kinds 3 / 4: NColUsesOnlyConsts, the lists 4 / 5)."""
+    defs = {}
+    for t in tups:
+        if t["kind"] != "I":
+            continue
+        for i, (k, r) in enumerate(zip(t["dstk"], t.get("dstr") or [])):
+            if k == 1 and r:
+                defs.setdefault(r, []).append(t)
+    return {r: len(ts) == 1 and bool(ts[0]["srck"]) and all(k in (3, 4, 7) for k in ts[0]["srck"]) for r, ts in defs.items()}
+
+
+def il_lists(f, tups=None):
+    """{candidate name: list 0..5} from the IL: the class of the candidate's SYM type, local = first and last tuple
+    in one block (of the IL's lifetime: the traced first / last are read later, after coalescing), constant-defined
+    (one definition from constants). Candidates without a SYM type in the IL get the traced-order inference."""
+    tups = tups if tups is not None else il_parse(f["il"])
+    ty, cd = il_types(tups), il_const_defs(tups)
+    x = il_inputs(f)
+    out = traced_lists(f)
+    for c in f["cands"]:
+        s = c.get("sym")
+        y = _ilcand(x, c)
+        if s not in ty or y is None or not y["ranges"]:
+            continue
+        loc = x["blk"][y["first"]] == x["blk"][y["last"]]    # at prioritization: the IL's lifetime
+        if not type_is_int(ty[s]):
+            out[c["name"]] = 0 if loc else 1
+        else:
+            out[c["name"]] = (2 if loc else 3) + (2 if cd.get(s) else 0)
+    return out
+
+
+def lists_of(f):
+    """The lists of a run: from the IL (il_lists) when the record has it, else the class from the IL of NColor's
+    entry (NRun: `il_fn`) with the traced locality, else the traced-order inference."""
+    if f.get("il"):
+        return il_lists(f)
+    out = traced_lists(f)
+    if f.get("il_fn"):
+        tu = il_parse(f["il_fn"])
+        ty = il_types(tu)
+        byname = {}                  # NColCanon may give a candidate a new SYM after NColor's entry: by name too
+        for t in tu:
+            for txt, r in list(zip(t["dst"], t.get("dstr") or [])) + list(zip(t["src"], t.get("srcr") or [])):
+                if r in ty and not txt.startswith("["):
+                    byname.setdefault(short(txt.split(":")[0].split("=")[-1]), ty[r])
+        st = f["state"]
+        for c in f["cands"]:
+            t = ty.get(c.get("sym"), byname.get(short(c["name"])))
+            if t is None or not c.get("ranges"):
+                continue
+            loc = blockof(st, c["first"]) == blockof(st, c["last"])
+            if not type_is_int(t):
+                out[c["name"]] = 0 if loc else 1
+            elif out[c["name"]] < 2:
+                out[c["name"]] = 2 if loc else 3
+    return out
+
+
+def traced_lists(f):
+    """{candidate name: list 0..5} inferred from the traced order alone (exports without IL): a list ends where the
+    sort order (descending priority, then ascending lifetime index) breaks; xmm candidates are in 0 / 1, integer ones
+    in 2..5 by locality; an integer global at the head of the integer locals is NColMdAdjustPriority's move (list 2)."""
+    st = f.get("state") or {}
+    out, cur, prev = {}, -1, None
+    cs = f["cands"]
+    for i, c in enumerate(cs):
+        p = c["prio"] - (1 << 32) if c["prio"] is not None and c["prio"] & 0x80000000 else (c["prio"] or 0)
+        loc = not c.get("ranges") or blockof(st, c["first"]) == blockof(st, c["last"])
+        allowed = (0, 1) if klass(c) == "xmm" else (2, 3, 4, 5)
+        allowed = [L for L in allowed if (L % 2 == 0) == loc]
+        brk = prev is not None and (p > prev[0] or (p == prev[0] and c.get("index", 0) < prev[1]))
+        nxt = cs[i + 1] if i + 1 < len(cs) else None
+        if not loc and klass(c) == "int" and cur < 2 and nxt is not None and klass(nxt) == "int" and \
+                blockof(st, nxt["first"]) == blockof(st, nxt["last"]):
+            L = 2                                    # NColMdAdjustPriority: the head of the int locals
+        else:
+            L = next((x for x in allowed if x > cur or (x == cur and not brk)), cur if cur >= 0 else allowed[0])
+        out[c["name"]] = L
+        cur, prev = L, (p, c.get("index", 0))
+    return out
+
+
+def max_zone_depth(f):
+    st = f["state"]
+    nb = max(st["blk"][:st["ntup"]] or [0]) + 1
+    return max([depth(st, b) for b in range(nb)] or [0])
+
+
+def order_of(f, pr, lists):
+    """NColPrioritizeCandidates' output order: lists 0..5 in turn, each sorted by descending priority, ties by
+    ascending lifetime index (NColColPriorityCompare); NColMdAdjustPriority first moves the int-global candidate
+    of highest priority to the head of list 2 when the function has a loop and that priority exceeds 16 times
+    max(1, the highest int-local priority) (zlib: the traced order of all 97 functions). -> candidate indices."""
+    cs = f["cands"]
+    L = [lists.get(c["name"], 3) for c in cs]
+    head = None
+    if max_zone_depth(f) and not f.get("no_adjust"):
+        hl = max([pr[i] for i in range(len(cs)) if L[i] == 2] or [0])
+        g = [i for i in range(len(cs)) if L[i] == 3 and pr[i] > 16 * max(1, hl)]
+        if g:
+            # list 3 is built by pushing on its head, scanned with `>`: a tie goes to the higher lifetime index
+            head = min(g, key=lambda i: (-pr[i], -cs[i].get("index", i)))
+    key = lambda i: (2 if i == head else L[i], i != head, -pr[i], cs[i].get("index", i))
+    return sorted(range(len(cs)), key=key)
+
+
+def bucket_edit(f, lists, e):
+    """`bucket:V=local|global|aggr|const|N`: the candidate V moved to another list. local / global keep the class
+    (int: 2 / 3, non-int: 0 / 1), aggr (a struct-typed value: class 6) is list 0 / 1 by V's locality, const 4 / 5,
+    a number is the list. -> (name, list)."""
+    v, _, to = e[7:].partition("=")
+    c = _cand(f, v)
+    if c is None:
+        sys.exit("whatif: no candidate %s" % v)
+    st = f["state"]
+    cur = lists.get(c["name"], 3)
+    loc = blockof(st, c["first"]) == blockof(st, c["last"])
+    if to.isdigit():
+        return c["name"], int(to)
+    base = 0 if cur < 2 else 2
+    return c["name"], dict(local=base, global_=base + 1, aggr=0 + (not loc), struct=0 + (not loc),
+                           const=4 + (not loc))[to if to != "global" else "global_"]
+
+
+# ------------------------------------------------------------------ trace-free inputs, part 2 (T17 item 1)
+#
+# What ncolsim read from the trace besides appearances / ranges / depth, computed from the IL (docs/c2/ncolor.md 12):
+# the tied physreg and its preference window (L+0x38 / L+0x54, f6a0), each region's preference list (copies at the
+# last use and the defs, partners already processed), the useable set (by size class; rbp / r13 out where the frame
+# needs them), the anti-preference set (memory bases), the processing order (lists) and the lifetime index.
+
+PREF_WINDOW = 15      # NColPrioritizeCandidates clips the window of a copy to / from a physreg to 15 tuples
+
+
+COPY_OPS = ("mov", "movaps", "movapd", "movdqa", "movdqu", "movsdx", "movss")   # NColMdIsCopyInstr (movsd / movss:
+                                                                                 # scalar float types only)
+
+
+def _is_copy(t):
+    return t["kind"] == "I" and t["op"] in COPY_OPS and len(t["dst"]) == 1 and len(t["src"]) == 1 and \
+        t["dstk"][:1] == [1] and t["srck"][:1] == [1]
+
+
+def _master_num(reg):
+    """The number of a master register as the export keeps ties and windows: rax..r15 1..16, the xmm family by its
+    master ymmN (112 + N)."""
+    return XMASTER + int(reg[3:]) if reg.startswith("xmm") else NUM[reg]
+
+
+def _leaf_reg(t, side, i):
+    """A REG leaf -> ('phys', master name) / ('cand', root SYM) / None."""
+    ops, ks = (t["dst"], t["dstk"]) if side == "d" else (t["src"], t["srck"])
+    rs = (t.get("dstr") if side == "d" else t.get("srcr")) or []
+    if i >= len(ops) or i >= len(ks) or ks[i] != 1:
+        return None
+    c, ph = _regleaf(ops[i])
+    if ph is not None:
+        g = ALIAS.get(ph)
+        return ("phys", g) if g and not ph.startswith("cc") else None
+    return ("cand", rs[i] if i < len(rs) and rs[i] else c)
+
+
+def il_tied(tups, x):
+    """{root: (master register name, (begin, end))}: L+0x38 / L+0x54 and the window NColAddRegPrefRange gets. A
+    `mov cand <- phys` at the begin of one of the lifetime's ranges, or `mov phys <- cand` at the end of one; of
+    several, the first in tuple order (the backward walk of NColBuildInfo keeps the last it sees); the window is that
+    range clipped to PREF_WINDOW tuples from the copy."""
+    out = {}
+    for t in tups:
+        if not _is_copy(t):
+            continue
+        d, sr = _leaf_reg(t, "d", 0), _leaf_reg(t, "s", 0)
+        if not d or not sr:
+            continue
+        for me, other, frm in ((d, sr, True), (sr, d, False)):
+            if me[0] != "cand" or other[0] != "phys" or me[1] in out:
+                continue
+            y = x["cands"].get(me[1])
+            if not y:
+                continue
+            n = t["n"]
+            for lo, hi in y["ranges"]:
+                if frm and lo == n:
+                    out[me[1]] = (other[1], (n, min(hi, n + PREF_WINDOW)))
+                    break
+                if not frm and hi == n:
+                    out[me[1]] = (other[1], (max(lo, n - PREF_WINDOW), n))
+                    break
+    return out
+
+
+PREF_LOADS = False    # a load at the last use (mov reg <- [cand..]) adds its destination: measured worse
+PREF_WHOLE = False    # a def copy counts only between whole symbols (not a view): measured worse
+PREF_LEA = False      # an lea def adds its base (NColMdLeaPref, as read): measured worse
+
+
+def il_pref_sources(tups, x):
+    """{root: [(tuple, ('phys', reg) / ('cand', root))]}: NColDeterminePhysregUseable's preference list before it
+    is resolved: at the last use, a mov (NColMdIsCopyInstr is the opcode alone) into a REG leaf: its destination
+    (appended); then every mov defining the whole candidate from a whole REG leaf: the source, put at the head (the
+    last def's source comes first); an lea defining it: its base (NColMdLeaPref, appended)."""
+    by = {t["n"]: t for t in tups}
+    out = {}
+    own = lambda t, j: (t.get("leafsym") or [None] * 99)[j] if j < len(t.get("leafsym") or []) else None
+    whole = lambda x: not PREF_WHOLE or x is None or len(x) < 5 or not x[4] or x[4] == x[0]
+    for r, y in x["cands"].items():
+        lst = []
+        uses = sorted({n for n in y["apps"] if r in (by[n].get("srcr") or [])})
+        defs = sorted({n for n in y["apps"] if r in (by[n].get("dstr") or [])})
+        if uses:
+            t = by[uses[-1]]
+            m0 = (t.get("src") or [""])[0]
+            direct = (t.get("srcr") or [None])[0] == r and t["srck"][:1] == [1] or PREF_LOADS and \
+                m0.startswith("[") and m0[1:].split("+")[0].split("]")[0].rsplit(":", 1)[0] == \
+                next((x.rsplit(":", 1)[0] for x, rr in zip(t["src"], t.get("srcr") or []) if rr == r), None)
+            if t["kind"] == "I" and t["op"] == "mov" and len(t["dst"]) == 1 and t["dstk"][:1] == [1] and direct:
+                q = _leaf_reg(t, "d", 0)
+                if q and q[1] != r:
+                    lst.append((uses[-1], q))
+        for n in defs:
+            t = by[n]
+            if (t.get("dstr") or [None])[0] != r:
+                continue
+            if _is_copy(t) and whole(own(t, 0)) and whole(own(t, len(t["dst"]))):
+                q = _leaf_reg(t, "s", 0)
+                if q:
+                    lst.insert(0, (n, q))
+            elif PREF_LEA and t["kind"] == "I" and t["op"] == "lea" and t["src"] and t["src"][0].startswith("["):
+                q = _leaf_reg(t, "s", 1) if len(t["src"]) > 1 else None
+                if q:
+                    lst.append((n, q))
+        if lst:
+            out[r] = lst
+    return out
+
+def il_prefs_of(f, src):
+    """The prefs_of(c, got) of simulate(): the region's preference list with the partners' registers as given so far
+    (got: name -> register), filtered by the useable set and without repeats."""
+    names = {c.get("sym"): c["name"] for c in f["cands"]}
+
+    def prefs_of(c, got):
+        out = []
+        u = useable(c)
+        for _n, (k, v) in src.get(c.get("sym"), []):
+            r = v if k == "phys" else got.get(names.get(v))
+            if r and r not in out and (u is None or r in u):
+                out.append(r)
+        return out
+    return prefs_of
+
+
+INT_MASTERS = [r for r in FULL if r != "rsp"]
+
+
+def il_useable(c, ty, frame_rbp=False, size=None):
+    """The first sparse-BV chunk of the useable set NColMdGetInitialRegisters gives for the candidate's type (the
+    integer class master sets: every register but rsp, of the candidate's width; rbp out when the frame uses it), in
+    the export's shape [base, low, high, next]; None for a non-integer candidate (xmm: the trace's banks stay)."""
+    if ty is None or not ((1 << ((ty >> 12) & 0x1f)) & 0x5e):
+        return None
+    sz = size or (ty & 0xfff)
+    base = {8: 1, 4: 17, 2: 33, 1: 49}.get(sz)
+    if base is None:
+        return None
+    bits = 0
+    for r in INT_MASTERS:
+        if frame_rbp and r == "rbp":
+            continue
+        n = base + FULL.index(r)
+        bits |= 1 << n
+    return [0, bits & 0xffffffff, (bits >> 32) & 0xffffffff, 0]
+
+
+def il_anti(tups):
+    """{name: 0 / 1 / 2}: the anti-preference set NColMdAddToPreferences (0x10069010) gives a candidate that is the
+    base of a memory operand: in a mov (opcode 0x13b) the first destination's memory operand, else the first source's
+    (or the second's when the first is a memory operand with another base); in an lea its memory source. A base
+    without index avoids r12 (SIB byte), without displacement rbp / r13 (disp8); the union over the appearances
+    (TLS+0x119c8 r12 / cc rbp,r13 / d0 all three: the index into ANTI)."""
+    out = {}
+
+    def mem(txt):
+        if not txt.startswith("[") or "]" not in txt:
+            return None
+        parts = txt[1:txt.index("]")].split("+")
+        base = parts[0].rsplit(":", 1)[0]
+        idx = next((q for q in parts[1:] if "*" in q), None)
+        disp = parts[-1] if len(parts) > 1 and parts[-1].lstrip("-").isdigit() else "0"
+        return base, idx, disp
+    for t in tups:
+        if t["kind"] != "I" or t["op"] not in ("mov", "lea"):
+            continue
+        ms = []
+        if t["op"] == "mov":
+            if t["dst"] and mem(t["dst"][0]):
+                ms = [mem(t["dst"][0])]
+            elif t["src"] and mem(t["src"][0]):
+                ms = [mem(t["src"][0])]
+        elif t["src"] and mem(t["src"][0]):
+            ms = [mem(t["src"][0])]
+        for base, idx, disp in ms:
+            if not base or base in _regnames() or base.lstrip("-").isdigit():
+                continue
+            out[base] = out.get(base, 0) | (1 if idx is None else 0) | (2 if disp == "0" else 0)
+    return {r: {1: 0, 2: 1, 3: 2}[m_] for r, m_ in out.items() if m_}
+
+def il_index(tups):
+    """NColInitializeSyms (0x1017a350): {root SYM: lifetime index}. Tuples forward, in each instruction the destinations
+    then the sources, REG leaves only: an untied leaf numbers its root as a candidate, a tied one (a preassigned
+    register whose root is not itself a physreg) numbers it in the nPhys sequence; one field (SYM+0x38) for both,
+    first seen wins. Exact only on the IL before NColSubsumption (`il_pre`: the coalesced copies are still there)."""
+    cand, phys, seen = {}, set(), set()
+    for t in tups:
+        if t["kind"] != "I":
+            continue
+        for ops, ks, rs in ((t["dst"], t["dstk"], t.get("dstr") or []), (t["src"], t["srck"], t.get("srcr") or [])):
+            for i, (k, x) in enumerate(zip(ks, ops)):
+                if k != 1:
+                    continue
+                c, ph = _regleaf(x)
+                r = rs[i] if i < len(rs) and rs[i] else (c or x)
+                if r in seen:
+                    continue
+                if c is not None:
+                    seen.add(r)
+                    cand[r] = len(cand) + 1
+                elif ph is not None and "=" in x:
+                    seen.add(r)
+                    phys.add(r)
+    return cand
+
+
+def _live_leaves(t, side):
+    """(kind 'c' candidate / 't' tied lifetime, root, the leaf's own SYM) of an instruction's REG leaves."""
+    ops, ks = (t["dst"], t["dstk"]) if side == "d" else (t["src"], t["srck"])
+    rs = (t.get("dstr") if side == "d" else t.get("srcr")) or []
+    ls = t.get("leafsym") or []
+    nd = len(t["dst"])
+    out = []
+    for i, (k, x) in enumerate(zip(ks, ops)):
+        if k != 1:
+            continue
+        c, ph = _regleaf(x)
+        j = i if side == "d" else nd + i
+        sym = ls[j][0] if j < len(ls) and ls[j] else None
+        root = rs[i] if i < len(rs) and rs[i] else (c or x)
+        if c is not None:
+            out.append(("c", root, sym))
+        elif ph is not None and "=" in x and not ph.startswith("cc"):
+            out.append(("t", root, sym))
+    return out
+
+
+def il_live(tups):
+    """NColBuildInfo's live count per block (f69c) and its maximum f698 [C: docs/c2/ncolor.md 12]. Liveness of the
+    global lifetimes only (first and last appearance in different blocks; candidates and tied lifetimes), pruned to
+    where a definition reaches (NColDoLiveness' second fixpoint: in = live-in & U pred out, out = live-out & (appears
+    | in - defs)); then backwards through each block: the count starts at |out| and adds one per source whose lifetime
+    is not in the live set (a birth: a value used again after it died counts again); a definition never adds, it
+    takes the lifetime out unless the tuple also reads it or it is a partial view (a view not live in and not
+    defined earlier in the block). Block 0 stores 0. Exact on the IL before NColSubsumption (il_pre). -> list."""
+    blocks = il_blocks(tups)
+    nb = len(blocks)
+    blk = {}
+    for i, b in enumerate(blocks):
+        for t in b["tups"]:
+            blk[t["n"]] = i
+    first, last = {}, {}
+    for t in tups:
+        if t["kind"] != "I":
+            continue
+        for sd in "ds":
+            for k, r, _s in _live_leaves(t, sd):
+                first.setdefault((k, r), t["n"])
+                last[(k, r)] = t["n"]
+    glob = {k for k in first if blk[first[k]] != blk[last[k]]}
+    gen = [set() for _ in range(nb)]
+    dfs = [set() for _ in range(nb)]
+    app = [set() for _ in range(nb)]
+    for i, b in enumerate(blocks):
+        for t in reversed(b["tups"]):
+            if t["kind"] != "I":
+                continue
+            for k, r, _s in _live_leaves(t, "d"):
+                if (k, r) in glob:
+                    dfs[i].add((k, r))
+                    app[i].add((k, r))
+                    gen[i].discard((k, r))
+            for k, r, _s in _live_leaves(t, "s"):
+                if (k, r) in glob:
+                    app[i].add((k, r))
+                    gen[i].add((k, r))
+    lin, lout = [set(g) for g in gen], [set() for _ in range(nb)]
+    ch = True
+    while ch:
+        ch = False
+        for i in range(nb - 1, -1, -1):
+            o = set().union(*[lin[x] for x in blocks[i]["succ"]]) if blocks[i]["succ"] else set()
+            if o != lout[i]:
+                lout[i], lin[i], ch = o, gen[i] | (o - dfs[i]), True
+    preds = [[] for _ in range(nb)]
+    for i, b in enumerate(blocks):
+        for x in b["succ"]:
+            preds[x].append(i)
+    r0, r4 = [set() for _ in range(nb)], [app[i] & lout[i] for i in range(nb)]
+    ch = True
+    while ch:
+        ch = False
+        for i in range(nb):
+            tmp = (set().union(*[r4[p] for p in preds[i]]) if preds[i] else set()) & lin[i]
+            if tmp != r0[i]:
+                r0[i], r4[i], ch = tmp, lout[i] & (app[i] | (tmp - dfs[i])), True
+    live = [0] * nb
+    for i, b in enumerate(blocks):
+        L = set(r4[i])
+        cnt = len(L)
+        tl = [t for t in b["tups"] if t["kind"] == "I"]
+        for j in range(len(tl) - 1, -1, -1):
+            t = tl[j]
+            srcsyms = {sym for _k, _r, sym in _live_leaves(t, "s")}
+            for k, r, sym in _live_leaves(t, "d"):
+                key = (k, r)
+                L.add(key)
+                if sym in srcsyms:
+                    continue
+                if sym != r and (key in r0[i] or any(rr == r for u in tl[:j] for _kk, rr, _x in _live_leaves(u, "d"))):
+                    continue
+                L.discard(key)
+            for k, r, _s in _live_leaves(t, "s"):
+                if (k, r) not in L:
+                    L.add((k, r))
+                    cnt += 1
+        live[i] = cnt if i > 0 else 0
+    return live
+
+
+CALL_CLOBBER = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")   # a call's kind-0xa destination (Win64 volatiles) [I]
+
+
+def il_avail(tups, ntup, regs=FULL):
+    """NColBuildInfo's initial availability lists (NColInitializeAvailability / NColStartAvailability /
+    NColTerminateAvailability, docs/c2/ncolor.md 12), integer masters: built backwards; a register is available at a
+    defining tuple and at the last use of the value defined there and busy strictly between; a definition or clobber
+    with no tied use later splits [.., t] / [t+1, ..]; a tied value read by the tuple that clobbers is not cut there.
+    -> {register number: [(begin, end)]} with the [0, 0] / [n, n] sentinels, as the export's state['avail']."""
+    nodes = {r: [] for r in regs}          # finished nodes, backwards
+    head = {r: [None, ntup] for r in regs}  # the open node: [begin (None: pending), end]
+    live_t = {}                            # tied root -> master (live in the backward walk)
+    busy = set()                           # B: masters holding a live tied value
+    tl = [t for t in tups if t["kind"] == "I"]
+
+    def setbeg(r, v):
+        if r in head and head[r][0] is None:
+            head[r][0] = v
+
+    def start(A, t, T):
+        rd = {ALIAS.get(_regleaf(x)[1]) for k, x in zip(T["srck"], T["src"]) if k == 1 and _regleaf(x)[1]}
+        for r in A:
+            if r in busy or r in rd or r not in head:
+                continue
+            nodes[r].append(head[r])
+            head[r] = [None, t]
+    for T in reversed(tl):
+        t = T["n"]
+        A = set()
+        srcroots = set(T.get("srcr") or [])
+        if T["op"] == "call":
+            # the Win64 volatiles; a callee of this unit compiled before may clobber fewer (interprocedural register
+            # usage: zlib _tr_init -> init_block keeps rcx, r9..r11), its set is not in the dump
+            A |= set(CALL_CLOBBER)
+        for i, (k, x) in enumerate(zip(T["dstk"], T["dst"])):
+            if k != 1:
+                continue
+            c, ph = _regleaf(x)
+            if ph is None or ph.startswith("cc"):
+                continue
+            m = ALIAS.get(ph)
+            if m is None:
+                continue
+            r = (T.get("dstr") or [None] * 9)[i]
+            if "=" not in x:
+                A.add(m)                   # a physreg-root destination (eax <- x): kills
+            elif r not in srcroots:
+                live_t.pop(r, None)
+                busy.discard(m)
+                A.add(m)
+        for r in A:
+            setbeg(r, t + 1)
+        if A:
+            start(A, t, T)
+        for i, (k, x) in enumerate(zip(T["srck"], T["src"])):
+            if k != 1 or "=" not in x:
+                continue
+            c, ph = _regleaf(x)
+            m = ALIAS.get(ph) if ph else None
+            if m is None or ph.startswith("cc"):
+                continue
+            r = (T.get("srcr") or [None] * 9)[i]
+            if r not in live_t:
+                live_t[r] = m
+                setbeg(m, t)
+                busy.add(m)
+    out = {}
+    for r in regs:
+        if r == "rsp":
+            continue
+        lst = [head[r]] + nodes[r][::-1]   # forward order: the open head first
+        out[NUM[r]] = [(0, 0)] + [(b or 0, e) for b, e in lst] + [(ntup, ntup)]
+    return out
+
+
+def il_premap(pre, post):
+    """{pre-Subsumption root: post root} from the two dumps of one stream (a removed copy is an empty op577 in the
+    same slot; the absorbed lifetime's leaves are renamed to views of the survivor)."""
+    out = {}
+    for a, b in zip(pre, post):
+        if a["kind"] != "I" or b["kind"] != "I" or b["op"] == "op577" and not b["dst"] and not b["src"]:
+            continue
+        for ra, rb in list(zip(a.get("dstr") or [], b.get("dstr") or [])) + list(zip(a.get("srcr") or [],
+                                                                                  b.get("srcr") or [])):
+            if ra and rb:
+                out.setdefault(ra, rb)
+    return out
+
+
+def il_subsume(pre, xpre=None, index=None):
+    """NColSubsumption (0x1009ab40) + NColCombineLifetimes (0x101475b0) on the IL before it (docs/c2/ncolor.md 12):
+    lifetimes in index order; for each copy `mov L <- S` defining the whole L from an untied S at offset 0: no def of
+    L inside S's ranges (but at a range end, the copy L <- S itself or a tuple reading S where S dies), and no def of
+    S inside L's (unless S has one use and one def, L is not used inside S and S's def is in the copy's block); the
+    wider survives, at equal size S when its leaf is a view or L is a temporary and S is not, else L. The copy goes
+    (an empty op577), the dead lifetime's lists join the survivor's. -> ({root: survivor root}, {survivor: lifetime})."""
+    if xpre is None:
+        xpre = dict(cands=_lifetimes(*_il_occ(pre))[0])
+    index = index or il_index(pre)
+    by = {t["n"]: t for t in pre}
+    syms = {}
+    for t in pre:
+        for x in t.get("leafsym") or []:
+            if x:
+                syms.setdefault(x[0], x)
+    blocks = il_blocks(pre)
+    blk = {}
+    for i, b in enumerate(blocks):
+        for t in b["tups"]:
+            blk[t["n"]] = i
+    L = {}
+    for r, y in xpre["cands"].items():
+        defs = sorted({n for n in y["apps"] if r in (by[n].get("dstr") or [])})
+        uses = sorted({n for n in y["apps"] if r in (by[n].get("srcr") or [])})
+        L[r] = dict(ranges=[list(q) for q in y["ranges"]], apps=list(y["apps"]), defs=defs, uses=uses)
+    alias = {r: r for r in L}
+    find = lambda r: r if alias.get(r, r) == r else find(alias[r])
+    temp = lambda r: r in syms and (syms[r][3] & 0xff) == 3 and (len(syms[r]) <= 7 or syms[r][7] == 0)
+    size = lambda r: syms[r][10] if r in syms and len(syms[r]) > 10 else 8
+
+    def reads(n, r):
+        return any(find(q) == r for q in (by[n].get("srcr") or []) if q)
+
+    def modified(A, Bk, skip):
+        a, b = L[A], L[Bk]
+        rg = b["ranges"]
+        for d in a["defs"]:
+            for k, (lo, hi) in enumerate(rg):
+                if lo <= d <= hi and d != skip:
+                    if d != hi:
+                        return True
+                    t = by[d]
+                    if _is_copy(t) and find((t.get("dstr") or [None])[0]) == A and \
+                            find((t.get("srcr") or [None])[0]) == Bk:
+                        continue
+                    if reads(d, Bk) and (k + 1 >= len(rg) or rg[k + 1][0] > d + 1):
+                        continue
+                    return True
+        return False
+
+    def merge_ranges(a, b):
+        out = []
+        for lo, hi in sorted(a + b):
+            if out and (lo <= out[-1][1] or lo == out[-1][1] + 1 and (blk.get(lo) == blk.get(out[-1][1]) or
+                                                                      blk.get(lo) in blocks[blk.get(out[-1][1], 0)]["succ"])):
+                out[-1][1] = max(out[-1][1], hi)
+            else:
+                out.append([lo, hi])
+        return out
+    order = sorted(L, key=lambda r: index.get(r, 1 << 30))
+    i = 0
+    while i < len(order):
+        r = order[i]
+        if find(r) != r:
+            i += 1
+            continue
+        restart = False
+        for t_n in list(L[r]["defs"]):
+            T = by[t_n]
+            if not _is_copy(T) or find((T.get("dstr") or [None])[0]) != r:
+                continue
+            dsym = (T.get("leafsym") or [None])[0]
+            if dsym and len(dsym) > 4 and dsym[4] and dsym[4] != dsym[0]:
+                continue                                  # a view of L: not a whole-symbol def
+            sl = _leaf_reg(T, "s", 0)
+            if not sl or sl[0] != "cand":
+                continue
+            S = find(sl[1])
+            ssym = (T.get("leafsym") or [None, None])[len(T["dst"])] if len(T.get("leafsym") or []) > len(T["dst"]) else None
+            if S == r or S not in L or (ssym and len(ssym) > 11 and ssym[11]):
+                continue
+            if modified(r, S, t_n):
+                continue
+            if modified(S, r, 0):
+                a, b = L[S], L[r]
+                if not (len(a["uses"]) == 1 and len(a["defs"]) == 1 and blk.get(a["defs"][0]) == blk.get(t_n) and
+                        not any(a["ranges"][0][0] < u <= a["ranges"][-1][1] for u in b["uses"])):
+                    continue
+            dsz = (T.get("dstv") or [(True, None)])[0][1] or size(r)
+            ssz = size(S)
+            if dsz > ssz:
+                surv, dead = r, S
+            elif dsz < ssz:
+                surv, dead = S, r
+            elif ssym and len(ssym) > 4 and ssym[4] and ssym[4] != ssym[0]:
+                surv, dead = S, r
+            elif temp(r) and not temp(S):
+                surv, dead = S, r
+            else:
+                surv, dead = r, S
+            for x, key in ((L[r], "defs"), (L[r], "apps"), (L[S], "uses"), (L[S], "apps")):
+                if t_n in x[key]:
+                    x[key].remove(t_n)
+            a, b = L[surv], L[dead]
+            a["apps"] = sorted(a["apps"] + b["apps"])
+            a["defs"] = sorted(a["defs"] + b["defs"])
+            a["uses"] = sorted(a["uses"] + b["uses"])
+            a["ranges"] = merge_ranges(a["ranges"], b["ranges"])
+            L[dead] = dict(ranges=[], apps=[], defs=[], uses=[])
+            alias[dead] = surv
+            restart = surv == r
+            break
+        if not restart:
+            i += 1
+    return {q: find(q) for q in L}, {q: v for q, v in L.items() if find(q) == q}
+
+
+def il_tied_pre(pre, xpre, xpost, premap):
+    """L+0x38 / L+0x54 as NColBuildInfo sets them on the stream before NColSubsumption (backward walk, both sites
+    overwrite: the qualifying copy with the smallest tuple number is kept): a copy `mov phys <- x` where the use is
+    the end of one of x's ranges, or any copy `mov x <- phys`; NColCombineLifetimes gives the survivor the absorbed
+    lifetime's tie when it has none; the window comes from the survivor's ranges at prioritization (xpost)."""
+    tie = {}
+    for t in pre:
+        if not _is_copy(t):
+            continue
+        d, sr = _leaf_reg(t, "d", 0), _leaf_reg(t, "s", 0)
+        if not d or not sr:
+            continue
+        n = t["n"]
+        if d[0] == "cand" and sr[0] == "phys":
+            tie.setdefault(d[1], (sr[1], n))
+        elif sr[0] == "cand" and d[0] == "phys":
+            y = xpre["cands"].get(sr[1])
+            if y and any(hi == n for _lo, hi in y["ranges"]):
+                tie.setdefault(sr[1], (d[1], n))
+    post = {}
+    for r, v in sorted(tie.items(), key=lambda kv: (premap.get(kv[0]) != kv[0], kv[1][1])):
+        q = premap.get(r, r)          # the survivor's own tie first, then an absorbed one
+        post.setdefault(q, v)
+    out = {}
+    for q, (reg, n) in post.items():
+        y = xpost["cands"].get(q)
+        if not y:
+            continue
+        for lo, hi in y["ranges"]:
+            if lo == n:
+                out[q] = (reg, (n, min(hi, n + PREF_WINDOW)))
+                break
+            if hi == n:
+                out[q] = (reg, (lo if not (n > PREF_WINDOW and lo <= n - PREF_WINDOW) else n - PREF_WINDOW, n))
+                break
+        else:
+            out[q] = (reg, None)
+    return out
+
+
+def il_rbp_reserved(tups, speed=True):
+    """NColMdPerFuncInit's rbp reservation (0x1009271d..: rbp becomes a frame base and leaves every useable set) when
+    the frame-reference score NColCanon accumulates (TLS+0x1196c) reaches 6 * 24 (speed; 6 * 12 otherwise). The score
+    as fitted on zlib [I]: 6 per leaf of a stack symbol (kind-2 leaf of a SYM of kind 4 / 5) plus 1 per kind-5 memory
+    operand; zlib: inflate, inflateBack and inflate_table (146) reserve it, the next highest scores 54."""
+    sc = 0
+    for t in tups:
+        if t["kind"] != "I":
+            continue
+        ls = t.get("leafsym") or []
+        for i, k in enumerate(t["dstk"] + t["srck"]):
+            x = ls[i] if i < len(ls) else None
+            if k == 2 and x and len(x) > 3 and (x[3] & 0xff) in (4, 5):
+                sc += 6
+            elif k == 5:
+                sc += 1
+    return sc >= 6 * (24 if speed else 12)
+
+
+def il_has_try(tups):
+    """A try block (OPEHTRY in the IL): the frame keeps rbp (FUNC+0xe4 / +0xe8 flags of an EH frame: rbp leaves the
+    useable sets) and NColMdAdjustPriority does not move a global (FUNC+0xe4 & 0x80) [I: tests/data/ncol c2.cpp's f2;
+    a destructor-only unwind (op579 / op581) keeps both]."""
+    return any(t["kind"] in "IK" and t["op"] == "OPEHTRY" for t in tups)
+
+
+IL_MODEL = ("tied", "prefs", "useable", "anti", "order", "live", "avail", "index")   # il_model_state's default
+
+
+def il_model_state(f, use=IL_USE + IL_MODEL):
+    """il_state() plus the inputs of part 2 named in `use`: tied / prefwin (il_tied, or il_tied_pre), prefs
+    (il_pref_sources: the record gets `prefs_src`, resolved in simulate), useable, anti, order (the record gets
+    `lists`: simulate orders by order_of instead of the traced buckets); with the IL before NColSubsumption
+    (`il_pre`, c2ncol --il) also live (il_live), avail (il_avail: the integer registers; xmm banks stay traced) and
+    index (il_index)."""
+    g = il_state(f, tuple(u for u in use if u in ("apps", "ranges", "live", "depth", "blk")))
+    tups = il_parse(f["il"])
+    x = il_inputs(f)
+    ty = il_types(tups)
+    st = g["state"]
+    names = {c.get("sym"): c for c in g["cands"]}
+    pre = il_parse(f["il_pre"]) if f.get("il_pre") else None
+    if "tied" in use:
+        td = il_tied(tups, x) if pre is None else \
+            il_tied_pre(pre, il_inputs(f, "il_pre"), x, il_premap(pre, tups))
+        pw = {r: [] for r in (st.get("prefwin") or {})}
+        for c in g["cands"]:
+            v = td.get(c.get("sym"))
+            c["tied"] = _master_num(v[0]) if v else None
+            c["prefwin"] = v[1] if v else None
+            if v and v[1] and c.get("apps"):
+                pw.setdefault(_master_num(v[0]), []).append(v[1])
+        st["prefwin"] = {r: sorted(w) for r, w in pw.items()}
+    if "prefs" in use:
+        g["prefs_src"] = il_pref_sources(tups, x)
+    if "useable" in use:
+        rbp = il_rbp_reserved(pre if pre is not None else tups, st.get("speed", 1)) or il_has_try(tups)
+        for c in g["cands"]:
+            t = ty.get(c.get("sym"))
+            u = il_useable(c, t, frame_rbp=rbp)
+            if u is not None and c.get("useable"):
+                c["useable"] = [u]
+    if "anti" in use:
+        an = il_anti(tups)
+        names_by = {c["name"]: c for c in g["cands"]}
+        for c in g["cands"]:
+            k = an.get(c["name"])
+            c["anti_r"] = [st["anti"][k] if k is not None and st.get("anti") else 0]
+    if pre is not None and "live" in use:          # exact from the stream NColBuildInfo walked
+        lv = il_live(pre)
+        st["live"] = lv + [0] * max(0, len(st["live"]) - len(lv))
+        st["maxlive"] = max(lv or [0])
+    if pre is not None and "avail" in use:
+        av = il_avail(pre, st["ntup"])
+        st["avail"] = {int(k): v for k, v in st["avail"].items()}
+        st["avail"].update(av)
+    if pre is not None and "index" in use:
+        ix = il_index(pre)
+        for c in g["cands"]:
+            if c.get("sym") in ix:
+                c["index"] = ix[c["sym"]]
+    if pre is not None and "subsume" in use:      # the lifetimes from the IL before NColSubsumption, coalesced by
+        _m, lives = il_subsume(pre, il_inputs(f, "il_pre"))     # the model (il_subsume) instead of read after it
+        for c in g["cands"]:
+            v = lives.get(c.get("sym"))
+            if v and v["apps"] and v["ranges"]:
+                c["apps"], c["ranges"] = list(v["apps"]), [tuple(q) for q in v["ranges"]]
+                c["first"], c["last"] = v["ranges"][0][0], v["ranges"][-1][1]
+    if "order" in use:
+        g["lists"] = il_lists(g, tups)
+        g["no_adjust"] = il_has_try(tups)
+    return g
+
+
+def cmd_ilmodel(fns, show=10):
+    """Part 2's inputs from the IL against the traced ones: per candidate the tied register and window, the preference
+    list (partners' registers as traced), the useable set, the anti-preference set; per function the order (lists,
+    priorities and indices as traced) and the lists. -> Counter."""
+    import collections
+    c = collections.Counter()
+    bad = collections.defaultdict(list)
+    sp = lambda p: p - (1 << 32) if p & 0x80000000 else p
+    for f in fns:
+        if not f.get("il") or not f.get("state"):
+            continue
+        g = il_model_state(f, ("tied", "prefs", "useable", "anti", "order"))
+        pof = il_prefs_of(g, g["prefs_src"])
+        given = {}
+        c["functions"] += 1
+        o = order_of(dict(f, no_adjust=g.get("no_adjust")), [sp(x["prio"]) for x in f["cands"]], g["lists"])
+        c["order same"] += o == list(range(len(f["cands"])))
+        if o != list(range(len(f["cands"]))):
+            bad["order"].append(f["func"])
+        for c0, c1 in zip(f["cands"], g["cands"]):
+            if not c0.get("ranges"):
+                continue
+            c["cands"] += 1
+            t0 = regname(c0["tied"]) if c0.get("tied") else None
+            t1 = regname(c1["tied"]) if c1.get("tied") else None
+            c["tied same"] += t0 == t1
+            w0 = tuple(c0["prefwin"]) if c0.get("prefwin") else None
+            w1 = tuple(c1["prefwin"]) if c1.get("prefwin") else None
+            c["window same"] += (t0, w0) == (t1, w1)
+            if (t0, w0) != (t1, w1):
+                bad["tied"].append((f["func"], c0["name"], t0, w0, t1, w1))
+            p0 = [regname(n) for n, _t in (c0.get("prefs") or [[]])[0]]
+            p1 = pof(c1, given)
+            c["prefs same"] += p0 == p1
+            if p0 != p1:
+                bad["prefs"].append((f["func"], c0["name"], p0, p1))
+            if c0["regions"]:
+                given[c0["name"]] = ALIAS.get(c0["regions"][0]["reg"])
+            if c0.get("useable"):
+                c["useable n"] += 1
+                c["useable same"] += useable(c0) == useable(c1)
+                if useable(c0) != useable(c1):
+                    bad["useable"].append((f["func"], c0["name"], sorted((useable(c0) or set()) ^ (useable(c1) or set()))))
+            a0, a1 = avoid(c0, f["state"]), avoid(c1, g["state"])
+            c["anti same"] += a0 == a1
+            if a0 != a1:
+                bad["anti"].append((f["func"], c0["name"], a0, a1))
+    for k in ("functions", "order same", "cands", "tied same", "window same", "prefs same", "useable n", "useable same",
+              "anti same"):
+        print("ilmodel: %-13s %d" % (k, c[k]))
+    for k, v in bad.items():
+        print("  %s: %d" % (k, len(v)))
+        for b in v[:show]:
+            print("    ", b)
+    return c
+
+
+def il_predict(f, use=None):
+    """{short name: register} the model gives from the function's IL alone (il_model_state + simulate): for a compile
+    of an edited source whose block structure changed (eqif, duplicated tails: docs/c2/ncolor.md 12), NColor's inputs
+    are recomputed from that compile's IL instead of being edited on the base run."""
+    g = il_model_state(f, use or IL_USE + IL_MODEL)
+    got = simulate(g, lists=g.get("lists"), prefs_of=il_prefs_of(g, g["prefs_src"]) if g.get("prefs_src") else None)
+    return {short(k): v for k, v in got.items()}
+
+
+def cmd_ilfull(fns, show=10, use=None):
+    """replay and sim with every input from the IL (il_model_state: IL_USE + IL_MODEL; exports of c2ncol --il carry
+    the IL before NColSubsumption that live, avail and index need; xmm availability stays traced)."""
+    use = use or IL_USE + IL_MODEL
+    gs = [il_model_state(f, use) if f.get("il") and f.get("state") else f for f in fns]
+    print("on the IL's inputs (%s):" % "+".join(use))
+    cmd_replay(gs, show)
+    cmd_sim(gs, show)
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
         sys.exit(__doc__)
@@ -1298,6 +2248,7 @@ def main(argv):
     return {"prio": cmd_prio, "replay": lambda f: cmd_replay(f, show), "sim": lambda f: cmd_sim(f, show),
             "ilin": lambda f: cmd_ilin(f, show) and 0, "ilprio": lambda f: cmd_ilprio(f) and 0,
             "ilprio+live": lambda f: cmd_ilprio(f, IL_USE + ("live",)) and 0,
+            "ilmodel": lambda f: cmd_ilmodel(f, show) and 0, "ilfull": lambda f: cmd_ilfull(f, show),
             "ilsim": lambda f: cmd_ilsim(f, show)}[argv[0]](fns)
 
 

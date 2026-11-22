@@ -24,7 +24,10 @@ import c2build   # noqa: E402  (--c2 is taken out of argv here)
 import c2trace   # noqa: E402
 
 # event kinds in hooks.ncol order; --why adds STATE (hooks.ncol_state: the liveness arrays after prioritization)
-CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF = range(8)
+CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF, PRE = range(9)
+# --il: the IL also at NColSubsumption's entry (0x1009ab40, after NColInitializeSyms / NColBuildInfo, before the copies
+# are coalesced and NColFoldTooCheap folds: the stream the lifetime indices, live counts and availability come from)
+PRE_HOOK = "1009ab40=tdccc>0>0>4$,tdccc>0>8>0>0x1c%"
 NAVAIL = 80          # nodes of each register's initial availability list (--export)
 # register numbers of _RegName whose lists are exported: rax..r15; fxmm0l..15l (doubles), fxmm0s..15s (floats);
 # preference windows are kept per master: rax..r15 and ymm0..15 (the xmm family's master, docs/c2/ncolor.md 9)
@@ -96,7 +99,8 @@ def parse_all(text):
             th = int(ln.split()[2])
             continue
         if ln.startswith("T ") and th in ilrec:
-            ilrec[th].setdefault("il", []).append(ln[2:])
+            r_, key = ilrec[th] if isinstance(ilrec[th], tuple) else (ilrec[th], "il")
+            r_.setdefault(key, []).append(ln[2:])
             continue
         if not ln.startswith("E ") or "|" not in ln:
             continue
@@ -112,6 +116,9 @@ def parse_all(text):
             continue
         c = fn_of(th)
         rec, cur = c["fn"], c["cur"]
+        if kind == PRE:
+            ilrec[th] = (rec, "il_pre")    # --il: the IL before NColSubsumption (T lines follow)
+            continue
         if kind == CAND:
             cur = dict(name=symtext(v[0], v[1], v[2]), prio=int(v[3], 16) if v[3] != "?" else None,
                        first=hx(v[4]), last=hx(v[5]), regions=[], choices=[], final=None)
@@ -256,6 +263,8 @@ def main(argv):
         hk.append(st)
         hk.append(c2build.hooks("ncol_fn", None))
         hk.append(c2build.hooks("ncol_pref", None))
+        if a.export and a.il and c2build.name().startswith("17.00"):
+            hk.append(PRE_HOOK)
     img, hk, rc, out, text = c2trace.run_trace(a.src, hk, cl or ["/O2"], keep=a.keep,
                                                func=a.func if a.func else (False if a.export else None))
     if rc:

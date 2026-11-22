@@ -1,0 +1,261 @@
+{
+"build": "17.00.61030-x64",
+"func": "?big4@@YAHH@Z",
+"nstack": 4,
+"params": [
+1
+],
+"elems": {
+"1": {
+"idx": 1,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 0,
+"key": 2,
+"name": "n",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 8,
+"lod": [
+0
+],
+"lodtrunc": false,
+"tnum": 2795,
+"never": false,
+"gs": 0
+},
+"0": {
+"idx": 0,
+"size": 4,
+"uses": 4,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 11,
+"name": "n$GSCopy$1",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+0
+],
+"lodtrunc": false,
+"tnum": 2854,
+"never": false,
+"gs": 0
+},
+"2": {
+"idx": 2,
+"size": 8,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 4,
+"name": "a",
+"align": 4,
+"ty": 24584,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+2,
+3
+],
+"lodtrunc": false,
+"tnum": 2799,
+"never": false,
+"gs": 0
+},
+"3": {
+"idx": 3,
+"size": 32,
+"uses": 2,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 16,
+"key": 3,
+"name": "v",
+"align": 6,
+"ty": 24608,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+2,
+3
+],
+"lodtrunc": false,
+"tnum": 2798,
+"never": false,
+"gs": 3
+}
+},
+"fn": {
+"npc": 0,
+"ebp": 0,
+"nparams": 1,
+"gs": true,
+"gscopies": true,
+"alloc": 0,
+"cap": 32,
+"dalign": null,
+"ebpadj": 0,
+"v13": false,
+"T": 64,
+"ncol": 4,
+"tround": 16,
+"undo": false,
+"up": true,
+"palign": true,
+"capdef": 16,
+"argarea": true,
+"frame": {
+"A": 272,
+"F": 384,
+"pushed": 40,
+"B": 272,
+"lrsp": false,
+"prsp": true,
+"dyn": 1,
+"cap": 32,
+"alloca": false,
+"Fend": 384
+}
+},
+"obs": {
+"run": [
+{
+"idx": 0,
+"tries": [],
+"res": [
+"c",
+1
+],
+"ncol": 1
+},
+{
+"idx": 2,
+"tries": [
+[
+"c",
+1,
+4
+]
+],
+"res": [
+"c",
+2
+],
+"ncol": 2
+},
+{
+"idx": 3,
+"tries": [
+[
+"c",
+2,
+8
+],
+[
+"c",
+1,
+4
+]
+],
+"res": [
+"c",
+3
+],
+"ncol": 3
+}
+],
+"undo": false,
+"cols": [
+{
+"c": 0,
+"base": 8,
+"members": [
+[
+1,
+8
+]
+]
+},
+{
+"c": 1,
+"base": 0,
+"members": [
+[
+0,
+0
+]
+]
+},
+{
+"c": 2,
+"base": 8,
+"members": [
+[
+2,
+8
+]
+]
+},
+{
+"c": 3,
+"base": 32,
+"members": [
+[
+3,
+32
+]
+]
+}
+],
+"done": {
+"T": 64,
+"npc": 0,
+"ebp": null,
+"joins": null
+}
+},
+"listing": {
+"1": {
+"lname": "n$",
+"loff": 432,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"0": {
+"lname": "n$GSCopy$1$",
+"loff": 0,
+"lsize": null,
+"lrefs": 4,
+"line": 12
+},
+"2": {
+"lname": "a$",
+"loff": 8,
+"lsize": null,
+"lrefs": 3,
+"line": 12
+},
+"3": {
+"lname": "v$",
+"loff": 32,
+"lsize": null,
+"lrefs": 2,
+"line": 12
+}
+}
+}

@@ -3058,7 +3058,7 @@ def x64_edit(s):
         return ["%sapp:%s:%s:1" % ("+" if f[0] == "ref" else "-", f[1].split("@p")[0].split("#")[0], f[2])]
     if f[0] == "before" and len(f) >= 3:
         return ["before:%s:%s" % (f[1], f[2])]
-    if s.startswith("index:") or s.startswith("prio:"):
+    if s.startswith("index:") or s.startswith("prio:") or s.startswith("bucket:"):
         return [s]
     return None
 
@@ -3120,6 +3120,8 @@ class X64Ctx:
                     out += list(self.rw.FAMILIES[fam](self.B))
             if "eqif" in fams or not self.a.constructs:
                 out += list(self.eqif())
+            if "box" in fams or not self.a.constructs:
+                out += list(self.box())
             if "store" in fams or (not self.a.constructs and (self.a.cmd == "edit" and not (self.a.from_ncol or
                                                                 self.a.from_rasim) or self.a.with_store)):
                 out += list(self.store())
@@ -3152,6 +3154,33 @@ class X64Ctx:
                 yield ("eqif", "eqif %s at line %d" % (v, self.line_of(s_)),
                        [(s_, e_, "if ((__int64)(%s) & 1) { %s } else { %s }" % (v, S, S))])
 
+    def box(self):
+        """`struct { T rz_v; } V = { E };` for a scalar or pointer `T V = E;`, every use V -> V.rz_v: V's symbol is
+        then class 6 (an aggregate held in an integer register), which NColPrioritizeCandidates puts in list 0 / 1
+        with the xmm candidates: processed before every integer candidate whatever its priority (`bucket:V=aggr`,
+        docs/c2/ncolor.md 12; a scope object whose constructor saves and destructor restores does the same). The
+        code is unchanged when the struct is not address-taken."""
+        B = self.B
+        for v, (ty, decl) in B.vars.items():
+            if decl < 0 or v == "this" or ty.rstrip().endswith("&") or "[" in ty or not (
+                    "*" in ty or re.search(r"\b(int|long|short|char|unsigned|signed|size_t|__int64|bool)\b", ty)):
+                continue
+            st = max([i for i in B.starts if i <= decl] or [-1])
+            if st < 0:
+                continue
+            j = decl
+            while j < len(B.toks) and not (B.toks[j][0] == ";" and B.paren[j] == B.paren[st]):
+                if B.toks[j][0] == "," and B.paren[j] == B.paren[st]:
+                    break
+                j += 1
+            if j >= len(B.toks) or B.toks[j][0] != ";":
+                continue
+            ed = [(B.toks[st][1], B.toks[decl][2], "struct { %s rz_v; } %s" % (ty, v))]
+            if decl + 1 < j and B.toks[decl + 1][0] == "=":
+                ed.append((B.toks[decl + 1][1], B.toks[j][1], "= { %s }" % B.text[B.toks[decl + 2][1]:B.toks[j][1]].strip()))
+            ed += [(B.toks[i][1], B.toks[i][2], "%s.rz_v" % v) for i in B.uses[v]]
+            yield ("box", "%s held in a one-member struct (line %d)" % (v, self.line_of(B.toks[st][1])), ed)
+
     def store(self):
         """`rz_keep(V);` (a store of V to a global) at every statement where V is in scope and assigned: exactly one
         appearance of V in that statement's block and nothing else at NColor when V is live there. One instruction
@@ -3183,6 +3212,7 @@ class X64Ctx:
             lines = self.text_lines(b)
             sel = [c for c in self.constructs()
                    if self.mentions(c, [v]) and any(self.line_of(s_) in lines for s_, _e, _r in c[2])
+                   and c[0] != "box"
                    and (c[0] not in ("eqif", "store") or re.match(r"(eqif |rz_keep\()%s\b" % re.escape(v), c[1]))]
             # a source line shared by several blocks (`if (m) { g(u); }` on one line, a for header): lines of B alone
             # first; on a line B shares with an earlier block the later positions, with a later block the earlier
@@ -3196,6 +3226,9 @@ class X64Ctx:
         if f[0] == "before":
             return [c for c in self.constructs() if c[0] in ("swap", "split", "alias", "eqif", "wrap")
                     and self.mentions(c, f[1:3])]
+        if f[0] == "bucket":                     # bucket:V=..: the box of V
+            v = f[1].split("=")[0]
+            return [c for c in self.constructs() if c[0] == "box" and c[1].split()[0] == v]
         return []
 
     def measure(self, tag, edits):
@@ -3230,6 +3263,13 @@ def x64_verdict(req, m):
             order = [c["name"].split("$")[0] for c in sorted(m["r"].f["cands"], key=lambda c: c.get("index", 0))]
             ok = ok and x in order and y in order and order.index(x) < order.index(y)
             got = [g for g in got if not g.startswith("index:")]
+        elif e.startswith("bucket:"):
+            # requested by name (aggr / local / ..), measured as the variant's list number
+            v = e[7:].split("=")[0]
+            want = m.get("want_list", {}).get(e)
+            hit = [g for g in got if g.startswith("bucket:%s=" % v) and (want is None or g.endswith("=%d" % want))]
+            ok = ok and bool(hit)
+            got = [g for g in got if g not in hit]
         elif e in got:
             got.remove(e)
         else:
@@ -3245,6 +3285,10 @@ def x64_inputs(c, m):
     """What a variant moved in NColor's inputs, and whether ncolsim predicts its registers from that."""
     d = m["d"]
     if d["blocks"]:
+        if m["r"].f.get("il_pre"):         # recomputed from the variant's IL (ncolsim.il_predict)
+            pm = c.N.il_predict(m["r"].f)
+            ok = all(pm[k] == m["got"].get(k, pm[k]) for k in pm if c.N.named(k))
+            return "the block structure (ncolsim from the variant's IL: %s)" % ("as traced" if ok else "differs")
         return "the block structure (not predicted)"
     pm = c.N.predict(c.base.f, d["edits"])
     ok = all(pm[k] == m["got"].get(k, pm[k]) for k in pm if c.N.named(k))
@@ -3256,7 +3300,8 @@ def x64_show(c, tag, desc, m, verdict, also, pred):
     N = c.N
     got = m["got"]
     chg = " ".join("%s:%s->%s" % (k, c.breg[k], got[k]) for k in c.breg if N.named(k) and k in got and got[k] != c.breg[k])
-    pm = None if m["d"]["blocks"] else N.predict(c.base.f, m["d"]["edits"])
+    pm = N.predict(c.base.f, m["d"]["edits"]) if not m["d"]["blocks"] else \
+        N.il_predict(m["r"].f) if m["r"].f.get("il_pre") else None
     okreq = None if pred is None else all(pred[k] == got.get(k, pred[k]) for k in pred if N.named(k))
     okm = None if pm is None else all(pm[k] == got.get(k, pm[k]) for k in pm if N.named(k))
     print("  %-8s %-6s code %d regs %d%s  %-6s pred(req) %-4s pred(meas) %-4s  %s  | %s%s" % (
@@ -3272,7 +3317,7 @@ def x64_cmd_edit(c, a):
         e = x64_edit(s)
         if e is None:
             sys.exit("realize (x64): %r is not an NColor edit (+app:V:B[:N], -app:V:B[:N], ref:V:B, unref:V:B, "
-                     "before:A:B)" % s)
+                     "before:A:B, bucket:V=aggr|local|global|const|N)" % s)
         reqs.append((s, e))
     N = c.N
     print("base: registers %s" % " ".join("%s=%s" % kv for kv in c.breg.items() if N.named(kv[0])))
@@ -3301,6 +3346,7 @@ def x64_cmd_edit(c, a):
             except (Exception, SystemExit) as ex:
                 print("  %-8s failed: %s | %s" % (tag, str(ex)[-100:], k[1]))
                 continue
+            m["want_list"] = {x: N.bucket_edit(c.base.f, N.lists_of(c.base.f), x)[1] for x in e if x.startswith("bucket:")}
             v, also = x64_verdict(e, m)
             if v == "no" and not a.all_variants and m["regs"] == 0 and not m["d"]["edits"]:
                 continue

@@ -6,7 +6,8 @@ usage: c2stage_vs2012.py ROOT [--out work/vs2012/stage]
 ROOT is the folder Microsoft's ISOs were unpacked into (it holds "Program Files/Microsoft Visual Studio 11.0" and
 "Windows Kits/8.0"). The stage is symbolic links only, in the layout setup
 copies from: vc/bin = VC/bin/x86_amd64 (the 32-bit-hosted x64 cross compiler), vc/include, vc/lib = VC/lib/amd64,
-sdk/Include = the kit's shared/ and um/ headers in one folder, sdk/Lib = Lib/win8/um/x64.
+sdk/Include = the kit's shared/ and um/ headers in one folder, sdk/Lib = Lib/win8/um/x64, vc/extra =
+Common7/IDE's msobj110.dll (link /LTCG needs it; setup copies extra/ into VC/Bin).
 """
 import argparse, os, sys
 
@@ -41,6 +42,12 @@ def main(argv):
                 os.symlink(os.path.abspath(os.path.join(d, f)), dst)
                 n += 1
     os.symlink(os.path.abspath(os.path.join(kit, "Lib", "win8", "um", "x64")), os.path.join(a.out, "sdk", "Lib"))
+    ide = os.path.join(a.root, "Program Files", "Microsoft Visual Studio 11.0", "Common7", "IDE")
+    extra = [f for f in ("msobj110.dll",) if os.path.isfile(os.path.join(ide, f))]   # link /LTCG loads it
+    if extra:
+        os.makedirs(os.path.join(a.out, "vc", "extra"))
+        for f in extra:
+            os.symlink(os.path.abspath(os.path.join(ide, f)), os.path.join(a.out, "vc", "extra", f))
     print("staged %s (%d SDK headers); next: uv run tools/c2build.py setup --c2 17.00" % (a.out, n))
 
 

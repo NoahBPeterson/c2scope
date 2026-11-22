@@ -506,6 +506,10 @@ def main():
         argv, cl = argv[:k], argv[k + 1:]
     if not argv or argv[0] not in ("facts", "callees", "stub", "stubs", "cmp"):
         sys.exit(__doc__)
+    if c2build.get("arch") == "x64":
+        sys.exit("ltcgstub: x86 only (32-bit code, eax/ecx/edx kill sets, MdmFlexParams conventions); for %s use "
+                 "c2ltcg.py asm / il (link /LTCG under the trace) and calleesum.py (Win64 memory summaries)"
+                 % c2build.name())
     sub = argv.pop(0)
     ap = argparse.ArgumentParser(prog="ltcgstub.py " + sub)
     ap.add_argument("exe")

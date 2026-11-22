@@ -1978,6 +1978,15 @@ def main(argv):
     if "--" in argv:
         k = argv.index("--")
         argv, cl = argv[:k], argv[k + 1:]
+    if "--c2" in argv:                   # --c2 BUILD as on every tool (c2build takes it from sys.argv, not argv)
+        k = argv.index("--c2")
+        os.environ["C2_BUILD"] = argv[k + 1] if k + 1 < len(argv) else ""
+        del argv[k:k + 2]
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import c2build
+    if c2build.get("arch") == "x64":
+        sys.exit("judge: x86-only equivalence for now; %s is x64 (no judge on x64 yet: docs/c2/port-1700.md)"
+                 % c2build.name())
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("src", nargs="?")
     ap.add_argument("--func", required=True)

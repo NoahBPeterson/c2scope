@@ -1,0 +1,774 @@
+{
+"build": "17.00.61030-x64",
+"func": "?tcp@@YAHHHHHPEAH@Z",
+"nstack": 12,
+"params": [
+3,
+6,
+7,
+8,
+9
+],
+"elems": {
+"3": {
+"idx": 3,
+"size": 4,
+"uses": 4,
+"param": true,
+"kind": 5,
+"fl6": 8,
+"fl7": 0,
+"key": 5,
+"name": "a",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 8,
+"lod": [
+3,
+6,
+7,
+8,
+9
+],
+"lodtrunc": false,
+"tnum": 2798,
+"never": false,
+"gs": 0
+},
+"6": {
+"idx": 6,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 8,
+"fl7": 0,
+"key": 4,
+"name": "b",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 16,
+"lod": [
+3,
+7,
+8,
+9
+],
+"lodtrunc": false,
+"tnum": 2799,
+"never": false,
+"gs": 0
+},
+"7": {
+"idx": 7,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 8,
+"fl7": 0,
+"key": 3,
+"name": "c",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 24,
+"lod": [
+3,
+6,
+8,
+9
+],
+"lodtrunc": false,
+"tnum": 2800,
+"never": false,
+"gs": 0
+},
+"8": {
+"idx": 8,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 8,
+"fl7": 0,
+"key": 2,
+"name": "d",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 32,
+"lod": [
+3,
+6,
+7,
+9
+],
+"lodtrunc": false,
+"tnum": 2801,
+"never": false,
+"gs": 0
+},
+"9": {
+"idx": 9,
+"size": 8,
+"uses": 4,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 32,
+"key": 1,
+"name": "p",
+"align": 4,
+"ty": 4104,
+"ssize": 8,
+"poff": 40,
+"lod": [
+3,
+6,
+7,
+8
+],
+"lodtrunc": false,
+"tnum": 2802,
+"never": false,
+"gs": 0
+},
+"0": {
+"idx": 0,
+"size": 4,
+"uses": 6,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 482,
+"name": "x6$1",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+2,
+3,
+5,
+9,
+10,
+11
+],
+"lodtrunc": false,
+"tnum": 2964,
+"never": false,
+"gs": 0
+},
+"1": {
+"idx": 1,
+"size": 4,
+"uses": 6,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 483,
+"name": "x7$1",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+2,
+3,
+5,
+9,
+10,
+11
+],
+"lodtrunc": false,
+"tnum": 2965,
+"never": false,
+"gs": 0
+},
+"2": {
+"idx": 2,
+"size": 4,
+"uses": 5,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 480,
+"name": "x4$1",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+2,
+3,
+9,
+10,
+11
+],
+"lodtrunc": false,
+"tnum": 2962,
+"never": false,
+"gs": 0
+},
+"4": {
+"idx": 4,
+"size": 4,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 490,
+"name": "x14$1",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+2,
+4,
+9,
+10,
+11
+],
+"lodtrunc": false,
+"tnum": 2972,
+"never": false,
+"gs": 0
+},
+"5": {
+"idx": 5,
+"size": 4,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 481,
+"name": "x5$1",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+2,
+3,
+5,
+9
+],
+"lodtrunc": false,
+"tnum": 2963,
+"never": false,
+"gs": 0
+},
+"10": {
+"idx": 10,
+"size": 8,
+"uses": 4,
+"param": false,
+"kind": 3,
+"fl6": 0,
+"fl7": 0,
+"key": 372,
+"name": null,
+"align": 4,
+"ty": 4104,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+2,
+4,
+5,
+9,
+10,
+11
+],
+"lodtrunc": false,
+"tnum": null,
+"never": false,
+"gs": 0
+},
+"11": {
+"idx": 11,
+"size": 8,
+"uses": 3,
+"param": false,
+"kind": 3,
+"fl6": 0,
+"fl7": 0,
+"key": 373,
+"name": null,
+"align": 4,
+"ty": 8200,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+2,
+4,
+5,
+9,
+10,
+11
+],
+"lodtrunc": false,
+"tnum": null,
+"never": false,
+"gs": 0
+}
+},
+"fn": {
+"npc": 5,
+"ebp": 0,
+"nparams": 5,
+"gs": false,
+"gscopies": false,
+"alloc": 0,
+"cap": 16,
+"dalign": null,
+"ebpadj": 0,
+"v13": false,
+"T": 48,
+"ncol": 8,
+"tround": 16,
+"undo": false,
+"up": true,
+"palign": true,
+"capdef": 16,
+"argarea": true,
+"frame": {
+"A": 32,
+"F": 72,
+"pushed": 64,
+"B": 32,
+"lrsp": true,
+"prsp": true,
+"dyn": 0,
+"cap": 16,
+"alloca": false,
+"Fend": 72
+}
+},
+"obs": {
+"run": [
+{
+"idx": 0,
+"tries": [
+[
+"p",
+0,
+4
+],
+[
+"p",
+1,
+4
+]
+],
+"res": [
+"p",
+1
+],
+"ncol": null
+},
+{
+"idx": 1,
+"tries": [
+[
+"p",
+0,
+4
+],
+[
+"p",
+1,
+4
+],
+[
+"p",
+2,
+4
+]
+],
+"res": [
+"p",
+2
+],
+"ncol": null
+},
+{
+"idx": 2,
+"tries": [
+[
+"p",
+0,
+4
+],
+[
+"p",
+1,
+4
+],
+[
+"p",
+2,
+4
+],
+[
+"p",
+3,
+4
+]
+],
+"res": [
+"p",
+3
+],
+"ncol": null
+},
+{
+"idx": 4,
+"tries": [
+[
+"p",
+0,
+4
+]
+],
+"res": [
+"p",
+0
+],
+"ncol": null
+},
+{
+"idx": 5,
+"tries": [
+[
+"p",
+0,
+4
+],
+[
+"p",
+1,
+4
+],
+[
+"p",
+2,
+4
+],
+[
+"p",
+3,
+4
+],
+[
+"p",
+4,
+8
+]
+],
+"res": [
+"c",
+5
+],
+"ncol": 5
+},
+{
+"idx": 10,
+"tries": [
+[
+"p",
+0,
+4
+],
+[
+"p",
+1,
+4
+],
+[
+"p",
+2,
+4
+],
+[
+"p",
+3,
+4
+],
+[
+"p",
+4,
+8
+],
+[
+"c",
+5,
+4
+]
+],
+"res": [
+"c",
+6
+],
+"ncol": 6
+},
+{
+"idx": 11,
+"tries": [
+[
+"p",
+0,
+4
+],
+[
+"p",
+1,
+4
+],
+[
+"p",
+2,
+4
+],
+[
+"p",
+3,
+4
+],
+[
+"p",
+4,
+8
+],
+[
+"c",
+6,
+8
+],
+[
+"c",
+5,
+4
+]
+],
+"res": [
+"c",
+7
+],
+"ncol": 7
+}
+],
+"undo": false,
+"cols": [
+{
+"c": 0,
+"base": 8,
+"members": [
+[
+3,
+8
+],
+[
+4,
+8
+]
+]
+},
+{
+"c": 1,
+"base": 16,
+"members": [
+[
+0,
+16
+],
+[
+6,
+16
+]
+]
+},
+{
+"c": 2,
+"base": 24,
+"members": [
+[
+1,
+24
+],
+[
+7,
+24
+]
+]
+},
+{
+"c": 3,
+"base": 32,
+"members": [
+[
+2,
+32
+],
+[
+8,
+32
+]
+]
+},
+{
+"c": 4,
+"base": 40,
+"members": [
+[
+9,
+40
+]
+]
+},
+{
+"c": 5,
+"base": 0,
+"members": [
+[
+5,
+0
+]
+]
+},
+{
+"c": 6,
+"base": 8,
+"members": [
+[
+10,
+8
+]
+]
+},
+{
+"c": 7,
+"base": 16,
+"members": [
+[
+11,
+16
+]
+]
+}
+],
+"done": {
+"T": 48,
+"npc": 5,
+"ebp": null,
+"joins": null
+}
+},
+"listing": {
+"3": {
+"lname": "a$",
+"loff": 144,
+"lsize": null,
+"lrefs": 2,
+"line": 24
+},
+"6": {
+"lname": "b$",
+"loff": 152,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"7": {
+"lname": "c$",
+"loff": 160,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"8": {
+"lname": "d$",
+"loff": 168,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"9": {
+"lname": "p$",
+"loff": 176,
+"lsize": null,
+"lrefs": 3,
+"line": 23
+},
+"0": {
+"lname": "x6$1$",
+"loff": 152,
+"lsize": null,
+"lrefs": 5,
+"line": 24
+},
+"1": {
+"lname": "x7$1$",
+"loff": 160,
+"lsize": null,
+"lrefs": 5,
+"line": 24
+},
+"2": {
+"lname": "x4$1$",
+"loff": 168,
+"lsize": null,
+"lrefs": 4,
+"line": 24
+},
+"4": {
+"lname": "x14$1$",
+"loff": 144,
+"lsize": null,
+"lrefs": 2,
+"line": 28
+},
+"5": {
+"lname": "x5$1$",
+"loff": 32,
+"lsize": null,
+"lrefs": 2,
+"line": 24
+},
+"10": {
+"lname": "tv372",
+"loff": 40,
+"lsize": null,
+"lrefs": 3,
+"line": 23
+},
+"11": {
+"lname": "tv373",
+"loff": 48,
+"lsize": null,
+"lrefs": 2,
+"line": 23
+}
+}
+}

@@ -242,7 +242,8 @@ the build does not have). StackPack fields replace the x86 globals: `this+4` col
 | sorted | 100e1d93 | after the sort: colours, T, params, cookie SSR (FUNC+0x68), FUNC+0xe4, MOD+0x396, Alloc_local (TLS+0xdd14), cap FUNC+0x4c; named by `slots.sorted` |
 | col | 100e1dc2 | offset loop: esi colour, eax base |
 | mem | 100e1e1d | member: edx SYM, its index +0x40, eax packed offset |
-| frame | 1006c6a1 | `MdmCalculateFrameInfo`: name, A = FUNC+0xa4, F (edi), pushed bytes (eax), B = FUNC+0xb8 |
+| frame | 1006c6a1 | `MdmCalculateFrameInfo`: name, A = FUNC+0xa4, F (edi), pushed bytes (eax), B = FUNC+0xb8, the frame registers of locals / params FUNC+0x74 / +0x78 with RegSym[5] (rsp; `[TLS+0x113f4]` + 5 * 0x64), FUNC+0x5c (bit 0 dynamic alignment), FUNC+0x4c, FUNC+0xe4 / +0xe8 (alloca: 0x1000 / 0x100) |
+| fend | 1011b9b0 | `EncEmitFunc` entry: name, F = FUNC+0x70 (0 when `TryRemoveArgumentAreaFromStackFrame` removed the argument area) |
 
 `slots` keys added for this build (all read by c2slots, none by build name): `sym` (the SYM field template: index
 +0x40, size +0x24, uses +0x3c, flags dword +8, number +0x20, name `[[+4]+4]`, alignment code +0x30, type +0,
@@ -263,7 +264,7 @@ are the x86 rules, so the four x86 tables need no change).
   ascending: buffers end up highest, next to the cookie).
 - Rule 8: offsets ascend from Alloc_local (the `sorted` record's value, 0 normally) in colour order, every member
   at its colour's base; `allotemp` rounds the size to the alignment, a 1-byte slot is not aligned, a 2-byte one to 2.
-- Final displacement (`MdmInsertEntryExit`): a local's `[rsp+N]` is packed + A, a parameter's and anything sharing
+- Final displacement (`MdmInsertEntryExit`; other frame kinds in 6.1): a local's `[rsp+N]` is packed + A, a parameter's and anything sharing
   its home is the home (8 + 8i) + F + pushed bytes. The report prints this `final` column and compares it with the
   listing's `name$ = N` lines (`listing: K of N`).
 - Code generation runs on worker threads: `parse` keeps one context per `# thread N` of the log.
@@ -287,9 +288,9 @@ zlib in numbers: 166 elements, 152 colours. Most zlib functions never reach `Col
 locals live in registers and the only frame elements are the parameters (`numElements == numParams` returns before
 colouring), e.g. all 18 of deflate.c, adler32, crc32, zutil; their listing lines are parameter homes, which the
 packer does not place. Not exercised by any of these: the param-home alignment refusal (a home is 8 bytes, so only an
-over-aligned element of at most 8 bytes could hit it), `PartitionSortedColors` (FrameChain builds), dynamic
-alignment and alloca frames (B != A; `final_offsets` uses A - B there, unverified), `TryRemoveArgumentAreaFromStackFrame`
-(F dropped from the homes), and LiveOnDef sets longer than 12 nodes (the largest frame had 20 elements).
+over-aligned element of at most 8 bytes could hit it), `PartitionSortedColors` (FrameChain builds: never, 6.1),
+and LiveOnDef sets longer than 12 nodes (the largest frame had 20 elements). Dynamic alignment, alloca and the
+removed argument area: 6.1.
 
 Example (`tests/data/slots.c --func big -- /O2 /GS`):
 
@@ -309,3 +310,44 @@ listing: 5 of 5 named elements at the model's final offset (packed + A; param ho
 ```
 
 The x86 rules are untouched: `run_tests.py`'s slots tests pass under `C2_BUILD=14.00` and `15.00` (7 / 7 each).
+
+### 6.1 Dynamic alignment, alloca, the removed argument area (cl 17.00 x64)
+
+The packer's decisions are the same in these frames (the model was exact on every function below); what differs
+is the register the listing's `name$ = N` is relative to, and so the `final` column. `MdmSetFramePointerRegs`
+picks the frame registers (FUNC+0x74 locals, +0x78 parameters), `MdmInsertEntryExit` adds the deltas. Read off the
+frame record and the listings **[C]**:
+
+| frame | prologue (examples) | locals (FUNC+0x74) | parameter homes (FUNC+0x78) |
+|---|---|---|---|
+| plain | `push ..; sub rsp, F` | rsp: packed + A | rsp: 8 + 8i + F + pushed |
+| dynamic alignment (FUNC+0x5c bit 0: a local aligned above 16; FUNC+0x4c = that alignment, 32 / 64 seen) | `push rbp; sub rsp, F; lea rbp, [rsp+A+cap]; and rbp, -cap` | the aligned rbp: packed + A - B = packed (B = A) | rsp: as plain |
+| alloca (FUNC+0xe4 & 0x1000) | `push rbp; sub rsp, F; lea rbp, [rsp+B]`, B = min(A, 0xf0) | rbp: packed + A - B | rbp: 8 + 8i + F + pushed - B |
+| alloca and dynamic alignment | `push r13; push rbp; ..; lea rbp, [rsp+0x40]; and rbp, -32`, epilogue `lea rsp, [r13+..]` | the aligned rbp: packed + A - B | r13 = rsp + B: 8 + 8i + F + pushed - B |
+| argument area removed (`TryRemoveArgumentAreaFromStackFrame`: F == align16(A) + 8, no call, rsp a register operand only of `sub` / `add rsp, F` and tail jumps (opcodes 0x103 / 0x104); `[rsp+N]` operands do not count) | none (tail jump, `mov [rsp+8], ecx` into a home) | (none packed: F would be larger) | rsp: 8 + 8i + pushed (F subtracted) |
+
+So locals: + A when FUNC+0x74 is rsp and B == A, else + A - B, as the map says (slots_map.md 3.2); homes: - B
+when FUNC+0x78 is not rsp, - F when FUNC+0x70 is 0 at encoding. `c2slots.frame_deltas` is that rule; it reads the
+new fields of the `frame` record and the `fend` role (build table: `hooks.slots`, generated by mktable.py), and
+the report says which frame it is (`frame, A=272 F=304 pushed=40, B=240, alloca; locals from the frame register,
+homes from the frame register`). Before, `final_offsets` used "+ A unless B != A": wrong in every dynamically
+aligned function (A instead of 0) and in every alloca frame (B == A whenever A <= 0xf0, and homes without - B).
+
+The flags as traced (frame probe, `tests/data/slots17/frames.cpp`, /GS): FUNC+0x5c = 1 and FUNC+0x4c = 0x20 / 0x40
+in al32 / al64 / alp / aca (16 otherwise); FUNC+0xe4 = 0x5103 / 0x5102 / 0x5183 in the alloca functions ac / ac2 /
+aca (0x1000 set), 0x41xx elsewhere; FUNC+0x74 != FUNC+0x78 in the dynamically aligned ones. `tc` (only a tail
+call: F = 0x28 at the frame decision) has no `sub rsp` and lists `a$ = 8`, `b$ = 16`; it has no packed elements, so
+the report does not show it, but `t2` / `t5` of `tests/data/slots17/tr.cpp` do (a struct and a volatile local in
+the parameter homes).
+
+`FrameChain` (0x103e78f8): read once (`MdmSetFramePointerRegs` 0x10092a35), written only by its static
+initialiser (`mov [0x103e78f8], 0` at 0x1025690c), no other reference in the image: `PartitionSortedColors` and the
+FrameChain frame variants cannot run in this build.
+
+**Validation** (`c2trace.py slots SRC --func "" --all -- /TP /O2 /GS` and `/GS-`, one compile at a time, local wine):
+
+| what | functions | model exact | listing `[reg+N]` | frame kinds |
+|---|---|---|---|---|
+| `tests/data/slots17/{frames,frames2,tr}.cpp` /GS (fixtures: `snap/*.json`, `run_tests.py` `slots17_frames_tests`) | 15 | 15 / 15 | 56 / 56 (rule before: 26 / 56) | 7 alloca (3 with B < A), 6 dynamic alignment, 2 removed argument areas |
+| `tests/data/slots17/genframes.py` seeds 1-3, 100 functions each, /GS and /GS- | 600 | 600 / 600 | 3,941 / 3,941 | 274 alloca, 114 dynamic alignment (32 and 64), 64 both, 112 with B < A, 112 removed argument areas |
+| `work/scratch/slots/gen.py` seed 1, `tests/data/slots.c` /GS, `tests/data/ncol` (no such frames: unchanged) | 108 | 108 / 108 | 919 + 23 + 15 | |

@@ -202,6 +202,10 @@ def setup(argv):
     if not os.path.isdir(tc):
         os.makedirs(os.path.join(tc, "VC"))
         shutil.copytree(tcpath(a.src, "bin"), os.path.join(tc, "VC", "Bin"))
+        ex = tcpath(a.src, "extra")
+        if os.path.isdir(ex):            # files the stage keeps beside bin/ (c2stage_vs2012: msobj110.dll for /LTCG)
+            for f in os.listdir(ex):
+                shutil.copy(os.path.join(ex, f), os.path.join(tc, "VC", "Bin", f))
         shutil.copytree(tcpath(a.src, "include"), os.path.join(tc, "VC", "INCLUDE"))
         shutil.copytree(tcpath(a.src, "lib"), os.path.join(tc, "VC", "LIB"))
         if a.sal and os.path.isfile(os.path.join(a.sal, "sal.h")):

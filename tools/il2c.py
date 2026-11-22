@@ -112,6 +112,11 @@ def split_ops(side):
     return [o for o in out if o != "->"]
 
 
+def _x64():
+    import c2build
+    return c2build.get("arch") == "x64"
+
+
 def parse_line(l):
     """dict(op, line, dsts, srcs, notes) of an `I` dump line; the address operands repeated after memory operands
     left out."""
@@ -122,6 +127,11 @@ def parse_line(l):
     d, _, s = rest.partition("<-")
     notes = dict(re.findall(r"(?:^| )([\w]+)=(\S+)", nt))
     dsts, srcs = split_ops(d.strip()), split_ops(s.strip())
+    if _x64():   # a code address prints as its symbol number (s8192), not s0: it gets the note of its position
+        for i, t in enumerate(srcs):
+            m = re.match(r"^(s\d+):", t)
+            if m and "s%d" % i in notes:
+                notes.setdefault(m.group(1), notes["s%d" % i])
     # the dump appends the address registers of every memory operand (both sides) to the sources, once per
     # occurrence: strip exactly those from the end (`_p <- [_p+4] _p`: the destination _p stays)
     inner = collections.Counter()
@@ -636,7 +646,8 @@ def trace_il(src, func, cl, keep):
     from image import Image
     img = Image("c2")
     got = dict((n, va) for n, va, _ in icount.resolve(img, ["Lower"]))
-    _i, hk, rc, out, log = c2trace.run_trace(src, ["%x%s" % (got["Lower"], c2il.SPEC)], cl, keep=keep, quiet=True,
+    spec = c2il.SPEC + ("+" if c2trace.c2build.get("arch") == "x64" and c2il.SPEC.endswith("%") else "")  # notes (x64)
+    _i, hk, rc, out, log = c2trace.run_trace(src, ["%x%s" % (got["Lower"], spec)], cl, keep=keep, quiet=True,
                                              func=func)
     for _p, lines, _f in c2il.parse(log, hk, func):
         return lines

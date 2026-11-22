@@ -1,0 +1,268 @@
+{
+"build": "17.00.61030-x64",
+"func": "?t2@@YAHHH@Z",
+"nstack": 5,
+"params": [
+0,
+1,
+3,
+4
+],
+"elems": {
+"0": {
+"idx": 0,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 8,
+"fl7": 0,
+"key": 2,
+"name": "a",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 8,
+"lod": [
+1,
+3,
+4
+],
+"lodtrunc": false,
+"tnum": 2560,
+"never": false,
+"gs": 0
+},
+"1": {
+"idx": 1,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 8,
+"fl7": 0,
+"key": 1,
+"name": "b",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 16,
+"lod": [
+0,
+3,
+4
+],
+"lodtrunc": false,
+"tnum": 2561,
+"never": false,
+"gs": 0
+},
+"3": {
+"idx": 3,
+"size": 8,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 0,
+"fl7": 0,
+"key": 13,
+"name": "",
+"align": 4,
+"ty": 4104,
+"ssize": 8,
+"poff": 24,
+"lod": [
+0,
+1,
+4
+],
+"lodtrunc": false,
+"tnum": 2627,
+"never": false,
+"gs": 0
+},
+"4": {
+"idx": 4,
+"size": 8,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 0,
+"fl7": 0,
+"key": 14,
+"name": "",
+"align": 4,
+"ty": 4104,
+"ssize": 8,
+"poff": 32,
+"lod": [
+0,
+1,
+3
+],
+"lodtrunc": false,
+"tnum": 2628,
+"never": false,
+"gs": 0
+},
+"2": {
+"idx": 2,
+"size": 8,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 3,
+"name": "p",
+"align": 4,
+"ty": 24584,
+"ssize": null,
+"poff": null,
+"lod": [
+2
+],
+"lodtrunc": false,
+"tnum": 2564,
+"never": false,
+"gs": 0
+}
+},
+"fn": {
+"npc": 4,
+"ebp": 0,
+"nparams": 4,
+"gs": false,
+"gscopies": false,
+"alloc": 0,
+"cap": 16,
+"dalign": null,
+"ebpadj": 0,
+"v13": false,
+"T": 0,
+"ncol": 4,
+"tround": 16,
+"undo": false,
+"up": true,
+"palign": true,
+"capdef": 16,
+"argarea": true,
+"frame": {
+"A": 32,
+"F": 40,
+"pushed": 0,
+"B": 32,
+"lrsp": true,
+"prsp": true,
+"dyn": 0,
+"cap": 16,
+"alloca": false,
+"Fend": 0
+}
+},
+"obs": {
+"run": [
+{
+"idx": 2,
+"tries": [
+[
+"p",
+0,
+4
+],
+[
+"p",
+1,
+4
+],
+[
+"p",
+2,
+8
+]
+],
+"res": [
+"p",
+2
+],
+"ncol": null
+}
+],
+"undo": false,
+"cols": [
+{
+"c": 0,
+"base": 8,
+"members": [
+[
+0,
+8
+]
+]
+},
+{
+"c": 1,
+"base": 16,
+"members": [
+[
+1,
+16
+]
+]
+},
+{
+"c": 2,
+"base": 24,
+"members": [
+[
+2,
+24
+],
+[
+3,
+24
+]
+]
+},
+{
+"c": 3,
+"base": 32,
+"members": [
+[
+4,
+32
+]
+]
+}
+],
+"done": {
+"T": 0,
+"npc": 4,
+"ebp": null,
+"joins": null
+}
+},
+"listing": {
+"0": {
+"lname": "a$",
+"loff": 8,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"1": {
+"lname": "b$",
+"loff": 16,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"2": {
+"lname": "p$",
+"loff": 24,
+"lsize": null,
+"lrefs": 3,
+"line": 4
+}
+}
+}

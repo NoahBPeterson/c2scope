@@ -590,6 +590,9 @@ def export(path, func, segs, pos, rcalls=(), orig=()):
 
 
 def main(argv):
+    if c2trace.c2build.get("arch") == "x64":     # x86 allocator only (docs/c2/port-1700.md, tool status)
+        sys.exit("c2trace.py scratch: %s has no RegAssign scratch path (temporaries are NColor candidates): "
+                 "use tools/c2ncol.py / tools/ncolsim.py" % c2trace.c2build.name())
     ap = argparse.ArgumentParser(prog="c2trace.py scratch", usage=__doc__)
     ap.add_argument("--func", required=True)
     ap.add_argument("--keep")

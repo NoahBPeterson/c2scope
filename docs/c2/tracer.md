@@ -427,10 +427,15 @@ word, one EH state attached later). To port it to another build, check these and
 the table's `dll` section (`set` directives; defaults are the 14.00 values): `ext` (0x30: the per-kind word
 after the operand lists: QUESTION cc, INTRINSIC number, SWITCH default with the case list at ext+4, EH record
 pointer), `labtup` (0x33: label symbol → LABEL tuple), `brcc` (0x0a: BRANCH cc nibble); the existing `blk` is
-also used for the +0x20 word of `P` lines. Not parameterised (edit `dumpilx` if they differ): operand lists at
-+0x28/+0x2c, leaf payload +0x18, kind numbers, the CASE node {+0xc, +0x10, +0x14}, LABEL +0x24, the name pointer
-at symbol +4, the EH record {+0, +4, +8, +0xc} and ehinfo {+0x10, +0x14, +0x18, +0x34}, and the IL opcode numbers
-0x2db..0x2e4 / 0x300 that select the EH and `OPUSERLABEL` decoding (13.10's IL opcodes are numbered differently).
+also used for the +0x20 word of `P` lines. Since 2026-11-21 `dumpilx` also reads the plain dump's layout
+variables (`lop`, `lkind`, `lflg`, `lline`, `lsrc`, `ldst`, `lnext`, `lpay`, the `kind` map; defaults = 14.00, so the
+x86 builds are unchanged) and has `extin` (INTRINSIC number, default `ext`), `labsym` (LABEL tuple -> symbol, 0x24),
+`casen` / `casenx` (CASE node: low, high +4, label +8 / next; 0xc / 0), `fc64 1` (FCONST is a double at `fcoff`).
+cl 17.00 x64 sets them all (port-1700.md 3.1: its notes agree with 14.00's on 16 of 20 ilx functions, the rest is
+other IL); its `il_spec` stays `%` because the x64 parsers of c2ncol / c2sched17 read the plain lines. Still not
+parameterised: the name pointer at symbol +4, the EH record {+0, +4, +8, +0xc} and ehinfo {+0x10, +0x14, +0x18,
++0x34}, and the opcode offsets inside the EH run (`ehop` + 0..9) and `OPUSERLABEL` (13.10's IL opcodes are numbered
+differently).
 
 **Call-target names in the plain dump (13.10, 15.00).** A CODEADDR leaf (call and tail-jump targets, `&f`) holds
 the front end's symbol, whose name pointer is at symbol +4; the plain dump printed every leaf as a back-end
