@@ -2,7 +2,7 @@
 """Call census by dispatch form, original against draft: is a byte gap a missing block?
 Doc: docs/c2/callform.md  (the triage `docs/c2/icount.py` cannot do without a compile)
 
-usage: callform.py FIRST.s SECOND.s [--targets] [--top K]
+usage: callform.py FIRST.s SECOND.s [--targets] [--syms FILE]
        callform.py ONE.s                        (census only, no diff)
 
 Both listings are one instruction per line, `VA mnemonic operands` (what orig.s / my_va.s are;
@@ -32,14 +32,52 @@ take it to the allocator (`tools/ncolspill.py`) and the alignment (`icount.py`).
 unresolved placeholders across listings: the original's image often shows `FUN_<addr>` where the
 draft listing has the mangled name, and the draft may show `[rip]` where the original resolves the
 IAT name, so identical counts with different spellings there are a listing artifact, not a finding.
+--syms FILE loads a registry (a pack.json's callee_names/data_names, or a `{"name": "0xVA"}` map)
+and resolves `FUN_<addr>` through it: the row shows the resolved name in parentheses, a pair whose
+sides resolve to one callee prints "(resolves to ...: the same callee)" instead of the artifact
+note, and a mangled destructor (`??1...`) is never an artifact -- it is a finding.
 """
-import argparse, collections, os, re, sys
+import argparse, collections, json, os, re, sys
 
 LINE = re.compile(r"^\s*(?:[0-9a-f]{8,16}|\+?0x[0-9a-f]+):?\s+([a-z][a-z0-9]*)\s*(.*)$", re.I)
 REG = r"(?:[re](?:ax|bx|cx|dx|si|di|bp|sp)|r(?:[0-9]|1[0-5])[dwb]?)"
 MEMREG = re.compile(r"^\[\s*(%s)\s*((?:[+-]\s*0x[0-9a-f]+)?)\s*\]$" % REG, re.I)
 RIP = re.compile(r"^\[\s*rip(?:\s*->\s*([^\]]*))?\s*\]$", re.I)
 DTOR = re.compile(r"^\?\?1")          # ?E~T@@  MSVC mangled destructor: ??1...@@UEAA@XZ
+PLACEHOLDER = re.compile(r"^(?:FUN_|sub_|DAT_|off_)([0-9a-f]{6,16})$", re.I)
+
+
+class Registry(dict):
+    """Address -> the mangled name(s) a symbol file binds there (a pack's callee_names/data_names, or a
+    `{"name": "0xVA"}` registry). FUN_<addr> placeholders resolve through it in --targets."""
+
+    @classmethod
+    def load(cls, path):
+        r = cls()
+        if path.endswith("pack.json") or os.path.basename(path) == "pack.json":
+            d = json.load(open(path))
+            for k in ("callee_names", "data_names"):
+                for name, what in (d.get(k) or {}).items():
+                    m = PLACEHOLDER.match(name)
+                    if m:
+                        r.setdefault(int(m.group(1), 16), []).append(what)
+            return r
+        d = json.load(open(path))
+        for name, v in (d.get("symbols") if isinstance(d, dict) and isinstance(d.get("symbols"), dict)
+                        else d).items():
+            try:
+                r.setdefault(int(str(v), 16), []).append(name)
+            except ValueError:
+                pass
+        return r
+
+    def resolve(self, target):
+        """A direct-call target as (spelling, resolved name or None): FUN_<addr> through the registry."""
+        m = PLACEHOLDER.match(target)
+        if not m:
+            return target, None
+        names = self.get(int(m.group(1), 16))
+        return target, names[0] if names else None
 
 
 def form_of(ops):
@@ -114,7 +152,10 @@ def main(argv):
     ap = argparse.ArgumentParser(prog="callform.py", usage=__doc__)
     ap.add_argument("listings", nargs="+", help="listings: FIRST.s SECOND.s (census only with one)")
     ap.add_argument("--targets", action="store_true", help="diff the callees of every form too")
+    ap.add_argument("--syms", metavar="FILE", help="a symbol registry to resolve FUN_<addr> callees in "
+                    "--targets: a pack.json (callee_names/data_names) or a {'name': '0xVA'} map")
     a = ap.parse_args(argv)
+    reg = Registry.load(a.syms) if a.syms else None
     for p in a.listings:
         if not os.path.exists(p):
             sys.exit("callform: no such listing %s" % p)
@@ -168,12 +209,25 @@ def main(argv):
                                           -(tgt1.get(t, 0) + tgt2.get(t, 0)), t))
             only1 = [s for s in tgt1 if s not in tgt2]
             only2 = [s for s in tgt2 if s not in tgt1]
-            partner, used = {}, set()
-            for s in sorted(only1, key=lambda s: (-tgt1[s], s)):
-                for u in sorted(only2, key=lambda u: (-tgt2[u], u)):
-                    if u not in used and tgt2[u] == tgt1[s]:
+            partner, kind, used = {}, {}, set()
+
+            def pairable(s):                   # only placeholder-vs-name spellings are resolution artifacts;
+                return bool((PLACEHOLDER.match(s) or s == "") and not DTOR.match(s))
+                # (a mangled destructor is a finding, never an artifact partner)
+
+            if reg is not None:                    # a resolved name binds the pair: confirmation, not a guess
+                for s in list(only1):
+                    rs = reg.resolve(s)[1]
+                    if rs and rs in tgt2 and rs not in tgt1 and s not in partner and tgt1[s] == tgt2[rs]:
+                        partner[s], partner[rs] = rs, s
+                        kind[s] = kind[rs] = "resolved"
+            for s in sorted((s for s in only1 if s not in partner), key=lambda s: (-tgt1[s], s)):
+                for u in sorted((u for u in only2 if u not in partner), key=lambda u: (-tgt2[u], u)):
+                    if u not in used and tgt2[u] == tgt1[s] and (pairable(s) or pairable(u)) \
+                            and not DTOR.match(s or "") and not DTOR.match(u or ""):
                         partner[s] = u
                         partner[u] = s
+                        kind[s] = kind[u] = "count"
                         used.add(u)
                         break
             for t in all_t:
@@ -182,12 +236,22 @@ def main(argv):
                     continue
                 if spelling:
                     pair = "   (registers are allocator spelling; the delta is the call count)"
+                elif t in partner and kind[t] == "resolved":
+                    pair = "   (resolves to %s: the same callee)" % partner[t]
                 elif t in partner:
                     pair = ("   (pairs with %s by count: symbol-resolution artifact, not a finding)"
                             % partner[t])
                 else:
                     pair = ""
-                print("  %-52s %5d %5d %+5d%s" % (t or "(unresolved)", x, y, y - x, pair))
+                r1 = (reg.resolve(t)[1] if reg and t in tgt1 else None)
+                r2 = (reg.resolve(t)[1] if reg and t in tgt2 else None)
+                if r1 and r2 and r1 == r2 and t != r1:
+                    print("  %-64s %5d %5d %+5d   (both sides resolve to %s)" % (t or "(unresolved)", x, y, y - x, r1))
+                    continue
+                shown = t or "(unresolved)"
+                if r1 or r2:
+                    shown = "%s (%s)" % (shown, r1 or r2)
+                print("  %-64s %5d %5d %+5d%s" % (shown, x, y, y - x, pair))
     return 0
 
 

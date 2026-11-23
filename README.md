@@ -100,6 +100,10 @@ Pass compiler flags literally after `--`; in zsh a `$FLAGS` variable holding sev
 | `c2trace.py il` | IL dump at any pass | docs/c2/il*.md |
 | `c2trace.py regmap` | which register each variable should have, from the original's code (inverse constraints) | tracer.md |
 | `tools/rasim` | Rust model of c2's priority formula and colouring order: `check`, `order`, `blocks`, `need` | tracer.md |
+| `tools/c2ncol.py` | the x64 allocator NColor traced: candidates, priority order, regions, registers (`--export` for the model) | docs/c2/ncolor.md |
+| `tools/ncolsim.py` | NColor's model, offline: `replay`/`sim`, `whatif` register edits (prio/bucket/app/split), IL-only inputs | docs/c2/ncolor.md |
+| `tools/ncolspill.py` | split/spill report of an export + frame load/store side-by-side for two listings | docs/c2/ncolor.md §13 |
+| `tools/callform.py` | call census by dispatch form, two listings: missing block vs allocator in one command | docs/c2/callform.md |
 | `tools/tsweep.py` | variant sweep scored by trace numbers and aligned register diff | tracer.md |
 | `tools/helpersweep.py` | finds inline-helper rewrites that fix a colouring order without code change | tracer.md, frontend.md |
 | `tools/rwsweep.py` | general search over mechanical source rewrites (identity helpers, aliases, dead uses, swaps): which ones move registers without changing code | tracer.md |

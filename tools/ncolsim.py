@@ -35,7 +35,11 @@ usage: ncolsim.py prio   EXPORT.json [EXPORT.json ..]      the priority formula 
        ncolsim.py whatif EXPORT.json --func F EDIT [EDIT..] the registers after an edit, against the unedited run:
                                                            +app:VAR:B[:N] / -app:VAR:B[:N] (N more / fewer
                                                            appearances of VAR in block B), prio:VAR=P,
-                                                           bucket:VAR=local|global|aggr|const|N (another list)
+                                                           bucket:VAR=local|global|aggr|const|N (another list),
+                                                           split:VAR=T1[,T2..] / split:VAR@blocks (the candidate's
+                                                           lifetime cut into pieces that each get their own
+                                                           order-walk choice: what the original's allocator does
+                                                           to a per-call-interval constant)
 
 EXPORT.json: `tools/c2ncol.py SRC --export FILE -- FLAGS` (candidates with appearances and ranges, the liveness
 arrays, the initial availability lists of rax..r15).
@@ -1788,7 +1792,7 @@ def simulate(f, prio_of=None, lists=None, prefs_of=None):
                         pw_drop(pw, tuple(c["prefwin"]), hidden, ghost)
                     continue
                 extra = extra_avail(il_tupmap(f), c, av) if "extra" in walk_of(f) else []
-        if extra is None and (not c.get("ranges") or not c["regions"] or
+        if extra is None and (not c.get("ranges") or (not c["regions"] and not c.get("_split")) or
                               ALIAS.get(c["regions"][0]["reg"]) not in NUM or
                               NUM[ALIAS[c["regions"][0]["reg"]]] not in av):
             for r in c["regions"]:              # not modelled: what the trace did
@@ -1988,9 +1992,10 @@ def edited_prio(f, edits):
     byname = {c["name"].split("$")[0]: c for c in f["cands"]}
     byname.update({c["name"]: c for c in f["cands"]})
     for e in edits:
-        if e.startswith("prio:"):
-            v, _, p = e[5:].partition("=")
-            out[byname[v]["name"]] = int(p)
+        if e.startswith(("prio:", "split:")):
+            if e.startswith("prio:"):
+                v, _, p = e[5:].partition("=")
+                out[byname[v]["name"]] = int(p)
             continue
         if e.startswith("bucket:"):
             continue                     # lists_after
@@ -2015,6 +2020,84 @@ def edited_prio(f, edits):
     return out
 
 
+def split_edits(f, edits):
+    """{name: cuts} for `split:V=T1[,T2..]` (the candidate's lifetime cut at tuple T: T opens a new
+    piece) and `split:V@blocks` (a piece per block the candidate is live in). The edit that models
+    what the original's allocator did to bhk's zero constant: per-call-interval regions on volatiles
+    instead of one whole-lifetime must-save register (ticket §12/§13, §15(b))."""
+    out = {}
+    st = f["state"]
+    byname = {c["name"].split("$")[0]: c for c in f["cands"]}
+    byname.update({c["name"]: c for c in f["cands"]})
+    for e in edits:
+        if not e.startswith("split:"):
+            continue
+        v, _, spec = e[6:].partition("=")
+        if "=" not in e:
+            v, _, spec = e[6:].partition("@")
+            if not spec:
+                sys.exit("whatif: %s needs =T1[,T2..] or @blocks" % e)
+            spec = "@blocks"
+        c = byname.get(v)
+        if c is None:
+            sys.exit("whatif: no candidate %r" % v)
+        if spec == "@blocks":
+            cuts = []
+            for lo, hi in c["ranges"]:
+                for t in range(lo + 1, hi + 1):
+                    if blockof(st, t) != blockof(st, t - 1):
+                        cuts.append(t)
+        else:
+            cuts = [int(t, 16) if t.startswith("0x") else int(t) for t in spec.split(",") if t.strip()]
+            span = set()
+            for lo, hi in c["ranges"]:
+                span.update(range(lo, hi + 1))
+            bad = [t for t in cuts if t not in span or t == c["ranges"][0][0]]
+            if bad:
+                sys.exit("whatif: cut %s is not inside %s's lifetime (or is its first tuple)" %
+                         (bad[0], v))
+        out[byname[v]["name"]] = cuts
+    return out
+
+
+def _split_ranges(ranges, cuts):
+    """Ranges cut at the given tuple boundaries: a cut t ends the piece at t-1 and opens one at t."""
+    cuts = sorted(set(cuts))
+    pieces = []
+    for lo, hi in ranges:
+        bounds = [lo] + [t for t in cuts if lo < t <= hi] + [hi + 1]
+        pieces.extend((a, b - 1) for a, b in zip(bounds, bounds[1:]))
+    return pieces
+
+
+def apply_splits(f, splits, np):
+    """f with every split candidate replaced by its pieces (`V#k`, one per piece, same bucket and
+    priority, the parent's prefs/useable/anti): -> (f2, {piece name: pinned priority})."""
+    st = f["state"]
+    cands, out_np = [], {}
+    for c in f["cands"]:
+        cuts = splits.get(c["name"])
+        if cuts is None:
+            cands.append(c)
+            continue
+        p0 = c["prio"] - (1 << 32) if c["prio"] & 0x80000000 else c["prio"]
+        pieces = _split_ranges(c["ranges"], cuts)
+        pw = [(w, list(v)) for w, v in (c.get("prefwin") or {}).items()] \
+            if isinstance(c.get("prefwin"), dict) else []
+        for k, (lo, hi) in enumerate(pieces):
+            pc = dict(c, name="%s#%d" % (c["name"], k), ranges=[[lo, hi]], first=lo, last=hi,
+                      apps=[a for a in c.get("apps") or [] if lo <= a <= hi],
+                      sym="%s#%d" % (c.get("sym") or c["name"], k), _split=True)
+            if pw:                       # a preference window only reaches the piece that holds it
+                pc["prefwin"] = dict((w, v) for w, v in pw if any(lo <= t <= hi for t in w))
+            cands.append(pc)
+            out_np[pc["name"]] = np.get(c["name"], p0)
+        np.pop(c["name"], None)          # the parent is gone; its edits live on the pieces
+    for k, v in np.items():              # prio edits for candidates the split did not touch stay
+        out_np.setdefault(k, v)
+    return dict(f, cands=cands), out_np
+
+
 def cmd_whatif(fns, func, edits):
     fs = [f for f in fns if func in (f["func"] or "")]
     if not fs:
@@ -2023,13 +2106,18 @@ def cmd_whatif(fns, func, edits):
     np = edited_prio(f, edits)
     lists, lp = lists_after(f, edits)
     np.update(lp)
-    base, new = simulate(f), simulate(f, np, lists)
-    for c in f["cands"]:
-        if c["name"] not in base:
+    sp = split_edits(f, edits)
+    if sp and lists is not None:
+        sys.exit("whatif: a bucket: edit and a split: edit on one candidate cannot be combined")
+    f2, np = apply_splits(f, sp, np) if sp else (f, np)
+    base, new = simulate(f), simulate(f2, np, lists)
+    for c in f2["cands"]:
+        if c["name"] not in new:
             continue
         p0 = prio(c, f["state"])
+        b0 = base.get(c["name"], "-")      # a split piece has no untraced counterpart
         print("  %-14s prio %-8s%s  %-5s -> %-5s%s" % (c["name"], p0, (" -> %d" % np[c["name"]]) if c["name"] in np else "",
-              base[c["name"]], new[c["name"]], "   *" if base[c["name"]] != new[c["name"]] else ""))
+              b0, new[c["name"]], "   *" if b0 != new[c["name"]] else ""))
     return 0
 
 

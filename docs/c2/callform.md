@@ -70,10 +70,13 @@ with the 121-byte residue confirmed as the allocator wall (§9.2), not structure
 
 - **Unresolved placeholders.** The original's listing spells direct callees
   `FUN_<addr>` where the draft has mangled names, and `[rip]` where the original
-  resolves `__imp_X`. `--targets` marks such pairs ("counts pair up on both
-  sides: symbol-resolution artifact"), and register rows inside a memory form are
-  labelled allocator spelling. They are spelling, not findings — the *form* rows
-  are the evidence.
+  resolves `__imp_X`. `--targets` marks such pairs ("pairs with ... by count:
+  symbol-resolution artifact"), and register rows inside a memory form are
+  labelled allocator spelling. `--syms FILE` resolves the placeholders through a
+  registry — a pack.json (`callee_names`/`data_names`) or any `{"name": "0xVA"}`
+  map — printing the resolved name in parentheses; a pair whose sides resolve to
+  one callee is marked *confirmed* instead of artifact, and a mangled destructor
+  (`??1...`) is never treated as an artifact: it is a finding.
 - **Slot numbers assume 8-byte vtable entries** (x64). A non-8-aligned
   displacement is reported raw, without a slot claim.
 - **Equal census does not prove equal structure** — two different blocks can call

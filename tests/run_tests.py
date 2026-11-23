@@ -1098,6 +1098,46 @@ def ncolspill_tests():
           "candidates 8: 8 whole, 0 split, 0 unallocated; 8 regions")
 
 
+def xdata_tests():
+    """tools/xdata.py offline (docs in the tool docstring): .pdata parsing, the fragment tiling walk,
+    CHAININFO payload decoding and the ICF twin census on synthetic bytes. No image, no compile."""
+    import xdata as X
+    ents = [(0x100, 0x110, 0x500), (0x110, 0x112, 0x520), (0x112, 0x130, 0x540), (0x200, 0x210, 0x560)]
+    check("xdata: .pdata entries parse (begin, end, unwind)", X.entries(b"".join(
+        X.RT.pack(*e) for e in ents)), ents)
+    frags = X.body_fragments(ents, 0x100)
+    check("xdata: a /GL+LTCG body's fragments tile begin->end (one entry per function is the plain layout)",
+          (len(frags), [f[0] for f in frags], X.body_fragments(ents, 0x200)[0][0]),
+          (3, [0x100, 0x110, 0x112], 0x200))
+    mm = bytearray(0x1000)
+    u = 0x400
+    mm[u] = 0x20                       # version 0, flags CHAININFO (0x4 in the high 5 bits), no codes
+    mm[u + 4:u + 16] = X.RT.pack(0x300, 0x310, 0x600)
+    check("xdata: a CHAININFO unwind's payload names the body it chains to",
+          X.chain_target(mm, u), 0x300)
+    mm[u] = 0x00                       # same bytes, flags 0
+    check("xdata: a plain unwind has no chain", X.chain_target(mm, u), None)
+    mm[u] = 0x21                       # version 1 + CHAININFO: the version bits do not disturb the flags
+    check("xdata: the version bits do not make a chain (or break one)",
+          X.chain_target(mm, u), 0x300)
+    mm[u] = 0x20                       # count 3 unwind codes: the payload sits behind them, aligned
+    mm[u + 2] = 3
+    mm[u + 12:u + 24] = X.RT.pack(0x300, 0x310, 0x600)
+    check("xdata: CountOfUnwindCodes (byte 2) moves the payload",
+          X.chain_target(mm, u), 0x300)
+    # ICF: two bodies with an identical 64-byte prefix are one twin; the other two are distinct
+    body = bytes(range(0x40)) + b"\xcc" * 0x40
+    mm2 = bytearray(0x200)
+    mm2[0x000:0x080] = body
+    mm2[0x080:0x100] = body                        # entry 1 = entry 0's bytes: one twin
+    mm2[0x100:0x180] = bytes(0x80)
+    mm2[0x180:0x200] = bytes(range(0x40, 0x80)) + bytes(0x40)
+    ic = [(0, 0x80, 0), (0x80, 0x100, 0), (0x100, 0x180, 0), (0x180, 0x200, 0)]
+    n, twins = X.icf_twins(mm2, ic, 4)
+    check("xdata: the ICF twin census counts bodies sharing an earlier body's 64-byte prefix",
+          (n, twins), (4, 1))
+
+
 def callform_tests():
     """tools/callform.py (docs/c2/callform.md): the call-dispatch-form census of two listings, the
     structure-vs-registers discriminator. Offline, no compile."""
@@ -1159,9 +1199,65 @@ def callform_tests():
     check("callform: unresolved FUN_ vs mangled names are paired as a listing artifact",
           "pairs with FUN_1414d7200 by count: symbol-resolution artifact" in
           run(orig, dev, "--targets"), True)
+    reg = os.path.join(d, "reg.json")
+    json.dump({"symbols": {"?callee@@YAXXZ": "0x141507190"}}, open(reg, "w"))
+    sa = listing("sa.s", ["00000000 call FUN_141507190", "00000005 call FUN_141507190",
+                          "0000000a call ?z@@YAXXZ"])
+    sb = listing("sb.s", ["00000000 call FUN_141507190", "00000005 call ?z@@YAXXZ"])
+    check("callform: --syms resolves a FUN_ placeholder on both sides to one callee",
+          "(both sides resolve to ?callee@@YAXXZ)" in run(sa, sb, "--targets", "--syms", reg), True)
+    sc = listing("sc.s", ["00000000 call FUN_141507190", "00000005 call ?other@@YAXXZ"])
+    se = listing("se.s", ["00000000 call ?callee@@YAXXZ", "00000005 call ?other@@YAXXZ",
+                          "0000000a call ?other@@YAXXZ"])
+    check("callform: --syms binds a cross-spelling pair as confirmed, not an artifact",
+          "resolves to ?callee@@YAXXZ: the same callee" in run(sc, se, "--targets", "--syms", reg), True)
+    dt = run(orig, dev, "--targets", "--syms", reg)
+    dtor = [l for l in dt.splitlines() if "??1Foo" in l]
+    check("callform: a mangled destructor is a finding, never an artifact partner",
+          bool(dtor) and all("pairs with" not in l for l in dtor), True)
     plus = listing("plus.s", ["+0x0000 call qword ptr [rax]", "+0x0005 call [rip -> __imp_TlsGetValue]"])
     check("callform: +0xN listings and a census of one listing",
           ("2 calls, 2 forms" in run(plus), "call [reg] (slot 0)" in run(plus)), (True, True))
+
+
+def ncolsim_splitwhatif_tests():
+    """ncolsim.py's `split:` whatif lever (docs/c2/ncolor.md 9): a candidate's lifetime cut into pieces
+    that each get their own order-walk choice. Offline, on the fixtures."""
+    import glob, io, contextlib, ncolsim as N
+    fns = N.load(sorted(glob.glob(os.path.join(HERE, "tests", "data", "ncol", "c2.json"))))
+    f = next(x for x in fns if x['func'] == '?f2@@YAHPEAHHINPEAUS@@@Z')
+    c = next(c for c in f["cands"] if c["name"] == "x$1")
+    mid = c["ranges"][0][1]
+    sp = N.split_edits(f, ["split:x$1=%d" % (mid + 1)])
+    check("ncolsim split whatif: the edit parses into one cut inside the lifetime",
+          list(sp.keys()), ["x$1"])
+    pieces = N._split_ranges(c["ranges"], [mid + 1])
+    check("ncolsim split whatif: the cut ends a piece at the tuple before the cut",
+          (pieces[0][1] < mid + 1 <= pieces[1][0], len(pieces)), (True, len(c["ranges"])))
+    f2, np2 = N.apply_splits(f, sp, {})
+    names = [x["name"] for x in f2["cands"] if x["name"].startswith("x$1#")]
+    check("ncolsim split whatif: the pieces replace the candidate, pinned at the parent's priority",
+          (len(names), np2.get(names[0]), all(x.get("_split") for x in f2["cands"] if x["name"] in names)),
+          (len(pieces), c["prio"] - (1 << 32) if c["prio"] & 0x80000000 else c["prio"], True))
+    got = N.simulate(f2, np2)
+    check("ncolsim split whatif: every piece gets its own register from the model's walk",
+          [got.get(k) for k in names], ["xmm7", "xmm6", "xmm0"])
+    b = io.StringIO()
+    with contextlib.redirect_stdout(b):
+        N.cmd_whatif(fns, f["func"], ["split:x$1=%d" % (mid + 1)])
+    out = b.getvalue()
+    check("ncolsim split whatif: whatif prints the pieces with their chosen registers",
+          ("#0" in out, "#1" in out, "#2" in out), (True, True, True))
+    try:
+        N.split_edits(f, ["split:x$1=1"])
+        check("ncolsim split whatif: a cut outside the lifetime is refused", False, True)
+    except SystemExit:
+        check("ncolsim split whatif: a cut outside the lifetime is refused", True, True)
+    sp2 = N.split_edits(f, ["split:x$1@blocks"])
+    f3, np3 = N.apply_splits(f, sp2, {})
+    nblocks = len({N.blockof(f["state"], lo) for lo, hi in c["ranges"]})
+    check("ncolsim split whatif: @blocks cuts at every block boundary the candidate is live across",
+          len([x for x in f3["cands"] if x["name"].startswith("x$1#")]) >= nblocks, True)
 
 
 def sched17_tests():
@@ -1973,6 +2069,8 @@ judge_tests()
 ncolsim_tests()
 ncolspill_tests()
 callform_tests()
+xdata_tests()
+ncolsim_splitwhatif_tests()
 ncol_levers_tests()
 sched17_tests()
 sched17_predict_tests()

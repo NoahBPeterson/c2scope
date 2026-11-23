@@ -821,6 +821,17 @@ region with the useable set), 0x10068877 (register per region), 0x100ca950 (regi
 
 ## 9. The model against traces (tools/ncolsim.py, 2026-11-20)
 
+`whatif` edits (2026-11-23): `+app:`/`-app:`, `prio:`, `bucket:` — and `split:VAR=T1[,T2..]` /
+`split:VAR@blocks`, the candidate's lifetime cut into pieces that each get their own order-walk
+choice (the pieces are pinned at the parent's priority, so they stay in its bucket and process
+back to back; a piece that finds no covering register takes None = memory, which is how the
+model expresses the original's per-call-interval zero and its re-materialisations). On the bhk
+export this answered the §12/§13 wall: the zero's 295 per-block pieces do free `r15` (3 pieces
+keep it), but `savedContext` still takes no register — its span [13..2394] is blocked in rsi by
+one 10-tuple temp (`t4606`), in rbx/rdi by `objects$1`/`lock$1`/the allocator global, so the
+original's `savedContext`-in-rsi needs the original source's appearance profile, not a split
+(ticket §15(b), measured).
+
 Input: `tools/c2ncol.py SRC --export FILE -- FLAGS` (every function's NColor run: candidates in processing
 order with appearances, ranges, own preference window, tied physreg, per region the preference list, the
 anti-preference set and the useable register set; after NColPrioritizeCandidates the liveness arrays, the
