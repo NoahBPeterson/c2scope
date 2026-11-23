@@ -19,6 +19,12 @@ _b = _fe.collect(_src, "?fe_f@@", ["/O2", "/TP", "/DASSIGN_IN_COND"])
 _e = _fe.effects(_a, _b)
 check("feshape: assignment in the condition adds an OPPAREN of the variable in the reader IL",
       any(s.startswith("fe:OPPAREN(") and s.endswith(":+1") for s in _e), True)
+if BUILD == "13.00.9044":    # port-1300.md: both passes run before Lower, so the inlined stage shows the same change
+    # (effects() leaves an `fi:` out when the reader stage already has the same change)
+    check("feshape 13.00.9044: the reader and inlined stages (Inline, OptFuncExpr) both see the OPPAREN",
+          (sorted(_a), _b["inlined"].get("OPPAREN(T:4004<-V:4004)"),
+           "fe:OPPAREN(T:4004<-V:4004):+1" in _e),
+          (["inlined", "reader"], 1, True))
 check("feshape: a wanted removal needs the opcode's net count to drop (an operand-kind change is no removal)",
       [_fe.hit(["fe:OPADD(T:1004<-V:1004,C:1004):-1", "fe:OPADD(T:1004<-T:1004,C:1004):+1"],
                "fe:OPADD(T:1004<-V:1004,C:1004):-1"),

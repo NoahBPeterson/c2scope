@@ -3,7 +3,18 @@ import sys as _sys
 _sys.path.insert(0, os.path.join(HERE, "tools"))
 import il2c as _il2c
 
-if _il2c.UNDNAME:
+if _il2c.UNDNAME and BUILD == "13.00.9044":
+    # 9044's tuples keep the flags and the type at other offsets (port-1300.md): the branch's condition code is not
+    # read, so il2c refuses every branch there (`unsupported: branch (cc None)`); the branch-free member store still
+    # round-trips
+    _src = os.path.join(HERE, "tests", "data", "il2c", "il2c_round.cpp")
+    _res = [_il2c.one(dict(id=f, src=_src, func=f, flags=["/O2", "/TP"]))
+            for f in ("?sum@Obj@@QAEHXZ", "?pick@Obj@@QAEHI@Z", "?mark@Obj@@QAEXH@Z", "?call_get@Obj@@QAEHH@Z")]
+    check("il2c 13.00.9044: a branch has no condition code (refused), an RMW still round-trips byte for byte",
+          [(r["func"], r["result"], r.get("bdiff")) for r in _res],
+          [(f, "unsupported: branch (cc None)", None) for f in ("?sum@Obj@@QAEHXZ", "?pick@Obj@@QAEHI@Z")]
+          + [("?mark@Obj@@QAEXH@Z", "ok", 0), ("?call_get@Obj@@QAEHH@Z", "unsupported: branch (cc None)", None)])
+elif _il2c.UNDNAME:
     _src = os.path.join(HERE, "tests", "data", "il2c", "il2c_round.cpp")
     _res = [_il2c.one(dict(id=f, src=_src, func=f, flags=["/O2", "/TP"]))
             for f in ("?sum@Obj@@QAEHXZ", "?pick@Obj@@QAEHI@Z", "?mark@Obj@@QAEXH@Z", "?call_get@Obj@@QAEHH@Z")]

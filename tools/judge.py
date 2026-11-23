@@ -266,24 +266,50 @@ def _listing_symbol(ops):
     return None
 
 
+FRAME_TEXT = re.compile(r"([?@$_A-Za-z][\w?@$]*\$)\[([^\]]*)\]")
+
+
+def listing_frame(texts):
+    """The frame variables of a listing given as its instructions' text (`_n$[esp+4]`: the operand's own offset), as
+    {name: value}: `a` for each variable read as a whole. A frame map for a listing that declares none (a synthetic
+    text side). The real path is frame_objects' declarations (cl.exe's `_n$ = 8`); `addr_of` adds a declaration to the
+    operand's own offset (`_n$[esp]` with `_n$ = 8` is the reader's `[esp + 8]`)."""
+    def off(t):
+        c = 0
+        for sign, x in re.findall(r"([+-]?)\s*([^+-]+)", t):
+            x = x.strip()
+            if x and x not in FAM:
+                c += (-1 if sign == "-" else 1) * (int(x, 16) if x.lower().startswith("0x") else int(x))
+        return c
+    out = {}
+    for t_ in texts:
+        for name, t in FRAME_TEXT.findall(str(t_ or "")):
+            out.setdefault(name, off(t))
+    return out
+
+
 def frame_objects(asm, func):
     """[(name, value, size, escaped)] of our listing's frame variables (`_x$ = -12 ; size = 12` before the PROC
-    line). The value is relative to a frame base the listing does not print (entry esp, or 4 below it): pass 1
-    measures it (Side.fcands). Escaped: its address is taken (`lea` of it) in the function."""
+    line; cl.exe's /FA prints the value alone). The value is the frame offset the declaration states (`_n$ = 8`),
+    which the text's operands show as `_n$[esp + 4]` and `addr_of` turns into the reader's +8; without declarations
+    the text's own offsets (listing_frame). Escaped: its address is taken (`lea` of it) in the function."""
     import c2trace
     text = open(asm, errors="replace").read()
     i, j = c2trace.listing_proc(text, func)
     head = text[:i].splitlines()[-400:]
     decls = []
     for ln in reversed(head):
-        m = re.match(r"([$\w?@]+\$\d*)\s*=\s*(-?\d+)\s*;\s*size\s*=\s*(\d+)", ln.strip())
-        if m:
-            decls.append((m.group(1), int(m.group(2)), int(m.group(3))))
+        m = re.match(r"([$\w?@]+\$\d*)\s*=\s*(-?\d+)(?:\s*;\s*size\s*=\s*(\d+))?", ln.strip())
+        if m:                                              # /FAsc prints the size, cl.exe's /FA the value alone
+            decls.append((m.group(1), int(m.group(2)), int(m.group(3) or 4)))
         elif re.search(r"\bSEGMENT\b|\bENDP\b", ln):
             break
     body = text[i:j]
+    if decls and not any(re.search(r"\b%s\[" % re.escape(name), body) for name, v, size in decls):
+        decls = []                                         # no operand shows a declared variable (a self-check's
+    names = listing_frame(body.splitlines())               # synthetic text): the text's own offsets
     out = []
-    for name, v, size in decls:
+    for name, v, size in decls or [(n, names[n], 4) for n in names]:
         esc = bool(re.search(r"\blea\b[^\n]*\b%s\[" % re.escape(name), body))
         out.append((name, v, size, esc))
     return out
@@ -366,8 +392,10 @@ def target(i):
 class Side:
     """One function's symbolic execution: per block, the effects and the values at its end."""
 
-    def __init__(self, name, ins, image=None):
+    def __init__(self, name, ins, image=None, listing=False):
         self.name = name
+        self.listing = listing
+                             # our listing's text: symbols, a frame form with no bytes
         self.blocks, self.entry = blocks_of(ins)
         self.order = sorted(self.blocks)
         self.image = image                                 # (lo, hi) image range: constants there are addresses
@@ -495,9 +523,10 @@ class State:
         return self.regs[r]
 
     def slot(self, off):
-        if off not in self.slots:
-            self.slots[off] = self.phi(("s", off))
-        return self.slots[off]
+        """The value of frame offset off, the reader's bytes: both sides read the frame alike (`addr_of` has already
+        put a listing's operand on those bytes, docs/c2/judge.md section 6)."""
+        key = off
+        return self.slots.setdefault(key, self.phi(("s", key)))
 
 
 def mem_alias(a1, s1, a2, s2):
@@ -529,8 +558,19 @@ class Exec:
 
     # operands ---------------------------------------------------------------------------------------------
     def addr_of(self, o, ins):
-        """Address expression of a memory operand (capstone text), or ("frame", offset) for a non-escaped local."""
-        m = re.match(r"^(?:(\w+)\s+ptr\s+)?(?:[cdefgs]s:)?\[(.*)\]$", o.strip())
+        """Address expression of a memory operand (capstone text), or ("frame", offset) for a non-escaped local. Our
+        side of a /FAsc listing is also capstone text (the code bytes), so its frame operands are the reader's bytes;
+        a text listing's operand may instead name a declared variable (`name[esp + N]`), whose frame offset is N plus
+        the declaration (docs/c2/judge.md section 6)."""
+        extra = 0
+        if self.side.listing and self.side.fsyms:          # a declared variable's operand is `name[esp + N]`
+            m = FRAME_TEXT.search(o)
+            if m and m.group(1) in self.side.fsyms:
+                extra = self.side.fsyms[m.group(1)]         # the name's declaration value
+                o = re.sub(re.escape(m.group(1)) + r"\s*(?=\[)", "", o, count=1)
+        c = re.sub(r"^(\w+)\s+ptr\s+", "", o.strip(), flags=re.I)
+        m = re.match(r"^(?:(\w+)\s+ptr\s+)?(?:[cdefgs]s:)?(?:[$\w?@]+\$)?\[(.*)\](?:\s*\[\s*(?:e?[a-d]x|[abcd][lh]|e?[sd]i|e?[sb]p)\s*\])?$",
+                     c, re.I)
         if not m:
             raise Unknown("operand %r" % o)
         parts = []
@@ -547,8 +587,10 @@ class Exec:
             else:
                 parts.append(C(_num(t) * k))
         a = add(*parts)
-        if self.side.fsyms:
-            mm = re.search(r"([$\w?@]+\$\d*)\[", ins.text)
+        if extra:                                          # name[N] -> [N + the declaration]
+            a = add(a, C(extra))
+        if self.side.fsyms and not self.side.listing:      # measure the frame base (pass 2, capstone texts): our
+            mm = re.search(r"([$\w?@]+\$\d*)\[", ins.text or "")   # access minus the variable's declared value
             off = self.frame_off(a) if mm and mm.group(1) in self.side.fsyms else None
             if off is not None:
                 self.side.fcands.append(off - self.side.fsyms[mm.group(1)])
@@ -735,10 +777,13 @@ class Exec:
             mn, i = mn + " " + w, Ins(i.addr, mn + " " + w, "", i.sym, text=i.text)
         ops = split_ops(i.ops)
         mn = mn.replace("lock ", "")
+        if self.side.listing and mn in ("offset", "fword", "tbyte", "xmmword") and len(ops) == 2:
+            i = Ins(i.addr, mn, ops[1], i.sym, i.target, i.text)   # a listing's operand prefix: a type, not an
+            ops = [ops[1]]                                         # instruction
         if mn in ("nop", "npad", "int3", "fwait", "wait") or (mn == "mov" and len(ops) == 2 and ops[0] == ops[1]
                                                                and ops[0] in FAM):
             return
-        if mn == "lea" and len(ops) == 2 and ops[1].startswith("[") and ops[0] in FAM:
+        if mn == "lea" and len(ops) == 2 and "[" in ops[1] and ops[0] in FAM:
             a = self.addr_of(ops[1], i)
             if ops[0] == "esp":
                 self.set_reg("esp", a)
@@ -759,11 +804,15 @@ class Exec:
             self.write(ops[0], op("zext" if mn == "movzx" else "sext", b, v), i)
             return
         if mn == "push":                                   # below every local: state, not memory, even when a
-            v = self.frame_value(self.val(ops[0], i))      # frame address escapes (call arguments, saves)
+            if self.side.listing and ops[0] in FAM:
+                v = self.reg(ops[0])                       # a listing without bytes: a saved register is a save
+            else:                                          # (the capstone flag `PTR reg` is the other side's)
+                v = self.frame_value(self.val(ops[0], i))  # frame address escapes (call arguments, saves)
             st.depth += 4
             st.slots[-st.depth] = v
             st.pushed.add(-st.depth)
-            if not (v[0] == "a" and v[1] == "init" and v[2] in CALLEE_SAVED):
+            if not (v[0] == "a" and any(v[1] == k for k in ("init", "phi", "clob")) and
+                    (v[2] in CALLEE_SAVED or (isinstance(v[2], tuple) and v[2][0] == "reg" and v[2][1] in CALLEE_SAVED))):
                 st.pushes.append(v)                        # a save of a callee-saved register is no argument
             return
         if mn == "pop":
@@ -882,9 +931,11 @@ class Exec:
 
     def call(self, i, ops):
         st = self.st
-        if re.fullmatch(r"\s*(0x[0-9a-f]+|\d+)\s*", i.ops):     # a direct call
+        # a direct call: `0x401000` (capstone) or `near ptr 401000` (a listing; cl prints hex without 0x)
+        m = re.fullmatch(r"\s*(?:near ptr\s+)?(0x[0-9a-f]+|[0-9a-f]*\d[0-9a-f]*)\s*", i.ops, re.I)
+        if m:
             name = i.sym[0] if i.sym else None
-            tgt = ("a", "sym", name if name else _num(i.ops))
+            tgt = ("a", "sym", name if name else _num(m.group(1)))
         else:                                              # through a register or memory (a virtual call, an import)
             tgt = self.val(ops[0], i)
             name = i.sym[0] if i.sym else None
@@ -914,6 +965,7 @@ class Exec:
             else:
                 conv, pop = self.cleanups[k]
         args = ("args",) + tuple(reversed(st.pushes))
+
         regs = ("regs",)
         if conv in ("thiscall", "fastcall"):
             regs += (self.reg("ecx"),)
@@ -1402,8 +1454,11 @@ def _match_terms(xs, ys, P):
 
 
 def _store_key(e):
+    """A store's canonical order key: its address as a linear form, terms keyed by shape and (for a symbol atom) by the
+    symbol as a string (13.00.9044's symbol atoms hold an address, an int: `shape(t), k` sorts unlike types),
+    then the constant and the size."""
     c, ts = lin(e[1])
-    return (repr(sorted((shape(t), k) for t, k in ts.items())), c, e[3])
+    return (repr(sorted((shape(t), t[2] if t[0] == "a" and t[1] == "sym" else 0, k) for t, k in ts.items())), c, e[3])
 
 
 def canon_effects(effs):
@@ -1429,16 +1484,21 @@ class Verdict(Exception):
     pass
 
 
-def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, known=None, frame=None,
-          frame_objects=False):
-    """Judge two instruction lists ([Ins]). With `frame` (frame_objects of our listing) and a local whose address
+def judge_pair(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, known=None, frame=None,
+               frame_objects=False, listing=True):
+    """Judge two instruction lists ([Ins]). With `listing` (the file paths: judge_files, judge_job), our side is read
+    as a listing's text (`Side` in listing mode: a `DWORD PTR`/`_n$[esp]` frame form), its frame variables from `frame`
+    (judge_files' frame_objects) or, without one, from the text's own `_n$[esp+N]` offsets (listing_frame). With
+    `listing=False` (the synthetic tests) both sides are capstone texts. With `frame` and a local whose address
     escapes: pass 1 treats every local as memory (and pairs the escaped addresses), pass 2 only the escaped objects'
-    bytes (ours from the listing; the original's: the paired address, our object's size). Pass 1's EQUIVALENT
-    stands; otherwise pass 2's verdict."""
+    bytes (ours from the listing; the original's: the paired address, our object's size). Pass 1's EQUIVALENT stands;
+    otherwise pass 2's verdict."""
+    fsyms = {name: v for name, v, n, esc in frame or ()}
     if not frame_objects:                                  # pass 2 is off by default: it used our object's size
         frame = None                                       # for the original's (docs/c2/judge.md section 4)
-    fsyms = {name: v for name, v, n, esc in frame or ()}
-    r1 = _judge(ours, orig, func, image, show_pairs, budget, known, collect=True, fsyms=fsyms)
+    if listing and not fsyms:                              # no map declared: the listing text's own offsets
+        fsyms = listing_frame([str(i.text or "") for i in ours])
+    r1 = _judge(ours, orig, func, image, show_pairs, budget, known, collect=True, listing=listing, fsyms=fsyms)
     keys = ("_fa", "_escaped", "_orig_escapes", "_our_escapes", "_F")
     if r1["verdict"] == "EQUIVALENT" or not frame or not r1.get("_escaped") or r1.get("_F") is None:
         for k in keys:
@@ -1465,7 +1525,8 @@ def judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, k
         for k in keys:
             r1.pop(k, None)
         return r1
-    r2 = _judge(ours, orig, func, image, show_pairs, budget, known, regions=(ours_regions, orig_regions))
+    r2 = _judge(ours, orig, func, image, show_pairs, budget, known, regions=(ours_regions, orig_regions),
+                listing=listing)
     for k in keys:
         r2.pop(k, None)
     r2["hints"] = r2.get("hints") or r1.get("hints")
@@ -1483,10 +1544,13 @@ def _merge(regions):
     return out
 
 
+judge = judge_pair       # the old name (the synthetic tests' helper); judge_pair's `listing` names the listing mode
+
+
 def _judge(ours, orig, func=None, image=None, show_pairs=False, budget=2000000, known=None, regions=None,
-           collect=False, fsyms=None):
+            collect=False, fsyms=None, listing=True):
     try:
-        A = Side("o", ours)
+        A = Side("o", ours, listing=listing)
         B = Side("r", orig, image=image)
     except Unknown as e:
         return dict(verdict="UNKNOWN", reason=str(e))
@@ -1691,6 +1755,8 @@ def _hname(key):
     """A pairing key as a hint name: a register, or `esp+0x18` / `esp-0x1c` (offset from esp at entry)."""
     if isinstance(key, tuple) and key[0] == "s":
         return "esp%s%#x" % ("+" if key[1] >= 0 else "-", abs(key[1]))
+    if isinstance(key, tuple) and key[0] == "a" and key[1] == "sym":   # a call target: ours a name, the original an
+        return re.sub(r"[^\w?@$]", "_", str(key[2]))                  # address (`?f@@...` -> `_f___...`)
     return str(key)
 
 
@@ -1755,7 +1821,7 @@ def judge_files(asm, func, orig_s, show_pairs=False, frame_objects=False):
         return dict(verdict="UNKNOWN", reason=str(e))
     lo, hi = tsweep._addr_range(org.va0)
     org_ins = orig_instrs(_trim_orig(org))
-    return judge(ours, org_ins, func, image=(lo, max(hi, lo + 0x10000000)), show_pairs=show_pairs,
+    return judge_pair(ours, org_ins, func, image=(lo, max(hi, lo + 0x10000000)), show_pairs=show_pairs,
                  frame=globals()["frame_objects"](asm, func), frame_objects=frame_objects)
 
 
@@ -1817,8 +1883,8 @@ def judge_job(job, budget=2000000, frame_objects=False):
             for x in job["ours"]]
     orig = [Ins(a, mn, ops, text="%s %s" % (mn, ops)) for a, mn, ops in job["orig"]]
     sys.setrecursionlimit(20000)
-    res = judge(ours, orig, job["func"], image=tuple(job["image"]), budget=budget, known=job.get("known"),
-                frame=job.get("frame"), frame_objects=frame_objects or job.get("frame_objects", False))
+    res = judge_pair(ours, orig, job["func"], image=tuple(job["image"]), budget=budget, known=job.get("known"),
+                     frame=job.get("frame"), frame_objects=frame_objects or job.get("frame_objects", False))
     res["id"] = job["id"]
     return res
 

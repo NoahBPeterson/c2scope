@@ -67,13 +67,47 @@ def server_alive():
         s.close()
 
 
+KEEPER = PREFIX.parent / (PREFIX.name + ".keeper")
+KEEP = os.environ.get("WINE_KEEP", "1") != "0"
+
+
+def keeper_pid():
+    """Pid of this prefix's keeper, if it is still running (0 otherwise)."""
+    try:
+        pid = int(KEEPER.read_text().strip())
+    except (OSError, ValueError):
+        return 0
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return 0
+    return pid
+
+
+def start_keeper(e):
+    """Hold a resident Wine process in the prefix so the wineserver does not exit between compiles.
+
+    A wineserver with no attached client exits about 3 s after its last process ends; every later compile then pays
+    a full cold start. Measured on an M1 Pro (wine-11.16, 32-bit x86 under Rosetta): `cl /c` on tailmerge.c took
+    2.37 s with a cold server on every call and 0.74 s with the server resident, and a traced `scratch` compile
+    went from 2.49 s to 0.74 s. `wineserver -p` does not help: it cannot start directly on this install
+    ("failed to load l_intl.nls"), and started through wine it still exits with the last client. A resident
+    `regedit` has no visible window and is enough for the server to stay up.
+
+    The keeper is detached and writes its pid file; it dies on its own when the prefix is reset (`wineserver -k`).
+    WINE_KEEP=0 disables it."""
+    quiet = dict(env=e, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(["wine", "regedit", "/dev/null"], start_new_session=True, **quiet)
+    KEEPER.write_text(str(p.pid))
+
+
 def ensure_wine(e):
-    """Start the prefix's wineserver if it is not running, under a lock file.
+    """Start the prefix's wineserver if it is not running, under a lock file, and keep it resident.
 
     Without this, parallel runs from a cold start each made wine start its own server, and one of them could exit
     rc 0 with no output at all (9 parallel compiles from cold: about one in three rounds; this was the "parallel
     traces come back empty" bug). A bare `wineserver` cannot start on this install ("failed to load l_intl.nls"),
-    so the server is started through wine itself."""
+    so the server is started through wine itself. With the server up, `start_keeper` keeps it up."""
     import fcntl
     quiet = dict(env=e, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     PREFIX.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +118,10 @@ def ensure_wine(e):
             subprocess.run(["wineboot", "-i"], start_new_session=True, **quiet)
         if not server_alive():
             subprocess.run(["wine", "cmd", "/c", "exit"], start_new_session=True, **quiet)
+            if KEEP:
+                start_keeper(e)
+        elif KEEP and not keeper_pid():
+            start_keeper(e)
 
 
 def run(tool, args, capture=False):

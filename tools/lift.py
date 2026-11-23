@@ -559,18 +559,42 @@ def listing_lines(asm, func):
     return out
 
 
-def trace(src, func, cl):
-    """(IL lines at Lower's entry, our final code as capstone texts, the source line of each instruction) from one
-    traced compile."""
-    import c2trace, c2il, icount, tempfile, shutil, tsweep
+def lower_va():
+    """Lower's address: the build table's `frontend.lower` pass (13.00.9044: @Lower@4), else the Lower symbol."""
+    import c2trace, icount
     from image import Image
     img = Image("c2")
+    fe = c2trace.c2build.get("frontend") or {}
+    if fe.get("lower"):
+        row = c2trace.c2build.get("functions", {}).get(fe["lower"])
+        r = img.by_sym.get(row[3]) if row and len(row) > 3 else None      # the table row's PDB name
+        if r:
+            try:
+                c2trace.parse_hook(img, "%x" % r["va"])
+                return r["va"]
+            except SystemExit:
+                pass
     got = dict((n, va) for n, va, _ in icount.resolve(img, ["Lower"]))
     if "Lower" not in got:
         raise RuntimeError("Lower is not hookable on this build")
+    return got["Lower"]
+
+
+def il_spec():
+    """The IL dump spec at Lower's entry: the table's (13.00.9044: the plain dump plus its front-end probe hooks),
+    extended on the x64 builds that keep il_spec plain."""
+    import c2trace, c2il
+    return c2il.SPEC + ("+" if c2trace.c2build.get("arch") == "x64" and c2il.SPEC.endswith("%") else "")
+
+
+def trace(src, func, cl):
+    """(IL lines at Lower's entry, our final code as capstone texts, the source line of each instruction) from one
+    traced compile."""
+    import tempfile, shutil, tsweep, c2trace, c2il
+    va = lower_va()
     keep = tempfile.mkdtemp(prefix="lift-")
     try:
-        _i, hk, rc, out, log = c2trace.run_trace(src, ["%x%s" % (got["Lower"], c2il.SPEC)], cl, keep=keep, quiet=True,
+        _i, hk, rc, out, log = c2trace.run_trace(src, ["%x%s" % (va, il_spec())], cl, keep=keep, quiet=True,
                                                  func=func)
         il = None
         for _pname, lines, _fname in c2il.parse(log, hk, func):

@@ -10,18 +10,21 @@ in any function: `OPASSIGN(V:1004<-T:1004)` (a variable written from a temporary
 immediate candidate, C a literal, M a memory operand, F a function (call target), and implicit operands by their
 name (cc, esp, regset). Physical registers (`eax=t3`) are dropped to the value. PAS operands are left out.
 
-Two stages, one traced compile: `reader` (the IL at MscRVO's entry, on 15.00 and 13.10 at Inline's: what the front
-end wrote, before same-unit callees are expanded) and `inlined` (at
-FgSimpleFoldCmps' entry: after Inline expanded same-unit callees). effectmine records the change of these multisets
-per mutation as model F (`fe:SHAPE:+n` for the reader stage, `fi:SHAPE:+n` after inlining), so the database is a
-measured map from source mutations to front-end IL; icount's `structure` verdict looks its tuple's shape up there.
+Two stages, one traced compile: `reader` (the IL at the front end's inlining pass: on 15.00, 13.10 and 17.00 at Inline's
+entry, what the front end wrote, before same-unit callees are expanded) and `inlined` (at the pass right after
+Inlining: FgSimpleFoldCmps on those builds, OptFuncExpr on 13.00.9044, which has no FgSimpleFoldCmps and inlines from
+dop2_InitialOptsAndSetup). effectmine records the change of these multisets per mutation as model F (`fe:SHAPE:+n` for
+the reader stage, `fi:SHAPE:+n` after inlining), so the database is a measured map from source mutations to front-end
+IL; icount's `structure` verdict looks its tuple's shape up there.
 """
 import argparse, collections, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c2trace
 X64 = c2trace.c2build.get("arch") == "x64"
-
-STAGES = (("reader", ("MscRVO", "Inline")), ("inlined", ("FgSimpleFoldCmps",)))   # 15.00 / 13.10: no MscRVO hook
+# another build's passes first (table key `frontend`: reader / inlined), then this module's 15.00 / 13.10 ones
+_FE = c2trace.c2build.get("frontend") or {}
+STAGES = ((("reader", (_FE["reader"],)), ("inlined", (_FE["inlined"],))) if _FE else ()) + \
+         (("reader", ("MscRVO", "Inline")), ("inlined", ("FgSimpleFoldCmps",)))
 IMPLICIT = re.compile(r"^(cc|fcc|esp|ebp|regset|fcw|cc_\w+|st|mem)\b")
 TYPED = re.compile(r"^(.*):([0-9a-f]+)$")
 
@@ -97,18 +100,33 @@ def x64plus(spec):
     return "+" if c2build.get("arch") == "x64" and spec.endswith("%") else ""
 
 
+def front_spec():
+    """The IL dump spec for a front-end pass on this build: the table's (another build: beside its front-end probes,
+    so a pass that is the only event asked for still shows), or 14.00's extended dump."""
+    import c2il
+    return (c2il.SPEC + (c2trace.c2build.get("hooks", {}).get("il_spec_extra") or "")) if c2trace.c2build.table() \
+        else c2il.SPEC
+
+
 def collect(path, func, cl, keep=None):
     """{stage: Counter of shapes} of the function from one traced compile (the IL dump at each stage's pass)."""
     import c2il, icount
     from image import Image
     img = Image("c2")
+    # icount.resolve() takes only the unambiguous names, and 13.00.9044's @OptFuncExpr@8 is also named in symkeys:
+    # a table's pass is taken from the table's own functions row instead
     got = dict((n, va) for n, va, _ in icount.resolve(img, [p for _, ps in STAGES for p in ps]))
     texts, names = [], []
     for st, ps in STAGES:
         p = next((p for p in ps if p in got), None)
-        if p is not None and got[p] not in [va for _s, va in names]:
-            texts.append("%x%s" % (got[p], c2il.SPEC + x64plus(c2il.SPEC)))
-            names.append((st, got[p]))
+        va = got.get(p) if p is not None else None
+        if va is None:
+            row = c2trace.c2build.get("functions", {}).get(next((p for p in ps if p in _FE.values()), ""))
+            if row:
+                va = img.base + int(row[0], 16)     # the table's own VA (`functions` rows: [rva, size, ...])
+        if va is not None and va not in [v for _s, v in names]:
+            texts.append("%x%s" % (va, front_spec() + x64plus(c2il.SPEC)))
+            names.append((st, va))
     if not texts:
         raise RuntimeError("no front-end passes on this build")
     _img, hk, rc, out, log = c2trace.run_trace(path, texts, cl, keep=keep, quiet=True, func=func)
@@ -207,7 +225,7 @@ def main(argv):
     ap = argparse.ArgumentParser(prog="feshape.py", usage=__doc__)
     ap.add_argument("src")
     ap.add_argument("--func", required=True)
-    ap.add_argument("--stage", default="reader", choices=[s for s, _ in STAGES])
+    ap.add_argument("--stage", default="reader", choices=list(dict.fromkeys(s for s, _ in STAGES)))
     argv, cl = c2trace.split_cl(argv)
     a = ap.parse_args(argv)
     d = collect(a.src, a.func, cl)

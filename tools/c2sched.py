@@ -42,7 +42,7 @@ HOOKS = c2trace.c2build.hooks("sched", HOOKS)    # another c2 build: its own tab
 
 def parse(log, funcpat):
     """-> [(funcname, pre IL lines, post IL lines, regions)] ; region = dict(nodes={tuple: info}, issue=[(cyc, [t..])])"""
-    funcs, cur, il_target, region, pend_edges = [], None, None, None, None
+    funcs, cur, il_target, region, pend_edges, pend_marks = [], None, None, None, None, None
     for ln in log.splitlines():
         if ln.startswith("T "):
             if il_target is not None:
@@ -72,9 +72,19 @@ def parse(log, funcpat):
                 pend_edges = []
             a, b, lat, typ, plat = [int(x, 16) if x != "?" else 0 for x in v[:5]]
             pend_edges.append((a, b, lat & 0xffff, typ, plat & 0xff, lat >> 16 & 0xff))
+        elif hk == 6:
+            # 13.00.9044 only: the edge's break kind after SchComputeStaticPriority's marking pass (the hk-5 probe
+            # reads it before marking, when it is still 0). Keyed by (from, to): one edge per pair (DagBuildGraph).
+            if pend_marks is None:
+                pend_marks = {}
+            a, b, lat = [int(x, 16) if x != "?" else 0 for x in v[:3]]
+            pend_marks[(a, b)] = lat >> 16 & 0xff
         elif hk == 1:
-            region = dict(nodes={}, issue=[], ready=[], events=[], edges=pend_edges or [])
-            pend_edges = None
+            edges = pend_edges or []
+            if pend_marks:
+                edges = [(a, b, lat, typ, plat, pend_marks.get((a, b), eb)) for a, b, lat, typ, plat, eb in edges]
+            region = dict(nodes={}, issue=[], ready=[], events=[], edges=edges)
+            pend_edges = pend_marks = None
             cur[3].append(region)
         elif hk == 2 and region is not None:
             t, prio, hl, pn, fl, est, cyc, lu, op = [int(x, 16) if x != "?" else 0 for x in v[:9]]
@@ -233,12 +243,20 @@ def simulate_p5(funcs, verbose=False):
       unit    SchmdGetFuncUnit 0x1075f249: an fdiv (op 0x46) waits while the last fdiv's 2-cycle flag is set;
               slot 0 needs units u and u+1 free (busy < 1; u = node +0x3a, 0 here), slot 1 needs SchmdPairable with
               slot 0's node and gets unit u+1
-      AGI     SchmdCauseAGI 0x10715ce0: a node with an unissued predecessor over an address edge (edge +0x16 & 0x1f
-              >= 0x10) whose est <= cycle + 1 waits
+      AGI     SchmdCauseAGI 0x10715ce0: a node with an unissued predecessor over an address edge (the marked break
+              kind, edge +0x16 & 0x1f >= 0x10) waits while that predecessor is itself ready (np == +0x24) and its
+              est <= cycle + 1
       x87     SchmdBadForFPSch 0x10715d3e (/Ot): right after an fxch an integer node waits while an x87 node is ready
               with est <= cycle + 1 (and unit 2 busy <= 1)
       est     est <= cycle + max(busy[unit], 0)
-    An issue adds the op's cost (column 2) to busy[unit]; every cycle subtracts 1 from every unit."""
+    An issue adds the op's cost (column 2) to busy[unit]; every cycle subtracts 1 from every unit.
+
+    Ready-list timing (the two slot-1 misses of the first model, port-1300.md 5): SchSelectInstrs fills slot 0 from
+    the list as the cycle began, then slot 1 from the list AFTER slot 0's issue walk has added its successors
+    (10715adc). A node becomes ready in the walk of its last non-breakable predecessor: if that predecessor took
+    slot 0 the node is visible to slot 1, if it took slot 1 only to the next cycle. The trace logs every add between
+    the cycle's entry and exit probes (the entry re-sort 15c7d re-adds the whole list), so a first add is placed by
+    whether slot 1's node is one of its non-breakable predecessors, not by its position in the log."""
     n = bad = 0
     for name, pre, post, regions in funcs:
         for k, r in enumerate(regions):
@@ -247,24 +265,36 @@ def simulate_p5(funcs, verbose=False):
             for a, b, lat, typ, plat, eb in r["edges"]:
                 preds.setdefault(b, []).append((a, eb & 0x1f))
             busy, fdiv = [0, 0, 0, 0], 0
-            ready, issued, last, lastc = [], set(), None, None
+            ready, issued, added, pending, last, lastc = set(), set(), set(), [], None, None
+            snap = []
             for e in r["events"]:
                 if e[0] == "add":
-                    ready.append(e[1])
+                    if e[1] not in added:        # a first add (a re-add is the entry re-sort: membership unchanged)
+                        added.add(e[1])
+                        pending.append(e[1])
                     continue
                 if e[0] == "sel":
+                    ready.update(pending)        # the initial build's adds (before the first sel)
+                    pending = []
                     if lastc is not None:
                         for c in range(lastc, e[1]):
                             busy = [b - 1 for b in busy]
                             fdiv -= 1
                     cyc = lastc = e[1]
-                    snap = [x for x in ready if x not in issued]
+                    snap = sorted(ready, key=lambda x: (-N[x]["prio"], N[x]["lex"]))
                     continue
+                ts = [x for x in e[2] if x]
+                t1 = ts[1] if len(ts) > 1 else None
+                # place this cycle's first adds: a node is ready in the walk of its last non-breakable predecessor,
+                # so it was added after slot 0 (visible to slot 1) unless slot 1's node is a non-breakable pred of it
+                after0, after1 = [], []
+                for x in pending:
+                    late = any(p == t1 and not ty for p, ty in preds.get(x, ()))
+                    (after1 if late else after0).append(x)
+                pending = []
                 first, units = None, []
-                for j, t in enumerate(x for x in e[2] if x):
-                    # slot 0 walks the list as the cycle began; an issue adds its successors at once (slot 1 sees them)
-                    pool = sorted(snap if j == 0 else (x for x in ready if x not in issued),
-                                  key=lambda x: (-N[x]["prio"], N[x]["lex"]))
+                for j, t in enumerate(ts):
+                    pool = snap if j == 0 else sorted(ready, key=lambda x: (-N[x]["prio"], N[x]["lex"]))
 
                     def unit(x):
                         X = N[x]
@@ -278,7 +308,7 @@ def simulate_p5(funcs, verbose=False):
                         return u + 1 if _p5_pairable(N[first], X) else None
 
                     def agi(x):
-                        return any(ty >= 0x10 and p in N and p not in issued and N[p]["est"] <= cyc + 1
+                        return any(ty >= 0x10 and p in ready and N[p]["est"] <= cyc + 1
                                    for p, ty in preds.get(x, ()))
 
                     def badfp(x):
@@ -295,9 +325,6 @@ def simulate_p5(funcs, verbose=False):
                         if not x:
                             break                           # the exit node ends the walk
                         u = unit(x)
-                        if not N[x]["np"] and any(p in N and p and p not in issued for p, ty in preds.get(x, ())):
-                            continue      # added by this cycle's later slot (all its preds issue first); np > 0 at
-                                          # the add = only breakable preds left (SchmdBreakDep folds them)
                         if u is None or agi(x) or badfp(x) or N[x]["est"] > cyc + max(busy[u], 0):
                             continue
                         best = x
@@ -311,10 +338,13 @@ def simulate_p5(funcs, verbose=False):
                                 "lex %d (prio %x)" % (N[best]["lex"], N[best]["prio"]) if best else "nothing"))
                     u = unit(t)
                     u = (0 if j == 0 else 1) if u is None else u
-                    if j == 0:
-                        first = t
+                    ready.discard(t)
                     issued.add(t)
                     units.append((t, u))
+                    if j == 0:
+                        first = t
+                        ready.update(after0)     # slot 0's issue walk added these: slot 1 (or the next cycle) sees them
+                ready.update(after1)             # slot 1's issue walk added these: the next cycle sees them
                 for t, u in units:
                     if 0 < N[t]["op"] < 0x246:
                         busy[u] = max(busy[u], 0) + op_cost(N[t]["op"])[1]

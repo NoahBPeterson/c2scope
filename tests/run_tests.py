@@ -1773,8 +1773,8 @@ def judge_tests():
         return [re.sub(r"\bL(\d+)", lambda m: hex(base + 4 * int(m.group(1))), l) for l in lines]
 
     def v(a, b, func="?f@@YAHPAH@Z"):
-        return J.judge(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), func,
-                       image=(0x400000, 0x4000000))["verdict"]
+        return J.judge_pair(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), func,
+                       image=(0x400000, 0x4000000), listing=False)["verdict"]
     vj = v
     p = ["mov eax, dword ptr [esp + 4]"]
     check("judge: other registers, lea against add, inc against add 1: EQUIVALENT",
@@ -1805,8 +1805,8 @@ def judge_tests():
     loop2 = ["mov edx, dword ptr [esp + 4]", "xor eax, eax", "mov ecx, dword ptr [edx]", "add eax, ecx",
              "add edx, 4", "cmp edx, dword ptr [esp + 8]", "jb L2", "ret"]
     check("judge: a loop in other registers, the load folded or not: EQUIVALENT", vj(loop, loop2), "EQUIVALENT")
-    hl = J.judge(ins(addr(loop, 0), 0), ins(addr(loop2, 0x401000), 0x401000), "?f@@YAHPAH@Z",
-                 image=(0x400000, 0x4000000))["hints"]
+    hl = J.judge_pair(ins(addr(loop, 0), 0), ins(addr(loop2, 0x401000), 0x401000), "?f@@YAHPAH@Z",
+                 image=(0x400000, 0x4000000), listing=False)["hints"]
     check("judge hints: at the loop head our ecx is the original's edx, eax is eax",
           (hl["regs"].get("ours:ecx"), hl["regs"].get("ours:eax"), list(hl["at"])), ("orig:edx", "orig:eax", ["0x401008"]))
     check("judge: the loop stepping 8 instead of 4: MISMATCH",
@@ -1829,8 +1829,8 @@ def judge_tests():
     two = ["mov ecx, dword ptr [esp + 4]", "test ecx, ecx", "je L5", "call ?a@@YAXXZ", "ret", "call ?b@@YAXXZ", "ret"]
     two_r = ["mov ecx, dword ptr [esp + 4]", "test ecx, ecx", "jne L5", "call 0x478f30", "ret", "call 0x478f80", "ret"]
     def vk(a, b, known):
-        return J.judge(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), "?f@@YAXPAH@Z",
-                       image=(0x400000, 0x4000000), known=known)["verdict"]
+        return J.judge_pair(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), "?f@@YAXPAH@Z",
+                       image=(0x400000, 0x4000000), known=known, listing=False)["verdict"]
     check("judge: two callees swapped between the paths: EQUIVALENT under a free pairing, MISMATCH once the "
           "project's symbol map anchors it",
           (vk(two, two_r, {}), vk(two, two_r, {"?a@@YAXXZ": 0x478f30, "?b@@YAXXZ": 0x478f80})),
@@ -1840,8 +1840,8 @@ def judge_tests():
     spill = ["sub esp, 8", "mov dword ptr [esp + 4], ecx", "lea eax, [esp]", "push eax", "call 0x478f30",
              "add esp, 4", "mov eax, dword ptr [esp + 4]", "add esp, 8", "ret"]
     def vf(a, b, frame):
-        return J.judge(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), "?f@@YAHXZ",
-                       image=(0x400000, 0x4000000), frame=frame, frame_objects=True)["verdict"]
+        return J.judge_pair(ins(addr(a, 0), 0), ins(addr(b, 0x401000), 0x401000), "?f@@YAHXZ",
+                       image=(0x400000, 0x4000000), frame=frame, frame_objects=True, listing=False)["verdict"]
     check("judge (--frame-objects, experimental): a local's address escapes and the original spills a value we keep "
           "in a register: MISMATCH with every local as memory, EQUIVALENT with the listing's frame objects",
           (vf(keep, spill, None), vf(keep, spill, [("_v$", -8, 4, True)]),
@@ -2592,9 +2592,12 @@ def untraced_tests():
     asm = os.path.join(k, "twoaddr.asm")
     lst = tsweep.listing_instrs(asm, "_addsum")
     rows = [list(x) for x in zip(lst.addrs, (dd[0] for dd in lst.decoded), (dd[1] for dd in lst.decoded))]
+    # 9044 sets the cdecl cleanup `add esp, 4` between the call and the sum; 14.00 / 13.10 / 15.00 have the sum
+    # right after the call (or a mov). The sum is the same commutative two-address op either way: `add eax, esi`.
+    prev = ("call", "mov", "add") if BUILD == "13.00.9044" else ("call", "mov")
     for i, (o, mn, ops) in enumerate(rows):
         mm = re.fullmatch(r"(e\w\w), (e\w\w)", ops)
-        if mn == "add" and mm and i and rows[i - 1][1] in ("call", "mov"):
+        if mn == "add" and mm and i and rows[i - 1][1] in prev:
             a, b = mm.groups()
             rows[i][2] = "%s, %s" % (b, a)
             for r in rows[i + 1:]:

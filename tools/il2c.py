@@ -645,9 +645,18 @@ def trace_il(src, func, cl, keep):
     import c2trace, c2il, icount
     from image import Image
     img = Image("c2")
-    got = dict((n, va) for n, va, _ in icount.resolve(img, ["Lower"]))
+    va = None
+    fe = c2trace.c2build.get("frontend") or {}
+    if fe.get("lower"):                      # 13.00.9044: @Lower@4, from the build table
+        row = c2trace.c2build.get("functions", {}).get(fe["lower"])
+        va = (img.by_sym.get(row[3]) or {}).get("va") if row and len(row) > 3 else None
+    if va is None:
+        got = dict((n, va) for n, va, _ in icount.resolve(img, ["Lower"]))
+        va = got.get("Lower")
+    if va is None:
+        raise Unsupported("Lower is not hookable on this build")
     spec = c2il.SPEC + ("+" if c2trace.c2build.get("arch") == "x64" and c2il.SPEC.endswith("%") else "")  # notes (x64)
-    _i, hk, rc, out, log = c2trace.run_trace(src, ["%x%s" % (got["Lower"], spec)], cl, keep=keep, quiet=True,
+    _i, hk, rc, out, log = c2trace.run_trace(src, ["%x%s" % (va, spec)], cl, keep=keep, quiet=True,
                                              func=func)
     for _p, lines, _f in c2il.parse(log, hk, func):
         return lines

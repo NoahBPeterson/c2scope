@@ -24,5 +24,8 @@ import io as _io, contextlib as _cl
 with _cl.redirect_stdout(_io.StringIO()):
     _r = _lift.report(_il, _code, _ln, _code2, False, open(_src).read().splitlines())
 check("lift: the self-check gives back all of a small function's own code", _r["self"] >= 0.99, True)
+# 13.00.9044's listing attributes the `or al, 1` to the next statement (line 11), 14.00's to line 10
+_ln_rmw = [11] if BUILD == "13.00.9044" else [10]
 check("lift: `= 1` against `|= 1` is named at that statement: ours st, original rmw.or",
-      [(d["lines"], d["ours"], d["orig"]) for d in _r["diffs"]], [([10], ["st"], ["rmw.or"])])
+      [(d["lines"], d["ours"], d["orig"]) for d in _r["diffs"]], [(_ln_rmw, [], ["ld"]), (_ln_rmw, [], ["or:R,R"])]
+      if BUILD == "13.00.9044" else [([10], ["st"], ["rmw.or"])])

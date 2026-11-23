@@ -123,9 +123,15 @@ class Region:
         self.edges = [(a, b, lat, typ) for a, b, lat, typ, plat, eb in r["edges"]]
         self.order = [t for c, ts in r["issue"] for t in ts if t]
         self.bylex = {n["lex"]: t for t, n in self.N.items()}
+        self.p5 = c2trace.c2build.get("sched_model") == "p5"
+        self.ekind = {(a, b): eb & 0x1f for a, b, lat, typ, plat, eb in r["edges"]}
         self.brk = breakable_edges(r, self.N)
-        # the cycle model needs every node's unit and op (13.00.9044's P5 pairing model is not replayed: shortcut)
-        self.cycles = c2trace.c2build.get("sched_model") != "p5" and all("unit" in n and "op" in n for n in self.N.values())
+        if self.p5:
+            # 13.00.9044 carries the marked break kind (c2sched hook 6): every breakable edge (kind != 0) is
+            # non-gating, not just the ones that broke in this trace; the address edges (kind >= 0x10) drive AGI
+            self.brk = {(a, b) for (a, b), ty in self.ekind.items() if ty and a in self.N and b in self.N}
+        # the cycle model needs every node's unit and op (13.00.9044 replays its P5 pairing / AGI model too)
+        self.cycles = all("unit" in n and "op" in n for n in self.N.values())
 
     def name(self, t):
         return "%d:%s" % (self.N[t]["lex"], c2sched.short(self.txt.get(t, "?")).split("<-")[0].strip()[:28])
@@ -158,6 +164,8 @@ class Region:
         for a, b, lat, typ in edges:
             if a in N and b in N:
                 lat_in.setdefault(b, []).append((a, lat))
+        if self.p5:
+            return self._simulate_p5(pred, lat_in, prio), prio
         return self._simulate(pred, lat_in, prio), prio
 
     def _shortcut(self, pred, prio):
@@ -211,6 +219,83 @@ class Region:
                 busy[u] = max(busy[u], 0) + c2sched.op_cost(N[x]["op"])[1]
             cyc += 1
             busy = [b - 1 for b in busy]
+        return out
+
+    def _simulate_p5(self, pred, lat_in, prio):
+        """The 13.00.9044 Pentium replay (c2sched.simulate_p5 / port-1300.md 5), driven by the DAG instead of the
+        trace's events: each cycle fills slot 0 then slot 1 from the ready list (priority descending, lex ascending;
+        a node is ready once its non-breakable predecessors have issued). Slot 0 needs units u and u+1 free
+        (busy < 1), slot 1 must pair with slot 0 (SchmdPairable) and takes u+1; an fdiv waits on its 2-cycle flag,
+        an address edge (break kind >= 0x10) whose producer is ready with est <= cycle+1 stalls its consumer
+        (SchmdCauseAGI), and right after an fxch an integer node waits for a ready x87 node (SchmdBadForFPSch,
+        /Ot). est = the latest issued predecessor's cycle + the edge latency (a node with none: its traced est);
+        a pick needs est <= cycle + max(busy[unit], 0). An issue adds the op's cost to busy[unit]; every cycle
+        subtracts 1. Slot 1 sees the nodes slot 0's issue freed (the ready list is rebuilt between the slots)."""
+        N = self.N
+        agi = {}
+        for (a, b), ty in self.ekind.items():
+            if ty >= 0x10 and a in N and b in N:
+                agi.setdefault(b, []).append(a)
+        issued, out, busy, cyc, fdiv, last = {}, [], [0, 0, 0, 0], 0, 0, None
+
+        def est(x):
+            ps = [issued[a] + lat for a, lat in lat_in.get(x, ()) if a in issued]
+            return max([N[x]["est"]] + ps)
+
+        def ready_list():
+            return sorted((t for t in N if t not in issued and pred.get(t, set()) <= issued.keys()),
+                          key=lambda x: (-prio[x], N[x]["lex"]))
+
+        def badfp(x, ready):
+            if last is None or not (N[last]["op"] == 0x5f or
+                                    (N[last]["op"] == 0x263 and N[last].get("x", [0, 0, 0])[2] == 0x5f)):
+                return False
+            if not (1 << (N[x]["x"][0] >> 28) & 0xe):
+                return False
+            return busy[2] <= 1 and any(N[y]["x"][0] >> 16 & 0xf000 == 0x4000 and est(y) <= cyc + 1 for y in ready)
+
+        while len(out) < len(N) and cyc < 100000:
+            first, units = None, []
+            for slot in range(2):
+                ready = ready_list()
+                rset = set(ready)
+                pick = None
+                for x in ready:
+                    X = N[x]
+                    if X["op"] == 0x46 and fdiv > 0:
+                        continue
+                    u = X["unit"] & 0xffff
+                    if u >= 4:
+                        u = 0 if all(b < 1 for b in busy) else None
+                    elif slot == 0:
+                        u = u if busy[u] < 1 and busy[u + 1] < 1 else None
+                    else:
+                        u = u + 1 if first is not None and c2sched._p5_pairable(N[first], X) else None
+                    if u is None:
+                        continue
+                    if any(p in rset and est(p) <= cyc + 1 for p in agi.get(x, ())):
+                        continue
+                    if badfp(x, ready) or est(x) > cyc + max(busy[u], 0):
+                        continue
+                    pick = (x, u)
+                    break
+                if pick is None:
+                    break
+                x, u = pick
+                issued[x] = cyc
+                out.append(x)
+                units.append((x, u))
+                if slot == 0:
+                    first = x
+            for x, u in units:                   # the costs land after both slots (SchSchedGraph 15e0d)
+                if 0 < N[x]["op"] < 0x246:
+                    busy[u] = max(busy[u], 0) + c2sched.op_cost(N[x]["op"])[1]
+                    if N[x]["op"] == 0x46:
+                        fdiv = 2
+                last = x
+            cyc += 1
+            busy = [b - 1 for b in busy]
+            fdiv -= 1
         return out
 
     def _delayed(self, x, pred, issued):
