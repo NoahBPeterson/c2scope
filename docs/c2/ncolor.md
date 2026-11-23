@@ -1451,3 +1451,56 @@ IL_SUB's float coalescing; inflateBack have$1's ranges and gen_bitlen base$1's a
 
 zlib: unchanged (ilfull replay 2669 / 2669, sim 2690 / 2690 with WALK_FULL); our sources ilfull replay 705 -> 706, sim
 763 -> 769 (e8regs +4 / +1, zoneswitch +13 sim, swlive +1 / +3).
+
+## 13. The split/spill report and the original's frame, side by side (tools/ncolspill.py, 2026-11-23)
+
+`tools/ncolspill.py [EXPORT.json] [--func F] [--asm FILE ...] [--top K]` answers the question a "why is my
+function shorter / longer" diff raises but `c2ncol.py` and `ncolsim.py` do not put next to the original: **what
+NColor did per candidate, and what the two listings actually do to the frame.** Input is a `c2ncol.py --export`
+JSON (cl 17.00 x86_amd64) and any number of listings in `VA mnemonic operands` form (what `orig_va.s` /
+`my_va.s` are; f4check's `+0xN` diff format is accepted too). It is offline: no compile, no trace, so it runs on
+an export made elsewhere.
+
+**Per candidate** the report counts the bucket each candidate landed in — one region (`whole`), two or more
+(`split`: NColBestCoverage separated a part another register covers), or none (`unallocated`: folded, dead, or
+given back by `NColPostspill`) — with the region count, the maximum live tuples and the registers by bank
+(gp64 / gp32 / gp8 / sse), then lists the splits in **processing order** (the export's array order: lists 0..5
+of §2 concatenated, each sorted on its own) with priority, lifetime, every region (`reg x..y`), the main
+(longest) region starred, and `stolen` on a part that took a must-save register. That order makes the cascade
+visible: the high-priority candidate that takes `r15`, then the next one that has to settle for `r14`.
+
+Measured on `work/f4/bhk141dbd030/ncolrun.json` (the bhk draft, 452 candidates):
+
+    candidates 452: 421 whole, 14 split, 17 unallocated; 456 regions
+    max live 84 tuples; speed mode
+    regions by bank: gp64 265, gp32 131, gp8 7, sse 53
+      #426 t3954  prio 113009  24..903  r15 24..903* | rdi 255..309 stolen | rdi 46a..4ad stolen
+      ...
+
+so the zero-in-`r15` finding (§9.2 of the ticket) is `t3954`, one whole-lifetime `r15` region plus two
+`rdi` steals; `arWorld$1` (#417) is the `r13` steal; `numClosest$1`/`rayProcessed$1` split into a long middle
+region (`esi`/`r9`) with single-tuple `eax`/`rax` ends, i.e. partial coverage rather than a cascade.
+
+**Per listing** it reports the frame-access proxy: for every `[rbp/rsp ± off]` slot the loads and stores, the
+slots reloaded or re-stored ≥3×, and the top slots by access count with a `reload` / `spill` / `even`
+pattern. `lea` is an address, not an access, and is not counted; a read-modify-write counts once as a load and
+once as a store, so the totals are comparable between two builds. Two listings also get the side-by-side
+table. bhk (first = original, second = the draft):
+
+    insns 1738 / 1635 (-103) | push/pop 6 / 4 | frame slots 129 / 125
+    loads 202 / 180 (-22)    | stores 239 / 270 (+31)
+    slots >=3 loads 27 / 26  | slots >=3 stores 37 / 50 (+13)
+
+i.e. the draft is shorter by 103 instructions but **stores 31 more times and re-stores 13 more slots ≥3×** —
+the opposite of "the original reloads more, mine keeps values in registers". That was the measurement that
+retracted the first pass's §4.1.
+
+**What it does not claim:** the original has no NColor trace, so the export half is only ever the draft (or a
+rebuilt source); the original's half is the frame proxy, never its candidate decisions. Use `c2slots.py
+--orig` / `framefields.py` for slot identity; use this tool for the allocation buckets and the load/store
+balance.
+
+Tests: `ncolspill_tests` in `tests/run_tests.py` (a synthetic export with one whole / one split / one
+unallocated candidate and two synthetic listings, then the `c1.json` fixture), so it runs on any build table
+without a compile.
+

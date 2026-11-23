@@ -1052,6 +1052,52 @@ def ncolsim_tests():
           lines[1].split(":")[1].split("single")[0].strip(), "159 of 160")
 
 
+def ncolspill_tests():
+    """tools/ncolspill.py offline (docs/c2/ncolor.md 13): an export's whole / split / unallocated counts and the
+    frame-access proxy for one or two listings. No compile."""
+    import io, contextlib, ncolspill as S
+    d = tempfile.mkdtemp()
+    exp = os.path.join(d, "x.json")
+    json.dump(dict(c2="17.00", src="t.cpp", functions=[dict(
+        func="?f@@YAXXZ", given=["rbx"], state=dict(maxlive=12, speed=1),
+        cands=[dict(name="a", prio=100, first=1, last=9,
+                    regions=[dict(reg="eax", first=1, last=9, benefit="1")]),
+               dict(name="b", prio=90, first=2, last=8,
+                    regions=[dict(reg="rcx", first=2, last=6, benefit="1"),
+                             dict(reg="rsi", first=7, last=8, benefit="1")]),
+               dict(name="c", prio=0, first=3, last=4, regions=[])])]), open(exp, "w"))
+    one = os.path.join(d, "one.s")
+    open(one, "w").write("00000000 mov dword ptr [rbp + 0x10], eax\n"
+                         "00000004 mov eax, dword ptr [rbp + 0x10]\n"
+                         "00000008 lea rcx, [rbp + 0x18]\n"
+                         "0000000c add qword ptr [rsp - 0x8], 1\n")
+    two = os.path.join(d, "two.s")
+    open(two, "w").write("00000000 push rbp\n"
+                         "00000001 mov qword ptr [rsp + 0x20], rcx\n"
+                         "00000005 mov rcx, qword ptr [rsp + 0x20]\n"
+                         "00000009 ret\n")
+    b = io.StringIO()
+    with contextlib.redirect_stdout(b):
+        S.main([exp, "--asm", one, "--asm", two, "--top", "4"])
+    out = b.getvalue()
+    check("ncolspill: an export's whole / split / unallocated candidates and the given-back registers",
+          ("candidates 3: 1 whole, 1 split, 1 unallocated; 3 regions" in out,
+           "given back by NColPostspill: rbx" in out), (True, True))
+    check("ncolspill: a split candidate's main region and its must-save part",
+          ("rcx 2..6*" in out, "rsi 7..8 stolen" in out), (True, True))
+    check("ncolspill: frame slots (lea is no access; a read-modify-write is a load and a store)",
+          "one.s: 4 insns, 0 push/pop, 2 frame slots, 2 loads / 2 stores" in out, True)
+    tail = out.split("## frame side by side")[-1] if "## frame side by side" in out else ""
+    check("ncolspill: two listings side by side (the deltas of insns, pushes, loads, stores)",
+          ("insns" in tail, "loads" in tail, "stores" in tail), (True, True, True))
+    b = io.StringIO()
+    with contextlib.redirect_stdout(b):
+        S.main([os.path.join(HERE, "tests", "data", "ncol", "c1.json")])
+    check("ncolspill: the c1 fixture (8 candidates, none split, none unallocated)",
+          b.getvalue().splitlines()[1] if len(b.getvalue().splitlines()) > 1 else "",
+          "candidates 8: 8 whole, 0 split, 0 unallocated; 8 regions")
+
+
 def sched17_tests():
     """tools/c2sched17.py's replay of the x64 scheduler (cl 17.00, K8 model) on traced regions
     (tests/data/sched17/*.json: `c2sched17.py --export` of tests/data/ncol's sources)."""
@@ -1859,6 +1905,7 @@ bdiff_tests()
 rdiff_tests()
 judge_tests()
 ncolsim_tests()
+ncolspill_tests()
 ncol_levers_tests()
 sched17_tests()
 sched17_predict_tests()
