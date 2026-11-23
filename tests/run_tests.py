@@ -1098,6 +1098,72 @@ def ncolspill_tests():
           "candidates 8: 8 whole, 0 split, 0 unallocated; 8 regions")
 
 
+def callform_tests():
+    """tools/callform.py (docs/c2/callform.md): the call-dispatch-form census of two listings, the
+    structure-vs-registers discriminator. Offline, no compile."""
+    import io, contextlib, callform as C
+    d = tempfile.mkdtemp()
+
+    def listing(name, lines):
+        p = os.path.join(d, name)
+        open(p, "w").write("\n".join(lines) + "\n")
+        return p
+
+    def run(a, b=None, *opts):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            C.main([a] + ([b] if b else []) + list(opts))
+        return buf.getvalue()
+
+    orig = listing("orig.s", [
+        "00000000 call qword ptr [rax]",                 # slot 0: the teardown pair
+        "00000005 call qword ptr [rax]",
+        "0000000a call qword ptr [r8 + 0x18]",           # slot 3
+        "0000000f call qword ptr [rax + 0x20]",          # slot 4
+        "00000014 call qword ptr [rip -> __imp_TlsGetValue]",
+        "00000019 call ?f@@YAHXZ",
+        "0000001e mov eax, 1",                           # no call: not counted
+    ])
+    # the 7231 draft: the two teardown calls absent, everything else at the same counts
+    missing = listing("missing.s", [
+        "0000000a call qword ptr [rax + 0x18]",
+        "0000000f call qword ptr [rax + 0x20]",
+        "00000014 call qword ptr [rip]",                 # unresolved thunk name
+        "00000019 call FUN_1414d7200",                   # unresolved direct name
+    ])
+    out = run(orig, missing)
+    check("callform: a missing teardown block is one slot-0 form delta, not scattered replacements",
+          ("call [reg] (slot 0)" in out, "2     0    -2" in out,
+           "missing virtual-dtor element teardown" in out, "structural lead" in out),
+          (True, True, True, True))
+    # the same calls through other registers, with both names unresolved on the second side
+    equal = listing("equal.s", [
+        "00000000 call qword ptr [r8]",
+        "00000005 call qword ptr [rax]",
+        "0000000a call qword ptr [rax + 0x18]",
+        "0000000f call qword ptr [rax + 0x20]",
+        "00000014 call qword ptr [rip]",
+        "00000019 call FUN_1414d7200",
+    ])
+    check("callform: register spelling (rax vs r8) is not a finding",
+          "allocator spelling, not a finding" in run(orig, equal, "--targets"), True)
+    check("callform: an equal census says the byte gap is the allocator, not structure",
+          "the call census is identical in every dispatch form" in run(orig, equal), True)
+    # devirtualisation: the same slot-0 calls, but two extra direct dtor calls on the second side
+    dev = listing("dev.s", open(equal).read().splitlines() +
+                  ["0000001e call ??1Foo@@UEAA@XZ", "00000023 call ??1Foo@@UEAA@XZ"])
+    devout = run(orig, dev)
+    check("callform: a devirtualised destructor shows as a direct delta naming ??1...",
+          ("devirtualised destructor(s): ??1Foo@@UEAA@XZ" in devout,
+           "structural lead" in devout), (True, True))
+    check("callform: unresolved FUN_ vs mangled names are paired as a listing artifact",
+          "pairs with FUN_1414d7200 by count: symbol-resolution artifact" in
+          run(orig, dev, "--targets"), True)
+    plus = listing("plus.s", ["+0x0000 call qword ptr [rax]", "+0x0005 call [rip -> __imp_TlsGetValue]"])
+    check("callform: +0xN listings and a census of one listing",
+          ("2 calls, 2 forms" in run(plus), "call [reg] (slot 0)" in run(plus)), (True, True))
+
+
 def sched17_tests():
     """tools/c2sched17.py's replay of the x64 scheduler (cl 17.00, K8 model) on traced regions
     (tests/data/sched17/*.json: `c2sched17.py --export` of tests/data/ncol's sources)."""
@@ -1906,6 +1972,7 @@ rdiff_tests()
 judge_tests()
 ncolsim_tests()
 ncolspill_tests()
+callform_tests()
 ncol_levers_tests()
 sched17_tests()
 sched17_predict_tests()
