@@ -9,7 +9,11 @@ usage: effectmine.py mine  <tu.cpp> --func F [--asm-vs ORIG.s] [--want EFFECT ..
        effectmine.py query <tu.cpp> --func F --want EFFECT [..] [--asm-vs ORIG.s] [--verify N] [-- <cl args>]
        effectmine.py table [--build B] [--type T] [--class RE] [--min-n 3] [--all-types] [--by build|vtype|..]
        effectmine.py stats
-   --c2 13.10 / 13.10.3052 / 15.00 as on every tool.
+   --c2 13.10 / 13.10.3052 / 15.00 as on every tool. --c2 17.00 (x64): the R model is NColor, every variant read
+   through ncolsim (c2ncol --export + the IL at NColor's entry); R effects in ncolsim's vocabulary (+app:V:B:N
+   -app:V:B:N live:B:+K index:V=K bucket:V=L, flags blocks: range: new: gone:, reg:V:a>b, before:A:B); features
+   regs,slots,keys,loads,frontend (no scratch, no sched); wanted effects +app:V:B[:N] -app:V:B[:N] (ref / unref:
+   one appearance) live:B:+K before:A:B reg:V=REG bdiff, fe:/fi:, keys, slots, loads. docs/c2/effectmine.md 8.
 
 The models (rasim, rasim scratch, c2slots, symkeys, c2sched, loadcse) say WHAT c2 must do differently; realize.py
 and rwsweep.py hold a hand-written catalogue of C++ spellings for some of those answers.  This tool measures the map
@@ -1028,6 +1032,94 @@ def regs_effects(b, v):
     return eff, code
 
 
+# ---------------------------------------------------------------- cl 17.00 x64: the R model is NColor (ncolsim)
+#
+# On a build table with arch x64 the allocator is NColor (docs/c2/ncolor.md), not Color: the regs trace of a variant is
+# one compile with ncolsim's hooks (c2ncol --export plus the IL at NColor's entry: ncolsim.NRun), and its R effects
+# are ncolsim.run_delta's edits (the whatif vocabulary: +app / -app per block, index, live, bucket), the flags it
+# raises (blocks, moved ranges, new / gone candidates), registers and processing-order flips. Records keep the x86
+# keys; only the effect strings are x64's (their types: R.app+ R.app- R.live+ R.live- R.index R.bucket R.blocks
+# R.range R.new R.gone R.reg R.before).
+
+X64_FEATURES = ("regs", "slots", "keys", "loads", "frontend")
+X64_NO = {"scratch": "the scratch picks are the x86 allocator's RegAssign (x64: NColor gives every register)",
+          "sched": "the scheduler model is c2sched (x86); x64 has tools/c2sched17.py, not wired in here"}
+
+
+def is_x64():
+    return c2trace.c2build.get("arch") == "x64"
+
+
+class X64Fn:
+    """One function of a cl 17.00 x64 compile read through NColor (an ncolsim.NRun): what the miner reads of
+    realize.Fn on the x86 builds (name, instrs, code / masked / bag, regs, blocks with their source line offsets)."""
+
+    def __init__(self, run):
+        import ncolsim
+        self.run, self.f = run, run.f
+        self.name = run.func
+        self.instrs = run.instrs
+        self.code = [(m, realize._norm(o, self.name)) for m, o in self.instrs]
+        self.masked = [(m, tsweep.REG.sub("r", o)) for m, o in self.code]
+        self.bag = sorted((m, re.sub(r"\[(r|rsp|esp)[+-]\d+\]", r"[\1]", o)) for m, o in self.masked if m != "npad")
+        self.regs = {k: v.split("/") for k, v in ncolsim.regs_of(self.f).items()}
+        # NRun's lines are listing lines (line0 + w - 1, line0 the PROC's first `; N` line); the line word w is the
+        # offset from the function's name line, realize.Fn's convention (so a prelude before the function moves nothing)
+        line0 = None
+        try:
+            lt = open(run.asm, errors="replace").read()
+            i, _j = c2trace.listing_proc(lt, self.name)
+            m = re.search(r"^; (\d+)\s+:", lt[i:], re.M)
+            line0 = int(m.group(1)) if m else None
+        except Exception:
+            pass
+        st = self.f.get("state") or {}
+        live = st.get("live") or []
+        self.lines = {b: sorted(L - line0 + 1 for L in ls) if line0 else [] for b, ls in run.lines.items()}
+        self.blocks = [(b, ncolsim.depth(st, b) if st else 0, live[b] if b < len(live) else 0, self.lines[b])
+                       for b in sorted(self.lines)]
+        self.nblocks = run.nblocks
+
+    def lines_of(self, b):
+        return self.lines.get(b, [])
+
+
+def ilsig_x64(fn):
+    """ilsig on x64: the IL at NColor's entry (blocks and instruction tuples, addresses removed)."""
+    h = hashlib.md5()
+    for ln in fn.f.get("il_fn") or []:
+        if ln[:2] in ("B ", "I "):
+            h.update((re.sub(r"^([BI]) [0-9a-f]+", r"\1", ln) + "\n").encode())
+    return h.hexdigest()
+
+
+def regs_effects_x64(b, v):
+    """The R effects and code numbers of variant v against reference b (X64Fn): ncolsim.run_delta's edits and flags,
+    registers of named candidates in both, and `before:A:B` for named candidates NColor now processes in the other
+    order (A before B)."""
+    import ncolsim as N
+    d = N.run_delta(b.f, v.f)
+    eff = list(d["edits"])
+    if d["blocks"]:
+        eff.append("blocks:%d>%d" % (b.nblocks, v.nblocks))
+    eff += ["range:%s" % x for x in d["ranges"]] + ["new:%s" % x for x in d["new"]] + ["gone:%s" % x for x in d["gone"]]
+    ga, gb = N.regs_of(b.f), N.regs_of(v.f)
+    eff += ["reg:%s:%s>%s" % (k, ga[k], gb[k]) for k in sorted(set(ga) & set(gb)) if N.named(k) and ga[k] != gb[k]]
+    order = lambda f: list(dict.fromkeys(N.short(c["name"]) for c in f["cands"] if N.named(N.short(c["name"]))))
+    oa, ob = order(b.f), order(v.f)
+    both = [x for x in ob if x in oa]
+    flips = ["before:%s:%s" % (x, y) for i, x in enumerate(both) for y in both[i + 1:] if oa.index(x) > oa.index(y)]
+    eff += flips[:40]
+    ad = realize.adiff
+    code = dict(code=ad(b.masked, v.masked), bag=ad(b.bag, v.bag), ident=ad(b.code, v.code),
+                dn=len(v.code) - len(b.code), n=len(v.code))
+    try:
+        code["bytes"] = ad(tsweep.bkeys(b.instrs), tsweep.bkeys(v.instrs))
+    except Exception:
+        code["bytes"] = None
+    return eff, code
+
+
 def sched_regions(path, func, cl, keep):
     import c2sched
     _i, _h, rc, out, log = c2trace.run_trace(path, c2sched.HOOKS, cl, keep=keep, quiet=True)
@@ -1134,6 +1226,10 @@ def etype(model, s):
     """The effect type of one effect string (what generalises across functions)."""
     k = s.split(":")[0]
     if model == "R":
+        if k in ("+app", "-app"):          # x64 (NColor): appearances per block
+            return "R.app" + k[0]
+        if k == "live":
+            return "R.live" + ("-" if s.split(":")[2].startswith("-") else "+")
         if k in ("ref", "P", "tmp"):
             return "R.%s%s" % (k, "+" if s.rstrip().split(":")[-1].startswith("+") else "-")
         if k == "pref":
@@ -1259,7 +1355,7 @@ class Ref:
         self.path = os.path.join(self.dir, tag + ".cpp")
         open(self.path, "w").write(miner.src_text(text))
         self.fn = miner.trace_regs(self.path, self.dir)
-        self.sig = ilsig(self.fn)
+        self.sig = ilsig_x64(self.fn) if miner.x64 else ilsig(self.fn)
         self.feat = {}
         self.lock = threading.Lock()
         self.alias = None                 # a control identical to the base: measure against the base
@@ -1377,6 +1473,10 @@ class Miner:
                 f.write(self.text)
         self.orig = tsweep.orig_instrs(a.asm_vs) if a.asm_vs else None
         self.orig_slot = None
+        self.x64 = is_x64()
+        if self.x64:
+            import ncolsim
+            ncolsim.trace_hooks()        # sets the IL dump options (ILRAW / ILSYMW / ILPAS) once, before any thread runs
         self.feats = [f for f in a.features.split(",") if f]
         self.compiles = 0
         self.per_feat = {}
@@ -1411,6 +1511,9 @@ class Miner:
         if mute is not None and self.func:
             mute.on = True
         try:
+            if self.x64:                              # NColor: c2ncol --export + the IL at its entry (ncolsim)
+                import ncolsim
+                return X64Fn(ncolsim.NRun(path, self.func or self.funcpat, self.cl, d))
             t = realize.Trace(path, self.cl, keep=d)
         finally:
             if mute is not None:
@@ -1495,12 +1598,12 @@ class Miner:
                    vs=ref.tag if ref is not None else None, ok=fn is not None, err=err, eff={}, code={})
         if fn is None:
             return rec
-        eff, code = regs_effects(ref.fn, fn)
+        eff, code = regs_effects_x64(ref.fn, fn) if self.x64 else regs_effects(ref.fn, fn)
         code["bdo"] = self.bdo(fn)
         code["rdo"] = self.rdo(fn)
         rec["code"] = code
         rec["eff"]["R"] = eff
-        rec["sig_same"] = ilsig(fn) == ref.sig
+        rec["sig_same"] = (ilsig_x64(fn) if self.x64 else ilsig(fn)) == ref.sig
         return rec
 
     def measure_more(self, rec, path, d, ref, v):
@@ -1590,6 +1693,19 @@ def parse_want(s):
     s = s.strip()
     if s in ("bdiff", "smaller"):
         return dict(m="C", kind="bdiff", text=s)
+    if is_x64():
+        # NColor's vocabulary (ncolsim whatif / run_delta); ref:V:B / unref:V:B read as one appearance more / fewer
+        m = re.fullmatch(r"([+-])app:(.+?):(\d+)(?::(\d+))?", s) or re.fullmatch(r"(ref|unref):(.+?):(\d+)(?::[+-]?(\d+))?", s)
+        if m:
+            sg = "+" if m.group(1) in ("+", "ref") else "-"
+            return dict(m="R", kind="app" + sg, x=m.group(2), blk=m.group(3), n=int(m.group(4) or 0), text=s, feat="regs")
+        m = re.fullmatch(r"live:(\d+):([+-]\d+)", s)
+        if m:
+            return dict(m="R", kind="live", blk=m.group(1), n=int(m.group(2)), text=s, feat="regs")
+        m = re.fullmatch(r"(ins|drop):\d+(?::\d+)?|sched:.+|pref:.+", s)
+        if m:
+            raise SystemExit("effectmine on x64: %r is an x86 model's answer (scratch picks, c2sched, Color's "
+                             "preferences); NColor's are +app:V:B[:N] -app:V:B[:N] live:B:+K before:A:B reg:V=REG" % s)
     m = re.fullmatch(r"(ins|drop):(\d+)(?::\d+)?", s)
     if m:
         return dict(m="S", kind=m.group(1), n=int(m.group(2)), text=s, feat="scratch")
@@ -1659,6 +1775,8 @@ def want_type(w, miner=None):
                     cur = None
             return "L.uses" + ("-" if cur is not None and w["n"] < cur else "+")
         return "L." + ("ord" if k == "pos" else k)
+    if w["m"] == "R" and k in ("app+", "app-", "live"):
+        return "R." + k if k != "live" else "R.live" + ("+" if w["n"] > 0 else "-")
     if w["m"] == "R":
         return {"pref": "R.pref+", "reg": "R.reg", "order": "R.before", "ref": "R.ref+", "unref": "R.unref",
                 "extend": "R.extend", "drop": "R.drop", "var": "R.var", "P": "R.P" + ("+" if w.get("n", 1) > 0 else "-")}[k]
@@ -1725,6 +1843,11 @@ def want_hit(w, rec, miner):
             hit = [s for s in R if s in ("before:%s:%s" % (x, y), "tie:%s>%s" % (x, y))]
         elif k == "P":
             hit = [s for s in R if s == "P:%s:%+d" % (w["blk"], w["n"])]
+        elif k in ("app+", "app-"):            # x64: N more / fewer appearances of V in block B (N = 0: any)
+            pat = r"%sapp:%s:%s:(\d+)$" % (re.escape(k[-1]), re.escape(x), w["blk"])
+            hit = [s for s in R if re.match(pat, s) and (not w["n"] or int(re.match(pat, s).group(1)) == w["n"])]
+        elif k == "live":
+            hit = [s for s in R if s == "live:%s:%+d" % (w["blk"], w["n"])]
         elif k == "ref":
             hit = [s for s in R if re.match(r"ref:%s:%s:\+" % (re.escape(x), w["blk"]), s) or
                    s == "extend:%s:%s" % (x, w["blk"])]
@@ -2220,7 +2343,9 @@ def prune(M, recs, wants):
 TYPE_ORDER = ["R.ref+", "R.ref-", "R.P+", "R.P-", "R.tmp+", "R.var", "R.gone", "R.extend", "R.drop", "R.tie",
               "R.before", "R.pref+", "R.reg", "R.interf", "S.ins", "S.drop", "S.regs", "L.uses+", "L.uses-", "L.pos",
               "L.ord", "L.conf+", "L.conf-", "L.off", "K.frame+", "K.tmp+", "K.moved", "K.flips", "Q.flip", "M.load+",
-              "M.load-", "C.regsonly", "C.bag0", "C.changed", "C.bdiff-"]
+              "M.load-", "C.regsonly", "C.bag0", "C.changed", "C.bdiff-",
+              # x64 (NColor, ncolsim.run_delta)
+              "R.app+", "R.app-", "R.live+", "R.live-", "R.index", "R.bucket", "R.range", "R.blocks", "R.new"]
 
 
 def denom(s, t):
@@ -2293,10 +2418,6 @@ def main():
     cmd = argv.pop(0)
     if cmd == "_loads":
         return _loads_child(argv, cl)
-    if cmd in ("mine", "query") and c2trace.c2build.get("arch") == "x64":
-        sys.exit("effectmine %s: every variant is observed through the x86 allocator's trace (Color: realize.Trace); "
-                 "not on %s: for x64 levers use realize.py / rwsweep.py (NColor, predicted with ncolsim)"
-                 % (cmd, c2trace.c2build.name()))
     ap = argparse.ArgumentParser(prog="effectmine.py " + cmd, usage=__doc__)
     if cmd in ("mine", "query"):
         ap.add_argument("src")
@@ -2304,7 +2425,7 @@ def main():
         ap.add_argument("--asm-vs")
         ap.add_argument("--want", nargs="+", default=[])
         ap.add_argument("--max-compiles", type=int, default=400)
-        ap.add_argument("--features", default=",".join(FEATURES))
+        ap.add_argument("--features", default=None, help="default: all (x64: %s)" % ",".join(X64_FEATURES))
         ap.add_argument("--focus", help="line offsets in the function (LO-HI,..) measured first, as wanted lines")
         ap.add_argument("--classes")
         ap.add_argument("--skip")
@@ -2320,6 +2441,12 @@ def main():
         ap.add_argument("--fresh", action="store_true", help="measure again what the database already has")
         ap.add_argument("--verify", type=int, default=None)
         a = ap.parse_args(argv)
+        if a.features is None:
+            a.features = ",".join(X64_FEATURES if is_x64() else FEATURES)
+        elif is_x64():
+            no = [f for f in a.features.split(",") if f in X64_NO]
+            if no:
+                sys.exit("effectmine %s on %s (x64): no %s feature: %s" % (cmd, c2trace.c2build.name(), no[0], X64_NO[no[0]]))
         if cmd == "query":
             if not a.want:
                 sys.exit("query needs --want")

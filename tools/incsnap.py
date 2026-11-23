@@ -107,7 +107,7 @@ class Snapshot:
     def path(self, p):
         """The snapshot's copy of a live path under the snapshot's root (the path itself outside it)."""
         p = os.path.normpath(os.path.abspath(p))
-        if p != self.root and not p.startswith(self.root + os.sep):
+        if os.path.commonpath([p, self.root]) != self.root:      # (root may be "/": sources under /tmp, headers under /Users)
             return p
         return os.path.join(self.dest, os.path.relpath(p, self.root))
 

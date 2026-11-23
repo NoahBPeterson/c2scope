@@ -272,7 +272,7 @@ are the x86 rules, so the four x86 tables need no change).
 **Tool changes** (`tools/c2slots.py`): the build table's `sym` template and the role list without null entries;
 the `frame` role; per-thread parsing; `RULES` gating the T rounding, the undo, the param-home alignment test, the
 upward allotemp and member offsets, and the final-offset/listing check; x64 listing lines (`name$ = N`, no size,
-`[rsp]` operands). `--orig`/`--search` still read 32-bit code (x86 only).
+`[rsp]` operands). `--orig` / `--search` / `orig` and framefields: section 6.2.
 
 **Validation** (`c2trace.py slots SRC --func "" --all --quiet -- /O2`, one compile at a time, local wine).
 "exact" as in section 5; "listing" = elements the listing names whose `[rsp+N]` the model gives.
@@ -351,3 +351,70 @@ FrameChain frame variants cannot run in this build.
 | `tests/data/slots17/{frames,frames2,tr}.cpp` /GS (fixtures: `snap/*.json`, `run_tests.py` `slots17_frames_tests`) | 15 | 15 / 15 | 56 / 56 (rule before: 26 / 56) | 7 alloca (3 with B < A), 6 dynamic alignment, 2 removed argument areas |
 | `tests/data/slots17/genframes.py` seeds 1-3, 100 functions each, /GS and /GS- | 600 | 600 / 600 | 3,941 / 3,941 | 274 alloca, 114 dynamic alignment (32 and 64), 64 both, 112 with B < A, 112 removed argument areas |
 | `work/scratch/slots/gen.py` seed 1, `tests/data/slots.c` /GS, `tests/data/ncol` (no such frames: unchanged) | 108 | 108 / 108 | 919 + 23 + 15 | |
+
+### 6.2 The original's slot map on x64 (`--orig`, `--search`, `c2slots.py orig` / `search`, framefields)
+
+Same use as on x86 (section 3): ORIG.s is the original function as `VA mnemonic operands` lines (capstone text, e.g.
+an image's disassembly; jump targets in the same VA space), or `--image EXE --va VA` (capstone 64-bit, x64 jump
+tables `lea rB, [rip+d]` = the image base, `mov r32, [rB + rI*4 + T]` RVAs, followed; not yet run on a real image).
+What differs is the walk, `c2slots.orig_slots64` (chosen by the build table's `arch: x64`):
+
+- **Keys** are relative to the return-address slot at entry, as on x86: the four register arguments' homes are
+  +8 .. +32, stack arguments from +40, locals negative. Depth = entry rsp - rsp: `push` +8, `pop` -8, `sub/add
+  rsp, N`, `mov eax, N; call __chkstk; sub rsp, rax`, and the epilogue's `lea rsp, [rbp+N]` / `mov rsp, rbp` from the
+  frame register. Calls change nothing (no callee pops, no pushes after the prologue).
+- **Frame registers**: any register set from rsp (`mov rbp, rsp`, `lea rbp, [rsp+N]`, `mov r11, rsp` for the saves
+  `mov [r11+8], rbx`, r13 next to an aligned rbp) keeps its depth until it is written; `and rbp, -cap` makes it a
+  dynamically aligned one, whose operands are keyed `ALIGNED` (-2^20) + displacement (their distance to rsp is not
+  known). Callee-saved registers saved into the homes before the prologue (`mov [rsp+8], rbx`) or into the frame
+  later (shrink-wrapped, `mov [rsp+0x78], rbx` after an early exit test) are just unnamed keys.
+- **Body depth** = the deepest point of the walk (shrink-wrapped paths are shallower). Code only reachable through a
+  jump table (`jmp rcx`) is walked at the most common state.
+- **Our coordinates, absolute** (no fitted shift, unlike x86): a home's key is its packer offset (8 + 8i) whatever
+  the original's frame size; a local is at body rsp + A + packed in every frame kind of 6.1 (MdmInsertEntryExit), so
+  packed = key + the original's body depth - A, with A (the outgoing-argument area) taken as ours; an aligned frame
+  register's operand: packed = displacement - the locals' delta (frame_deltas). The report prints the original's
+  frame (`frame: 24 pushed, sub rsp 128, body depth 152, frame registers rbp`) and says when the x86 best-fitting
+  shift would differ (a frame of another size, an element added in front: inftrees_pad below says -8; or another
+  argument area, which this rule cannot see).
+- **Fields**: each of our operands votes for its element's base, not for the byte it touches. The listing writes
+  `name$[REG+X]` = REG + name$ + X with name$ relative to the region's frame register (FUNC+0x74 / +0x78); X minus
+  (rsp - REG when that register is rsp but the code goes through REG) is the field. Without it a struct read only by
+  fields (example.c's `d_stream`, 88 bytes, never at +0) or `this$[rbp-127]` (inflate's `code`, 4 bytes, +1) or
+  va_start's `format$[rsp+8]` (gzprintf: the address after a home) voted one field off.
+- **Alignment**: regmap's alignment with x64 operand shapes (regmap.REG is the 32-bit set: r12 would be an
+  immediate), our side as capstone text of the listing's bytes (the original's form), names from the listing text.
+
+framefields uses the same walk and alignment on both sides; on x64 it skips elements of at most 8 bytes (pointers)
+unless `--all` and takes access widths from the operands (`qword ptr`) for the extents.
+
+**Validation** (our own 17.00 compile as "the original": ORIG.s = capstone of its listing's bytes; one compile at a
+time, local wine, `/O2`; zlib `/I` its folder, slots17 / genframes `/TP /GS`, gen.py `/TP`). "exact" = the offset
+`--orig` gives an element is the original's packed offset (the original's own trace, matched by listing name;
+`tvN` temporaries are numbered per compile and left out of the perturbed rows).
+
+| source | functions | identity: elements exact (functions) | `volatile char` in front: moved / exact | `volatile int[5]`: moved / exact | one more use (`ext(0); g += v;`): moved / exact; `--search` |
+|---|---|---|---|---|---|
+| zlib 1.2.1, 14 files | 29 | 70 / 70 (29 / 29) | 14 functions changed, 28 elements moved; 68 / 69 | 20 changed, 28 moved; 67 / 68 | (no such lines) |
+| tests/data/slots.c `/GS` | 6 | 17 / 17 | 9 moved; 13 / 13 | 4 moved; 14 / 14 | |
+| tests/data/slots17 frames, frames2, tr | 15 | 29 / 29 | nothing moves; 27 / 27 | 27 / 27 | |
+| gen.py seeds 1-3 (100 each) | 300 | 2,308 / 2,308 | 266 changed, 924 moved; 1,420 / 1,420 | 264 changed, 960 moved; 1,431 / 1,432 | 34 changed, 86 moved; 2,166 / 2,176; one edit puts every element back in 31 of 34 |
+| genframes seeds 1-3 (alloca, dynamic alignment, B < A, removed argument areas) | 300 | 1,103 / 1,103 | nothing moves (the pad lands last); 957 / 957 | 957 / 957 | 48 changed, 116 moved; 890 / 912; one edit restores all in 40 of 48, improves 47 |
+
+Identity is exact everywhere (3,527 elements in 650 functions, 0 depth conflicts). The perturbed rows miss 35 of
+8,072 elements, 32 of them in the `use` rows; every miss looked at is an alignment error next to the inserted code
+with one or two votes (zlib inflate_fast `window$1$` 1/2 votes; genframes f40 `v1$`: our `lea rcx, v1$` paired with
+the original's `lea rcx` of v2), not the walk. `--search`'s winners are the inverse of the perturbation
+(`uses:v=N-1`, or a visiting position that amounts to it). framefields: no layout difference reported in 650 of 650
+identity functions and in all padded ones but 3 of zlib's (compress2 / uncompress `stream$`, minigzip main
+`outmode$`: one pair each misaligned by the inserted store); a second read (`use`) gives 15 such one-pair false
+reports in 600. A real layout change, S12 `{ int v[3]; }` -> `{ int x0; int v[3]; }` (gen.py, genframes): every one
+of the 186 S12 locals read through a field is reported as moved (`+0->+4` ...), none else; 91 S12 locals only passed
+by address (`ext(&v)`) cannot show it. `tests/data/framefields` (a.cpp against b.cpp) on 17.00: the temporary `$T1`
+is reported (`+8->+4`, extent 16 ours against 12), the x64 form of the x86 `_value$` row.
+
+Fixtures (`tests/data/slots17orig/`, `run_tests.py` `slots17_orig_tests`, no compile): `gen_use_f46` (8 of 16 moved;
+`--search` top edit `uses:#5=2` puts 16 of 16 back), `inftrees_pad` (zlib inflate_table padded; all 12 at the
+original's offsets), `gf_padarr_f76` (alloca + dynamic alignment, r13 and the aligned rbp, B < A), `gzprintf_id`
+(`__chkstk`, va_start on a home); each NAME.json (snapshot), NAME.lst (our listing, the function only), NAME.s (the
+original).

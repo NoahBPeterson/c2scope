@@ -590,6 +590,32 @@ larger of the two credits at tuple +0x16). FgTryTailMerge is `@4` in 13.10: the 
 inside (`FgDagInitializeGraph`, `DagBuildGraph`). 15.00 (PDB names): `FgDoCommonTailMerge(ecx = A, edx = B,
 [pass, &out])`, walk end 5107d4bd ([ebp-0x5c] matches, esi = B side, ebx = A side), size 5107d609 (ecx, edi).
 
+**17.00 x64** (cl 17.00.61030 x86_amd64, `--c2 17.00`; PDB names, plain fastcall; tuples +4 next, +0x18 prev,
++8 opcode, +0xc kind) **[C: code read, trace]**. `FgDoCommonTailMerge(ecx = FUNC, edx = B = J1, [esp+4] = A = J2,
+pass, &out)`, `ret 0xc`, 0x100b4e10: the walk keeps B's side in esi and A's in edi (both through +0x18), skips
+labels (kind 0x1a) and OPUSERLABEL 0x59e, and every stop (the compare failed, the other jump reached, a branch /
+return on J1's side) joins at **0x100b4fb0** (walk probe: `[ebp-8]` matches, esi, edi, `[ebp-0x30]` / `[ebp-0x34]`
+the whole-block point). The size rule counts `csize` from the walk end's next up to J1 and stops once the count
+reaches the limit, then adds the larger credit (+0x24 of the two jumps): **0x100b5140** (size probe: ebx = total,
+Speed = TLS +0xdd08; limit 20 or 2 as before). A merge retargets J1 (`ReplaceBranchTarget` to
+`FindOrMakeAnAdjacentLabel` of A's copy) and removes B's copy (`RemoveRange`); `*out` = 1 when the roles swapped (J1's
+walk reached J2's label), so `merges` prints `merged (roles swapped: J2's copy removed)` there. The other hooks are
+the 15.00 ones by PDB name with fastcall arguments: FgDoLateFlowOpts(ecx = FUNC, edx = mode), FgTryCommonTailMerge /
+FgTryCommonHeadMerge(ecx = FUNC, edx = label), FgMdInstrsMatch(ecx, edx) with the call target's name at
+`[[[t+0x30]+0x24]+4]`, FgTryTailMerge / FgCrossJumpRemove / FgTryHeadMerge(ecx = the jump),
+FgDoCommonHeadMerge(ecx = FUNC, edx, [esp+4]); the final offsets from the IL at `Encode`. c2 17.00 compiles on
+worker threads, so the parser demuxes the log by `# thread N` first (a function's events, FgDoLateFlowOpts to
+Encode, stay on one thread). tailmerge.c on 17.00: c1 2 of 2 merged (5 matched, size 24 > 20; the second pair 44
+with the credit), c2 1 of 2 (arm 2 stops at `call target f2 / f1`, 12 <= 20), c3 as c1, **r1 2 of 2 merged** (x64
+passes `&a` in rcx by the convention: no scratch rotation, `lea rcx` in every arm), r2 2 of 2; the listing agrees
+(c1: one `call f`, arm 3 keeps the code, as 14.00). zlib 1.2.1 (14 files, 116 functions at mode 2): 1163 pairs, 45
+merged (6 with the roles swapped), every walk probe's match count equals the successful compares under it (an
+interleaved, undemuxed log gave one mismatch), and in every merged pair with a decidable final IL the matched
+tuples of the removed side are gone (J1's in 18, J2's in the 2 swapped ones; the other 25: tuple addresses reused
+after the removal or the epilogue copied, not decidable from addresses). Verdicts by kind: 361 operand, 311
+instruction, 250 register, 194 other jump / start, 2 call target. Offline: `merges --from DIR/c2trace.log` reports
+a kept log (`tests/data/merges17/tailmerge.log`, run_tests x64_merges_tests).
+
 **`c2trace.py merges SRC --func F -- FLAGS`** (also `il --merges`; tools/c2merges.py) hooks the functions above
 plus the two probes and prints, per `FgDoLateFlowOptsOnce` iteration of the mode-2 run, every tail pair with
 its two jumps (tuple, source line offset, listing offset or `gone`), the number of matched instructions, the

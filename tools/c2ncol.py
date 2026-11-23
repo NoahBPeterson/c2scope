@@ -25,7 +25,8 @@ import c2trace   # noqa: E402
 
 # event kinds in hooks.ncol order; --why adds STATE (hooks.ncol_state: the liveness arrays after prioritization)
 CAND, FIRST, STORE, GIVEBACK, REWRITE, STATE, FN, PREF, PRE, REGSET, PERFUNC, COVREG, COVBEST, SEPARATE = range(14)
-DPA_TRY, DPA_COVER, DPA_C, DPA_B, DPA_A = range(14, 19)
+MINKEPT, MINREST = 14, 15
+DPA_TRY, DPA_COVER, DPA_C, DPA_B, DPA_A = range(16, 21)
 # --il: the IL also at NColSubsumption's entry (0x1009ab40, after NColInitializeSyms / NColBuildInfo, before the copies
 # are coalesced and NColFoldTooCheap folds: the stream the lifetime indices, live counts and availability come from)
 PRE_HOOK = "1009ab40=tdccc>0>0>4$,tdccc>0>8>0>0x1c%"
@@ -49,8 +50,14 @@ NCLU = 24
 COVREG_HOOK = ("1006a348=ecx,ebp>-0x20>0x20,ebp>-0x98,ebp>-0x4c*%d:16:20,ebp>-0x4c*%d:24:28,ebp>-0x4c*%d:8:12"
                % (NCLU, NCLU, NCLU))
 COVBEST_HOOK = "1006aeb3=ecx,ebp>-0x20>0x20,edx>0x10,edx>0x14,edx>0x18,edx>0x1c"
-NSEP = 96            # f668 entries read at NColSeparateProcessedRegion (a split global has one per block it keeps)
+NSEP = 400           # f668 entries read at NColSeparateProcessedRegion (a split global has one per block it keeps)
 SEPARATE_HOOK = "100c7a20=s2,edx>0x24,edx>0x28,tf668>0#%d" % (6 * NSEP)
+# --cov: what NColSeparateProcessedRegion makes of those pieces (docs/c2/ncolor.md 4.5): MINKEPT_HOOK after the first
+# NColRangesToMinTupleRegions (0x100c7a55, eax = the NCOLTUPRGN list the region keeps; `mov edx, [ebp-4]; mov [ebp+0xc],
+# eax`, 6 bytes, nothing branches inside), MINREST_HOOK where the second one's result goes into the new region
+# (0x100c7acb, esi = the rest's list, eax = the new region; `mov [eax+0x10], esi; mov ecx, [edi+0x14]`, 6 bytes)
+MINKEPT_HOOK = "100c7a55=eax*%d" % NSEP
+MINREST_HOOK = "100c7acb=esi*%d" % NSEP
 # --dpa (with --export --il, after --cov's hooks): NColDeterminePhysregAvail's order loop (docs/c2/ncolor.md 7): a
 # register number that passed the useable test (0x10069635, esi), a physreg that covers every range (0x10069750, its
 # number; the displaced cmp feeds a later jae), the fallbacks C (0x100699d0, ecx = its gap), B (0x10069a35), A
@@ -171,6 +178,10 @@ def parse_all(text, fn_flags=False):
                 n, w = g(v[0]) or 0, arr(v[3]) if v[3].startswith("[") else []
                 cur.setdefault("separate", []).append(dict(n=n, first=g(v[1]), last=g(v[2]),
                                                            ranges=[w[6 * k:6 * k + 6] for k in range(min(n, len(w) // 6))]))
+            continue
+        if kind in (MINKEPT, MINREST) and cur is not None and cur.get("separate"):   # --cov: the kept / rest lists
+            w = arr(v[0]) if v and v[0].startswith("[") else []
+            cur["separate"][-1]["kept" if kind == MINKEPT else "rest"] = [w[2 * k:2 * k + 2] for k in range(len(w) // 2)]
             continue
         if DPA_TRY <= kind <= DPA_A and cur is not None:                # --dpa
             g = lambda x: hx(x) if x not in ("?", "") else None
@@ -312,7 +323,7 @@ def main(argv):
                     "trace-free inputs (docs/c2/ncolor.md 11, 12)")
     ap.add_argument("--cov", action="store_true", help="with --export --il: NColBestCoverage's scores and clusters per "
                     "register, its new bests and the ranges NColSeparateProcessedRegion keeps (candidates get cov, "
-                    "covbest, separate; docs/c2/ncolor.md 4.4)")
+                    "covbest, separate: the pieces, kept and rest; docs/c2/ncolor.md 4.4, 4.5)")
     ap.add_argument("--dpa", action="store_true", help="with --export --il --cov: NColDeterminePhysregAvail's order "
                     "loop per region (candidates get dpa: [event, register ..]; docs/c2/ncolor.md 4.3)")
     ap.add_argument("--keep")
@@ -341,7 +352,7 @@ def main(argv):
             hk.append(REGSET_HOOK)
             hk.append(PERFUNC_HOOK)
             if a.cov or a.dpa:
-                hk += [COVREG_HOOK, COVBEST_HOOK, SEPARATE_HOOK]
+                hk += [COVREG_HOOK, COVBEST_HOOK, SEPARATE_HOOK, MINKEPT_HOOK, MINREST_HOOK]
             if a.dpa:
                 hk += DPA_HOOKS
     img, hk, rc, out, text = c2trace.run_trace(a.src, hk, cl or ["/O2"], keep=a.keep,

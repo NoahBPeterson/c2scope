@@ -29,7 +29,8 @@ Each prints the new offset of every element that moved.
 push depth removed (esp operands) or from ebp, are aligned with our listing (regmap's alignment) and give each of
 our elements the original's offset (side by side). --search then tries single edits (uses +-1..3, visiting position
 within the size run, removing a conflict that refused a join, adding one that splits a colour) and ranks them by how
-many elements end at the original's offset.
+many elements end at the original's offset. x64 (cl 17.00): rsp depth and frame registers instead of push depth,
+offsets back in the packer's coordinates without a fitted shift (orig_slots64; docs/c2/slots.md 6.2).
 """
 import argparse, bisect, collections, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -661,7 +662,7 @@ def check(s, res):
 
 # ---------------------------------------------------------------- listing
 SYMLINE = re.compile(r"^(\S+) = (-?\d+)\s*(?:; size = (\d+))?\s*$")      # x64 listings give no size
-OPSYM = re.compile(r"([_$A-Za-z0-9?@]+)\[(?:esp|ebp|rsp|rbp)")
+OPSYM = re.compile(r"([_$A-Za-z0-9?@]+)\[(?:esp|ebp|rsp|rbp|r1[0-5]\b)")
 
 
 def listing_slots(asm, func):
@@ -981,19 +982,38 @@ def read_orig(path=None, image=None, va=None):
     import capstone, pefile
     pe = pefile.PE(image, fast_load=True)
     base = pe.OPTIONAL_HEADER.ImageBase
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    x64 = is_x64()
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if x64 else capstone.CS_MODE_32)
 
     def rd(a, n):
         return pe.get_data(a - base, n)
     seen, work = {}, [va]
+    ibase = {}                          # x64: registers holding the image base (`lea rdx, [rip - X]` = __ImageBase)
     while work:
         a = work.pop()
+        ibase = {}
         while a not in seen:
             i = next(md.disasm(rd(a, 16), a), None)
             if i is None:
                 break
             seen[a] = (i.address, i.mnemonic, i.op_str)
             m = i.mnemonic
+            if x64:
+                # a jump table: `lea rB, [rip + d]` (= the image base), `mov ecx, [rB + rI*4 + T]` (RVAs), `add rcx,
+                # rB`, `jmp rcx`; every entry inside the function's neighbourhood is a case
+                rip = re.fullmatch(r"(r\w+), \[rip ([+-]) (0x[0-9a-f]+)\]", i.op_str) if m == "lea" else None
+                if rip and i.address + i.size + int(rip.group(3), 16) * (1 if rip.group(2) == "+" else -1) == base:
+                    ibase[rip.group(1)] = True
+                else:
+                    tb = re.fullmatch(r"\w+, dword ptr \[(r\w+) \+ r\w+\*4 \+ (0x[0-9a-f]+)\]", i.op_str) \
+                        if m == "mov" else None
+                    if tb and tb.group(1) in ibase:
+                        T = base + int(tb.group(2), 16)
+                        for k in range(4096):
+                            v = base + int.from_bytes(rd(T + 4 * k, 4), "little")
+                            if not (va <= v < va + 0x100000):
+                                break
+                            work.append(v)
             if m == "ret" or (m == "jmp" and not i.op_str.startswith("0x")):
                 if m == "jmp" and "*4 +" in i.op_str:          # jump table: jmp dword ptr [reg*4 + T]
                     t = re.search(r"\+ (0x[0-9a-f]+)\]", i.op_str)
@@ -1085,20 +1105,193 @@ def _prologue(ins, m0=None):
     return out
 
 
-def orig_x86():
-    """Exit on an x64 build: the original's frame walk (orig_slots) is the 32-bit one (esp/ebp, push depth)."""
+def is_x64():
     import c2build
-    if c2build.get("arch") == "x64":
-        sys.exit("c2slots --orig / --search / orig, framefields: 32-bit code only (esp/ebp push depth); not ported to "
-                 "%s: compare the `final` column of `c2trace.py slots` with the original's [rsp+N] by hand"
-                 % c2build.name())
+    return c2build.get("arch") == "x64"
+
+
+# ---------------------------------------------------------------- x64: the original's frame walk
+# Win64 code: the frame is fixed after the prologue (callee-saved pushes, `sub rsp, F` or `mov eax, F; call
+# __chkstk; sub rsp, rax`; callee-saved registers also saved into the home slots before it, `mov [rsp+8], rbx`, or
+# into the frame later, shrink-wrapped); no pushes or callee pops in the body, so a call changes nothing. Frame
+# registers: `mov rbp, rsp` / `lea rbp, [rsp+N]` (alloca, rbp frames), `and rbp, -cap` (dynamic alignment: rbp's
+# distance to rsp is unknown, its operands get keys of their own), and any other register set from rsp the same way
+# (r13 next to an aligned rbp). Keys as on x86: relative to the return-address slot at entry (homes of the four
+# register arguments +8 .. +32, stack arguments from +40, locals negative); a dynamically aligned register's
+# operands are keyed ALIGNED + displacement.
+FRAMEOP64 = re.compile(r"\[(r[a-z0-9]+)(?:\s*\+\s*r[a-z0-9]+(?:\s*\*\s*\d)?)?(?:\s*([+-])\s*(0x[0-9a-f]+|\d+))?\]")
+ALIGNED = -(1 << 20)
+_R64 = r"r[abcd]x|r[sd]i|r[sb]p|r(?:[89]|1[0-5])"
+_SUB = {}
+for _r in ("ax", "bx", "cx", "dx"):
+    _SUB["r" + _r] = {"r" + _r, "e" + _r, _r, _r[0] + "l", _r[0] + "h"}
+for _r in ("si", "di", "bp", "sp"):
+    _SUB["r" + _r] = {"r" + _r, "e" + _r, _r, _r + "l"}
+for _n in range(8, 16):
+    _SUB["r%d" % _n] = {"r%d%s" % (_n, x) for x in ("", "d", "w", "b")}
+_NOWRITE = ("cmp", "test", "push", "call", "bt", "ucomiss", "ucomisd", "comiss", "comisd")
+
+
+def _writes(mn, ops, reg):
+    """Does `mn ops` write the 64-bit register reg (or a part of it)? (Destination = the first operand.)"""
+    if mn == "pop":
+        return ops.strip() in _SUB.get(reg, {reg})
+    if mn in _NOWRITE or mn.startswith("j"):
+        return False
+    dst = ops.split(",", 1)[0].strip()
+    if mn in ("xchg", "xadd") and "," in ops:
+        return dst in _SUB.get(reg, {reg}) or ops.split(",", 1)[1].strip() in _SUB.get(reg, {reg})
+    return dst in _SUB.get(reg, {reg})
+
+
+def orig_slots64(ins):
+    """orig_slots for Win64 code (see FRAMEOP64): [(index into ins, [frame keys])] and the frame summary (pushed
+    bytes, F, the frame registers)."""
+    by = {a: k for k, (a, _, _) in enumerate(ins)}
+    nxt = {ins[k][0]: ins[k + 1][0] for k in range(len(ins) - 1)}
+    depth = {}                          # address -> (bytes below the return-address slot, {frame reg: its depth})
+    work, conflicts = [(ins[0][0], 0, ())], 0
+    pushed = F = None
+    fregs = collections.Counter()
+    seeded = False
+    while work or not seeded:
+        if not work:
+            # code the descent did not reach (jump tables: `jmp rcx`): walked at the body's state
+            seeded = True
+            if not depth:
+                break
+            st = collections.Counter(depth.values()).most_common(1)[0][0]
+            work = [(a, st[0], st[1]) for a, _, _ in ins if a not in depth][::-1]
+            if not work:
+                break
+        a, d, fp = work.pop()
+        if seeded and a in depth:
+            continue
+        fp = dict(fp)
+        eax = None
+        while a in by:
+            k = by[a]
+            if a in depth:
+                if depth[a][0] != d:
+                    conflicts += 1
+                break
+            depth[a] = (d, tuple(sorted(fp.items())))
+            _, mn, ops = ins[k]
+            o = [x.strip() for x in ops.split(",")]
+            if mn == "push":
+                d += 8
+                if F is None:
+                    pushed = (pushed or 0) + 8
+            elif mn == "pop":
+                d -= 8
+            elif mn in ("sub", "add") and o[0] == "rsp" and len(o) == 2:
+                if o[1] == "rax" and eax is not None:          # mov eax, F; call __chkstk; sub rsp, rax
+                    n = eax
+                else:
+                    try:
+                        n = _num(o[1])
+                    except ValueError:
+                        n = None
+                if n is not None:
+                    d += n if mn == "sub" else -n
+                    if mn == "sub" and F is None:
+                        F, pushed = n, pushed or 0
+            elif mn in ("mov", "lea") and o[0] == "rsp" and len(o) == 2:      # epilogue: rsp from a frame register
+                m = FRAMEOP64.fullmatch(o[1]) if mn == "lea" else None
+                src = m.group(1) if m else o[1]
+                disp = (_num(m.group(3)) * (1 if m.group(2) == "+" else -1) if m and m.group(3) else 0)
+                if src in fp and fp[src] is not None:
+                    d = fp[src] - disp
+            if mn == "mov" and re.fullmatch(r"eax, (0x[0-9a-f]+|\d+)", ops):
+                eax = _num(ops.split(",")[1].strip())
+            # frame registers
+            for r in list(fp):
+                if mn == "and" and o[0] == r:
+                    fp[r] = None                                # dynamically aligned
+                elif _writes(mn, ops, r) and not (mn in ("mov", "lea") and o[0] == r and o[1].startswith(("rsp", "[rsp"))):
+                    del fp[r]
+            if len(o) == 2 and re.fullmatch(_R64, o[0]) and o[0] != "rsp":
+                if mn == "mov" and o[1] == "rsp":
+                    fp[o[0]] = d
+                    fregs[o[0]] += 1
+                elif mn == "lea" and o[1].startswith("[rsp"):
+                    m = FRAMEOP64.fullmatch(o[1])
+                    if m and "*" not in o[1] and o[1].count("+") + o[1].count("-") <= 1:
+                        fp[o[0]] = d - (_num(m.group(3)) * (1 if m.group(2) == "+" else -1) if m.group(3) else 0)
+                        if o[0] in ("rbp", "r13"):
+                            fregs[o[0]] += 1
+            if mn == "ret":
+                break
+            if mn.startswith("j") and re.fullmatch(r"0x[0-9a-f]+", ops):
+                work.append((int(ops, 16), d, tuple(sorted(fp.items()))))
+                if mn == "jmp":
+                    break
+            elif mn == "jmp":
+                break
+            a = nxt.get(a)
+    out = []
+    for k, (a, mn, ops) in enumerate(ins):
+        if a not in depth or mn == "nop" or mn.startswith("prefetch"):
+            continue
+        d, fp = depth[a]
+        fp = dict(fp)
+        keys = []
+        for m in FRAMEOP64.finditer(ops):
+            r = m.group(1)
+            disp = _num(m.group(3)) * (1 if m.group(2) == "+" else -1) if m.group(3) else 0
+            if r == "rsp":
+                keys.append(disp - d)
+            elif r in fp:
+                keys.append(disp - fp[r] if fp[r] is not None else ALIGNED + disp)
+        if keys:
+            out.append((k, keys))
+    # the body depth: the deepest point (x64 has no pushes after the prologue; shrink-wrapped paths are shallower)
+    body = max((d for d, _ in depth.values()), default=0)
+    return out, dict(reached=len(depth), total=len(ins), conflicts=conflicts, frame=F, pushed=pushed,
+                     fregs=sorted(fregs), body=body, states={k: depth[a] for k, (a, _, _) in enumerate(ins) if a in depth})
+
+
+_REG64 = re.compile(r"(?:" + _R64 + r"|r(?:[89]|1[0-5])[dwb]|e?[abcd]x|[abcd][lh]|e?[sd]i|[sd]il|e?[sb]p|[sb]pl|"
+                    r"[xy]mm\d+|st\(\d\))")
+
+
+def _shape64(ins):
+    """regmap.shape with the x64 registers (regmap's REG is the 32-bit set: r12 would be an immediate)."""
+    ops = re.sub(r"\b(xmmword|ymmword|mmword|tbyte|dword|qword|word|byte|short)\s+ptr\b|\bshort\b|\boffset\b", "",
+                 ins[1].lower())
+    ops = re.sub(r"[^,]*\[[^\]]*\][^,]*", "M", ops)
+    parts = []
+    for o in ops.split(","):
+        o = o.strip()
+        parts.append("M" if o == "M" else "R" if _REG64.fullmatch(o) else "I" if o else "")
+    return ins[0].lower() + " " + ",".join(parts)
+
+
+def align_ins(ours, orig):
+    """regmap.align (same mnemonic and operand shape), with the x64 operand shapes on an x64 build."""
+    import regmap
+    if not is_x64():
+        return regmap.align(ours, orig)
+    import difflib
+    a = [_shape64(x) for x in ours]
+    b = [_shape64(y) for y in orig]
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    pairs = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            pairs.extend(zip(range(i1, i2), range(j1, j2)))
+        elif op == "replace" and i2 - i1 == j2 - j1:
+            pairs.extend((i, j) for i, j in zip(range(i1, i2), range(j1, j2)) if a[i] == b[j])
+    return pairs
 
 
 def orig_slots(ins, callee_pop=None):
     """[(index into ins, [frame keys])] and the frame summary. A key is the operand's address relative to the
     return-address slot at entry (0 = the return address, +4 the first stack argument; esp operands: displacement
     minus push depth; ebp operands: displacement plus where ebp points). Depth: push/pop/sub/add esp, calls (callee pops when no `add esp` follows: the pushes since
-    the previous call), `mov eax, N` + call at the start (__chkstk)."""
+    the previous call), `mov eax, N` + call at the start (__chkstk). x64: orig_slots64."""
+    if is_x64():
+        return orig_slots64(ins)
     by = {a: k for k, (a, _, _) in enumerate(ins)}
     nxt = {ins[k][0]: ins[k + 1][0] for k in range(len(ins) - 1)}
     depth, work, conflicts = {}, [(ins[0][0], 0, 0, None)], 0      # bytes below the return-address slot
@@ -1198,18 +1391,70 @@ def orig_slots(ins, callee_pop=None):
     return out, dict(reached=len(depth), total=len(ins), conflicts=conflicts, frame=frame)
 
 
+def _region(k):
+    return 2 if k < ALIGNED // 2 else int(k > 0)
+
+
+def _our_fields(s, L_, ours):
+    """{(our instruction, operand number): byte offset into its element}. The listing writes an operand as
+    `name$[REG+X]` = REG + name$ + X, name$ relative to the region's frame register (FUNC+0x74 locals, +0x78 homes:
+    rsp, or rbp in an alloca / dynamically aligned frame); when that register is rsp but the code addresses through
+    another (inflate: `push ..; mov rbp, rsp; sub rsp, 128`, then `hbuf$[rbp-128]`), X also holds rsp - REG, read off
+    our own walk (orig_slots64). The rest of X is the field: `this$[rbp-127]` (a `code` struct's byte +1) votes for the
+    struct's base, `format$[rsp+8]` (va_start: the address after a home) for the home."""
+    if not L_.decoded or not L_.addrs:
+        return {}
+    mine = [(a, mn, ops) for a, (mn, ops) in zip(L_.addrs, tsweep_cs(L_))]
+    slots, info = orig_slots64(mine)
+    okeys, states = dict(slots), info["states"]
+    fr = s["fn"].get("frame") or {}
+    out = {}
+    for i, (mn, ops) in enumerate(ours):
+        ms = list(LSTOP.finditer(ops))
+        ks = okeys.get(i, [])
+        if not ms or len(ms) != len(ks) or i not in states:
+            continue
+        d, fp = states[i]
+        fp = dict(fp)
+        for q, (m, k) in enumerate(zip(ms, ks)):
+            reg = m.group(2).lower()
+            rest = re.sub(r"\b\w+\s*\*\s*\d+", "", m.group(3))
+            X = sum(int(v.replace(" ", ""), 0) for v in re.findall(r"[+-]\s*(?:0x[0-9a-fA-F]+|\d+)\b(?!\s*\*)", rest))
+            X0 = 0
+            if reg != "rsp" and fp.get(reg) is not None and fr.get("prsp" if k > 0 else "lrsp", True):
+                X0 = fp[reg] - d
+            out[(i, q)] = X - X0
+    return out
+
+
+LSTOP = re.compile(r"([_$A-Za-z0-9?@]+)\[(rsp|rbp|r1[0-5]|esp|ebp)\b([^\]]*)\]", re.I)
+
+
+def tsweep_cs(L_):
+    import tsweep
+    return tsweep.cs_text(L_)
+
+
 def orig_map(s, asm, ins, callee_pop=None):
     """{element idx: (orig offset in our packer's coordinates, votes, total)} by aligning our listing with ins."""
     import regmap, tsweep
-    lst = tsweep.listing_offsets(asm, s["func"])           # the text: its operands carry the slot names
-    offs = sorted(lst)
-    ours = [regmap.norm(tsweep.canon_listing(lst[o].split()[0], lst[o].split(None, 1)[1] if " " in lst[o] else ""))
-            for o in offs]                                 # in capstone's operand order, as orig (test, xchg)
     orig = [(mn, ops) for _, mn, ops in ins]
+    if is_x64():
+        # the listing's text carries the slot names; capstone of its bytes (the original's form) gives the shapes
+        L_ = tsweep.listing_instrs(asm, s["func"])
+        ours = [regmap.norm(tsweep.canon_listing(mn, ops)) for mn, ops in L_]
+        pairs = align_ins(tsweep.cs_text(L_) if L_.decoded else ours, orig)
+        field = _our_fields(s, L_, ours)
+    else:
+        field = {}
+        lst = tsweep.listing_offsets(asm, s["func"])           # the text: its operands carry the slot names
+        offs = sorted(lst)
+        ours = [regmap.norm(tsweep.canon_listing(lst[o].split()[0], lst[o].split(None, 1)[1] if " " in lst[o] else ""))
+                for o in offs]                                 # in capstone's operand order, as orig (test, xchg)
+        pairs = regmap.align(ours, orig)
     slots, info = orig_slots(ins, callee_pop)
     okeys = dict(slots)
     name2i = {L["lname"]: i for i, L in s["listing"].items()}
-    pairs = regmap.align(ours, orig)
     votes = collections.defaultdict(collections.Counter)
     diffs = {True: collections.Counter(), False: collections.Counter()}     # keyed by "above the return address"
     for i, j in pairs:
@@ -1217,10 +1462,11 @@ def orig_map(s, asm, ins, callee_pop=None):
         ks = okeys.get(j, [])
         if not ns or len(ns) != len(ks):
             continue
-        for n, key in zip(ns, ks):
+        for q, (n, key) in enumerate(zip(ns, ks)):
             e = name2i.get(n)
             if e is None:
                 continue
+            key -= field.get((i, q), 0)            # x64: the field our operand touches (its element's base votes)
             votes[e][key] += 1
             L = s["listing"][e]
             if L.get("loff") is not None:
@@ -1240,10 +1486,40 @@ def orig_map(s, asm, ins, callee_pop=None):
     CL = max(diffs[False], key=_fit) if diffs[False] else 0
     CP = diffs[True].most_common(1)[0][0] if diffs[True] else (CL if s["fn"].get("ebp") else CL - 4)
     out = {}
+    fr = s["fn"].get("frame") if s["fn"].get("argarea") else None
+    if fr and info.get("body") is not None:
+        # x64: absolute, no fitted shift. A key is relative to the return-address slot, so a home's key is its packer
+        # offset (8 + 8i) whatever the original's frame size; a local sits at body rsp + A + packed (MdmInsertEntryExit,
+        # rbp frames included), so packed = key + the original's body depth - A, with A (the outgoing-argument area)
+        # taken as ours; a dynamically aligned frame register's operands: packed = displacement - the locals' delta
+        dl = frame_deltas(fr)[0]
+        for e, v in votes.items():
+            key, n = v.most_common(1)[0]
+            r = _region(key)
+            out[e] = (key if r == 1 else key - ALIGNED - dl if r == 2 else key + info["body"] - fr["A"], n,
+                      sum(v.values()))
+        # the shift the x86 fit would take, in the listing's coordinates: -(body depth) when the frames agree
+        return out, dict(info, pairs=len(pairs), ours=len(ours), orig=len(orig), shift=CL, pshift=CP,
+                         absolute=-(info["body"] - fr["A"] + frame_deltas(fr)[0]) if not fr.get("dyn") else None)
+    # x86: the listing's offsets are the packer's (ESP frames relative to the return-address slot)
     for e, v in votes.items():
         key, n = v.most_common(1)[0]
         out[e] = (key - (CP if key > 0 else CL), n, sum(v.values()))
     return out, dict(info, pairs=len(pairs), ours=len(ours), orig=len(orig), shift=CL, pshift=CP)
+
+
+def print_orig_info(oi, out=sys.stdout):
+    if oi.get("body") is not None:          # x64
+        out.write("\n# original: %d instructions, %d reached (%d depth conflicts), %d aligned with ours; frame: %d pushed, "
+                  "sub rsp %s, body depth %d%s; locals: packed = key + %d - A%s\n" % (
+                      oi["total"], oi["reached"], oi["conflicts"], oi["pairs"], oi["pushed"] or 0, oi["frame"],
+                      oi["body"], (", frame registers " + " ".join(oi["fregs"])) if oi["fregs"] else "", oi["body"],
+                      "" if oi.get("absolute") is None or oi["absolute"] == oi["shift"] else
+                      " (the best-fitting shift differs by %+d: another argument area or frame?)" % (
+                          oi["shift"] - oi["absolute"])))
+        return
+    out.write("\n# original: %d instructions, %d reached (%d depth conflicts), %d aligned with ours, shift %d (locals) %d "
+              "(params)\n" % (oi["total"], oi["reached"], oi["conflicts"], oi["pairs"], oi["shift"], oi["pshift"]))
 
 
 def side_by_side(s, om, res, out=sys.stdout):
@@ -1327,6 +1603,7 @@ def trace(src, func, cl, keep=None):
     if rc:
         sys.stdout.write(out)
     funcs = [F for F in parse(log, info) if c2trace.func_match(func, F["name"] or "")]
+    funcs.sort(key=lambda F: (F["name"] or "").strip('"') != func)      # a function named exactly F first
     asm = os.path.join(d, os.path.splitext(os.path.basename(src))[0] + ".asm")
     return info, funcs, asm, d
 
@@ -1398,11 +1675,9 @@ def run_one(F, info, asm, a):
         print()
         what(s, a.what)
     if a.orig or a.image:
-        orig_x86()
         ins = read_orig(a.orig, a.image, int(a.va, 16) if a.va else None)
         om, oi = orig_map(s, asm, ins, image_callee_pop(a.image) if a.image else None)
-        print("\n# original: %d instructions, %d reached (%d depth conflicts), %d aligned with ours, shift %d (locals) %d (params)"
-              % (oi["total"], oi["reached"], oi["conflicts"], oi["pairs"], oi["shift"], oi["pshift"]))
+        print_orig_info(oi)
         side_by_side(s, om, res)
         if a.search:
             search(s, om, a.top, a.limit)
@@ -1420,8 +1695,6 @@ def offline(argv):
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--limit", type=int, default=800)
     a = ap.parse_args(argv[1:])
-    if argv[0] in ("orig", "search"):
-        orig_x86()
     if argv[0] == "orig":
         ins = read_orig(a.orig, a.image, int(a.va, 16) if a.va else None)
         slots, info = orig_slots(ins)
@@ -1439,6 +1712,7 @@ def offline(argv):
         sys.exit("search needs --asm OUR.asm (the listing the snapshot was made from; c2trace.py slots --keep DIR)")
     ins = read_orig(a.orig, a.image, int(a.va, 16) if a.va else None)
     om, oi = orig_map(s, a.asm, ins)
+    print_orig_info(oi)
     res = model_of(s).run(base_order(s), record=True)
     side_by_side(s, om, res)
     search(s, om, a.top, a.limit)

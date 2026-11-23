@@ -4,10 +4,13 @@
 usage: loadcse.py SRC --func F [--c2 BUILD] [--all] [--loc RE] [--json OUT] [-- <cl args>]
 
 One traced compile (c2trace.py il, with the PAS index of every memory leaf: C2TRACE_ILPAS=1) dumps the function at
-  V   @GdfInsertArtificialAssigns@4 (first entry: right after HshBuildTable gave every expression a hash temp)
-  S2  @GoptLocalCopyPropagation@4   (after sweep 2, the CSE sweep)
+  V   @GdfInsertArtificialAssigns@4 (its last entry before S2: the hash table sweep 2 uses; the first entry, right
+                                    after HshBuildTable, is V1. 14.00 enters it twice with the same IL; on 17.00
+                                    sweep 1 runs in between and can rejoin values: "sweep 1 rejoined it")
+  S2  @GoptLocalCopyPropagation@4   (its first entry after V1: after sweep 2, the CSE sweep; 17.00 also enters it
+                                    before HshBuildTable)
   O   @Opeq@4                       (read-modify-write formation; its input)
-  C   @Color@4                      (what register allocation gets)
+  C   @Color@4                      (what register allocation gets; x64: @NColor@4)
   E   @EncEmitFunc@4                (final code, after LateGlobalOptimize and MscClean)
 and reports, per memory location read more than once (locations are resolved through address temporaries, so
 `[t128+0]` with `t128 = _this + 352` is `[_this+352]`, and `[t131+0]` with `t131 = [_pf]` is `[[_pf+0]+0]`):
@@ -21,9 +24,12 @@ and reports, per memory location read more than once (locations are resolved thr
                      defined by an address expression: `T& r = p->m`, `T* q = &p->m`, an inline method's `this`
                      on a sub-object), so the hash of the address differs
       R4 dependent   the base pointer itself has another hash temp (it was renumbered, see its own line)
-      R5 kill        same hash temp, but a call or a possibly aliasing store lies between (opt.md §5)
-      R6 path        same hash temp, nothing in between in stream order: the value is not available on every
-                     path into the block (computed on one arm only; c2 has no partial redundancy elimination)
+      R5 kill        same hash temp, but a call, a memory-writing intrinsic (memcpy ..) or a possibly aliasing
+                     store lies between (opt.md §5), or a variable of the address is assigned (`*++s`: another
+                     address that prints the same)
+      R6 path        (only without branch targets) same hash temp, nothing in between in stream order
+      R? kept        same hash temp, the earlier read dominates and no path between writes the location, yet
+                     sweep 2 kept it (not explained)
   and the final count: loads of that location at Color entry and in the final code (a load that LateGlobalOptimize
   or MscClean turned into a register copy is counted as removed after allocation).
 
@@ -34,6 +40,11 @@ listed with FORMED (Opeq turned it into `op [m], y`) or the reason it was not:
       M3 operator       the operator has no memory form (mul, neg, not, y - [m] ...; isel.md §7.2)
       M4 not-adjacent   the computation is not the tuple just before the store
       M5 other-location the operand read is another location than the one stored (or a different spelling)
+      M6 mixed-chain    the old value is under a chain of two operators (`(m & ~1) | 2`); 17.00 splits some of
+                        these into two RMWs before Opeq (OpeqBitAssigns: "bit-assign split")
+x64 (17.00) memory leaves print the location's own hash temp before the base (`[t129+t128:1008+0]`); it is dropped
+from the address, and allocated names (`rsi=p$1`) are the variable.  A location read more often in the final code
+than at Color entry gets a note (a register copy folded back into a memory operand, e.g. `cmova r, [m]`).
 Only builds whose dump has block and label lines give block numbers; all four do.
 """
 import argparse, json, os, re, sys
@@ -49,6 +60,10 @@ RMW_OPS = {"OPADD": "add", "OPSUB": "sub", "OPAND": "and", "OPOR": "or", "OPXOR"
            "OPSHR": "shr", "OPSAR": "sar"}
 NO_RMW = {"OPMUL", "OPDIV", "OPMOD", "OPNEG", "OPNOT", "OPUDIV", "OPUMOD", "OPROL", "OPROR"}
 LOADS = {"OPLOAD", "mov", "OPASSIGN", "movzx", "movsx"}
+M6_X64 = ("; 17.00's OpeqBitAssigns splits `([m] & c) | y` into two RMWs only when the old value is a memory "
+          "operand and [m] is register- or parameter-based (not through a loaded pointer or a global; loadcse.md 8)"
+          if X64 else "")
+REGNAME = re.compile(r"[re]?(ax|bx|cx|dx|si|di|sp|bp)|r\d+[dwb]?|[abcd][lh]|[sd]il|[sb]pl|x?mm\d+|cc\w*")
 
 
 def split_ops(s):
@@ -98,18 +113,23 @@ def mem_parts(tok):
         if k == len(terms) - 1 and re.fullmatch(r"-?\d+", t):
             disp = int(t)
             continue
+        if re.fullmatch(r"t\d+", t) and len(terms) > 1:
+            # x64 (17.00): the leaf's +0x24 symbol, printed untyped before the base (`[t129+t128:1008+0]`), is the
+            # hash temp of the location itself after HshBuildTable, not an address term
+            continue
         scale = None
         if "*" in t:
             t, scale = t.rsplit("*", 1)
         lm = LEAF.match(t)
-        nm = lm.group(2) if lm else t
+        nm = re.sub(r"\$\d+$", "", lm.group(2) if lm else t)
         names.append(nm + ("*" + scale if scale else ""))
     return names, disp, pas, ty
 
 
 def leaf_name(tok):
     m = LEAF.match(tok)
-    return m.group(2) if m else tok
+    n = m.group(2) if m else tok
+    return re.sub(r"\$\d+$", "", n)     # x64 allocated names: `rsi=p$1` is the variable p
 
 
 def leaf_type(tok):
@@ -241,20 +261,31 @@ class Stage:
             return name, 0, via
         if not is_temp(name):
             ds = self.defs.get(name, ())
-            if name.startswith("_") and len(ds) == 1:
+            # variables: `_p` on x86; x64 prints them bare (`p`, `re`): anything that is not a register name
+            if (name.startswith("_") or X64 and not REGNAME.fullmatch(name)) and len(ds) == 1:
                 b, o, v2 = self._resolve_def(ds[0], depth, via)
                 if b is not None and (b != name) and ("+" in b or b.startswith("[") or o or b.startswith("_")):
                     if b.startswith("[") or o or b != name:
                         return b, o, v2 + [name]
             return name, 0, via
         d = self.last_def(name, idx)
-        if d is None:
+        if d is None or not d.srcs:
+            # x64 after lowering: an incoming-register temp (`rcx=t135 <-` of the entry pseudo-op) is the parameter
+            # it is copied into (`p <- rcx=t135`)
+            for u in self.uses.get(name, ()):
+                if u.op in ("mov", "OPASSIGN") and u.dsts and len(u.srcs) == 1 and \
+                        leaf_name(u.srcs[0]) == name and not u.dsts[0].startswith("[") and \
+                        not is_temp(leaf_name(u.dsts[0])):
+                    return leaf_name(u.dsts[0]), 0, via
             return name, 0, via
         b, o, v2 = self._resolve_def(d, depth, via)
         return (b, o, v2) if b is not None else (name, 0, via)
 
     def _resolve_def(self, d, depth, via):
         op, s = d.op, d.srcs
+        if op in ("OPADD", "add") and len(s) >= 2 and is_const(s[1]) and s[0].startswith("[") and "s0=&" not in d.notes:
+            # a load folded into the add (x64 at Opeq: `t131 <- [rq+0] + 92`)
+            return "{" + self.memkey(s[0], d.idx, depth + 1)[0] + "}", int(s[1].split(":")[0]), via
         if op in ("OPADD", "add") and len(s) >= 2 and is_const(s[1]) and not s[0].startswith("["):
             b, o, v = self.resolve(leaf_name(s[0]), d.idx, depth + 1, via)
             return b, o + int(s[1].split(":")[0]), v
@@ -313,19 +344,36 @@ def run(src, func, cl, keep=None):
         sys.exit("function %r not seen at any of the passes" % func)
     got = {}
     fn = passes[0][2]
-    for name, lines, f in passes:
-        if f != fn:
-            continue
-        for tag, p in PASSES:
-            core = re.sub(r"^@|@\d+$", "", p)
-            if name == p or re.search(r"\b\??%s@" % re.escape(core), name) or name.strip("@?").startswith(core):
-                if tag not in got:              # first entry (V: right after HshBuildTable)
-                    got[tag] = lines
+    # each pass is the first entry *after* the previous pass's: 17.00 also runs GoptLocalCopyPropagation in sweep 1,
+    # before HshBuildTable / GdfInsertArtificialAssigns, and that entry is not S2 (on 14.00 the order is the same
+    # either way)
+    def hit(name, p):
+        core = re.sub(r"^@|@\d+$", "", p)
+        return name == p or re.search(r"\b\??%s@" % re.escape(core), name) or name.strip("@?").startswith(core)
+
+    k = 0
+    for tag, p in PASSES:
+        for j in range(k, len(passes)):
+            name, lines, f = passes[j]
+            if f == fn and hit(name, p):
+                got[tag] = lines
+                k = j + 1
+                break
+    # V is the hash table sweep 2 works with: the *last* GdfInsertArtificialAssigns entry before S2.  14.00 enters it
+    # twice with the same IL; on 17.00 sweep 1 runs in between and can rejoin values (the first entry is kept as V1)
+    vs = [j for j, (name, _, f) in enumerate(passes) if f == fn and hit(name, PASSES[0][1])]
+    s2 = next((j for j, (name, _, f) in enumerate(passes) if f == fn and vs and j > vs[0] and hit(name, PASSES[1][1])),
+              None)
+    if vs:
+        got["V1"] = passes[vs[0]][1]
+        before = [j for j in vs if s2 is None or j < s2]
+        got["V"] = passes[before[-1]][1]
     return fn, got
 
 
 def analyse(fn, got, all_locs=False, locre=None):
     V, S2 = Stage(got.get("V", [])), Stage(got.get("S2", []))
+    V1 = Stage(got.get("V1", []))
     O, C, E = Stage(got.get("O", [])), Stage(got.get("C", [])), Stage(got.get("E", []))
     rep = {"function": fn, "locations": [], "rmw": []}
     # ---- loads at V
@@ -338,7 +386,13 @@ def analyse(fn, got, all_locs=False, locre=None):
             key, via, pas, ty = key_stage.memkey(s2.srcs[0] if alive else i.srcs[0], idx)
             vkey, vvia, vpas, vty = V.memkey(i.srcs[0], i.idx)
             mp = mem_parts(i.srcs[0])
-            loads.append(dict(tup=i.tup, idx=i.idx, block=i.block, hash=leaf_name(i.dsts[0]), key=key, vkey=vkey,
+            v1 = V1.by_tup.get(i.tup)
+            first = None          # (hash, pas) at the first hash table when sweep 1 changed them (17.00)
+            if v1 is not None and v1.op == "OPLOAD" and v1.dsts and v1.srcs and v1.srcs[0].startswith("["):
+                f1 = (leaf_name(v1.dsts[0]), mem_parts(v1.srcs[0])[2] if mem_parts(v1.srcs[0]) else None)
+                if f1 != (leaf_name(i.dsts[0]), vpas):
+                    first = f1
+            loads.append(dict(first_hash=first, tup=i.tup, idx=i.idx, block=i.block, hash=leaf_name(i.dsts[0]), key=key, vkey=vkey,
                               raw=re.sub(r":[0-9a-f]+|@[0-9a-f]+", "", i.srcs[0]),
                               via=vvia or via, pas=vpas, type=vty, alive=alive,
                               base=[n.split("*")[0] for n in mp[0]] if mp else []))
@@ -374,7 +428,8 @@ def analyse(fn, got, all_locs=False, locre=None):
             reach[b0] = seen
 
     def on_path(i, a, b):
-        if not reach:
+        if not reach or (a["block"] == b["block"] and a["idx"] < b["idx"]):
+            # stream order; and within one block the path from a to b is the tuples between them (not around a loop)
             return a["idx"] < i.idx < b["idx"]
         if i.block == a["block"] and i.idx <= a["idx"] and a["block"] != b["block"]:
             return False
@@ -382,15 +437,27 @@ def analyse(fn, got, all_locs=False, locre=None):
             return i.block in reach.get(i.block, ()) and i.block in reach.get(a["block"], ()) and a["block"] != b["block"]
         if i.block == a["block"]:
             return i.idx > a["idx"] and (i.idx < b["idx"] or a["block"] != b["block"])
+        if i.block == b["block"]:          # before b in b's own block (e.g. a call at the head of the arm)
+            return b["block"] in reach.get(a["block"], ())
         return i.block in reach.get(a["block"], ()) and b["block"] in reach.get(i.block, ())
 
     def kills_between(a, b):
         out = []
+        # variables the address is computed from: assigning one between the reads makes it another address
+        # (`*++scan` in a loop: the location prints as [scan+0] both times, but scan moved)
+        avars = {n for n in re.findall(r"(?<![\w$])([A-Za-z_][\w$]*)", a["key"]) if not is_temp(n)}
         for i in V.ins:
             if not on_path(i, a, b):
                 continue
-            if i.op in ("OPCALL", "call"):
+            hit = [leaf_name(d) for d in i.dsts if not d.startswith("[") and leaf_name(d) in avars]
+            if hit:
+                out.append("assignment to %s (the address moved)" % hit[0])
+            elif i.op in ("OPCALL", "call"):
                 out.append("call %s" % (i.notes.replace("s0=", "") or "?"))
+            elif i.op == "OPINTRINSIC" and any(d.startswith("pas") for d in i.dsts):
+                # an intrinsic that writes memory (its points-at set is a destination): memcpy / memset ..
+                m = re.search(r"intrin=(\d+)", i.notes)
+                out.append("intrinsic %s" % (m.group(1) if m else "?"))
             elif i.dsts and i.dsts[0].startswith("[") and i.op in ("OPASSIGN", "OPVOLATILEASSIGN"):
                 sk, _, spas, _ = V.memkey(i.dsts[0], i.idx)
                 same_base = sk.rsplit("+", 1)[0] == a["key"].rsplit("+", 1)[0] and sk != a["key"] and \
@@ -422,6 +489,12 @@ def analyse(fn, got, all_locs=False, locre=None):
             if a["type"] != b["type"]:
                 return "R1 type", "IL types %s / %s" % (a["type"], b["type"])
             return "R? hash", "different hash temp (%s / %s), operands print the same" % (a["hash"], b["hash"])
+        if V.dom is not None:
+            # with branch targets the earlier read dominates this one (only dominating reads are paired) and no path
+            # between them writes the location: by the availability rule sweep 2 should have deleted it
+            return "R? kept", "same hash temp %s, the read in block %d dominates and nothing on the paths between " \
+                              "writes it, yet sweep 2 kept it (not explained: seen at a join after an if-converted " \
+                              "arm, zlib updatewindow, on 14.00 and 17.00)" % (b["hash"], a["block"])
         return "R6 path", "same hash temp %s, nothing between in stream order: killed or absent on another path " \
                           "into block %d (other arm, loop back edge; no PRE)" % (b["hash"], b["block"])
 
@@ -448,6 +521,8 @@ def analyse(fn, got, all_locs=False, locre=None):
                 first = ld
             elif not ld["alive"]:
                 st, why_ = "REUSED", "same hash temp %s, available" % ld["hash"]
+                if ld["first_hash"]:
+                    why_ += "; at the first hash table it was %s PAS %s: sweep 1 rejoined it" % ld["first_hash"]
             else:
                 prev = [x for x in lds if x["idx"] < ld["idx"]]
                 if V.dom is not None:
@@ -463,6 +538,10 @@ def analyse(fn, got, all_locs=False, locre=None):
                                      type=ld["type"], spelled=ld["raw"], status=st, why=why_))
         ent["at_color"] = final_count(C) if C.ins else None
         ent["final"] = final_count(E) if E.ins else None
+        if ent["final"] is not None and ent["at_color"] is not None and ent["final"] > ent["at_color"]:
+            ent["note"] = ("the final code reads it %d more time(s) than Color's input: a register copy of the value was "
+                           "folded back into a memory operand after allocation (e.g. `cmova r, [m]` of an "
+                           "if-converted `x = m`), not a reload decision" % (ent["final"] - ent["at_color"]))
         rep["locations"].append(ent)
     # ---- RMW at O
     for k, i in enumerate(O.ins):
@@ -491,6 +570,25 @@ def analyse(fn, got, all_locs=False, locre=None):
                     formed = True
                     ent.update(status="FORMED", code="%s %s" % (c.op, " ".join(c.srcs[1:2])), tup=c.tup)
                     break
+        pre = O.ins[d.idx - 1] if d is not None and d.idx > 0 else None
+        if pre is not None and pre.op in RMW_OPS and pre.dsts and pre.dsts[0].startswith("[") and \
+                O.memkey(pre.dsts[0], pre.idx)[0] == dkey:
+            # 17.00 x64: OpeqBitAssigns (OpeqTryBitAssignRewrite) already split `[m] = ([m] op1 c1) op2 c2` into
+            # `[m] op1= c1` before Opeq, which then makes `[m] op2= c2` of the rest: two RMWs
+            c1 = C.by_tup.get(pre.tup)
+            first = "%s %s" % (RMW_OPS[pre.op], " ".join((c1 or pre).srcs[1:2]))
+            nxt = [c for c in C.ins[c1.idx + 1:c1.idx + 4] if c.op in RMW_OPS.values() and c.dsts and
+                   c.dsts[0].startswith("[") and _same_loc(C, c, dkey, O)] if c1 is not None else []
+            if nxt:
+                ent.update(status="FORMED", tup=nxt[0].tup,
+                           code="%s, then %s %s; bit-assign split by OpeqBitAssigns before Opeq" % (
+                               first, nxt[0].op, " ".join(nxt[0].srcs[1:2])))
+            elif formed:
+                ent["code"] = "%s, then %s; bit-assign split by OpeqBitAssigns before Opeq" % (first, ent["code"])
+            else:
+                formed = True
+                ent.update(status="FORMED", code="%s (bit-assign split by OpeqBitAssigns), the rest stays %s" % (
+                    first, d.op), tup=pre.tup)
         if formed:
             rt = ent.get("tup")
             e = E.by_tup.get(rt) if rt else None
@@ -524,7 +622,7 @@ def analyse(fn, got, all_locs=False, locre=None):
                             reads = True
                             if t.op != top_op:
                                 reasons.append(("M6 mixed-chain", "%s over %s of %s: Opeq follows only a chain of "
-                                                "one operator (deep_opeq)" % (top_op, t.op, dkey)))
+                                                "one operator (deep_opeq)%s" % (top_op, t.op, dkey, M6_X64)))
                         continue
                     n = leaf_name(x)
                     if not is_temp(n) or depth > 6:
@@ -538,6 +636,9 @@ def analyse(fn, got, all_locs=False, locre=None):
                             reasons.append(("M1 shared-load", "the old value is %s = %s, a temp with %d uses (shared "
                                             "with another read, so it is not a memory operand)" % (
                                                 n, dkey, len(O.uses.get(n, ())))))
+                            if t.op != top_op:
+                                reasons.append(("M6 mixed-chain", "%s over %s of %s: Opeq follows only a chain of "
+                                                "one operator (deep_opeq)%s" % (top_op, t.op, dkey, M6_X64)))
                     elif sd.op in RMW_OPS or sd.op in NO_RMW:
                         walk(sd, depth + 1, top_op)
             walk(d, 0, d.op)
@@ -566,6 +667,8 @@ def show(rep):
     for ent in rep["locations"]:
         print("%s   loads at Color entry: %s, in the final code: %s%s" % (ent["location"], ent["at_color"], ent["final"],
               "" if ent.get("cfg") else "   (no branch targets in this build's dump: paired in stream order)"))
+        if ent.get("note"):
+            print("  note: " + ent["note"])
         for ld in ent["loads"]:
             print("  %-22s blk %-3s %-6s pas %-3s :%s  %s%s" % (ld["status"].split(" (")[0], ld["block"], ld["hash"],
                   ld["pas"], ld["type"], ld["spelled"], ("   " + ld["why"]) if ld["why"] else ""))

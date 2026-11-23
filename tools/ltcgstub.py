@@ -34,6 +34,14 @@ Stub properties and what c2 reads from them (docs/c2/ltcg.md section 5):
   no export, --regs              custom convention: the stub's entry block uses its register parameters first, in
                                  the order given, so its own allocation loads them into the registers c2 then
                                  makes the convention (checked by `cmp --check-stubs`)
+
+x64 images (PE32+, cl 17.00 `--c2 17.00`; docs/c2/ltcg.md 12): the volatile set is rax rcx rdx r8-r11 and xmm0-5,
+capstone decodes 64-bit, function extents come from .pdata, jump tables hold RVAs. 17.00 has no custom
+conventions (no MdmFlexParams: arguments stay in rcx rdx r8 r9 / xmm0-3 and on the stack), but it does remove dead
+parameters at the callers, fold constant arguments (WPA) and use the callee's kill set -- except for an exported
+callee, whose callers assume every volatile register is killed. So an x64 stub is not exported (unless --std / std),
+keeps every parameter the original reads, and makes its kill set with values that are live at the same time (n ints
+take the first n free registers of rax rcx rdx r8 r9 r10 r11, n doubles xmm0, xmm1 ..). --regs does not apply.
 """
 import argparse, io, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,9 +54,18 @@ VOL = ("eax", "ecx", "edx")
 XMM = tuple("xmm%d" % k for k in range(8))
 ALL = set(VOL) | set(XMM)
 SAVED = ("ebx", "esi", "edi", "ebp")
+# x64 (PE32+, cl 17.00): the Win64 volatile set; xmm6-15 are callee-saved
+VOL64 = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")
+XMM64 = tuple("xmm%d" % k for k in range(6))
+ALL64 = set(VOL64) | set(XMM64)
+SAVED64 = ("rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15")
+ARGS64 = ("rcx", "rdx", "r8", "r9")
+INORDER64 = ARGS64 + ("rax", "r10", "r11") + SAVED64 + tuple("xmm%d" % k for k in range(16))
 
 
-def full(name):
+def full(name, x64=False):
+    if x64:
+        return calleesum.FULL64.get(name, name if name.startswith("xmm") else None)
     return calleesum.FULL.get(name, name if name.startswith("xmm") else None)
 
 
@@ -59,13 +76,41 @@ class Code:
         self.exe = exe if isinstance(exe, calleesum.Exe) else calleesum.Exe(exe)
         self.span = span
         self.memo = {}
+        self.x64 = bool(getattr(self.exe, "x64", False))
+        self.MASK = (1 << 64) - 1 if self.x64 else 0xffffffff
+        self.VOL, self.ALL, self.SAVED = (VOL64, ALL64, SAVED64) if self.x64 else (VOL, ALL, SAVED)
+        self.XMM = XMM64 if self.x64 else XMM
+        self.RET = "rax" if self.x64 else "eax"
+        self.jt = {}                                        # jmp site -> jump-table targets (walk)
+        self.pstarts = []                                   # x64: function starts from .pdata (RUNTIME_FUNCTION)
+        if self.x64:
+            try:
+                pe = self.exe.pe
+                pe.parse_data_directories(directories=[3])
+                self.pstarts = sorted({self.exe.base + e.struct.BeginAddress
+                                       for e in getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", [])})
+            except Exception:
+                self.pstarts = []
+
+    def limit(self, va):
+        """the end of the code a jump may stay inside: va + span; x64: also the next .pdata function start (a jmp
+        past it is a tail jump; leaf functions have no .pdata entry, so this is an upper bound)"""
+        import bisect
+        k = bisect.bisect_right(self.pstarts, va)
+        return min(va + self.span, self.pstarts[k]) if k < len(self.pstarts) else va + self.span
+
+    def full(self, name):
+        return full(name, self.x64)
 
     def ins(self, va):
         return self.exe.ins(va)
 
-    def table(self, ins, va):
-        """Targets of `jmp dword ptr [r*4 + table]` that lie in the function's span."""
+    def table(self, ins, va, recent=()):
+        """Targets of `jmp dword ptr [r*4 + table]` that lie in the function's span (x64: `jmp reg` after
+        `mov r32, [base + idx*4 + table_rva]; add reg, base`, the table holding RVAs)."""
         out = []
+        if self.x64:
+            return self.table64(ins, va, recent)
         op = ins.operands[0]
         if op.type != X.X86_OP_MEM or op.mem.scale != 4 or op.mem.base:
             return out
@@ -77,17 +122,39 @@ class Code:
             out.append(v)
         return out
 
+    def table64(self, ins, va, recent):
+        op = ins.operands[0] if ins.operands else None
+        if op is None or op.type != X.X86_OP_REG:
+            return []
+        for j in reversed(list(recent)[-12:]):
+            if j.id == X.X86_INS_MOV and len(j.operands) == 2 and j.operands[1].type == X.X86_OP_MEM and \
+                    j.operands[1].mem.scale == 4 and j.operands[1].mem.base and j.operands[1].size == 4:
+                t, out = self.exe.base + (j.operands[1].mem.disp & 0xffffffff), []
+                for k in range(256):
+                    v = self.exe.u32(t + 4 * k)
+                    if v is None:
+                        break
+                    v += self.exe.base
+                    if not (va <= v < va + self.span) or not self.exe.in_text(v):
+                        break
+                    out.append(v)
+                return out
+        return []
+
     def walk(self, va):
         """(instruction VAs, direct call targets {site: target}, indirect call sites, tail-jump targets, ret imms)."""
         seen, work = set(), [va]
         calls, ind, tails, rets = {}, [], set(), set()
+        lim = self.limit(va)
         while work:
             a = work.pop()
+            recent = []
             while a not in seen and self.exe.in_text(a) and len(seen) < 20000:
                 i = self.ins(a)
                 if i is None:
                     break
                 seen.add(a)
+                recent.append(i)
                 if i.id in (X.X86_INS_RET, X.X86_INS_RETF):
                     rets.add(i.operands[0].imm if i.operands else 0)
                     break
@@ -96,38 +163,40 @@ class Code:
                 if i.id == X.X86_INS_CALL:
                     op = i.operands[0]
                     if op.type == X.X86_OP_IMM:
-                        calls[a] = op.imm & 0xffffffff
+                        calls[a] = op.imm & self.MASK
                     else:
                         ind.append(a)
                 elif i.id == X.X86_INS_JMP:
                     op = i.operands[0]
                     if op.type == X.X86_OP_IMM:
-                        t = op.imm & 0xffffffff
-                        if va <= t < va + self.span:
+                        t = op.imm & self.MASK
+                        if va <= t < lim:
                             a = t
                             continue
                         tails.add(t)
                         break
-                    tbl = self.table(i, va)
+                    tbl = self.table(i, va, recent)
+                    self.jt[a] = tbl
                     if tbl:
                         work.extend(tbl)
                     else:
                         tails.add(None)                     # jmp [iat] / jmp reg: an unknown function
                     break
                 elif i.group(X.X86_GRP_JUMP) and i.operands and i.operands[0].type == X.X86_OP_IMM:
-                    work.append(i.operands[0].imm & 0xffffffff)
+                    work.append(i.operands[0].imm & self.MASK)
                 a += i.size
         return seen, calls, ind, tails, rets
 
     def written(self, va, _active=None):
-        """Volatile registers (eax ecx edx, xmm0-7) the function writes, through its calls and tail jumps: what c2
-        records in CGNODE+0x60 for its callers. A call or jump to code without a body (import, pointer) or a
-        recursion cycle counts as every volatile register."""
+        """Volatile registers (eax ecx edx, xmm0-7; x64: rax rcx rdx r8-r11, xmm0-5) the function writes, through its
+        calls and tail jumps: what c2 records in CGNODE+0x60 for its callers. A call or jump to code without a body
+        (import, pointer) or a recursion cycle counts as every volatile register."""
         if va in self.memo:
             return self.memo[va]
+        ALL_ = self.ALL
         active = _active if _active is not None else set()
         if va in active:
-            return set(ALL)
+            return set(ALL_)
         active.add(va)
         seen, calls, ind, tails, rets = self.walk(va)
         w = set()
@@ -140,25 +209,30 @@ class Code:
             except capstone.CsError:
                 continue
             for r in wr:
-                f = full(i.reg_name(r))
-                if f in ALL:
+                f = self.full(i.reg_name(r))
+                if f in ALL_:
                     w.add(f)
         if ind or None in tails:
-            w |= ALL
+            w |= ALL_
         for t in list(calls.values()) + [t for t in tails if t is not None]:
             if t in seen:
                 continue
             if self.exe.in_text(t) and self.exe.ins(t) is not None:
                 w |= self.written(t, active)
             else:
-                w |= ALL
+                w |= ALL_
         active.discard(va)
         self.memo[va] = w
         return w
 
-    def inputs(self, va):
+    def inputs(self, va, _active=None):
         """Registers read on some path from the entry before any write (must-defined dataflow): the register
-        arguments. `push reg` of a callee-saved register and `xor r, r` are not reads."""
+        arguments. `push reg` of a callee-saved register and `xor r, r` are not reads. x64: a direct call or tail
+        jump reads the argument registers its target reads (an argument passed through unchanged)."""
+        active = _active if _active is not None else set()
+        if va in active:
+            return []
+        active.add(va)
         seen, _, _, _, _ = self.walk(va)
         order = sorted(seen)
         succ = {}
@@ -169,16 +243,16 @@ class Code:
                 pass
             elif i.id == X.X86_INS_JMP:
                 op = i.operands[0]
-                if op.type == X.X86_OP_IMM and (op.imm & 0xffffffff) in seen:
-                    nxt = [op.imm & 0xffffffff]
-                elif op.type == X.X86_OP_MEM:
-                    nxt = [t for t in self.table(i, va) if t in seen]
+                if op.type == X.X86_OP_IMM and (op.imm & self.MASK) in seen:
+                    nxt = [op.imm & self.MASK]
+                elif op.type == X.X86_OP_MEM or self.x64:
+                    nxt = [t for t in self.jt.get(a, ()) if t in seen]
             else:
                 if i.group(X.X86_GRP_JUMP) and i.operands and i.operands[0].type == X.X86_OP_IMM:
-                    nxt.append(i.operands[0].imm & 0xffffffff)
+                    nxt.append(i.operands[0].imm & self.MASK)
                 nxt.append(a + i.size)
             succ[a] = [t for t in nxt if t in seen]
-        gpr = set(calleesum.GPR)
+        gpr = set(calleesum.GPR64) | set(XMM64) if self.x64 else set(calleesum.GPR)
         IN = {va: set()}
         work = [va]
         reads = set()
@@ -190,19 +264,42 @@ class Code:
                 rd, wr = i.regs_access()
             except capstone.CsError:
                 rd, wr = [], []
-            rd = {full(i.reg_name(r)) for r in rd} & gpr
-            wr = {full(i.reg_name(r)) for r in wr} & gpr
-            if i.id in (X.X86_INS_XOR, X.X86_INS_SUB, X.X86_INS_SBB) and len(i.operands) == 2 and \
+            rd = {self.full(i.reg_name(r)) for r in rd} & gpr
+            wr = {self.full(i.reg_name(r)) for r in wr} & gpr
+            if i.id in SELF_XOR and len(i.operands) == 2 and \
                     i.operands[0].type == i.operands[1].type == X.X86_OP_REG and i.operands[0].reg == i.operands[1].reg:
                 rd = set()
-            if i.id == X.X86_INS_PUSH and i.operands[0].type == X.X86_OP_REG and full(i.reg_name(i.operands[0].reg)) in SAVED:
+            if i.id == X.X86_INS_PUSH and i.operands[0].type == X.X86_OP_REG and \
+                    self.full(i.reg_name(i.operands[0].reg)) in self.SAVED:
                 rd = set()
-            if i.id == X.X86_INS_PUSH and i.operands[0].type == X.X86_OP_REG and full(i.reg_name(i.operands[0].reg)) == "ecx" \
-                    and "ecx" not in d and a == va:
+            if i.id in (X.X86_INS_OR, X.X86_INS_AND) and len(i.operands) == 2 and i.operands[0].type == X.X86_OP_REG and \
+                    i.operands[1].type == X.X86_OP_IMM and \
+                    (i.operands[1].imm & 0xffffffff) == (0xffffffff if i.id == X.X86_INS_OR else 0):
+                rd = set()                                  # `or r, -1` / `and r, 0`: a constant, not a read
+            if self.x64 and i.id in (X.X86_INS_MOV, X.X86_INS_MOVAPS, X.X86_INS_MOVDQA) and len(i.operands) == 2 and \
+                    i.operands[0].type == X.X86_OP_MEM and i.operands[1].type == X.X86_OP_REG and \
+                    i.operands[0].mem.base in (X.X86_REG_RSP, X.X86_REG_RBP) and \
+                    (self.full(i.reg_name(i.operands[1].reg)) in self.SAVED or
+                     i.reg_name(i.operands[1].reg) in ("xmm%d" % k for k in range(6, 16))):
+                rd = set()                                  # x64 prologue: a callee-saved register saved to the frame
+            if not self.x64 and i.id == X.X86_INS_PUSH and i.operands[0].type == X.X86_OP_REG and \
+                    full(i.reg_name(i.operands[0].reg)) == "ecx" and "ecx" not in d and a == va:
                 rd = set()                                  # `push ecx` as the first instruction reserves a slot
+            if self.x64 and i.id in (X.X86_INS_CALL, X.X86_INS_JMP) and i.operands and \
+                    i.operands[0].type == X.X86_OP_IMM:
+                t = i.operands[0].imm & self.MASK
+                if t not in seen and self.exe.in_text(t):
+                    rd |= set(self.inputs(t, active)) & (set(ARGS64) | {"xmm0", "xmm1", "xmm2", "xmm3"})
             reads |= rd - d
             if i.id == X.X86_INS_CALL:
-                wr |= set(VOL)
+                if self.x64:
+                    # a direct call to a body in the image writes its kill set only (17.00 LTCG callers rely on that:
+                    # a value kept in xmm2 across a callee writing xmm0-1); otherwise every volatile register
+                    op = i.operands[0]
+                    t = op.imm & self.MASK if op.type == X.X86_OP_IMM else None
+                    wr |= self.written(t) if t is not None and self.exe.in_text(t) else set(self.ALL)
+                else:
+                    wr |= set(VOL)
             d |= wr
             for t in succ.get(a, []):
                 if t not in IN:
@@ -211,6 +308,8 @@ class Code:
                 elif not IN[t] <= d:
                     IN[t] &= d
                     work.append(t)
+        if self.x64:
+            return [r for r in INORDER64 if r in reads]
         return [r for r in ("eax", "ecx", "edx", "ebx", "esi", "edi", "ebp") if r in reads]
 
     def end(self, va):
@@ -222,14 +321,27 @@ class Code:
         seen, calls, ind, tails, rets = self.walk(va)
         inp = self.inputs(va)
         pop = max(rets) if rets else 0
-        conv = classify(inp, pop)
+        conv = classify64(inp) if self.x64 else classify(inp, pop)
         return dict(va=va, kill=sorted(self.written(va), key=regkey), inputs=inp, pop=pop, conv=conv,
                     calls=calls, indirect=ind, tails=tails, end=self.end(va))
 
 
+SELF_XOR = {X.X86_INS_XOR, X.X86_INS_SUB, X.X86_INS_SBB, X.X86_INS_XORPS, X.X86_INS_XORPD, X.X86_INS_PXOR}
+
+
 def regkey(r):
-    order = list(VOL) + list(XMM)
+    order = list(VOL) + list(XMM) + list(VOL64)
     return order.index(r) if r in order else 99
+
+
+def classify64(inp):
+    """x64: one convention (rcx rdx r8 r9 / xmm0-3, the rest on the stack); cl 17.00 has no MdmFlexParams, so an LTCG
+    callee keeps it (docs/c2/ltcg.md 12)"""
+    other = [r for r in inp if r not in ARGS64 and r not in ("xmm0", "xmm1", "xmm2", "xmm3")]
+    if not other:
+        return "win64"
+    return "win64, also reads %s at entry (not an argument register; 17.00 LTCG makes no custom conventions)" % \
+        ",".join(other)
 
 
 def classify(inp, pop):
@@ -262,13 +374,14 @@ def live_across(code, caller, site):
             rd, wr = j.regs_access()
         except capstone.CsError:
             break
-        rd = {full(j.reg_name(r)) for r in rd}
-        wr = {full(j.reg_name(r)) for r in wr}
-        if j.id in (X.X86_INS_XOR, X.X86_INS_SUB) and len(j.operands) == 2 and \
+        rd = {code.full(j.reg_name(r)) for r in rd}
+        wr = {code.full(j.reg_name(r)) for r in wr}
+        if j.id in SELF_XOR and len(j.operands) == 2 and \
                 j.operands[0].type == j.operands[1].type == X.X86_OP_REG and j.operands[0].reg == j.operands[1].reg:
             rd = set()
-        for r in VOL:
-            if r in rd and r not in done and r != "eax":
+        vol = list(code.VOL) + ([x for x in XMM64 if x != "xmm0"] if code.x64 else [])
+        for r in vol:
+            if r in rd and r not in done and r != code.RET:
                 keep.add(r)
             if r in wr:
                 done.add(r)
@@ -290,6 +403,8 @@ EXPORT = '#pragma comment(linker, "/EXPORT:" __FUNCDNAME__)   // standard conven
 
 def make_stub(exe, code, va, proto_text, regs=None, std=None, out=sys.stdout, vary=False, tu=None):
     """calleesum's memory-pattern stub, plus the kill set and the convention of the original at va."""
+    if code.x64:
+        return make_stub64(exe, code, va, proto_text, regs, std, out, vary, tu)
     f = code.facts(va)
     proto = calleesum.parse_proto(proto_text)
     conv = proto["conv"]
@@ -401,6 +516,105 @@ def make_stub(exe, code, va, proto_text, regs=None, std=None, out=sys.stdout, va
     return f
 
 
+FLOAT_T = re.compile(r"^(const\s+)?(float|double|long\s+double)$")
+
+
+def make_stub64(exe, code, va, proto_text, regs=None, std=None, out=sys.stdout, vary=False, tu=None):
+    """x64 (cl 17.00): calleesum's memory-pattern stub, every parameter the original reads kept live (17.00 removes
+    dead parameters at the callers too), and the kill set made by values live at the same time (docs/c2/ltcg.md 12):
+    n simultaneously live ints take the first n free volatile registers in the order rax rcx rdx r8 r9 r10 r11
+    (a register holding a parameter that is used later is not free), n doubles xmm0, xmm1 ... There is no custom
+    convention (no MdmFlexParams on 17.00), and an exported callee's kill set is not used by its callers."""
+    if regs:
+        sys.exit("ltcgstub: --regs / regs= do not apply on x64: cl 17.00 makes no custom conventions under /LTCG")
+    f = code.facts(va)
+    proto = calleesum.parse_proto(proto_text)
+    member = proto["conv"] == "thiscall"
+    an = calleesum.Analyzer(exe, tu=tu if tu is not None else (exe.base, exe.base + exe.size))
+    allp = ([("void*", "this", 1)] if member else []) + list(proto["params"])
+    s = an.summarize(va, "x64", len(allp))
+    s.returns = proto["ret"] != "void"
+    buf = io.StringIO()
+    calleesum.stub(exe, s, proto, out=buf)
+    text = buf.getvalue()
+    pos, nstack, _ = exe.quick64(va)
+    used = set(pos) | set(range(4, 4 + nstack))
+    # a parameter the original reads must stay a parameter: the stub stores it to a volatile. If the original
+    # overwrites the parameter's register (it is in the kill set), that store comes first and frees the register for
+    # the kill block; otherwise it comes last, so the register stays taken while the kill block runs
+    want = [r for r in VOL64 if r in f["kill"]]
+    wantx = [r for r in XMM64 if r in f["kill"]]
+    held, early, late = set(), [], []
+    for k, (ty, nm, _) in enumerate(allp):
+        if k not in used:
+            continue
+        fl = bool(FLOAT_T.match(ty.strip()))
+        reg = (("xmm%d" % k) if fl else ARGS64[k]) if k < 4 else None
+        if fl:
+            ln = "    ltcgstub_kd[0] = %s;%s// read by the original: stays a parameter" % (nm, " " * max(1, 22 - len(nm)))
+        else:
+            ln = "    ltcgstub_k[0] = (int)%s%s;%s// read by the original: stays a parameter" % (
+                "(__int64)" if "*" in ty else "", nm, " " * max(1, 18 - len(nm)))
+        if reg is not None and reg not in want and reg not in wantx:
+            held.add(reg)
+            late.append(ln)
+        else:
+            early.append(ln)
+    unused = [nm for k, (_, nm, _) in enumerate(allp) if k not in used]
+    ret = proto["ret"].strip()
+    retx = bool(FLOAT_T.match(ret))
+    if "calleesum_ext(" in text or "calleesum_pass(" in text:
+        want, wantx = [], []                                # an unsummarised call in the stub kills every register
+    free = [r for r in VOL64 if r not in held]
+    # a double result takes xmm0 early (the constant's `xorps xmm0, xmm0` is scheduled ahead of the kill block)
+    freex = [r for r in XMM64 if r not in held and not (retx and r == "xmm0")]
+    n = max([free.index(r) + 1 for r in want if r in free] or [0])
+    nx = max([freex.index(r) + 1 for r in wantx if r in freex] or [0])
+    if ret != "void" and not retx and n == 1 and free and free[0] == "rax":
+        n = 0                                               # the returned value writes rax anyway
+    made = set(free[:n]) | set(freex[:nx]) | ({"xmm0"} if retx else {"rax"} if ret != "void" else set())
+    lines = []
+    if n:
+        lines.append("    { int %s;   // kill set: %d ints live at once take %s" % (
+            ", ".join("k%d = ltcgstub_k[%d]" % (j, j % 8) for j in range(n)), n, ",".join(free[:n])))
+        lines.append("      %s }" % " ".join("ltcgstub_k[%d] = k%d;" % (j % 8, j) for j in range(n)))
+    if nx:
+        lines.append("    { double %s;   // kill set: %d doubles live at once take %s" % (
+            ", ".join("d%d = ltcgstub_kd[%d]" % (j, j % 8) for j in range(nx)), nx, ",".join(freex[:nx])))
+        lines.append("      %s }" % " ".join("ltcgstub_kd[%d] = d%d;" % (j % 8, j) for j in range(nx)))
+    head = ["// ---- ltcgstub for %x: kill set %s; convention win64 ----" % (va, ",".join(f["kill"]) or "none")]
+    exact = made == set(want) | set(wantx) and not (retx and nx)     # a double result's xorps moves the block
+    if not exact:
+        head.append("// NOTE: this stub writes %s, the original %s (registers are taken in order, a parameter register "
+                    "is not rewritten): check with `cmp --check-stubs`" % (
+                        ",".join(sorted(made, key=regkey)) or "none", ",".join(f["kill"]) or "none"))
+    for nm in unused:
+        head.append("// NOTE: %s is never read by the original: c2 removes it (dead parameter, the callers do not pass it); "
+                    "the stub does not use it either" % nm)
+    if std:
+        head.append("// exported: the callers then treat it as killing every volatile register (17.00 does not use an "
+                    "exported callee's kill set)")
+    body = []
+    for ln in text.splitlines():
+        if ln.startswith("    return ") or ln == "}":
+            body.extend(late)
+            late = []
+        body.append(ln)
+        if ln == "{":
+            if std:
+                body.append(EXPORT)
+            body.append("    volatile int ltcgstub_k[8]; volatile double ltcgstub_kd[8];")
+            body.extend(early)
+            body.extend(lines)
+    if vary and not proto["cls"] and all(re.fullmatch(r"(const\s+)?(unsigned\s+|signed\s+)?(int|long|short|char|bool|"
+                                                    r"float|double|\w+\s*\*+)", t.strip()) for t, _, _ in proto["params"]):
+        nmv = re.sub(r"\W", "_", proto["name"])
+        body.append('extern "C" __declspec(dllexport) void ltcgstub_vary_%s(void) { volatile int v = 0; %s(%s); }'
+                    % (nmv, proto["name"], ", ".join("(%s)v" % t for t, _, _ in proto["params"])))
+    out.write("\n".join(head + body) + "\n")
+    return f
+
+
 def read_protos(path):
     """Lines `VA  DECL  [regs=eax,ecx] [std|custom]` (# comments)."""
     out = []
@@ -420,9 +634,10 @@ def read_protos(path):
 def masked(code, va, n):
     """(bytes, mask offsets) of [va, va+n): in-image absolute operands and rel32 targets leaving the range."""
     exe = code.exe
+    x64 = bool(getattr(exe, "x64", False))
     b = exe.read(va, n)
     m = set()
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if x64 else capstone.CS_MODE_32)
     md.detail = True
     for i in md.disasm(b, va):
         o = i.address - va
@@ -431,14 +646,18 @@ def masked(code, va, n):
                 v = int.from_bytes(b[o + at:o + at + 4], "little")
                 if exe.in_image(v):
                     m.update(range(o + at, o + at + 4))
+        if x64 and i.disp_offset and i.disp_size == 4 and \
+                any(op.type == X.X86_OP_MEM and op.mem.base == X.X86_REG_RIP for op in i.operands):
+            # x64: a rip-relative operand (a global, a constant, the image base) moves with the image layout
+            m.update(range(o + i.disp_offset, o + i.disp_offset + 4))
         if i.id in (X.X86_INS_CALL, X.X86_INS_JMP) or i.group(X.X86_GRP_JUMP):
             if i.operands and i.operands[0].type == X.X86_OP_IMM and i.size >= 5:
-                t = i.operands[0].imm & 0xffffffff
+                t = i.operands[0].imm & ((1 << 64) - 1 if x64 else 0xffffffff)
                 if not (va <= t < va + n):
                     m.update(range(o + i.size - 4, o + i.size))
     # jump tables: capstone's sweep stops in them or decodes them as code, so their entries (image addresses, which
-    # differ between the two images) were compared raw. Mask every aligned run of 2+ image-address dwords.
-    img = lambda o: o + 4 <= n and exe.in_image(int.from_bytes(b[o:o + 4], "little"))
+    # differ between the two images; x64: RVAs) were compared raw. Mask every aligned run of 2+ such dwords.
+    img = lambda o: o + 4 <= n and exe.in_image(int.from_bytes(b[o:o + 4], "little") + (exe.base if x64 else 0))
     o = (-va) % 4
     while o + 8 <= n:
         if img(o) and img(o + 4):
@@ -451,7 +670,7 @@ def masked(code, va, n):
 
 
 def instrs(code, va, n):
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if getattr(code.exe, "x64", False) else capstone.CS_MODE_32)
     return [(i.address - va, i.size, i.mnemonic, i.op_str) for i in md.disasm(code.exe.read(va, n), va)]
 
 
@@ -506,10 +725,6 @@ def main():
         argv, cl = argv[:k], argv[k + 1:]
     if not argv or argv[0] not in ("facts", "callees", "stub", "stubs", "cmp"):
         sys.exit(__doc__)
-    if c2build.get("arch") == "x64":
-        sys.exit("ltcgstub: x86 only (32-bit code, eax/ecx/edx kill sets, MdmFlexParams conventions); for %s use "
-                 "c2ltcg.py asm / il (link /LTCG under the trace) and calleesum.py (Win64 memory summaries)"
-                 % c2build.name())
     sub = argv.pop(0)
     ap = argparse.ArgumentParser(prog="ltcgstub.py " + sub)
     ap.add_argument("exe")
@@ -616,11 +831,12 @@ def main():
                 print("  stub %08x %s: not in the image (inlined? add noinline)" % (va, nm))
                 continue
             g, h = code.facts(va), ours.facts(mine[0][1])
-            ok = [r for r in VOL if r in g["kill"]] == [r for r in VOL if r in h["kill"]] and g["inputs"] == h["inputs"] \
+            vol = (list(VOL64) + list(XMM64)) if code.x64 else list(VOL)     # x64 stubs make xmm kill sets too
+            ok = [r for r in vol if r in g["kill"]] == [r for r in vol if r in h["kill"]] and g["inputs"] == h["inputs"] \
                 and g["pop"] == h["pop"]
             print("  stub %08x %-28s orig kill %-10s entry %-8s ret %d | stub kill %-10s entry %-8s ret %d  %s" % (
-                va, nm[:28], ",".join(x for x in g["kill"] if x in VOL), ",".join(g["inputs"]) or "-", g["pop"],
-                ",".join(x for x in h["kill"] if x in VOL), ",".join(h["inputs"]) or "-", h["pop"], "ok" if ok else "DIFFERS"))
+                va, nm[:28], ",".join(x for x in g["kill"] if x in vol), ",".join(g["inputs"]) or "-", g["pop"],
+                ",".join(x for x in h["kill"] if x in vol), ",".join(h["inputs"]) or "-", h["pop"], "ok" if ok else "DIFFERS"))
     return 0 if r["exact"] else 1
 
 

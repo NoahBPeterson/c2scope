@@ -199,6 +199,14 @@ address-taken `idx`) among 48 answers; 0x406e50 all 37 regions in the original's
 allocator's); 0x4dc350 regions 1 and 2 replayed exactly, no perturbation gives the original's order. Test:
 `schedwant_break_tests` (tests/data/schedbreak.cpp).
 
+On x64 (cl 17.00, `--c2 17.00`) the same command runs on tools/c2sched17.py's model (sched17.md 6.3): the DAG
+predicted from the IL (or the traced one), static priorities recomputed per perturbation, the K8 or Atom replay
+with breakable edges. It adds **`move:X<Y` / `move:X>Y`**: X's statement moved in the IL and the DAG rebuilt, the
+direct answer when the original has a store or load in another place (zlib inflateReset with `strm->msg = Z_NULL`
+moved: `move:5>9`; tests/data/sched17/schedwant17.c: `move:2>6`, `sched17_schedwant_tests`). `unalias` on x64 means
+the two accesses' points-at sets do not meet (sched17.md 6.2: one base pointer at disjoint offsets, a local whose
+address is never taken, a pointer argument against a local).
+
 Registers are allocated before this pass, so only priorities and dependencies can be changed:
 - Height and successor counts come from the DAG: adding or removing a use of a value, or changing which value
   feeds a push, changes them (q4: in `a*b + c*d` the load of `c` jumps above the first `imul`, while in `a*b +

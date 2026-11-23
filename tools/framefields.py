@@ -23,6 +23,18 @@ import c2trace  # noqa: F401  (build selection)
 import c2slots, regmap, tsweep
 
 
+X64 = c2slots.is_x64()
+_WID = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "xmmword": 16, "ymmword": 32}
+
+
+def _width(text):
+    """Bytes an instruction's memory operand touches (x64 report): its `PTR` size; a lea's address: 1."""
+    if text.split(None, 1)[0].lower() == "lea":
+        return 1
+    m = re.search(r"\b(byte|word|dword|qword|xmmword|ymmword) ptr\b", text, re.I)
+    return _WID[m.group(1).lower()] if m else 4
+
+
 def our_instrs(asm, func):
     lst = tsweep.listing_instrs(asm, func)
     dec = getattr(lst, "decoded", None)
@@ -38,7 +50,8 @@ def element_rows(s, ours_txt, ours_cs, orig):
     mkeys = dict(c2slots.orig_slots(ours_cs)[0])
     a = [regmap.norm(tsweep.canon_listing(*x)) for x in ours_txt]     # capstone's operand order, as orig
     b = [(mn, ops) for _, mn, ops in orig]
-    pairs = regmap.align(a, b)
+    # x64: aligned on the x64 operand shapes of capstone's text of our bytes (the original's form)
+    pairs = c2slots.align_ins([(mn, ops) for _, mn, ops in ours_cs] if c2slots.is_x64() else a, b)
     rows = collections.defaultdict(list)          # element name -> [(our key, orig key, our text, orig text, lea)]
     seen_orig = set()
     for i, j in pairs:
@@ -75,8 +88,8 @@ def report(s, rows, allorig, seen_orig, npairs, show_all):
             bg = bo + (fit or sh)[0][0]
         d = [(r[0] - bo, r[1] - bg) for r in rs]
         sz = size.get(n, None)
-        if sz is not None and sz <= 4 and not show_all:
-            continue                              # a scalar: its slot is `slots --orig`'s business
+        if sz is not None and sz <= (8 if c2slots.is_x64() else 4) and not show_all:
+            continue                              # a scalar (x64: or a pointer): its slot is `slots --orig`'s business
         lim = sz if sz is not None else 1 << 20
         # a pair outside the element on our side, or far outside on the original's, is an alignment or push-depth
         # error, not a field: shown with '?' and left out of the summary
@@ -88,11 +101,17 @@ def report(s, rows, allorig, seen_orig, npairs, show_all):
         if not bad and not show_all:
             continue
         do = [x[0] for x, z in zip(d, noise) if not z] or [0]
-        ext_o = (min(do), max(do) + 4)
-        ext_g = (min(go), max(go) + 4)
+        if X64:                                   # x64: the access widths from the operands (qword stores are common)
+            ok = [(x, r) for x, r, z in zip(d, rs, noise) if not z]
+            ext_o = (min(do), max([x[0] + _width(r[2]) for x, r in ok] or [4]))
+            ext_g = (min(go), max([x[1] + _width(r[3]) for x, r in ok] or [4]))
+        else:
+            ext_o = (min(do), max(do) + 4)
+            ext_g = (min(go), max(go) + 4)
         print("\n## %s (%s bytes ours)%s" % (n, sz if sz is not None else "?", "" if bad else "  fields agree"))
-        print("   accesses cover ours +%d..+%d, the original's +%d..+%d (4-byte accesses assumed for the end)" % (
-            ext_o[0], ext_o[1] - 1, ext_g[0], ext_g[1] - 1))
+        print("   accesses cover ours +%d..+%d, the original's +%d..+%d (%s)" % (
+            ext_o[0], ext_o[1] - 1, ext_g[0], ext_g[1] - 1,
+            "access widths from the operands" if X64 else "4-byte accesses assumed for the end"))
         for (x, y), r, z in zip(d, rs, noise):
             print("   ours %+4d -> orig %+4d %s  %-40s | %s" % (x, y, "?" if z else " " if x == y else "*", r[2][:40],
                                                              r[3][:40]))
@@ -131,7 +150,6 @@ def main(argv):
         k = argv.index("--")
         argv, cl = argv[:k], argv[k + 1:]
     a = ap.parse_args(argv)
-    c2slots.orig_x86()
     info, funcs, asm, d = c2slots.trace(a.src, a.func, cl)
     if not funcs:
         sys.exit("no frame elements for %r (or the compile failed)" % a.func)

@@ -588,10 +588,36 @@ code loads a pointer member's address into a temp first: `p->fx * q->fx` sorts `
 `[$o21 key 65+0]`, not `[p+0]` against `[q+0]`), and a pad at the top shifts every later frame key alike; what flips
 orders is a key crossing into a later block (rule 6) against an operand of another class.
 
+**Levers checked by compiles** (2026-11-22). `levers` was run on a target, its best edit applied as a source
+change, the variant compiled and exported, and `compare` run against it:
+
+| function | target | best lever | source change | target reached | keys | pass-2 orders |
+|---|---|---|---|---|---|---|
+| symkeys.cpp kparams | `--var r --above 40` | `add:frame@r:28` | 28 initialised dead `int dN = N;` before r | r 128, as predicted | 10/10 | 3/3 |
+| symkeys.cpp kdead | `--var r --below 4` | `sub:frame@r:1` (removes d) | drop the dead `float d = 0;` | r 3 | 7/7 | 2/2 |
+| symkeys.cpp kx87 | `--site '1:s>[p'` | `add:frame@s:1 add:frame@q:4` | one unused parameter after s, four between q and s | yes (s first) | 12/12 | 7/7 (1 changed, predicted) |
+| zlib adler32 | `--site '12:s1>s2'` (16 sorts) | `swap:s2,s1` | declare s2 before s1 | 16/16 | 27/27 | 75/75 (17 changed: 16 + the predicted other flip) |
+| zlib inflate_fast | `--site '83:hold>dmask'` | `swap:dmask,state` | `dmask = 0;` (dead) before `state = ...` | yes | 38/38 | 111/111 (1 changed) |
+| zlib inflate_fast | `--var len --below 20` | `swap:len,dmask` | `len = 0;` (dead) before `dmask = ...` | len 18 | 38/38 | 111/111 |
+
+6 of 6 levers gave the predicted key or order; 132 of 132 keys and 309 of 309 pass-2 orders predicted. What was
+wrong before the run, and is fixed: (1) a `sub` edit removed the last n allocations of a class whatever they
+were, so `levers --site` ranked first edits that delete symbols the code reads (adler32: `sub:frame@s2:2` drops s1
+and adler; all 102 full solutions were such subs). A sub that drops SymInit's dummy or a symbol a sort reads is
+now discarded (`realizable`), and the shown edit sets name the locals they remove (`removes: d (each must be an
+unread local in the source)`), ranked after those that remove none. (2) Neither `levers` mode tried a different
+first-reference order, which is the realizable answer when two locals of one block must swap: both now try
+`swap:V,W` for the function's own named locals (a dead store `V = 0;` before W's first use does it, code-neutral).
+(3) A parameter anchor read "before the first reference of a": it is now "before parameter a (... one more
+parameter after it)". (4) `compare` did not pair a variant whose signature the lever changed (added parameters):
+it now falls back to the undecorated name. Fixtures: tests/data/symkeys17_levers (the three symkeys.cpp variants
+and their exports; run_tests symkeys17_levers_tests).
+
 ### 10.4 Not covered on x64
 
-- `levers` runs (it only replays) but was not measured against compiles here; the construct table of section 4
-  and the hash-temp levers of 8.2 were not re-measured beyond the rows above.
+- `levers` with the `tmp` and `hash` classes was not checked by compiles (the six runs above are frame edits and
+  swaps); the construct table of section 4 and the hash-temp levers of 8.2 were not re-measured beyond the rows
+  above.
 - A memory leaf's displacement is logged at the sort (`symkeys_sort_disp`), not in `sort3` (shown as `+?` for the
   third and fourth operands when absent); the hash itself is recorded, so the model is not affected.
 - Sorts whose first source changes with the edit (an inner sort flips, so the outer OPADD's subtree is named by

@@ -4,6 +4,7 @@ docs/c2/port-1500.md section 8
 
 usage: c2ltcg.py [--c2 BUILD] regs|scratch|il|raw|regmap|tsweep|rwsweep|helpersweep <main.c> --with other.c[,more.c]
                  [--export sym[,sym]] [the subcommand's own options, e.g. --func S --why a,b] [-- <cl args>]
+       (x64, --c2 17.00: regs and scratch are c2ncol.py's NColor report: --func F [--why])
        c2ltcg.py [--c2 BUILD] asm <main.c> --with other.c [--export sym] [--out DIR] [--func S] [-- <cl args>]
 
 Under /GL the compiler proper writes IL objects and c2.dll generates no code; `link /LTCG` loads c2.dll and runs
@@ -209,7 +210,14 @@ def main(argv):
     if sub == "raw":
         sys.argv = [sys.argv[0]] + rest + tail[1:]
         return c2trace.main()
-    import importlib
+    import importlib, c2build
+    if sub in ("regs", "scratch") and c2build.get("arch") == "x64":
+        # x64 (cl 17.00): one allocator, NColor, assigns every register (no Color / RegSimpleAssign pair): both go
+        # to its report, c2ncol.py (docs/c2/ncolor.md); it needs --func F (c2ncol's own --export is not reachable
+        # here: --export names this wrapper's DLL exports)
+        if not any(a == "--func" or a.startswith("--func=") for a in rest):
+            sys.exit("c2ltcg %s: on x64 this is c2ncol.py's NColor report, which needs --func F" % sub)
+        return importlib.import_module("c2ncol").main(rest + tail)
     mod = importlib.import_module(MODS[sub])
     if sub in ("tsweep", "rwsweep", "helpersweep"):      # these read sys.argv themselves
         sys.argv = [sub + ".py"] + rest + tail

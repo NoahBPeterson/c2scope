@@ -9,7 +9,7 @@ applies a large generic set of meaning-preserving mutations to one function and 
 reads every model's input and decisions with the existing parsers, and stores mutation → effect in a database that
 grows with every function it is run on. The database's per-class rates are the measured inverse map (section 4).
 
-Builds: all four (14.00 default, 15.00, 13.10.3077, 13.10.3052; `--c2`). Every traced compile goes to the compile
+Builds: all four (14.00 default, 15.00, 13.10.3077, 13.10.3052; `--c2`), and cl 17.00 x64 (section 8: the R model is NColor, read through ncolsim). Every traced compile goes to the compile
 server; a compile the server declines would run under wine here and is refused instead (`RemoteDeclined`, the run
 stops after the first one; `EFFECTMINE_ALLOW_LOCAL=1` lifts it). With no compile server configured (or
 `C2TRACE_REMOTE=0`) every traced compile runs under wine, as in any other tool.
@@ -381,3 +381,68 @@ that a mutation added or removed such a tuple somewhere in the function; the sit
 is only as wide as the mutation classes (section 3): a construct no class writes (a different loop form, a helper
 the source never had) is not measured. F records accumulate with every mine run that traces `frontend` (`--features ...,frontend` or a `--want fe:`).
 
+
+## 8. cl 17.00 x64: the R model is NColor (2026-11-22)
+
+On a build table with `"arch": "x64"` (`--c2 17.00`) `mine` and `query` read every variant through NColor instead of
+the x86 allocator's trace (realize.Trace, Color): the regs trace is one compile with ncolsim's hooks (`ncolsim.NRun`:
+c2ncol --export plus the IL at NColor's entry, the same hooks realize / rwsweep use on x64), wrapped as `X64Fn` (the
+listing, registers, NColor blocks with their source line offsets: what the generators read of realize.Fn). The
+include snapshot (incsnap) and everything else are as on x86. Records keep their keys (`run`, `fkey`, `cls`, `edits`,
+`ctx`, `code`, `eff`, `types`, ..); only the R effect strings are NColor's, from `ncolsim.run_delta` of the reference
+and the variant:
+
+| R effect (x64) | meaning | type |
+|---|---|---|
+| `+app:V:B:N` / `-app:V:B:N` | N appearances of V more / fewer in NColor block B (the priority's k) | `R.app+` / `R.app-` |
+| `live:B:+K` | K candidates more (fewer) live in block B (every global's per-appearance term there) | `R.live+` / `R.live-` |
+| `index:V=K` | the lifetime-index order of named candidates changed (the priority tie-break) | `R.index` |
+| `bucket:V=L` | V moved to another NColPrioritizeCandidates list | `R.bucket` |
+| `blocks:a>b` | the block count at NColor changed (no appearance edits then) | `R.blocks` |
+| `range:V` / `new:V` / `gone:V` | a moved range, a new / lost named candidate | `R.range` / `R.new` / `R.gone` |
+| `reg:V:a>b`, `before:A:B` | V's register; A now processed before B | `R.reg`, `R.before` |
+
+The code numbers (`code` registers masked with the x64 register set, `bag`, `ident`, `bytes`, `bdo` / `rdo` against
+`--asm-vs`) and `ilsig` (the IL at NColor's entry, addresses removed) are computed as on x86. Features: `regs`,
+`slots`, `keys`, `loads`, `frontend` (the default); `scratch` and `sched` refuse with the reason (the scratch picks
+are the x86 RegAssign's; c2sched17 is not wired in). Wanted effects: `+app:V:B[:N]`, `-app:V:B[:N]`, `ref:V:B` /
+`unref:V:B` (one appearance), `live:B:+K`, `before:A:B` / `A>B`, `reg:V=REG`, `bdiff`, and the K / L / M / F forms;
+`ins:` / `drop:` / `sched:` / `pref:` refuse. `table` and `stats` mix the builds as before (the x64 types are new
+names, so no x86 rate changes).
+
+**What the first x64 runs show** (tests/data/effectmine.cpp, /TP /MT /GS /EHsc /Gy): a copy `int rz_c = n;` with the
+later uses renamed is code 0 and keeps one candidate more live (`live:1:+1 live:2:+1 live:3:+1`, `new:rz_c gone:n`:
+NColor coalesces the copy); an unused initialised local is one frame key (`keys:frame:+1`, ident 0, as on x86);
+declarations before the function are null. Equal arms (`eqif.*`, `eqif2`) are **not** code-neutral here: the arms are
+blocks at NColor (`blocks:9>12`) and 4 of 4 `eqif.assign` variants changed 2 to 5 instructions (`(int)p & 1`
+truncates a pointer on x64; realize's x64 eqif tests `(__int64)V`). A reference alias of n exchanged n's and s's
+registers (rbx / rsi) with 4 instructions changed.
+
+**Recovery: our own compile as the original.** A perturbed source is mined with `--asm-vs` the listing of the
+unperturbed source's compile (the listing's bytes through capstone as an orig.s) and `--want bdiff`; recovered = a
+measured variant with bdiff 0. Budget 150 single compiles, depth 2 (30), pairs 8, `--features regs`, `--jobs 1`
+(wine, one compile at a time).
+
+| source | function | perturbation (a mined variant of the original) | base rdiff / bdiff | recovered by | |
+|---|---|---|---|---|---|
+| tests/data/effectmine17/pert_alias.cpp | em__base | `int& rw_a = n;` alias (code 4, n / s registers exchanged) | 3 / 26 | `unalias` (bdiff 0); pairs with it too | yes |
+| zlib trees.c (/TP /O2) | scan_tree | headdup `prevlen = curlen;` into both arms (code 0) | 1 / 26 | `headhoist` | yes |
+| | scan_tree | eqif2 around `max_count = 7, min_count = 4` (blocks 26 > 28, count / min_count exchanged) | 0 / 24 | `uneqif`, `tailhoist` | yes |
+| | build_tree | alias.ref of m (8 uses; code 2, no register change) | 4 / 5 | `unalias` | yes |
+| | gen_bitlen | alias.ref of s (+app:s, m / n exchanged) | 0 / 28 | `unalias` | yes |
+| | gen_bitlen | eqif.decl of `tree` (5 registers move) | 14 / 68 | `uneqif`, `tailhoist` | yes |
+| | gen_bitlen | cflow.taildup of `n--;` (code 0, m / n exchanged) | 0 / 28 | `tailhoist` | yes |
+| | pqdownheap | eqif.assign `if ((int)k & 1) j <<= 1; else ..` (code 3, j / s move) | 16 / 58 | `uneqif`; `hs_bind(j)` too | yes |
+
+8 of 8 recovered to bdiff 0, each by the inverse class first. zlib 1.2.1's trees.c is tests/data/zlib17/trees.c: its
+K&R heads rewritten as ANSI ones (the generators' function finder, helpersweep.functions, reads only ANSI
+definitions: on the original file `definition of gen_bitlen not found`), compiled /TP (as /TC the helper
+templates do not compile: 72 of 156 variants of build_tree failed). The perturbations were picked from a first mine
+of each original (150 compiles each: 2 to 10 of about 140 compiled variants moved a register with at most 4 instructions
+changed). The same perturbations through `realize --from-ncol` (the wanted registers = the original's): 0 of 6 (5:
+ncolsim's need() has no appearance / order answer; 1: 12 answers, 60 compiles, none realised): realize's x64
+constructs have no inverse families (uneqif, headhoist, tailhoist), effectmine's catalogue has them.
+
+**Limits on x64.** Each variant costs one compile with the ncol hooks (1 to 2 s for trees.c under wine). `scratch` /
+`sched` are not available. (A perturbed source in a temp folder with headers elsewhere used to stop incsnap with
+`SameFileError` when the only common folder was the filesystem root; fixed, incsnap_tests.)

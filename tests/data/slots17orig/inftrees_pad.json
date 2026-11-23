@@ -1,0 +1,1750 @@
+{
+"build": "17.00.61030-x64",
+"func": "inflate_table",
+"nstack": 21,
+"params": [
+7,
+8,
+13,
+14,
+17,
+18
+],
+"elems": {
+"7": {
+"idx": 7,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 12,
+"fl7": 0,
+"key": 7,
+"name": "type",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 8,
+"lod": [
+0,
+1,
+2,
+3,
+4,
+5,
+6,
+7,
+8,
+9,
+10,
+11,
+12,
+13,
+14,
+15,
+16,
+17,
+18,
+19,
+20
+],
+"lodtrunc": false,
+"tnum": 3842,
+"never": true,
+"gs": 0
+},
+"8": {
+"idx": 8,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 12,
+"fl7": 0,
+"key": 5,
+"name": "codes",
+"align": 4,
+"ty": 8196,
+"ssize": 4,
+"poff": 24,
+"lod": [
+0,
+1,
+2,
+3,
+4,
+5,
+6,
+7,
+8,
+9,
+10,
+11,
+12,
+13,
+14,
+15,
+16,
+17,
+18,
+19,
+20
+],
+"lodtrunc": false,
+"tnum": 3844,
+"never": true,
+"gs": 0
+},
+"13": {
+"idx": 13,
+"size": 8,
+"uses": 2,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 32,
+"key": 3,
+"name": "bits",
+"align": 4,
+"ty": 4104,
+"ssize": 8,
+"poff": 40,
+"lod": [
+5,
+7,
+8,
+11,
+12,
+14,
+15,
+16,
+17,
+18
+],
+"lodtrunc": false,
+"tnum": 3846,
+"never": false,
+"gs": 0
+},
+"14": {
+"idx": 14,
+"size": 8,
+"uses": 2,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 32,
+"key": 2,
+"name": "work",
+"align": 4,
+"ty": 4104,
+"ssize": 8,
+"poff": 48,
+"lod": [
+5,
+7,
+8,
+11,
+12,
+13,
+15,
+16,
+17,
+18
+],
+"lodtrunc": false,
+"tnum": 3847,
+"never": false,
+"gs": 0
+},
+"17": {
+"idx": 17,
+"size": 8,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 32,
+"key": 6,
+"name": "lens",
+"align": 4,
+"ty": 4104,
+"ssize": 8,
+"poff": 16,
+"lod": [
+5,
+7,
+8,
+11,
+12,
+13,
+14,
+15,
+16,
+18
+],
+"lodtrunc": false,
+"tnum": 3843,
+"never": false,
+"gs": 0
+},
+"18": {
+"idx": 18,
+"size": 8,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 32,
+"key": 4,
+"name": "table",
+"align": 4,
+"ty": 4104,
+"ssize": 8,
+"poff": 32,
+"lod": [
+5,
+7,
+8,
+11,
+12,
+13,
+14,
+15,
+16,
+17
+],
+"lodtrunc": false,
+"tnum": 3845,
+"never": false,
+"gs": 0
+},
+"0": {
+"idx": 0,
+"size": 1,
+"uses": 1,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 8,
+"name": "zz_pad_",
+"align": 1,
+"ty": 4097,
+"ssize": null,
+"poff": null,
+"lod": [
+5,
+11,
+12,
+15,
+16,
+19,
+20
+],
+"lodtrunc": false,
+"tnum": 3850,
+"never": false,
+"gs": 0
+},
+"1": {
+"idx": 1,
+"size": 4,
+"uses": 13,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 30,
+"name": "this",
+"align": 3,
+"ty": 24580,
+"ssize": null,
+"poff": null,
+"lod": [
+1,
+2,
+3,
+4,
+5,
+6,
+9,
+10,
+11,
+12,
+15,
+16,
+19
+],
+"lodtrunc": false,
+"tnum": 3865,
+"never": false,
+"gs": 0
+},
+"2": {
+"idx": 2,
+"size": 4,
+"uses": 4,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1706,
+"name": "low$1",
+"align": 3,
+"ty": 8196,
+"ssize": null,
+"poff": null,
+"lod": [
+1,
+2,
+3,
+4,
+5,
+6,
+9,
+10,
+11,
+12,
+15,
+16,
+19,
+20
+],
+"lodtrunc": false,
+"tnum": 4096,
+"never": false,
+"gs": 0
+},
+"3": {
+"idx": 3,
+"size": 4,
+"uses": 4,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 251,
+"name": "sym$2",
+"align": 3,
+"ty": 8196,
+"ssize": null,
+"poff": null,
+"lod": [
+1,
+2,
+3,
+4,
+5,
+6,
+9,
+10,
+11,
+12,
+15,
+16,
+19
+],
+"lodtrunc": false,
+"tnum": 4081,
+"never": false,
+"gs": 0
+},
+"4": {
+"idx": 4,
+"size": 4,
+"uses": 4,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1707,
+"name": "used$1",
+"align": 3,
+"ty": 8196,
+"ssize": null,
+"poff": null,
+"lod": [
+1,
+2,
+3,
+4,
+5,
+6,
+9,
+10,
+11,
+12,
+15,
+16,
+19
+],
+"lodtrunc": false,
+"tnum": 4097,
+"never": false,
+"gs": 0
+},
+"5": {
+"idx": 5,
+"size": 4,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 243,
+"name": "type$1",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+5,
+11,
+13,
+14,
+15
+],
+"lodtrunc": false,
+"tnum": 4073,
+"never": false,
+"gs": 0
+},
+"6": {
+"idx": 6,
+"size": 4,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1708,
+"name": "mask$1",
+"align": 3,
+"ty": 8196,
+"ssize": null,
+"poff": null,
+"lod": [
+2,
+3,
+4,
+5,
+6,
+9,
+10,
+11,
+12,
+15,
+16,
+19
+],
+"lodtrunc": false,
+"tnum": 4098,
+"never": false,
+"gs": 0
+},
+"9": {
+"idx": 9,
+"size": 8,
+"uses": 6,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1699,
+"name": "base$1",
+"align": 4,
+"ty": 4104,
+"ssize": null,
+"poff": null,
+"lod": [
+2,
+5,
+9,
+10,
+11,
+12,
+15,
+16,
+19
+],
+"lodtrunc": false,
+"tnum": 4089,
+"never": false,
+"gs": 0
+},
+"10": {
+"idx": 10,
+"size": 8,
+"uses": 6,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1700,
+"name": "extra$1",
+"align": 4,
+"ty": 4104,
+"ssize": null,
+"poff": null,
+"lod": [
+2,
+5,
+9,
+10,
+11,
+12,
+15,
+16,
+19
+],
+"lodtrunc": false,
+"tnum": 4090,
+"never": false,
+"gs": 0
+},
+"11": {
+"idx": 11,
+"size": 8,
+"uses": 4,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1715,
+"name": "table$GSCopy$1",
+"align": 4,
+"ty": 4104,
+"ssize": null,
+"poff": null,
+"lod": [
+11,
+13,
+14
+],
+"lodtrunc": false,
+"tnum": 4105,
+"never": false,
+"gs": 0
+},
+"12": {
+"idx": 12,
+"size": 8,
+"uses": 3,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1717,
+"name": "work$GSCopy$1",
+"align": 4,
+"ty": 4104,
+"ssize": null,
+"poff": null,
+"lod": [
+5,
+11,
+12,
+15,
+16
+],
+"lodtrunc": false,
+"tnum": 4107,
+"never": false,
+"gs": 0
+},
+"15": {
+"idx": 15,
+"size": 8,
+"uses": 2,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1714,
+"name": "lens$GSCopy$1",
+"align": 4,
+"ty": 4104,
+"ssize": null,
+"poff": null,
+"lod": [
+11,
+13,
+14,
+15
+],
+"lodtrunc": false,
+"tnum": 4104,
+"never": false,
+"gs": 0
+},
+"16": {
+"idx": 16,
+"size": 8,
+"uses": 2,
+"param": false,
+"kind": 4,
+"fl6": 2,
+"fl7": 0,
+"key": 1716,
+"name": "bits$GSCopy$1",
+"align": 4,
+"ty": 4104,
+"ssize": null,
+"poff": null,
+"lod": [
+5,
+11,
+14,
+15,
+16
+],
+"lodtrunc": false,
+"tnum": 4106,
+"never": false,
+"gs": 0
+},
+"19": {
+"idx": 19,
+"size": 32,
+"uses": 15,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 11,
+"name": "count",
+"align": 4,
+"ty": 24608,
+"ssize": null,
+"poff": null,
+"lod": [
+1,
+2,
+3,
+4,
+5,
+6,
+9,
+10,
+11,
+12,
+15,
+16,
+19,
+20
+],
+"lodtrunc": false,
+"tnum": 3870,
+"never": false,
+"gs": 5
+},
+"20": {
+"idx": 20,
+"size": 32,
+"uses": 6,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 18,
+"name": "offs",
+"align": 4,
+"ty": 24608,
+"ssize": null,
+"poff": null,
+"lod": [
+2,
+5,
+11,
+12,
+15,
+16,
+19,
+20
+],
+"lodtrunc": false,
+"tnum": 3871,
+"never": false,
+"gs": 5
+}
+},
+"fn": {
+"npc": 0,
+"ebp": 0,
+"nparams": 6,
+"gs": true,
+"gscopies": true,
+"alloc": 0,
+"cap": 16,
+"dalign": null,
+"ebpadj": 0,
+"v13": false,
+"T": 272,
+"ncol": 21,
+"tround": 16,
+"undo": false,
+"up": true,
+"palign": true,
+"capdef": 16,
+"argarea": true,
+"frame": {
+"A": 32,
+"F": 208,
+"pushed": 40,
+"B": 32,
+"lrsp": true,
+"prsp": true,
+"dyn": 0,
+"cap": 16,
+"alloca": false,
+"Fend": 208
+}
+},
+"obs": {
+"run": [
+{
+"idx": 0,
+"tries": [],
+"res": [
+"c",
+6
+],
+"ncol": 6
+},
+{
+"idx": 1,
+"tries": [
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+7
+],
+"ncol": 7
+},
+{
+"idx": 2,
+"tries": [
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+8
+],
+"ncol": 8
+},
+{
+"idx": 3,
+"tries": [
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+9
+],
+"ncol": 9
+},
+{
+"idx": 4,
+"tries": [
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+10
+],
+"ncol": 10
+},
+{
+"idx": 5,
+"tries": [
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+11
+],
+"ncol": 11
+},
+{
+"idx": 6,
+"tries": [
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+12
+],
+"ncol": 12
+},
+{
+"idx": 9,
+"tries": [
+[
+"c",
+12,
+4
+],
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+13
+],
+"ncol": 13
+},
+{
+"idx": 10,
+"tries": [
+[
+"c",
+13,
+8
+],
+[
+"c",
+12,
+4
+],
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+14
+],
+"ncol": 14
+},
+{
+"idx": 11,
+"tries": [
+[
+"c",
+14,
+8
+],
+[
+"c",
+13,
+8
+],
+[
+"c",
+12,
+4
+],
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+15
+],
+"ncol": 15
+},
+{
+"idx": 12,
+"tries": [
+[
+"c",
+15,
+8
+],
+[
+"c",
+14,
+8
+],
+[
+"c",
+13,
+8
+],
+[
+"c",
+12,
+4
+],
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+16
+],
+"ncol": 16
+},
+{
+"idx": 15,
+"tries": [
+[
+"c",
+16,
+8
+],
+[
+"c",
+15,
+8
+],
+[
+"c",
+14,
+8
+],
+[
+"c",
+13,
+8
+],
+[
+"c",
+12,
+4
+],
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+17
+],
+"ncol": 17
+},
+{
+"idx": 16,
+"tries": [
+[
+"c",
+17,
+8
+],
+[
+"c",
+16,
+8
+],
+[
+"c",
+15,
+8
+],
+[
+"c",
+14,
+8
+],
+[
+"c",
+13,
+8
+],
+[
+"c",
+12,
+4
+],
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+18
+],
+"ncol": 18
+},
+{
+"idx": 19,
+"tries": [
+[
+"c",
+18,
+8
+],
+[
+"c",
+17,
+8
+],
+[
+"c",
+16,
+8
+],
+[
+"c",
+15,
+8
+],
+[
+"c",
+14,
+8
+],
+[
+"c",
+13,
+8
+],
+[
+"c",
+12,
+4
+],
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+19
+],
+"ncol": 19
+},
+{
+"idx": 20,
+"tries": [
+[
+"c",
+19,
+32
+],
+[
+"c",
+18,
+8
+],
+[
+"c",
+17,
+8
+],
+[
+"c",
+16,
+8
+],
+[
+"c",
+15,
+8
+],
+[
+"c",
+14,
+8
+],
+[
+"c",
+13,
+8
+],
+[
+"c",
+12,
+4
+],
+[
+"c",
+11,
+4
+],
+[
+"c",
+10,
+4
+],
+[
+"c",
+9,
+4
+],
+[
+"c",
+8,
+4
+],
+[
+"c",
+7,
+4
+],
+[
+"c",
+6,
+1
+]
+],
+"res": [
+"c",
+20
+],
+"ncol": 20
+}
+],
+"undo": false,
+"cols": [
+{
+"c": 0,
+"base": 8,
+"members": [
+[
+7,
+8
+]
+]
+},
+{
+"c": 1,
+"base": 24,
+"members": [
+[
+8,
+24
+]
+]
+},
+{
+"c": 2,
+"base": 40,
+"members": [
+[
+13,
+40
+]
+]
+},
+{
+"c": 3,
+"base": 48,
+"members": [
+[
+14,
+48
+]
+]
+},
+{
+"c": 4,
+"base": 16,
+"members": [
+[
+17,
+16
+]
+]
+},
+{
+"c": 5,
+"base": 32,
+"members": [
+[
+18,
+32
+]
+]
+},
+{
+"c": 6,
+"base": 0,
+"members": [
+[
+1,
+0
+]
+]
+},
+{
+"c": 7,
+"base": 4,
+"members": [
+[
+2,
+4
+]
+]
+},
+{
+"c": 8,
+"base": 8,
+"members": [
+[
+3,
+8
+]
+]
+},
+{
+"c": 9,
+"base": 12,
+"members": [
+[
+0,
+12
+]
+]
+},
+{
+"c": 10,
+"base": 16,
+"members": [
+[
+4,
+16
+]
+]
+},
+{
+"c": 11,
+"base": 24,
+"members": [
+[
+9,
+24
+]
+]
+},
+{
+"c": 12,
+"base": 32,
+"members": [
+[
+5,
+32
+]
+]
+},
+{
+"c": 13,
+"base": 40,
+"members": [
+[
+10,
+40
+]
+]
+},
+{
+"c": 14,
+"base": 48,
+"members": [
+[
+6,
+48
+]
+]
+},
+{
+"c": 15,
+"base": 56,
+"members": [
+[
+11,
+56
+]
+]
+},
+{
+"c": 16,
+"base": 64,
+"members": [
+[
+12,
+64
+]
+]
+},
+{
+"c": 17,
+"base": 72,
+"members": [
+[
+16,
+72
+]
+]
+},
+{
+"c": 18,
+"base": 80,
+"members": [
+[
+15,
+80
+]
+]
+},
+{
+"c": 19,
+"base": 88,
+"members": [
+[
+19,
+88
+]
+]
+},
+{
+"c": 20,
+"base": 120,
+"members": [
+[
+20,
+120
+]
+]
+}
+],
+"done": {
+"T": 272,
+"npc": 0,
+"ebp": null,
+"joins": null
+}
+},
+"listing": {
+"7": {
+"lname": "type$",
+"loff": 256,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"8": {
+"lname": "codes$",
+"loff": 272,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"13": {
+"lname": "bits$",
+"loff": 288,
+"lsize": null,
+"lrefs": 1,
+"line": 39
+},
+"14": {
+"lname": "work$",
+"loff": 296,
+"lsize": null,
+"lrefs": 1,
+"line": 39
+},
+"17": {
+"lname": "lens$",
+"loff": 264,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"18": {
+"lname": "table$",
+"loff": 280,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"0": {
+"lname": "zz_pad_$",
+"loff": 44,
+"lsize": null,
+"lrefs": 1,
+"line": 107
+},
+"1": {
+"lname": "this$",
+"loff": 32,
+"lsize": null,
+"lrefs": 12,
+"line": 211
+},
+"2": {
+"lname": "low$1$",
+"loff": 36,
+"lsize": null,
+"lrefs": 4,
+"line": 114
+},
+"3": {
+"lname": "sym$2$",
+"loff": 40,
+"lsize": null,
+"lrefs": 4,
+"line": 204
+},
+"4": {
+"lname": "used$1$",
+"loff": 48,
+"lsize": null,
+"lrefs": 4,
+"line": 204
+},
+"5": {
+"lname": "type$1$",
+"loff": 64,
+"lsize": null,
+"lrefs": 3,
+"line": 107
+},
+"6": {
+"lname": "mask$1$",
+"loff": 80,
+"lsize": null,
+"lrefs": 3,
+"line": 204
+},
+"9": {
+"lname": "base$1$",
+"loff": 56,
+"lsize": null,
+"lrefs": 3,
+"line": 204
+},
+"10": {
+"lname": "extra$1$",
+"loff": 72,
+"lsize": null,
+"lrefs": 5,
+"line": 189
+},
+"11": {
+"lname": "table$GSCopy$1$",
+"loff": 88,
+"lsize": null,
+"lrefs": 3,
+"line": 39
+},
+"12": {
+"lname": "work$GSCopy$1$",
+"loff": 96,
+"lsize": null,
+"lrefs": 3,
+"line": 107
+},
+"15": {
+"lname": "lens$GSCopy$1$",
+"loff": 112,
+"lsize": null,
+"lrefs": 2,
+"line": 107
+},
+"16": {
+"lname": "bits$GSCopy$1$",
+"loff": 104,
+"lsize": null,
+"lrefs": 2,
+"line": 107
+},
+"19": {
+"lname": "count$",
+"loff": 120,
+"lsize": null,
+"lrefs": 13,
+"line": 108
+},
+"20": {
+"lname": "offs$",
+"loff": 152,
+"lsize": null,
+"lrefs": 5,
+"line": 133
+}
+}
+}

@@ -2,7 +2,8 @@
 
 Scope: why c2 keeps a memory value in a register and reuses it in a later block (or the same block), why it reloads
 it instead, and when `x op= y` on memory becomes one `op [m], y` instead of load / op / store. All four builds:
-14.00.50727.762 (default), 15.00.30729.1, 13.10.3077, 13.10.3052. Read opt.md §4 and §5 first (CSE and the kill
+14.00.50727.762 (default), 15.00.30729.1, 13.10.3077, 13.10.3052; cl 17.00 x64 (VS2012) in section 8, where two
+rules differ (R2 is undone by sweep 1; `(m & c) | y` becomes two RMWs). Read opt.md §4 and §5 first (CSE and the kill
 table); this page is the part they did not cover: **which reads have the same value number at all**.
 
 **Tags.** **[C]** seen in the code (address given), in a trace or in a probe compile (probe named); **[I]** inferred; **[M]** measured: a probe in `tests/data/rules/RX_*.cpp` decides it on all four builds (checks in `tests/probes/misc.py`).
@@ -216,13 +217,23 @@ pointer chain into `T* q = CHAIN;` before the block; one load instead of the per
 uv run tools/loadcse.py SRC --func F [--c2 BUILD] [--loc REGEX] [--all] [--json OUT] -- /TP /MT /O2 /GS /EHsc /Gy
 ```
 
-One traced compile (C2TRACE_ILPAS=1) dumps the function at `@GdfInsertArtificialAssigns@4` (first entry),
-`@GoptLocalCopyPropagation@4`, `@Opeq@4`, `@Color@4` and `@EncEmitFunc@4`. For each location read more than once
+One traced compile (C2TRACE_ILPAS=1) dumps the function at `@GdfInsertArtificialAssigns@4`,
+`@GoptLocalCopyPropagation@4`, `@Opeq@4`, `@Color@4` (x64: `@NColor@4`) and `@EncEmitFunc@4`. V is the last
+GdfInsertArtificialAssigns entry before S2 (14.00 enters it twice with the same IL; 17.00 runs sweep 1 in between,
+section 8), V1 its first entry, S2 the first GoptLocalCopyPropagation entry after V1 (17.00 also enters it before
+the hash table), each later pass the first entry after the previous one. For each location read more than once
 (addresses resolved through address temps: `[t128+0]` with `t128 = _this + 352` prints as `[_this+352]`, a loaded
 pointer as `{[_p+4]}`) it lists every read: FIRST, REUSED (deleted by sweep 2), or RELOADED with the rule (R2 pas, R3
 base with the alias variable's name, R4 dependent, R5 kill with the call or store, R6 path), its block, hash temp, PAS
 index and the spelling, then the number of reads at Color entry and in the final code. For each store of `X op y`
-it prints FORMED, FORMED + SPLIT after allocation (13.10), or NOT FORMED with M1..M6. Pairs use dominators when the dump
+it prints FORMED, FORMED + SPLIT after allocation (13.10), or NOT FORMED with M1..M6. Since 2026-11-22 (all builds):
+a memory-writing intrinsic (memcpy as OPINTRINSIC 172 with a points-at-set destination) is a kill; an assignment
+to a variable of the address between two reads (`*++s`) is reported as R5 "the address moved" (zlib longest_match:
+16 former R6 lines); a kill in the later read's own block before it (a call at an arm's head) is found; within one
+block the path between two reads is the tuples between them, not the way around a loop; with branch targets an
+unexplained reload is "R? kept" instead of R6 (zlib updatewindow, on 14.00 and 17.00: a read at the join after an
+if-converted arm); a location read more often in the final code than at Color entry gets a note (a register copy
+folded back into a memory operand, `cmova r, [m]`). Pairs use dominators when the dump
 has branch targets (the extended dump, on all four builds since 2026-11-19); with a plain dump (`il --plain`, or a
 compile server with an older c2trace.dll) they are paired in stream order and the output says so, so a read in a
 sibling arm can be shown as R5/R6 where it is simply on another path.
@@ -259,8 +270,74 @@ lea ecx,[ecx]`, our listing has `npad 14`, and bdiff keeps the first `jmp` as an
 
 ## 7. Open
 
+- (17.00) Why sweep 1 rejoins the dereferences ComputePointsAtSets split (section 8.2) when 14.00's does not, and
+  the exact OpeqTryBitAssignRewrite conditions (measured in 8.3, not read).
+- zlib updatewindow `state->write` (14.00 and 17.00): a read dominated by an equal one with nothing in between is
+  kept at the join after an if-converted `if (dist > copy) dist = copy;` ("R? kept").
+
 - Why ComputePointsAtSets splits the alias class of a loaded pointer's dereferences per storing block (R2 mechanism),
   and the exceptions (p6 `c3`: a call between read and store keeps one class).
 - (Settled: the 13.10 RMW split is Riscify + Riscify_undo, §3.)
 - Address-temp folding into a compare (F3 0x00ab47e0) and load folding of a single-use guard (M&B 0051d7c0) are
   allocation/lowering decisions not covered here.
+
+## 8. cl 17.00 x64 (VS2012, `--c2 17.00`) **[C: traces and /FAsc listings]**
+
+Checked 2026-11-22: tests/data/loadcse.cpp and loadcse17.cpp (every verdict against the listing),
+work/scratch/loadcse/cons/cons.cpp (counts from the listing, `g17cse/cons17.py` in the session scratch), and ten
+zlib 1.2.1 functions at /O2 (flush_pending, fill_window, read_buf, deflateSetDictionary, longest_match_fast,
+updatewindow, inflateReset, _tr_align, pqdownheap, compress_block, _tr_stored_block: 105 FIRST, 74 REUSED, 117 R5,
+1 R3, 1 R? kept; 62 RMWs FORMED, 31 not; spot-checked against the listings: flush_pending, _tr_stored_block,
+updatewindow, longest_match_fast; every load count of those equals the listing's).
+
+### 8.1 What the tool needed
+
+| | 14.00 | 17.00 x64 | fix |
+|---|---|---|---|
+| pass order | GdfInsertArtificialAssigns twice (same IL), GoptLocalCopyPropagation after sweep 2 | GoptLocalCopyPropagation **before** HshBuildTable too; GdfInsertArtificialAssigns twice with **sweep 1 in between** (GoptRemoveAssumes between the two entries) | S2 = the first GoptLocalCopyPropagation entry after the first V entry (the old "first entry" was the pre-hash one: killcall said REUSED because the "S2" stage had t71/t72, not the hash temps); V = the last V entry before S2 |
+| memory leaf | `[t128:1004+0]` (the symbol is the address temp) | `[t129+t128:1008+0]`: the leaf's +0x24 symbol, printed untyped first, is the **location's own hash temp**; the base follows | the untyped temp is dropped from the address |
+| variables | `_p` | `p`, allocated `rsi=p$1` | any non-register name is a variable; `$N` dropped |
+| incoming registers after lowering | (on the stack) | `rcx=t135 <-` (entry pseudo-op 0x577), `p <- rcx=t135` | such a temp resolves to the parameter it is copied to |
+| folded load in an add at Opeq | — | `t131 <- [rq+0] + 92` | resolved as `{[..]}+92` |
+
+### 8.2 R2 does not survive on 17.00
+
+ComputePointsAtSets splits the arm's dereferences as on 14.00: at the first GdfInsertArtificialAssigns entry
+twolevel's arm has `[p+8]@20` / `@21` with hash temps t136 / t138 (14.00: `@1f` / `@20`). But 17.00's sweep 1
+rewrites them, one GoptOptimizeInstr at a time (hooked: `?GoptOptimizeInstr@@YIXPAVTuple@@PAUtagBLOCK@@PAUtagFUNC@@@Z`,
+`?GoptRehashMemRefs@@YIXPAVTuple@@@Z`), to the dominating read's class: `t136 <- [p+8]@20` becomes
+`t130 <- [p+8]@8; t136 <- t130`, and GoptRehashMemRefs rehashes the dependent `[t136+0]@21` as `[t130+0]@7`. At the
+second entry every read has the first read's PAS and hash temp, and sweep 2 deletes them: **one load** where 14.00
+has two. cons.cpp on 17.00, the rows that differ from 14.00 (L loads, S stores, RMW of `[reg+92]`):
+
+| probe | 14.00 | 17.00 | why |
+|---|---|---|---|
+| B0 twolevel, B2 `Q*& rq`, B3 global pointer, B4 split statement, B6 `int*& pf` | L2 S1 | **L1 S1** | sweep 1 rejoins the class (8.2) |
+| C2 sub-object accessor, C2b `E**& r` | L1 RMW1 | **L1 S1** | the same: `back()`'s and `pop()`'s reads are one value again (at the first hash t135 PAS 29 / 26), so `--e` shares the read (M4/M2) |
+| C3 `(m & ~1) \| 2` | L1 S1 | **RMW2** (`and [m], -2; or [m], 2`) | 8.3 |
+
+All other 38 rows are as on 14.00 (A0..A21 including the R3 aliases A15/A17/A21, the kills A8/A10/A11, A14's
+path, B1/B5/B7, C0/C4..C14). What still reloads on 17.00 is R3 (refmember: `x.e` through `re` in both arms, three
+`[r9+8]` loads), the kills R5 (a call at the arm's head, loadcse17.cpp call_arm: the reads after it have PAS 20 /
+21 and are reloads by the call, not by the class), and R6-type paths.
+
+### 8.3 OpeqBitAssigns: `[m] = ([m] & c) | y` is two RMWs **[C trace, M]**
+
+17.00 has `OpeqBitAssigns` (0x1009a970) / `OpeqTryBitAssignRewrite` (0x101a45b0) / `OpeqSearchForAndOfOpr`, which
+14.00 lacks. Between GoptLocalCopyPropagation and Opeq the AND becomes `and [m] <- [m] -2` in place and the OR reads
+the memory again (`t64 <- [m] | 2; [m] <- t64`), which Opeq then makes `or [m], 2`. Measured (listing, `bit.cpp`
+probes in the session scratch):
+
+| `p->m = ...` | 17.00 |
+|---|---|
+| `(m & ~1) \| 2`, `(m & ~1) \| a` (variable), `(m \| 2) & ~1`, `((m & ~1) \| 2) & ~8` (folded to `& -10`), `(m & ~0xf0) \| 0x30`, `*p` of `unsigned char*`, `a[i]` | `and [m], c` + `or [m], y` |
+| `(m & a) \| 2` (variable mask), `(m ^ 1) \| 2`, `(m + 1) \| 2`, `(m << 1) \| 1`, `(m & ~1) + 2` | load / op / store |
+| the old value shared with a test (`if (!(m & 3)) m = (m & ~1) \| 2`) | load / op / store (M1) |
+| through a loaded pointer (`p->q->m`, also after a call) or a global `g` | load / op / store |
+| the value used again (`...; return p->m;`) | two RMWs + reload |
+
+`loadcse.py` reports the split as `FORMED (and -2, then or 2; bit-assign split by OpeqBitAssigns before Opeq)`.
+For a decompiler: two RMW instructions on one location with a constant AND mask are one source statement
+`m = (m & c) | y` on 17.00, and on 17.00 a `p->q->m` update after a test of it is one load (no need for the 14.00
+local-pointer spelling).
+

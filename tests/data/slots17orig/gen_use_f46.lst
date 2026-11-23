@@ -1,0 +1,385 @@
+v11$1 = 32
+v7$2 = 32
+v5$3 = 32
+v2$4 = 32
+v0$5 = 32
+v10$6 = 36
+v9$ = 37
+v13$7 = 40
+v6$8 = 40
+v3$9 = 40
+v1$10 = 40
+v15$ = 48
+v8$11 = 56
+v14$12 = 72
+v12$13 = 72
+v4$14 = 72
+__$ArrayPad$ = 112
+p0$ = 160
+p1$ = 168
+p2$ = 176
+?f46@@YAHHHH@Z PROC					; f46, COMDAT
+
+; 1952 : {
+
+$LN28:
+  00000	48 89 5c 24 08	 mov	 QWORD PTR [rsp+8], rbx
+  00005	48 89 74 24 20	 mov	 QWORD PTR [rsp+32], rsi
+  0000a	55		 push	 rbp
+  0000b	57		 push	 rdi
+  0000c	41 56		 push	 r14
+  0000e	48 8b ec	 mov	 rbp, rsp
+  00011	48 81 ec 80 00
+	00 00		 sub	 rsp, 128		; 00000080H
+  00018	48 8b 05 00 00
+	00 00		 mov	 rax, QWORD PTR __security_cookie
+  0001f	48 33 c4	 xor	 rax, rsp
+  00022	48 89 45 f0	 mov	 QWORD PTR __$ArrayPad$[rbp-128], rax
+  00026	8b d9		 mov	 ebx, ecx
+
+; 1953 :     {
+; 1954 :         int v0;
+; 1955 :         ext(&v0);
+
+  00028	48 8d 4d a0	 lea	 rcx, QWORD PTR v0$5[rbp-128]
+  0002c	41 8b f8	 mov	 edi, r8d
+  0002f	8b f2		 mov	 esi, edx
+  00031	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1956 :         g += v0;
+; 1957 :         g += v0;
+
+  00036	8b 05 00 00 00
+	00		 mov	 eax, DWORD PTR ?g@@3HA	; g
+  0003c	8b 55 a0	 mov	 edx, DWORD PTR v0$5[rbp-128]
+
+; 1958 :         double v1;
+; 1959 :         ext(&v1);
+
+  0003f	48 8d 4d a8	 lea	 rcx, QWORD PTR v1$10[rbp-128]
+  00043	8d 14 50	 lea	 edx, DWORD PTR [rax+rdx*2]
+  00046	89 15 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, edx	; g
+  0004c	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1960 :         gd += v1;
+; 1961 :         gd += v1;
+; 1962 :     }
+; 1963 :     for (g = 0; g < p0; g++) {
+
+  00051	45 33 f6	 xor	 r14d, r14d
+  00054	f2 0f 10 0d 00
+	00 00 00	 movsdx	 xmm1, QWORD PTR ?gd@@3NA ; gd
+  0005c	f2 0f 58 4d a8	 addsd	 xmm1, QWORD PTR v1$10[rbp-128]
+  00061	44 89 35 00 00
+	00 00		 mov	 DWORD PTR ?g@@3HA, r14d	; g
+  00068	f2 0f 58 4d a8	 addsd	 xmm1, QWORD PTR v1$10[rbp-128]
+  0006d	f2 0f 11 0d 00
+	00 00 00	 movsdx	 QWORD PTR ?gd@@3NA, xmm1 ; gd
+  00075	85 db		 test	 ebx, ebx
+  00077	7e 43		 jle	 SHORT $LN10@f46
+  00079	0f 1f 80 00 00
+	00 00		 npad	 7
+$LL12@f46:
+
+; 1964 :         short v2;
+; 1965 :         ext(&v2);
+
+  00080	48 8d 4d a0	 lea	 rcx, QWORD PTR v2$4[rbp-128]
+  00084	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1966 :         g += v2;
+
+  00089	0f bf 4d a0	 movsx	 ecx, WORD PTR v2$4[rbp-128]
+
+; 1967 :         g += v2;
+; 1968 :         g += v2;
+
+  0008d	8b c1		 mov	 eax, ecx
+  0008f	03 05 00 00 00
+	00		 add	 eax, DWORD PTR ?g@@3HA	; g
+  00095	8d 04 48	 lea	 eax, DWORD PTR [rax+rcx*2]
+
+; 1969 :         int v3;
+; 1970 :         ext(&v3);
+
+  00098	48 8d 4d a8	 lea	 rcx, QWORD PTR v3$9[rbp-128]
+  0009c	89 05 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, eax	; g
+  000a2	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+  000a7	8b 55 a8	 mov	 edx, DWORD PTR v3$9[rbp-128]
+  000aa	ff c2		 inc	 edx
+  000ac	03 15 00 00 00
+	00		 add	 edx, DWORD PTR ?g@@3HA	; g
+  000b2	89 15 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, edx	; g
+  000b8	3b d3		 cmp	 edx, ebx
+  000ba	7c c4		 jl	 SHORT $LL12@f46
+$LN10@f46:
+
+; 1971 :         g += v3;
+; 1972 :     }
+; 1973 :     for (g = 0; g < p0; g++) {
+
+  000bc	44 89 35 00 00
+	00 00		 mov	 DWORD PTR ?g@@3HA, r14d	; g
+  000c3	85 db		 test	 ebx, ebx
+  000c5	7e 36		 jle	 SHORT $LN7@f46
+$LL9@f46:
+
+; 1974 :         S40 v4;
+; 1975 :         ext(&v4);
+
+  000c7	48 8d 4d c8	 lea	 rcx, QWORD PTR v4$14[rbp-128]
+  000cb	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1976 :         g += v4.v[0];
+
+  000d0	8b 45 c8	 mov	 eax, DWORD PTR v4$14[rbp-128]
+
+; 1977 :         ext(&v4);
+
+  000d3	48 8d 4d c8	 lea	 rcx, QWORD PTR v4$14[rbp-128]
+  000d7	01 05 00 00 00
+	00		 add	 DWORD PTR ?g@@3HA, eax	; g
+  000dd	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1978 :         short v5;
+; 1979 :         ext(&v5);
+
+  000e2	48 8d 4d a0	 lea	 rcx, QWORD PTR v5$3[rbp-128]
+  000e6	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+  000eb	8b 05 00 00 00
+	00		 mov	 eax, DWORD PTR ?g@@3HA	; g
+  000f1	ff c0		 inc	 eax
+  000f3	89 05 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, eax	; g
+  000f9	3b c3		 cmp	 eax, ebx
+  000fb	7c ca		 jl	 SHORT $LL9@f46
+$LN7@f46:
+
+; 1980 :     }
+; 1981 :     g += ext2(p1);
+
+  000fd	8b ce		 mov	 ecx, esi
+  000ff	e8 00 00 00 00	 call	 ?ext2@@YAHH@Z		; ext2
+
+; 1982 :     {
+; 1983 :         int v6;
+; 1984 :         ext(&v6);
+
+  00104	48 8d 4d a8	 lea	 rcx, QWORD PTR v6$8[rbp-128]
+  00108	01 05 00 00 00
+	00		 add	 DWORD PTR ?g@@3HA, eax	; g
+  0010e	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1985 :         int v7;
+; 1986 :         ext(&v7);
+
+  00113	48 8d 4d a0	 lea	 rcx, QWORD PTR v7$2[rbp-128]
+  00117	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1987 :         g += v7; ext(0); g += v7;
+
+  0011c	8b 45 a0	 mov	 eax, DWORD PTR v7$2[rbp-128]
+  0011f	33 c9		 xor	 ecx, ecx
+  00121	01 05 00 00 00
+	00		 add	 DWORD PTR ?g@@3HA, eax	; g
+  00127	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1988 :         g += v7;
+; 1989 :         g += v7;
+
+  0012c	8b 4d a0	 mov	 ecx, DWORD PTR v7$2[rbp-128]
+  0012f	8b c1		 mov	 eax, ecx
+  00131	03 05 00 00 00
+	00		 add	 eax, DWORD PTR ?g@@3HA	; g
+  00137	8d 04 48	 lea	 eax, DWORD PTR [rax+rcx*2]
+
+; 1990 :         S12 v8;
+; 1991 :         ext(&v8);
+
+  0013a	48 8d 4d b8	 lea	 rcx, QWORD PTR v8$11[rbp-128]
+  0013e	89 05 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, eax	; g
+  00144	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1992 :         g += v8.v[0];
+; 1993 :         g += v8.v[2];
+
+  00149	8b 4d b8	 mov	 ecx, DWORD PTR v8$11[rbp-128]
+  0014c	03 4d c0	 add	 ecx, DWORD PTR v8$11[rbp-120]
+  0014f	01 0d 00 00 00
+	00		 add	 DWORD PTR ?g@@3HA, ecx	; g
+
+; 1994 :         ext(&v8);
+
+  00155	48 8d 4d b8	 lea	 rcx, QWORD PTR v8$11[rbp-128]
+  00159	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1995 :     }
+; 1996 :     char v9;
+; 1997 :     ext(&v9);
+
+  0015e	48 8d 4d a5	 lea	 rcx, QWORD PTR v9$[rbp-128]
+  00162	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1998 :     {
+; 1999 :         char v10;
+; 2000 :         ext(&v10);
+
+  00167	48 8d 4d a4	 lea	 rcx, QWORD PTR v10$6[rbp-128]
+  0016b	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 2001 :         g += v10;
+
+  00170	0f be 4d a4	 movsx	 ecx, BYTE PTR v10$6[rbp-128]
+
+; 2002 :         g += v10;
+
+  00174	8b 05 00 00 00
+	00		 mov	 eax, DWORD PTR ?g@@3HA	; g
+  0017a	8d 0c 48	 lea	 ecx, DWORD PTR [rax+rcx*2]
+  0017d	89 0d 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, ecx	; g
+
+; 2003 :         short v11;
+; 2004 :         ext(&v11);
+
+  00183	48 8d 4d a0	 lea	 rcx, QWORD PTR v11$1[rbp-128]
+  00187	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 2005 :         g += v11;
+
+  0018c	0f bf 4d a0	 movsx	 ecx, WORD PTR v11$1[rbp-128]
+
+; 2006 :         g += v11;
+; 2007 :         g += v11;
+
+  00190	8b c1		 mov	 eax, ecx
+  00192	03 05 00 00 00
+	00		 add	 eax, DWORD PTR ?g@@3HA	; g
+  00198	8d 04 48	 lea	 eax, DWORD PTR [rax+rcx*2]
+
+; 2008 :         ext(&v11);
+
+  0019b	48 8d 4d a0	 lea	 rcx, QWORD PTR v11$1[rbp-128]
+  0019f	89 05 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, eax	; g
+  001a5	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 2009 :     }
+; 2010 :     for (g = 0; g < p0; g++) {
+
+  001aa	44 89 35 00 00
+	00 00		 mov	 DWORD PTR ?g@@3HA, r14d	; g
+  001b1	85 db		 test	 ebx, ebx
+  001b3	7e 39		 jle	 SHORT $LN4@f46
+$LL6@f46:
+
+; 2011 :         S40 v12;
+; 2012 :         ext(&v12);
+
+  001b5	48 8d 4d c8	 lea	 rcx, QWORD PTR v12$13[rbp-128]
+  001b9	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 2013 :         ext(&v12);
+
+  001be	48 8d 4d c8	 lea	 rcx, QWORD PTR v12$13[rbp-128]
+  001c2	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 2014 :         int v13;
+; 2015 :         ext(&v13);
+
+  001c7	48 8d 4d a8	 lea	 rcx, QWORD PTR v13$7[rbp-128]
+  001cb	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+  001d0	8b 4d a8	 mov	 ecx, DWORD PTR v13$7[rbp-128]
+  001d3	8b c1		 mov	 eax, ecx
+  001d5	8d 0c 4d 01 00
+	00 00		 lea	 ecx, DWORD PTR [rcx*2+1]
+  001dc	03 05 00 00 00
+	00		 add	 eax, DWORD PTR ?g@@3HA	; g
+  001e2	03 c8		 add	 ecx, eax
+  001e4	89 0d 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, ecx	; g
+  001ea	3b cb		 cmp	 ecx, ebx
+  001ec	7c c7		 jl	 SHORT $LL6@f46
+$LN4@f46:
+
+; 2016 :         g += v13;
+; 2017 :         g += v13;
+; 2018 :         g += v13;
+; 2019 :     }
+; 2020 :     for (g = 0; g < p0; g++) {
+
+  001ee	44 89 35 00 00
+	00 00		 mov	 DWORD PTR ?g@@3HA, r14d	; g
+  001f5	85 db		 test	 ebx, ebx
+  001f7	7e 25		 jle	 SHORT $LN1@f46
+  001f9	0f 1f 80 00 00
+	00 00		 npad	 7
+$LL3@f46:
+
+; 2021 :         S40 v14;
+; 2022 :         ext(&v14);
+
+  00200	48 8d 4d c8	 lea	 rcx, QWORD PTR v14$12[rbp-128]
+  00204	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+  00209	8b 55 cc	 mov	 edx, DWORD PTR v14$12[rbp-124]
+  0020c	ff c2		 inc	 edx
+  0020e	03 15 00 00 00
+	00		 add	 edx, DWORD PTR ?g@@3HA	; g
+  00214	89 15 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, edx	; g
+  0021a	3b d3		 cmp	 edx, ebx
+  0021c	7c e2		 jl	 SHORT $LL3@f46
+$LN1@f46:
+
+; 2023 :         g += v14.v[1];
+; 2024 :     }
+; 2025 :     double v15;
+; 2026 :     ext(&v15);
+
+  0021e	48 8d 4d b0	 lea	 rcx, QWORD PTR v15$[rbp-128]
+  00222	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 2027 :     gd += v15;
+; 2028 :     gd += v15;
+; 2029 :     gd += v15;
+; 2030 :     g += ext2(p2);
+
+  00227	8b cf		 mov	 ecx, edi
+  00229	f2 0f 10 45 b0	 movsdx	 xmm0, QWORD PTR v15$[rbp-128]
+  0022e	f2 0f 10 0d 00
+	00 00 00	 movsdx	 xmm1, QWORD PTR ?gd@@3NA ; gd
+  00236	f2 0f 58 c8	 addsd	 xmm1, xmm0
+  0023a	f2 0f 58 c8	 addsd	 xmm1, xmm0
+  0023e	f2 0f 58 c8	 addsd	 xmm1, xmm0
+  00242	f2 0f 11 0d 00
+	00 00 00	 movsdx	 QWORD PTR ?gd@@3NA, xmm1 ; gd
+  0024a	e8 00 00 00 00	 call	 ?ext2@@YAHH@Z		; ext2
+  0024f	8b 0d 00 00 00
+	00		 mov	 ecx, DWORD PTR ?g@@3HA	; g
+  00255	03 c8		 add	 ecx, eax
+  00257	89 0d 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, ecx	; g
+
+; 2031 :     return g;
+
+  0025d	8b c1		 mov	 eax, ecx
+
+; 2032 : }
+
+  0025f	48 8b 4d f0	 mov	 rcx, QWORD PTR __$ArrayPad$[rbp-128]
+  00263	48 33 cc	 xor	 rcx, rsp
+  00266	e8 00 00 00 00	 call	 __security_check_cookie
+  0026b	4c 8d 9c 24 80
+	00 00 00	 lea	 r11, QWORD PTR [rsp+128]
+  00273	49 8b 5b 20	 mov	 rbx, QWORD PTR [r11+32]
+  00277	49 8b 73 38	 mov	 rsi, QWORD PTR [r11+56]
+  0027b	49 8b e3	 mov	 rsp, r11
+  0027e	41 5e		 pop	 r14
+  00280	5f		 pop	 rdi
+  00281	5d		 pop	 rbp
+  00282	c3		 ret	 0
+?f46@@YAHHHH@Z ENDP					; f46

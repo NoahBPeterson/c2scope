@@ -136,6 +136,43 @@ Rule probes (tests/data/rules, rules_misc_tests; opt.md §8.1 items 5 and 6):
 | R1280 `copy_ours` vs `direct_orig` | `void* start = First(); Node* cursor = (Node*)start; while (cursor)` against the result assigned straight to `cursor` | +1: `structure` (`xor eax, eax`; `mov esi, eax`) + `structure:inline` (`jmp`) + MISSING `regalloc:callee-saved` | a kept `xor; test; je` join after an inlined `return 0` is this copy: assign to the tested variable to get the threaded form, or add the copy to keep the join. The class names no flow pass: the threading is GlobalOptimize deciding the guard on the 0 path, and the copy in the join block blocks it |
 | R1276 `f_hlive` vs `l1_rev` | guard copy-propagated to the head, head live after the loop | +0, no class (registers only) | `regmap`; spell the loop variable as the definition and the head as its copy |
 
+### 3.1 cl 17.00 x64 (`--c2 17.00`)
+
+The pipeline's names resolve by base name in the 17.00 PDB (every GlobalOptimize sub-pass of the x86 list:
+GoptCanonicalize, GoptReverseCopyProp, GdfRemoveDeadStores, GoptSingleUseCopyProp, GoptConstantFoldCompareBlk,
+HshBuildTable, GdfInsertArtificialAssigns, GdfInsertAssertions, GoptRemoveAssumes, LoptInitFunc .. LoptTermFunc,
+GdfCalcAvail, GoptLocalCopyPropagation, GoptCleanUp, GoptTermFunc). 17.00's GlobalOptimize (0x1009c270, read) adds
+passes the x86 list lacks, hooked by decorated name (`PIPE_X64`): **SsaOptimize** (the SSA optimiser: renaming with
+copy / constant propagation, partial redundancy, range checks; run before value numbering, again between the
+assertions and sweep 1, in the loop path, and from LateGlobalOptimize), **WpaRangeGlobopt** (after the second),
+**SsaOptimizeEnd**, **GoptQuickConstantFoldCompare**, **MscAvoidStoreForwardStalls**, **Vectorize** /
+**Vectorize_Finish** (whose cleanup is the function's first GoptLocalCopyPropagation, OptFuncExpr and second
+GoptCanonicalize), and outside it **MscRVOProcessFunc**, **FgDFOReorderLoopRecogEx**, **NColor**, and the
+`Schedule` / `Encode` whose base names are ambiguous in the 17.00 PDB (`MTDependencyGraph::Schedule`,
+`BinaryAnnotation::Encode`). Labels that depend on context: an SsaOptimize / SsaOptimizeEnd after
+LateGlobalOptimize is `peephole:LateGlobalOptimize`; FgDFOReorderLoopRecogEx after NColor is NColor's own
+(NColBlockInfo calls it) and labelled `regalloc:NColor`; SsaOptimizeEnd inside sweep 1 is labelled sweep 1 (the
+interval runs into the first GoptOptimizeBlock). The merge events are the 17.00 ones of c2merges (il_fg.md 7.5),
+and a load that 17.00's SizeOpt re-makes after value numbering (`a <- [p]` becomes `t <- [p]; a <- t`) takes the
+lineage of the statement that reads it, so loadcse's verdicts reach it.
+
+Probes on 17.00 (`/TP /O2`, `--allow-local`; tests/data/icount.cpp and icount17.cpp, run_tests x64_compile_tests):
+
+| probe | 17.00 |
+|---|---|
+| cse, alias, fp (icount.cpp) | 0: ours and the original have the same count on x64 (no class) |
+| kill | +2 kept:kill (the reload, R5; before the lineage fix: `made-by:lower:SizeOpt`) + the p->q load and store (structure) |
+| range | -2 folded:range-check (GoptConstantFoldCompareBlk in sweep 1) |
+| dead | -1 removed-by:GlobalOptimize/DeadStores |
+| tail | merged:FgDoLateFlowOpts (FgTryTailMerge twins) |
+| stmt | -1 structure |
+
+Per-interval tuple counts on icount17.cpp's `pre_ours` / `dom_ours` / `copy_ours` show the new intervals at work
+(SsaOptimize / SsaOptimizeEnd removing and adding tuples before value numbering, LateGlobalOptimize's SSA pass
+after allocation). Not done: a 17.00 probe whose difference is removed by SsaOptimize itself (the SSA class is
+labelled, not yet seen as a verdict), and the vectoriser (`inv_ours`: +42 instructions, mostly `made-by:loop:vectorize`
+and alignment noise).
+
 ## 4. The benchmark functions
 
 - **M&B 0x0047cfe0** (13.10.3077, 207 against 209). The difference is one run, `cmp ecx, ebp; jl` before

@@ -1,0 +1,494 @@
+{
+"build": "17.00.61030-x64",
+"func": "?f76@@YAHH@Z",
+"nstack": 7,
+"params": [
+2
+],
+"elems": {
+"2": {
+"idx": 2,
+"size": 4,
+"uses": 1,
+"param": true,
+"kind": 5,
+"fl6": 10,
+"fl7": 0,
+"key": 2,
+"name": "p0",
+"align": 4,
+"ty": 4100,
+"ssize": 4,
+"poff": 8,
+"lod": [
+1
+],
+"lodtrunc": false,
+"tnum": 3534,
+"never": false,
+"gs": 0
+},
+"0": {
+"idx": 0,
+"size": 1,
+"uses": 1,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 6,
+"name": "v3",
+"align": 1,
+"ty": 4097,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+3,
+4,
+5,
+6
+],
+"lodtrunc": false,
+"tnum": 3541,
+"never": false,
+"gs": 0
+},
+"1": {
+"idx": 1,
+"size": 4,
+"uses": 6,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 9,
+"name": "p0$GSCopy",
+"align": 3,
+"ty": 4100,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+3,
+4,
+5,
+6
+],
+"lodtrunc": false,
+"tnum": 5094,
+"never": false,
+"gs": 0
+},
+"3": {
+"idx": 3,
+"size": 8,
+"uses": 2,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 5,
+"name": "v2",
+"align": 4,
+"ty": 20488,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+3,
+4,
+5,
+6
+],
+"lodtrunc": false,
+"tnum": 3539,
+"never": false,
+"gs": 0
+},
+"4": {
+"idx": 4,
+"size": 8,
+"uses": 1,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 0,
+"key": 4,
+"name": "v1",
+"align": 4,
+"ty": 20488,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+3,
+4,
+5,
+6
+],
+"lodtrunc": false,
+"tnum": 3538,
+"never": false,
+"gs": 0
+},
+"5": {
+"idx": 5,
+"size": 32,
+"uses": 2,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 16,
+"key": 3,
+"name": "v0",
+"align": 6,
+"ty": 24608,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+3,
+4,
+5,
+6
+],
+"lodtrunc": false,
+"tnum": 3537,
+"never": false,
+"gs": 3
+},
+"6": {
+"idx": 6,
+"size": 32,
+"uses": 2,
+"param": false,
+"kind": 4,
+"fl6": 130,
+"fl7": 16,
+"key": 7,
+"name": "v4",
+"align": 6,
+"ty": 24608,
+"ssize": null,
+"poff": null,
+"lod": [
+0,
+1,
+3,
+4,
+5,
+6
+],
+"lodtrunc": false,
+"tnum": 3542,
+"never": false,
+"gs": 3
+}
+},
+"fn": {
+"npc": 0,
+"ebp": 0,
+"nparams": 1,
+"gs": true,
+"gscopies": true,
+"alloc": 0,
+"cap": 32,
+"dalign": null,
+"ebpadj": 0,
+"v13": false,
+"T": 128,
+"ncol": 7,
+"tround": 16,
+"undo": false,
+"up": true,
+"palign": true,
+"capdef": 16,
+"argarea": true,
+"frame": {
+"A": 272,
+"F": 416,
+"pushed": 40,
+"B": 240,
+"lrsp": false,
+"prsp": false,
+"dyn": 1,
+"cap": 32,
+"alloca": true,
+"Fend": 416
+}
+},
+"obs": {
+"run": [
+{
+"idx": 0,
+"tries": [],
+"res": [
+"c",
+1
+],
+"ncol": 1
+},
+{
+"idx": 1,
+"tries": [
+[
+"c",
+1,
+1
+]
+],
+"res": [
+"c",
+2
+],
+"ncol": 2
+},
+{
+"idx": 3,
+"tries": [
+[
+"c",
+2,
+4
+],
+[
+"c",
+1,
+1
+]
+],
+"res": [
+"c",
+3
+],
+"ncol": 3
+},
+{
+"idx": 4,
+"tries": [
+[
+"c",
+3,
+8
+],
+[
+"c",
+2,
+4
+],
+[
+"c",
+1,
+1
+]
+],
+"res": [
+"c",
+4
+],
+"ncol": 4
+},
+{
+"idx": 5,
+"tries": [
+[
+"c",
+4,
+8
+],
+[
+"c",
+3,
+8
+],
+[
+"c",
+2,
+4
+],
+[
+"c",
+1,
+1
+]
+],
+"res": [
+"c",
+5
+],
+"ncol": 5
+},
+{
+"idx": 6,
+"tries": [
+[
+"c",
+5,
+32
+],
+[
+"c",
+4,
+8
+],
+[
+"c",
+3,
+8
+],
+[
+"c",
+2,
+4
+],
+[
+"c",
+1,
+1
+]
+],
+"res": [
+"c",
+6
+],
+"ncol": 6
+}
+],
+"undo": false,
+"cols": [
+{
+"c": 0,
+"base": 8,
+"members": [
+[
+2,
+8
+]
+]
+},
+{
+"c": 1,
+"base": 0,
+"members": [
+[
+1,
+0
+]
+]
+},
+{
+"c": 2,
+"base": 4,
+"members": [
+[
+0,
+4
+]
+]
+},
+{
+"c": 3,
+"base": 8,
+"members": [
+[
+3,
+8
+]
+]
+},
+{
+"c": 4,
+"base": 16,
+"members": [
+[
+4,
+16
+]
+]
+},
+{
+"c": 5,
+"base": 32,
+"members": [
+[
+5,
+32
+]
+]
+},
+{
+"c": 6,
+"base": 64,
+"members": [
+[
+6,
+64
+]
+]
+}
+],
+"done": {
+"T": 128,
+"npc": 0,
+"ebp": null,
+"joins": null
+}
+},
+"listing": {
+"2": {
+"lname": "p0$",
+"loff": 224,
+"lsize": null,
+"lrefs": 0,
+"line": null
+},
+"0": {
+"lname": "v3$",
+"loff": 36,
+"lsize": null,
+"lrefs": 1,
+"line": 1109
+},
+"1": {
+"lname": "p0$GSCopy$",
+"loff": 32,
+"lsize": null,
+"lrefs": 6,
+"line": 1099
+},
+"3": {
+"lname": "v2$",
+"loff": 40,
+"lsize": null,
+"lrefs": 2,
+"line": 1106
+},
+"4": {
+"lname": "v1$",
+"loff": 48,
+"lsize": null,
+"lrefs": 1,
+"line": 1104
+},
+"5": {
+"lname": "v0$",
+"loff": 64,
+"lsize": null,
+"lrefs": 2,
+"line": 1101
+},
+"6": {
+"lname": "v4$",
+"loff": 96,
+"lsize": null,
+"lrefs": 2,
+"line": 1111
+}
+}
+}

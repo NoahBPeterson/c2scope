@@ -64,6 +64,25 @@ Color RewriteAsReal RegSimpleAssign RegSimpleAssignBody Riscify MdmAvoidMOBStall
 FgDoLateFlowOpts LoFinalLower LateGlobalOptimize LoFinishFinalLower FgCodeMotion FgCoalesceLabels MscClean Schedule
 MdmSuperHack FgLowerSwitches MdmEnsureNotEndInCall EncEmitFunc Encode""".split()
 FINE = ["GoptOptimizeBlock", "GoptOptimizeLoop"]
+# cl 17.00 x64 (docs/c2/icount.md, 17.00): names the x86 pipeline lacks, or whose base name is ambiguous there,
+# by decorated name. GlobalOptimize runs the SSA optimiser (SsaOptimize) before value numbering and again between
+# the assertions and sweep 1 (then WpaRangeGlobopt), GoptQuickConstantFoldCompare in place of 14.00's compare pass,
+# and the vectoriser's cleanup (Vectorize_Finish: local copy propagation, OptFuncExpr, canonicalisation); allocation
+# is NColor (which runs FgDFOReorderLoopRecogEx again from NColBlockInfo).
+PIPE_X64 = [
+    ("MscRVOProcessFunc", "?MscRVOProcessFunc@@YIXPAUtagFUNC@@@Z"),
+    ("FgDFOReorderLoopRecogEx", "?FgDFOReorderLoopRecogEx@@YIXPAUtagFUNC@@HH@Z"),
+    ("SsaOptimize", "?SsaOptimize@@YIXPAUtagFUNC@@HHHHHH@Z"),
+    ("WpaRangeGlobopt", "?WpaRangeGlobopt@@YIXPAUtagFUNC@@@Z"),
+    ("SsaOptimizeEnd", "?SsaOptimizeEnd@@YIXPAUtagFUNC@@@Z"),
+    ("Vectorize", "?Vectorize@@YIXPAUtagFUNC@@@Z"),
+    ("Vectorize_Finish", "?Vectorize_Finish@@YIXPAUtagFUNC@@@Z"),
+    ("MscAvoidStoreForwardStalls", "?MscAvoidStoreForwardStalls@@YI_NPAUtagFUNC@@@Z"),
+    ("GoptQuickConstantFoldCompare", "?GoptQuickConstantFoldCompare@@YIXPAUtagFUNC@@@Z"),
+    ("NColor", "?NColor@@YIXPAUtagFUNC@@@Z"),
+    ("Schedule", "?Schedule@@YIXPAUtagFUNC@@H@Z"),
+    ("Encode", "?Encode@@YIXPAUtagFUNC@@@Z"),
+]
 
 # interval label of a snapshot's pass: (verdict class, what runs from this pass's entry to the next snapshot)
 INTERVAL = {
@@ -141,6 +160,22 @@ INTERVAL = {
     "EncEmitFunc": ("lower:EncEmitFunc", "EncEmitFunc (late intrinsics, EH funclets, branch lengthening)"),
     "Encode": ("final", "Encode"),
     "GoptOptimizeBlock": ("removed-by:GlobalOptimize/sweep", "GoptOptimizeBlock of one block"),
+    # 17.00 x64 (PIPE_X64)
+    "MscRVOProcessFunc": ("front", "MscRVOProcessFunc / EH canonicalisation (reader IL)"),
+    "FgDFOReorderLoopRecogEx": ("loop:rotation", "FgDFOReorderLoopRecogEx (loop recognition and rotation: the guard "
+                                                 "test is duplicated)"),
+    "SsaOptimize": ("removed-by:GlobalOptimize/SSA", "SsaOptimize (the SSA optimiser: renaming with copy and constant "
+                    "propagation, partial redundancy (SsaPartiallyAvailable), range checks, aliased rewrite)"),
+    "WpaRangeGlobopt": ("folded:range-check", "WpaRangeGlobopt (compares decided from value ranges)"),
+    "SsaOptimizeEnd": ("removed-by:GlobalOptimize/SSA", "SsaOptimizeEnd (out of SSA)"),
+    "Vectorize": ("loop:vectorize", "Vectorize (the loop vectoriser)"),
+    "Vectorize_Finish": ("loop:vectorize", "Vectorize_Finish (local copy propagation, OptFuncExpr, canonicalisation "
+                                           "after the vectoriser's pass)"),
+    "MscAvoidStoreForwardStalls": ("lower:MscAvoidStoreForwardStalls", "MscAvoidStoreForwardStalls, then the "
+                                   "second dead-store and single-use copy propagation round"),
+    "GoptQuickConstantFoldCompare": ("folded:compare", "GoptQuickConstantFoldCompare (branches with a known outcome, "
+                                                       "before value numbering), dead stores"),
+    "NColor": ("regalloc:NColor", "NColor (x64 allocation: candidates, regions, spill code, rewrite to registers)"),
     "GoptOptimizeLoop": ("loop:invariant", "GoptOptimizeLoop of one loop (invariant code motion, LoptOptimizeLoop)"),
 }
 # what removes an instruction of a kind (EXTRA: which of these ran after the tuple was born and kept it)
@@ -181,6 +216,26 @@ def resolve(img, names):
     return out
 
 
+def resolve_x64(img, passes):
+    """passes + PIPE_X64 (exact decorated names; snapshots are ordered by the log, not by this list)."""
+    seen = {va for _, va, _ in passes}
+    out = list(passes)
+    # a function the build table names is indexed under its table key (`@Encode@4`), not its PDB name
+    keyof = {v[3]: k for k, v in (c2build.get("functions") or {}).items() if len(v) > 3}
+    for n, sym in PIPE_X64:
+        r = img.by_sym.get(sym) or img.by_sym.get(keyof.get(sym, ""))
+        if r is None or r["va"] in seen:
+            continue
+        try:
+            c2trace.steal_len(img, r["va"])
+            c2trace.parse_hook(img, "%x" % r["va"])
+        except SystemExit:
+            continue
+        seen.add(r["va"])
+        out.append((n, r["va"], sym))
+    return out
+
+
 def il_spec():
     return c2il.SPEC
 
@@ -191,6 +246,8 @@ def run(src, func, cl, fine=False, keep=None):
     img = Image("c2")
     names = PIPE + (FINE if fine else [])
     passes = resolve(img, names)
+    if c2build.get("arch") == "x64":
+        passes = resolve_x64(img, passes)
     spec = il_spec()
     # the late flow optimiser's own events first (tools/c2merges.py: which tuples a merge matched), hook ids
     # 0..len(KEYS)-1; its FgDoLateFlowOptsOnce and Encode hooks dump the IL and double as snapshots
@@ -199,7 +256,7 @@ def run(src, func, cl, fine=False, keep=None):
         mh = dict(c2merges.BUILDS[c2build.name()])
         mh["once"] = mh["once"] + spec
         enc = next((va for n, va, _ in passes if n == "Encode"), None)
-        mh["final"] = ("%x" % enc + spec) if enc else c2scratch.HOOKS[3]
+        mh["final"] = ("%x" % enc + spec) if enc else c2merges.hooks_for(c2build.name())[c2merges.KEYS.index("final")]
         mtexts = [mh[k] for k in c2merges.KEYS]
         taken = set()
         for t in mtexts:
@@ -244,6 +301,8 @@ def run(src, func, cl, fine=False, keep=None):
                 if keep_t:
                     sub.append(ln)
             elif ln.startswith("T ") and keep_t:
+                sub.append(ln)
+            elif ln.startswith("# thread "):         # cl 17.00's worker threads: c2merges.parse demuxes by them
                 sub.append(ln)
         try:
             merges = [g for g in c2merges.parse("\n".join(sub), hk[:nm]) if c2trace.func_match(func, g["name"])]
@@ -749,12 +808,19 @@ class Analysis:
         s = self.snaps[k]
         cls, desc = INTERVAL.get(s.name, ("?", s.name))
         ph = self.gopt_phase(k)
-        if s.name in ("GoptOptimizeBlock", "GoptConstantFoldCompareBlk", "FgCoalesceLabels", "GdfCalcAvail",
-                      "GdfInsertAssertions", "GdfInsertArtificialAssigns", "GoptRemoveAssumes") and \
+        if s.name in ("SsaOptimize", "SsaOptimizeEnd") and ph is None and \
+                next((x.name for x in reversed(self.snaps[:k]) if x.name in ("GlobalOptimize", "LateGlobalOptimize")),
+                     None) == "LateGlobalOptimize":       # 17.00: LateGlobalOptimize runs the SSA optimiser too
+            cls, desc = "peephole:LateGlobalOptimize", "LateGlobalOptimize (its SSA pass: %s)" % s.name
+        elif s.name == "FgDFOReorderLoopRecogEx" and any(x.name == "NColor" for x in self.snaps[:k]):
+            cls, desc = "regalloc:NColor", "NColor (from its loop recognition in NColBlockInfo on)"
+        elif s.name in ("GoptOptimizeBlock", "GoptConstantFoldCompareBlk", "FgCoalesceLabels", "GdfCalcAvail",
+                        "GdfInsertAssertions", "GdfInsertArtificialAssigns", "GoptRemoveAssumes", "SsaOptimizeEnd") and \
                 ph in ("sweep1", "sweep2"):
             if ph == "sweep1":
                 cls = "removed-by:GlobalOptimize/sweep1"
-                desc = ("GlobalOptimize sweep 1 (GoptOptimizeBlock per block: copy and constant propagation, constant "
+                desc = ("SsaOptimizeEnd (out of SSA), then " if s.name == "SsaOptimizeEnd" else "") + (
+                        "GlobalOptimize sweep 1 (GoptOptimizeBlock per block: copy and constant propagation, constant "
                         "and branch folding, compares decided by dominating tests (assertions); CSE off)")
             else:
                 cls = "removed-by:GlobalOptimize/CSE"
@@ -905,6 +971,10 @@ class Analysis:
         initialisation `_a <- t130` whose load is `t130 <- [_p+0]` until GoptCleanUp folds it back)"""
         out = {t}
         v = next((x for x in self.snaps if x.name == "GdfInsertArtificialAssigns"), None)
+        if v is not None and t not in v.by_tup and c2build.get("arch") == "x64":
+            for u in self._split_from(t, v):          # 17.00: a load re-made after V (SizeOpt: `a <- [p]` becomes
+                out |= self.ancestors(u)              # `t137 <- [p]; a <- t137`): the lineage of its consumer
+            return out
         if v is None or t not in v.by_tup:
             return out
         st = v.stage()
@@ -916,6 +986,19 @@ class Analysis:
             if d is not None and d.op == "OPLOAD":
                 out.add(d.tup)
         return out
+
+    def _split_from(self, t, v):
+        """Tuples present at V that read t's destination in the first snapshot after V that has t (t a load split off
+        a V-stage tuple later: its reader is the original statement)"""
+        s0 = next((x for x in self.snaps[v.idx + 1:] if t in x.by_tup), None)
+        if s0 is None:
+            return []
+        i = s0.by_tup[t]
+        if not i["dsts"] or i["dsts"][0].startswith("["):
+            return []
+        d = loadcse.leaf_name(i["dsts"][0])
+        return [j["tup"] for j in s0.ins if j["tup"] != t and j["tup"] in v.by_tup and
+                any(not x.startswith("[") and loadcse.leaf_name(x) == d for x in j["srcs"])]
 
     # -- missing
     def anchors(self, run, snap, n=2):

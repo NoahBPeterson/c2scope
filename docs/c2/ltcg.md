@@ -54,6 +54,17 @@ wrapper always compiles and links locally: it sets `C2TRACE_REMOTE=0` and disabl
 a traced compile sent to the remote compile server is one ordinary object compile, which bypasses the /GL + /LTCG
 step (the listing is then cl's own and the code is not the LTCG code).
 
+**cl 17.00 x64** (`--c2 17.00`). `il`, `raw` and `asm` run as on x86 (link /LTCG needs `msobj110.dll`, staged
+from `Common7/IDE`; port-1700.md 7). `regs` and `scratch` go to **c2ncol.py** (NColor, docs/c2/ncolor.md): x64
+has one allocator for every register, so both print NColor's per-candidate report (`--func F`, required; `--why`
+adds the priority terms), traced inside link.exe. c2ncol's own `--export` is not reachable through the wrapper
+(`--export` names the DLL's exports). `regmap` is not routed (it refuses on x64 and points at c2ncol). Checked
+**[C]** on tests/data/ltcg_a.c + ltcg_b.c (`helper`: s r9d, t r10d, a rcx, the loop counter r11, k r8d, n edx: the
+image listing's registers) and on ltcg_kill_a.c + ltcg_kill_b.c: in `c_eax` a, b, p stay in edx, r8d, r9 across
+the call (k_eax was compiled first and writes only rax: a callee of the unit compiled before clobbers only what it uses, ncolor.md),
+in `c_std` (k_std is exported) and `c_ext` (k_ext calls a function without a body) they are in esi, edi, rbx.
+k_eax still takes its argument in ecx: no custom argument convention on x64 (run_tests x64_compile_tests).
+
 ## 2. Custom calling conventions **[C]**
 
 ### 2.1 Which functions get one
@@ -296,6 +307,9 @@ Original bytes from `spore-decomp/work/SporeApp.analysis.bin`. Flags `/O2 /MD /G
 | dead parameters | removed | removed | removed |
 | constant arguments folded into the callee (WPA) | **no** | yes | yes |
 
+cl 17.00 x64: no custom conventions, an exported callee's kill set unused, dead parameters and WPA as 14.00, the
+Win64 kill sets; `ltcgstub.py` works on x64 images (section 12).
+
 ## 9. Workflow for a decompiler agent (an LTCG caller)
 
 1. `ltcgstub.py callees EXE VA`: the calls, what the caller keeps across each (`keeps edx`), and each callee's
@@ -417,3 +431,43 @@ with `ret` (IDA's meaning: the caller cleans; the README's examples say the oppo
 generated as for `__fastcall` and does not pop either (`int __usercall __ebx f(int a, int b)` called with b on the
 stack: `push; call f` and no `add esp, 4`; the same in the published binaries, master and the branch).
 `__userpurge` (`ret N`) is consistent.
+
+## 12. cl 17.00 x64 (VS2012, `--c2 17.00`) and `ltcgstub.py` on x64 images **[C]**
+
+Probes (2026-11-22): tests/data/ltcg17_a.cpp + ltcg17_b.cpp (the regression test `ltcgstub17_tests`),
+tests/data/ltcg_kill_a.c + ltcg_kill_b.c, and two in the session scratch (`lp/`: dead / constant / stack / double
+parameters and kill sets of div, shl, loops, SSE; `ks/`: stub bodies), each built with
+`uv run tools/c2ltcg.py --c2 17.00 asm a --with b --out DIR` (link /LTCG works on 17.00: section 1, port-1700.md).
+
+| fact (section 0) | 13.10 / 14.00 / 15.00 | 17.00 x64 | evidence |
+|---|---|---|---|
+| memory summary | yes | yes (calleesum's Win64 summaries) | — |
+| kill set of a callee | the volatile registers its code writes (eax ecx edx, xmm0-7) | the same rule on **rax rcx rdx r8 r9 r10 r11, xmm0-5**: `cdiv` keeps a, b, c in r11, r10, r9 across `fdiv` (writes rax rdx r8), `cshl` keeps r8..r11 across `fshl` (rax rcx), `cd` keeps x in **xmm2** across `fd` (xmm0 xmm1); a callee writing all of them (`fx`) makes the caller use rbx/rsi/rdi | lp, ltcg17 |
+| exported callee | keeps its recorded set (p8 `e2`) | **all volatile killed**: `c_std` keeps a, b, p in rbx, rsi, rdi across `k_std` (writes only rax), `c_eax` keeps them in r8, rdx, r9 across the identical unexported `k_eax` | ltcg_kill |
+| custom convention | MdmFlexParams (register arguments in the entry block's registers) | **none**: arguments stay in rcx rdx r8 r9 / xmm0-3 in declaration order (`f13(a, b)` reading b first still takes a in rcx), the 5th and 6th stay at [rsp+0x28] / [rsp+0x30] (`f2`); `k_eax` takes a in rcx. 17.00's c2.dll has no MdmFlexParams / MscAllowCallingConventionChange (PDB names), while MscSetDeadParamMap, WpaGenConstParamInfoUse, MscCollectUsedRegs, MscRecordInterProcRegInfo, LoAddCallScratchRegs and LtcgMarkExtRefSyms exist | lp, `work/index/17.00.61030-x64` |
+| dead parameters | removed at callers | removed: `c12(x, y)` is `jmp f12` with y in edx and no `x * 3` (the register of the dead first parameter is simply not loaded) | lp |
+| constant arguments (WPA) | 14.00 / 15.00 | yes: `kc(x, 5)` from every caller becomes `kc` computing `a * 5`, the callers pass only ecx; `kv` (5 and 7) keeps edx | lp |
+
+**`ltcgstub.py` on x64 images** (the build table's `arch` no longer makes it refuse; the image's PE32+ header picks
+the x64 path): `facts` / `callees` decode 64-bit, take function extents from .pdata (a `jmp` past the next .pdata
+start is a tail jump; leaf functions have none), follow `jmp reg` jump tables (`mov r32, [base + idx*4 + rva]`,
+RVAs), and report the Win64 kill set and entry registers (`conv win64`; a direct call or tail jump counts as reading
+the argument registers its target reads, and writes only the target's kill set, so `cxm` reads y in xmm2 at entry;
+`or r, -1` is not a read). `stub` / `stubs` keep every parameter the original reads (calleesum's `quick64`: dead
+parameters stay unused, so callers drop them as for the original), do not export (an exported stub would make its
+callers assume every volatile register killed; `--std` / `std` does it on purpose), and make the kill set from
+values live at the same time: n ints read from a volatile array and stored back take the first n free registers of
+rax rcx rdx r8 r9 r10 r11 (measured with `ks/`: 1..6 values → rax; rax,rcx; ... rax..r10; with x, y held in rcx,
+rdx: rax, r8), n doubles xmm0, xmm1 ... A parameter whose register the original overwrites is stored first (its
+register is then free), the others last (their registers stay taken). `cmp` masks rip-relative displacements and
+RVA jump-table runs. --regs / custom conventions do not apply on x64.
+
+Validation (ltcg17, the regression test): the callees' facts are as listed above; stubs generated from the image
+for the 7 callees, with the callers rebuilt against them: `cdiv`, `cx`, `cxm`, `ck1` (and in `lp/` also `cshl`,
+`ck2`, `c2`, `c13`, `c12`) **byte-exact** (relocations masked); `cmp --check-stubs`: 5 of 7 stubs have the
+original's kill set and entry registers. The two that differ are the scheme's limits: `f12` (original rax, rdx;
+the stub rax, rcx, rdx: registers are taken in order, so rdx cannot be written without rcx when no parameter holds
+rcx) and `fxmm` (calleesum's pointer reads add rcx, r10). In `lp/` `fd` (xmm0, xmm1) gets xmm0 only or xmm0..2: the
+double result's `xorps xmm0, xmm0` is scheduled before or after the kill block depending on its size, so its caller
+`cd` (keeps x in xmm2) is the one caller that differs (regdiff 4). Not done on x64: stubs for members with hidden
+return buffers, stack-parameter reads beyond calleesum's count, xmm6-15 (callee-saved, never in a kill set).

@@ -1,0 +1,2112 @@
+# c2trace base 7aa40000 hooks 13
+E 0 0 0 0 8b5a40 0 0 104fef4 843cd0 8b5a40 104feac | 0 "f2fwd"
+E 1 0 1 104fe68 8b5a40 0 8b5a40 104fea8 1 0 104fe00 | "f2fwd" IL
+T B 8e92b0
+T I 8b6b58 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e84a8 mov 1 0 | rcx=p$1:1008 <- rcx=t65:1008
+T I 8e8408 mov 1 0 | rcx=t64:1008 <- rcx=p$1:1008
+T I 8e82e8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t64:1008 pas7:8000 rsp:1008
+T I 8eab70 add 1 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8eac10 _eret 1 0 | cc:9000 <- 0:1004
+T B 0
+# thread 1
+E 2 0 0 0 8cd6f0 0 0 124fef4 86bd40 8cd6f0 124feac | 0 "c2"
+E 3 0 1 124fe68 8cd6f0 0 8cd6f0 124fea8 1 0 124fe00 | "c2" IL
+T B 1354080
+T I 1351f68 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e5798 mov 1 0 | ecx=x$1:1004 <- ecx=t138:1004
+T I 8e4ba0 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8e4c20 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8e4da8 mov 1 0 | w1:1004 <- 11:1004
+T I 1351e38 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e4e60 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8e4fd0 mov 1 0 | rcx=t65:1008 <- gv:1008
+T I 8e4ed0 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t65:1008 pas7:8000 rsp:1008
+T I 8e50b8 mov 1 0 | b1:1001 <- 21:1001
+T I 8e5168 jmp 1 0 | <- s0:0 ->
+T L 8e4be0
+T I 8e5290 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8e5310 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8e5498 mov 1 0 | w2:1004 <- 11:1004
+T I 135b520 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e5538 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8e5658 mov 1 0 | rcx=t67:1008 <- gv:1008
+T I 8e55a8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas7:8000 rsp:1008
+T I 8e5728 mov 1 0 | b1:1001 <- 21:1001
+T I 8e57d8 jmp 1 0 | <- s0:0 ->
+T L 8e52d0
+T I 8e1f18 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8e1f98 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8e2108 mov 2 0 | w3:1004 <- 11:1004
+T I 1370478 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 8e21a8 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 8e22c8 mov 2 0 | rcx=t69:1008 <- gv:1008
+T I 8e2218 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 8e2398 mov 2 0 | b1:1001 <- 21:1001
+T I 8e2448 jmp 2 0 | <- s0:0 ->
+T L 8e1f58
+T I 8e2558 mov 2 0 | w4:1004 <- 9:1004
+T L 8e2408
+T I 8e2678 mov 2 0 | ecx=t70:1004 <- 0:1004
+T I 8e25c8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 8e27f8 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 8e2748 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 8e28b0 mov 2 0 | v1:1004 <- 3:1004
+T I 8e2950 mov 2 0 | w1:1004 <- 4:1004
+T I 8e2a70 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 8e29c0 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 1370398 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8e2b10 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+# thread 2
+E 4 0 0 0 8d1710 0 0 134fef4 8805f0 8d1710 134feac | 0 "r1"
+E 5 0 1 134fe68 8d1710 0 8d1710 134fea8 1 0 134fe00 | "r1" IL
+T B 8e0490
+T I 1368438 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8eb2f8 mov 1 0 | ecx=x$1:1004 <- ecx=t151:1004
+T I 8d8dc8 mov 1 0 | a:1004 <- ecx=x$1:1004
+T I 8d8e98 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8d8f18 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8d90a0 mov 1 0 | w1:1004 <- 11:1004
+T I 135e0c8 mov 1 0 | eax=t153:1004 <- 7:1004
+T I 8d9158 mov 1 0 | s1:1002 <- ax=t152:1002
+T I 8d92b0 lea 1 0 | rcx=t65:1008 <- a:1008
+T I 8d91c8 call 1 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t65:1008 pas10:8000 rsp:1008
+T I 8d9398 mov 1 0 | b1:1001 <- 21:1001
+T I 8d9448 jmp 1 0 | <- s0:0 ->
+T L 8d8ed8
+T I 8d9570 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8d95f0 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8d9778 mov 1 0 | w2:1004 <- 11:1004
+T I 1368fa0 mov 1 0 | eax=t153:1004 <- 7:1004
+T I 8d9818 mov 1 0 | s1:1002 <- ax=t152:1002
+T I 8d9938 lea 1 0 | rcx=t67:1008 <- a:1008
+T I 8d9888 call 1 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas10:8000 rsp:1008
+T I 8eb288 mov 1 0 | b1:1001 <- 21:1001
+T I 8eb338 jmp 1 0 | <- s0:0 ->
+T L 8d95b0
+T I 8eb460 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8eb4e0 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8eb650 mov 2 0 | w3:1004 <- 11:1004
+T I 1368638 mov 2 0 | eax=t153:1004 <- 7:1004
+T I 8eb6f0 mov 2 0 | s1:1002 <- ax=t152:1002
+T I 8eb810 lea 2 0 | rcx=t69:1008 <- a:1008
+T I 8eb760 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas10:8000 rsp:1008
+T I 8eb8e0 mov 2 0 | b1:1001 <- 21:1001
+T I 8eb990 jmp 2 0 | <- s0:0 ->
+T L 8eb4a0
+T I 8ebaa0 mov 2 0 | w4:1004 <- 9:1004
+T L 8eb950
+T I 8ebbc0 mov 2 0 | ecx=t70:1004 <- a:1004
+T I 8ebb10 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas10:8000 rsp:1008
+T I 8ebd10 mov 2 0 | ecx=t71:1004 <- 0:1004
+T I 8ebc90 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas10:8000 rsp:1008
+T I 8ebe90 mov 2 0 | ecx=t72:1004 <- w4:1004
+T I 8ebde0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas10:8000 rsp:1008
+T I 8ebf48 mov 2 0 | v1:1004 <- 3:1004
+T I 8ebfe8 mov 2 0 | w1:1004 <- 4:1004
+T I 8ec108 mov 2 0 | ecx=t73:1004 <- 2:1004
+T I 8ec058 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t73:1004 pas10:8000 rsp:1008
+T I 8ec1a8 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 1368308 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+# thread 3
+E 6 0 0 0 8b2a28 0 0 114fef4 857818 8b2a28 114feac | 0 "c1"
+E 7 0 1 114fe68 8b2a28 0 8b2a28 114fea8 1 0 114fe00 | "c1" IL
+T B 8dea90
+T I 8dc978 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8db970 mov 1 0 | ecx=x$1:1004 <- ecx=t138:1004
+T I 8dad78 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8dadf8 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8daf80 mov 1 0 | w1:1004 <- 11:1004
+T I 8dc848 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8db038 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8db1a8 mov 1 0 | rcx=t65:1008 <- gv:1008
+T I 8db0a8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t65:1008 pas7:8000 rsp:1008
+T I 8db290 mov 1 0 | b1:1001 <- 21:1001
+T I 8db340 jmp 1 0 | <- s0:0 ->
+T L 8dadb8
+T I 8db468 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8db4e8 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8db670 mov 1 0 | w2:1004 <- 11:1004
+T I 1361550 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8db710 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8db830 mov 1 0 | rcx=t67:1008 <- gv:1008
+T I 8db780 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas7:8000 rsp:1008
+T I 8db900 mov 1 0 | b1:1001 <- 21:1001
+T I 8db9b0 jmp 1 0 | <- s0:0 ->
+T L 8db4a8
+T I 8e5928 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8e59a8 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8e5b18 mov 2 0 | w3:1004 <- 11:1004
+T I 1369440 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 8e5bb8 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 8e5cd8 mov 2 0 | rcx=t69:1008 <- gv:1008
+T I 8e5c28 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 8e5da8 mov 2 0 | b1:1001 <- 21:1001
+T I 8e5e58 jmp 2 0 | <- s0:0 ->
+T L 8e5968
+T I 8e5f68 mov 2 0 | w4:1004 <- 9:1004
+T L 8e5e18
+T I 8e6088 mov 2 0 | ecx=t70:1004 <- 0:1004
+T I 8e5fd8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 8e6208 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 8e6158 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 8e62c0 mov 2 0 | v1:1004 <- 3:1004
+T I 8e6360 mov 2 0 | w1:1004 <- 4:1004
+T I 8e6480 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 8e63d0 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 1369360 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8e6520 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+# thread 0
+E 8 0 0 842b60 8b5a40 2 0 104fef4 843cd0 8b5a40 104feac | 2 "f2fwd"
+E 9 0 1 104fe68 8b5a40 2 8b5a40 104fea8 1 0 104fe00 | "f2fwd" IL
+T B 13620f0
+T I 8b6b58 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e82e8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t64:1008 pas7:8000 rsp:1008
+T I 8eab70 add 1 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8eac10 _eret 1 0 | cc:9000 <- 0:1004
+T B 0
+# thread 3
+E 10 0 0 8566a8 8b2a28 2 0 114fef4 857818 8b2a28 114feac | 2 "c1"
+E 11 0 1 114fe68 8b2a28 2 8b2a28 114fea8 1 0 114fe00 | "c1" IL
+T B 137f1d8
+T I 8dc978 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8dad78 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8dadf8 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8daf80 mov 1 0 | w1:1004 <- 11:1004
+T I 8dc848 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8db038 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8db1a8 lea 1 0 | rcx=t65:1008 <- gv:1008
+T I 8db0a8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t65:1008 pas7:8000 rsp:1008
+T I 8db290 mov 1 0 | b1:1001 <- 21:1001
+T I 8db340 jmp 1 0 | <- s0:0 ->
+T L 8dadb8
+T I 8db468 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8db4e8 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8db670 mov 1 0 | w2:1004 <- 11:1004
+T I 1361550 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8db710 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8db830 lea 1 0 | rcx=t67:1008 <- gv:1008
+T I 8db780 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas7:8000 rsp:1008
+T I 8db900 mov 1 0 | b1:1001 <- 21:1001
+T I 8db9b0 jmp 1 0 | <- s0:0 ->
+T L 8db4a8
+T I 8e5928 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8e59a8 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8e5b18 mov 2 0 | w3:1004 <- 11:1004
+T I 1369440 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 8e5bb8 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 8e5cd8 lea 2 0 | rcx=t69:1008 <- gv:1008
+T I 8e5c28 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 8e5da8 mov 2 0 | b1:1001 <- 21:1001
+T I 8e5e58 jmp 2 0 | <- s0:0 ->
+T L 8e5968
+T I 8e5f68 mov 2 0 | w4:1004 <- 9:1004
+T L 8e5e18
+T I 8e6088 xor 2 0 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 8e5fd8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 8e6208 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 8e6158 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 8e62c0 mov 2 0 | v1:1004 <- 3:1004
+T I 8e6360 mov 2 0 | w1:1004 <- 4:1004
+T I 8e6480 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 8e63d0 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 1369360 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8e6520 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+# thread 2
+E 12 0 0 87f088 8d1710 2 0 134fef4 8805f0 8d1710 134feac | 2 "r1"
+E 13 0 1 134fe68 8d1710 2 8d1710 134fea8 1 0 134fe00 | "r1" IL
+T B 137c1c0
+T I 1368438 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8d8dc8 mov 1 0 | a:1004 <- ecx=x$1:1004
+T I 8d8e98 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8d8f18 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8d90a0 mov 1 0 | w1:1004 <- 11:1004
+T I 135e0c8 mov 1 0 | eax=t153:1004 <- 7:1004
+T I 8d9158 mov 1 0 | s1:1002 <- ax=t152:1002
+T I 8d92b0 lea 1 0 | rcx=t65:1008 <- a:1008
+T I 8d91c8 call 1 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t65:1008 pas10:8000 rsp:1008
+T I 8d9398 mov 1 0 | b1:1001 <- 21:1001
+T I 8d9448 jmp 1 0 | <- s0:0 ->
+T L 8d8ed8
+T I 8d9570 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8d95f0 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8d9778 mov 1 0 | w2:1004 <- 11:1004
+T I 1368fa0 mov 1 0 | eax=t153:1004 <- 7:1004
+T I 8d9818 mov 1 0 | s1:1002 <- ax=t152:1002
+T I 8d9938 lea 1 0 | rcx=t67:1008 <- a:1008
+T I 8d9888 call 1 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas10:8000 rsp:1008
+T I 8eb288 mov 1 0 | b1:1001 <- 21:1001
+T I 8eb338 jmp 1 0 | <- s0:0 ->
+T L 8d95b0
+T I 8eb460 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8eb4e0 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8eb650 mov 2 0 | w3:1004 <- 11:1004
+T I 1368638 mov 2 0 | eax=t153:1004 <- 7:1004
+T I 8eb6f0 mov 2 0 | s1:1002 <- ax=t152:1002
+T I 8eb810 lea 2 0 | rcx=t69:1008 <- a:1008
+T I 8eb760 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas10:8000 rsp:1008
+T I 8eb8e0 mov 2 0 | b1:1001 <- 21:1001
+T I 8eb990 jmp 2 0 | <- s0:0 ->
+T L 8eb4a0
+T I 8ebaa0 mov 2 0 | w4:1004 <- 9:1004
+T L 8eb950
+T I 8ebbc0 mov 2 0 | ecx=t70:1004 <- a:1004
+T I 8ebb10 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas10:8000 rsp:1008
+T I 8ebd10 xor 2 0 | ecx=t71:1004 cc:9000 <- ecx=t71:1004 ecx=t71:1004
+T I 8ebc90 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas10:8000 rsp:1008
+T I 8ebe90 mov 2 0 | ecx=t72:1004 <- w4:1004
+T I 8ebde0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas10:8000 rsp:1008
+T I 8ebf48 mov 2 0 | v1:1004 <- 3:1004
+T I 8ebfe8 mov 2 0 | w1:1004 <- 4:1004
+T I 8ec108 mov 2 0 | ecx=t73:1004 <- 2:1004
+T I 8ec058 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t73:1004 pas10:8000 rsp:1008
+T I 8ec1a8 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 1368308 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 14 0 11 0 8d8f18 134fe68 0 134fdfc 8d8f18 8d90a0 134fdbc | 8d8f18
+# thread 3
+E 15 0 11 0 8dadf8 114fe68 0 114fdfc 8dadf8 8daf80 114fdbc | 8dadf8
+# thread 1
+E 16 0 0 86a7d8 8cd6f0 2 0 124fef4 86bd40 8cd6f0 124feac | 2 "c2"
+E 17 0 1 124fe68 8cd6f0 2 8cd6f0 124fea8 1 0 124fe00 | "c2" IL
+T B 1372170
+T I 1351f68 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e4ba0 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8e4c20 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8e4da8 mov 1 0 | w1:1004 <- 11:1004
+T I 1351e38 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e4e60 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8e4fd0 lea 1 0 | rcx=t65:1008 <- gv:1008
+T I 8e4ed0 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t65:1008 pas7:8000 rsp:1008
+T I 8e50b8 mov 1 0 | b1:1001 <- 21:1001
+T I 8e5168 jmp 1 0 | <- s0:0 ->
+T L 8e4be0
+T I 8e5290 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8e5310 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8e5498 mov 1 0 | w2:1004 <- 11:1004
+T I 135b520 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e5538 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8e5658 lea 1 0 | rcx=t67:1008 <- gv:1008
+T I 8e55a8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas7:8000 rsp:1008
+T I 8e5728 mov 1 0 | b1:1001 <- 21:1001
+T I 8e57d8 jmp 1 0 | <- s0:0 ->
+T L 8e52d0
+T I 8e1f18 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8e1f98 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8e2108 mov 2 0 | w3:1004 <- 11:1004
+T I 1370478 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 8e21a8 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 8e22c8 lea 2 0 | rcx=t69:1008 <- gv:1008
+T I 8e2218 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 8e2398 mov 2 0 | b1:1001 <- 21:1001
+T I 8e2448 jmp 2 0 | <- s0:0 ->
+T L 8e1f58
+T I 8e2558 mov 2 0 | w4:1004 <- 9:1004
+T L 8e2408
+T I 8e2678 xor 2 0 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 8e25c8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 8e27f8 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 8e2748 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 8e28b0 mov 2 0 | v1:1004 <- 3:1004
+T I 8e2950 mov 2 0 | w1:1004 <- 4:1004
+T I 8e2a70 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 8e29c0 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 1370398 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8e2b10 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 18 0 11 0 8e4c20 124fe68 0 124fdfc 8e4c20 8e4da8 124fdbc | 8e4c20
+E 19 1 6 139d480 8e4da8 8e5290 124fe68 124fdb8 139d480 139d810 124fd84 | 8e4da8 8e5290 ? ""
+# thread 3
+E 20 1 6 1354090 8daf80 8db468 114fe68 114fdb8 1354090 1354420 114fd84 | 8daf80 8db468 ? ""
+# thread 1
+X 21 1 6 100 8e5290 | 100
+E 22 1 6 139d4e0 1351e38 8e5290 124fe68 124fdb8 139d4e0 139d810 124fd84 | 1351e38 8e5290 ? ""
+# thread 3
+X 23 1 6 100 8db468 | 100
+E 24 1 6 13540f0 8dc848 8db468 114fe68 114fdb8 13540f0 1354420 114fd84 | 8dc848 8db468 ? ""
+# thread 0
+E 25 0 12 843cd0 8b5a40 1 8b6ce8 104fea8 8b5a40 8b5a40 104fe8c | "f2fwd" IL
+T B 13620f0
+T I 8eb218 jmp 1 5 | <- s8192:1008 rcx=t64:1008 pas7:8000 rsp:1008 ->
+T B 0
+# thread 1
+X 26 1 6 100 8e5290 | 100
+E 27 1 6 139d5a0 8e4fd0 8e5290 124fe68 124fdb8 139d5a0 139d810 124fd84 | 8e4fd0 8e5290 "" ""
+X 28 1 6 100 8e5290 | 100
+# thread 2
+E 29 1 6 8d7a68 8d90a0 8d9570 134fe68 134fdb8 8d7a68 8d7df8 134fd84 | 8d90a0 8d9570 ? ""
+# thread 3
+X 30 1 6 100 8db468 | 100
+E 31 1 6 13541b0 8db1a8 8db468 114fe68 114fdb8 13541b0 1354420 114fd84 | 8db1a8 8db468 "" ""
+# thread 1
+X 32 0 11 0 0 | 0
+# thread 2
+X 33 1 6 100 8d9570 | 100
+E 34 1 6 8d7ac8 135e0c8 8d9570 134fe68 134fdb8 8d7ac8 8d7df8 134fd84 | 135e0c8 8d9570 ? ""
+# thread 3
+X 35 1 6 100 8db468 | 100
+X 36 0 11 0 0 | 0
+# thread 1
+E 37 0 6 80000000 8e4ba0 8e5290 8e5290 124fd5c 8e4ba0 8e4c20 124fd4c | 8e4ba0 8e5290 "" ""
+X 38 0 6 0 8e4b18 | 0
+# thread 3
+E 39 0 6 80000000 8dad78 8db468 8db468 114fd5c 8dad78 8dadf8 114fd4c | 8dad78 8db468 "" ""
+X 40 0 6 0 8dacf0 | 0
+# thread 1
+E 41 0 7 103 8e5168 124fe68 0 124fdfc 8e5168 8e4be0 124fdbc | 8e5168
+# thread 3
+E 42 0 7 103 8db340 114fe68 0 114fdfc 8db340 8dadb8 114fdbc | 8db340
+# thread 2
+X 43 1 6 100 8d9570 | 100
+E 44 1 6 8d7b88 8d92b0 8d9570 134fe68 134fdb8 8d7b88 8d7df8 134fd84 | 8d92b0 8d9570 "" ""
+X 45 1 6 100 8d9570 | 100
+X 46 0 11 0 0 | 0
+E 47 0 6 80000000 8d8e98 8d9570 8d9570 134fd5c 8d8e98 8d8f18 134fd4c | 8d8e98 8d9570 "" ""
+# thread 1
+E 48 1 6 124fe68 8e2558 8e50b8 139dbd0 124fdb8 139d708 8e5168 124fd94 | 8e2558 8e50b8 ? ?
+# thread 2
+X 49 0 6 0 8d8e48 | 0
+E 50 0 7 103 8d9448 134fe68 0 134fdfc 8d9448 8d8ed8 134fdbc | 8d9448
+# thread 3
+E 51 1 6 114fe68 8e5f68 8db290 13547e0 114fdb8 1354318 8db340 114fd94 | 8e5f68 8db290 ? ?
+# thread 2
+E 52 1 6 134fe68 8ebaa0 8d9398 8d81b8 134fdb8 8d7cf0 8d9448 134fd94 | 8ebaa0 8d9398 ? ?
+# thread 3
+X 53 1 6 0 8db290 | 0
+# thread 2
+X 54 1 6 0 8d9398 | 0
+# thread 3
+X 55 0 7 0 8db290 | 0
+# thread 1
+X 56 1 6 0 8e50b8 | 0
+# thread 2
+X 57 0 7 0 8d9398 | 0
+E 58 0 8 0 8d9448 8d9398 0 134fdfc 8d9448 8d8ed8 134fdc4 | 8d9448
+X 59 0 8 0 1 | 0
+# thread 3
+E 60 0 8 0 8db340 8db290 0 114fdfc 8db340 8dadb8 114fdc4 | 8db340
+X 61 0 8 0 1 | 0
+E 62 0 2 2 8b2a28 8dadb8 8b2a28 114fdfc 8dadb8 8db468 114fdc4 | 8dadb8
+# thread 1
+X 63 0 7 0 8e50b8 | 0
+E 64 0 8 0 8e5168 8e50b8 0 124fdfc 8e5168 8e4be0 124fdc4 | 8e5168
+X 65 0 8 0 1 | 0
+E 66 0 2 2 8cd6f0 8e4be0 8cd6f0 124fdfc 8e4be0 8e5290 124fdc4 | 8e4be0
+X 67 0 2 0 8e4be0 | 0
+# thread 2
+E 68 0 2 2 8d1710 8d8ed8 8d1710 134fdfc 8d8ed8 8d9570 134fdc4 | 8d8ed8
+X 69 0 2 0 8d8ed8 | 0
+E 70 0 9 0 8d1710 8d8ed8 8d1710 134fdfc 8d8ed8 8d9570 134fdc4 | 8d8ed8
+# thread 1
+E 71 0 9 0 8cd6f0 8e4be0 8cd6f0 124fdfc 8e4be0 8e5290 124fdc4 | 8e4be0
+X 72 0 9 0 8e4be0 | 0
+E 73 0 11 0 8e5310 124fe68 0 124fdfc 8e5310 8e5498 124fdbc | 8e5310
+E 74 1 6 139d480 8e5498 8e1f18 124fe68 124fdb8 139d480 139d810 124fd84 | 8e5498 8e1f18 ? ""
+# thread 3
+X 75 0 2 0 8dadb8 | 0
+E 76 0 9 0 8b2a28 8dadb8 8b2a28 114fdfc 8dadb8 8db468 114fdc4 | 8dadb8
+# thread 2
+X 77 0 9 0 8d8ed8 | 0
+E 78 0 11 0 8d95f0 134fe68 0 134fdfc 8d95f0 8d9778 134fdbc | 8d95f0
+E 79 1 6 8d7a68 8d9778 8eb460 134fe68 134fdb8 8d7a68 8d7df8 134fd84 | 8d9778 8eb460 ? ""
+# thread 1
+X 80 1 6 100 8e1f18 | 100
+E 81 1 6 139d4e0 135b520 8e1f18 124fe68 124fdb8 139d4e0 139d810 124fd84 | 135b520 8e1f18 ? ""
+# thread 3
+X 82 0 9 0 8dadb8 | 0
+E 83 0 11 0 8db4e8 114fe68 0 114fdfc 8db4e8 8db670 114fdbc | 8db4e8
+E 84 1 6 1354090 8db670 8e5928 114fe68 114fdb8 1354090 1354420 114fd84 | 8db670 8e5928 ? ""
+# thread 2
+X 85 1 6 100 8eb460 | 100
+E 86 1 6 8d7ac8 1368fa0 8eb460 134fe68 134fdb8 8d7ac8 8d7df8 134fd84 | 1368fa0 8eb460 ? ""
+# thread 1
+X 87 1 6 100 8e1f18 | 100
+E 88 1 6 139d5a0 8e5658 8e1f18 124fe68 124fdb8 139d5a0 139d810 124fd84 | 8e5658 8e1f18 "" ""
+# thread 3
+X 89 1 6 100 8e5928 | 100
+E 90 1 6 13540f0 1361550 8e5928 114fe68 114fdb8 13540f0 1354420 114fd84 | 1361550 8e5928 ? ""
+# thread 2
+X 91 1 6 100 8eb460 | 100
+E 92 1 6 8d7b88 8d9938 8eb460 134fe68 134fdb8 8d7b88 8d7df8 134fd84 | 8d9938 8eb460 "" ""
+# thread 1
+X 93 1 6 100 8e1f18 | 100
+X 94 0 11 0 0 | 0
+E 95 0 6 80000000 8e5290 8e1f18 8e1f18 124fd5c 8e5290 8e5310 124fd4c | 8e5290 8e1f18 "" ""
+# thread 3
+X 96 1 6 100 8e5928 | 100
+E 97 1 6 13541b0 8db830 8e5928 114fe68 114fdb8 13541b0 1354420 114fd84 | 8db830 8e5928 "" ""
+# thread 1
+X 98 0 6 0 8e5240 | 0
+E 99 0 7 103 8e57d8 124fe68 0 124fdfc 8e57d8 8e52d0 124fdbc | 8e57d8
+# thread 2
+X 100 1 6 100 8eb460 | 100
+# thread 1
+E 101 1 6 124fe68 8e2558 8e5728 139dbd0 124fdb8 139d708 8e57d8 124fd94 | 8e2558 8e5728 ? ?
+# thread 2
+X 102 0 11 0 0 | 0
+E 103 0 6 80000000 8d9570 8eb460 8eb460 134fd5c 8d9570 8d95f0 134fd4c | 8d9570 8eb460 "" ""
+# thread 3
+X 104 1 6 100 8e5928 | 100
+# thread 1
+X 105 1 6 0 8e5728 | 0
+X 106 0 7 0 8e5728 | 0
+E 107 0 8 0 8e57d8 8e5728 0 124fdfc 8e57d8 8e52d0 124fdc4 | 8e57d8
+# thread 3
+X 108 0 11 0 0 | 0
+E 109 0 6 80000000 8db468 8e5928 8e5928 114fd5c 8db468 8db4e8 114fd4c | 8db468 8e5928 "" ""
+# thread 1
+X 110 0 8 0 1 | 0
+E 111 0 2 2 8cd6f0 8e52d0 8cd6f0 124fdfc 8e52d0 8e1f18 124fdc4 | 8e52d0
+# thread 3
+X 112 0 6 0 8db418 | 0
+E 113 0 7 103 8db9b0 114fe68 0 114fdfc 8db9b0 8db4a8 114fdbc | 8db9b0
+E 114 1 6 114fe68 8e5f68 8db900 13547e0 114fdb8 1354318 8db9b0 114fd94 | 8e5f68 8db900 ? ?
+# thread 1
+X 115 0 2 0 8e52d0 | 0
+E 116 0 9 0 8cd6f0 8e52d0 8cd6f0 124fdfc 8e52d0 8e1f18 124fdc4 | 8e52d0
+# thread 2
+X 117 0 6 0 8d9520 | 0
+# thread 1
+X 118 0 9 0 8e52d0 | 0
+E 119 0 11 0 8e1f98 124fe68 0 124fdfc 8e1f98 8e2108 124fdbc | 8e1f98
+# thread 2
+E 120 0 7 103 8eb338 134fe68 0 134fdfc 8eb338 8d95b0 134fdbc | 8eb338
+# thread 1
+E 121 1 6 139d480 8e2108 8e2558 124fe68 124fdb8 139d480 139d810 124fd84 | 8e2108 8e2558 ? ?
+# thread 2
+E 122 1 6 134fe68 8ebaa0 8eb288 8d81b8 134fdb8 8d7cf0 8eb338 134fd94 | 8ebaa0 8eb288 ? ?
+# thread 3
+X 123 1 6 0 8db900 | 0
+# thread 1
+X 124 1 6 ffffff00 0 | ffffff00
+E 125 1 6 139d4e0 1370478 8e2558 124fe68 124fdb8 139d4e0 139d810 124fd84 | 1370478 8e2558 ? ?
+X 126 1 6 0 8e20a8 | 0
+E 127 1 6 139d5a0 8e22c8 8e2558 124fe68 124fdb8 139d5a0 139d810 124fd84 | 8e22c8 8e2558 "" ?
+# thread 2
+X 128 1 6 0 8eb288 | 0
+# thread 3
+X 129 0 7 0 8db900 | 0
+E 130 0 8 0 8db9b0 8db900 0 114fdfc 8db9b0 8db4a8 114fdc4 | 8db9b0
+# thread 1
+X 131 1 6 100 8e2558 | 100
+# thread 3
+X 132 0 8 0 1 | 0
+# thread 1
+X 133 0 11 0 0 | 0
+E 134 0 7 103 8e2448 124fe68 0 124fdfc 8e2448 8e1f58 124fdbc | 8e2448
+# thread 3
+E 135 0 2 2 8b2a28 8db4a8 8b2a28 114fdfc 8db4a8 8e5928 114fdc4 | 8db4a8
+# thread 1
+E 136 1 6 124fe68 8e2558 8e2398 139d870 124fdb8 139d708 8e2448 124fd94 | 8e2558 8e2398 ? ?
+# thread 2
+X 137 0 7 0 8eb288 | 0
+E 138 0 8 0 8eb338 8eb288 0 134fdfc 8eb338 8d95b0 134fdc4 | 8eb338
+# thread 3
+X 139 0 2 0 8db4a8 | 0
+E 140 0 9 0 8b2a28 8db4a8 8b2a28 114fdfc 8db4a8 8e5928 114fdc4 | 8db4a8
+# thread 1
+X 141 1 6 0 8e2398 | 0
+# thread 3
+X 142 0 9 0 8db4a8 | 0
+E 143 0 11 0 8e59a8 114fe68 0 114fdfc 8e59a8 8e5b18 114fdbc | 8e59a8
+E 144 1 6 1354090 8e5b18 8e5f68 114fe68 114fdb8 1354090 1354420 114fd84 | 8e5b18 8e5f68 ? ?
+# thread 2
+X 145 0 8 0 1 | 0
+E 146 0 2 2 8d1710 8d95b0 8d1710 134fdfc 8d95b0 8eb460 134fdc4 | 8d95b0
+# thread 1
+X 147 0 7 0 8e2398 | 0
+E 148 0 8 0 8e2448 8e2398 0 124fdfc 8e2448 8e1f58 124fdc4 | 8e2448
+X 149 0 8 0 1 | 0
+E 150 0 2 2 8cd6f0 8e1f58 8cd6f0 124fdfc 8e1f58 8e2558 124fdc4 | 8e1f58
+X 151 0 2 0 8e1f58 | 0
+E 152 0 9 0 8cd6f0 8e1f58 8cd6f0 124fdfc 8e1f58 8e2558 124fdc4 | 8e1f58
+# thread 3
+X 153 1 6 ffffff00 0 | ffffff00
+E 154 1 6 13540f0 1369440 8e5f68 114fe68 114fdb8 13540f0 1354420 114fd84 | 1369440 8e5f68 ? ?
+X 155 1 6 0 8e5ab8 | 0
+# thread 1
+X 156 0 9 0 8e1f58 | 0
+E 157 0 2 2 8cd6f0 8e2408 8cd6f0 124fdfc 8e2408 8e2678 124fdc4 | 8e2408
+# thread 3
+E 158 1 6 13541b0 8e5cd8 8e5f68 114fe68 114fdb8 13541b0 1354420 114fd84 | 8e5cd8 8e5f68 "" ?
+# thread 2
+X 159 0 2 0 8d95b0 | 0
+E 160 0 9 0 8d1710 8d95b0 8d1710 134fdfc 8d95b0 8eb460 134fdc4 | 8d95b0
+X 161 0 9 0 8d95b0 | 0
+E 162 0 11 0 8eb4e0 134fe68 0 134fdfc 8eb4e0 8eb650 134fdbc | 8eb4e0
+# thread 3
+X 163 1 6 100 8e5f68 | 100
+X 164 0 11 0 0 | 0
+# thread 2
+E 165 1 6 8d7a68 8eb650 8ebaa0 134fe68 134fdb8 8d7a68 8d7df8 134fd84 | 8eb650 8ebaa0 ? ?
+X 166 1 6 ffffff00 0 | ffffff00
+# thread 3
+E 167 0 7 103 8e5e58 114fe68 0 114fdfc 8e5e58 8e5968 114fdbc | 8e5e58
+# thread 1
+E 168 1 3 8e2448 8cd6f0 8e57d8 1 124fdc0 8e2490 8e5820 124fd90 | 8e57d8 8e2448 1
+# thread 3
+E 169 1 6 114fe68 8e5f68 8e5da8 1354480 114fdb8 1354318 8e5e58 114fd94 | 8e5f68 8e5da8 ? ?
+# thread 2
+E 170 1 6 8d7ac8 1368638 8ebaa0 134fe68 134fdb8 8d7ac8 8d7df8 134fd84 | 1368638 8ebaa0 ? ?
+# thread 1
+E 171 2 6 13b 8e5728 8e2398 8e57d8 124fd8c 8e5728 8e2398 124fd3c | 8e5728 8e2398 ? ?
+# thread 3
+X 172 1 6 0 8e5da8 | 0
+# thread 2
+X 173 1 6 0 8eb5f0 | 0
+E 174 1 6 8d7b88 8eb810 8ebaa0 134fe68 134fdb8 8d7b88 8d7df8 134fd84 | 8eb810 8ebaa0 "" ?
+# thread 3
+X 175 0 7 0 8e5da8 | 0
+E 176 0 8 0 8e5e58 8e5da8 0 114fdfc 8e5e58 8e5968 114fdc4 | 8e5e58
+# thread 1
+X 177 2 6 1 8e56d8 | 1
+# thread 2
+X 178 1 6 100 8ebaa0 | 100
+X 179 0 11 0 0 | 0
+E 180 0 7 103 8eb990 134fe68 0 134fdfc 8eb990 8eb4a0 134fdbc | 8eb990
+E 181 1 6 134fe68 8ebaa0 8eb8e0 8d7e58 134fdb8 8d7cf0 8eb990 134fd94 | 8ebaa0 8eb8e0 ? ?
+X 182 1 6 0 8eb8e0 | 0
+X 183 0 7 0 8eb8e0 | 0
+E 184 0 8 0 8eb990 8eb8e0 0 134fdfc 8eb990 8eb4a0 134fdc4 | 8eb990
+# thread 1
+E 185 2 6 18 8e55a8 8e2218 8e57d8 124fd8c 8e55a8 8e2218 124fd3c | 8e55a8 8e2218 "f2" "f1"
+# thread 3
+X 186 0 8 0 1 | 0
+# thread 1
+X 187 2 6 819e00 8e5588 | 819e00
+# thread 2
+X 188 0 8 0 1 | 0
+E 189 0 2 2 8d1710 8eb4a0 8d1710 134fdfc 8eb4a0 8ebaa0 134fdc4 | 8eb4a0
+# thread 0
+E 190 0 0 0 8b5a40 0 0 104fef4 843cd0 8b5a40 104feac | 0 "r2"
+E 191 0 1 104fe68 8b5a40 0 8b5a40 104fea8 1 0 104fe00 | "r2" IL
+T B 8e68a8
+T I 1365d18 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 137d910 mov 1 0 | ecx=x$1:1004 <- ecx=t165:1004
+T I 8ea620 mov 1 0 | a:1004 <- ecx=x$1:1004
+T I 8ea6f0 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8ea770 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 137d7b0 mov 1 0 | eax=t158:1004 <- gx:1004
+T I 8ea9a8 lea 1 0 | eax=t164:1004 <- [eax=t158:1004+1]:1004 eax=t158:1004
+T I 1362258 mov 1 0 | w1:1004 <- eax=t164:1004
+T I 137d4f0 mov 1 0 | eax=t155:1004 <- gy:1004
+T I 8eab48 lea 1 0 | eax=t163:1004 <- [eax=t155:1004+1]:1004 eax=t155:1004
+T I 13620e8 mov 1 0 | w2:1004 <- eax=t163:1004
+T I 8ead10 lea 1 0 | rcx=t67:1008 <- a:1008
+T I 8eac28 call 1 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas10:8000 rsp:1008
+T I 8eadf8 mov 1 0 | b1:1001 <- 21:1001
+T I 8eaea8 jmp 1 0 | <- s0:0 ->
+T L 8ea730
+T I 8eafd0 cmp 1 0 | cc=t68:9000 <- ecx=x$1:1004 2:1004
+T I 8eb050 _jcc 1 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 1350fb0 mov 1 0 | eax=t157:1004 <- gx:1004
+T I 8eb220 lea 1 0 | eax=t162:1004 <- [eax=t157:1004+2]:1004 eax=t157:1004
+T I 1383068 mov 1 0 | w2:1004 <- eax=t162:1004
+T I 13a3d40 mov 1 0 | eax=t154:1004 <- gy:1004
+T I 13621e8 lea 1 0 | eax=t161:1004 <- [eax=t154:1004+2]:1004 eax=t154:1004
+T I 1382f08 mov 1 0 | w3:1004 <- eax=t161:1004
+T I 1362378 lea 1 0 | rcx=t71:1008 <- a:1008
+T I 13622c8 call 1 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t71:1008 pas10:8000 rsp:1008
+T I 1362448 mov 1 0 | b1:1001 <- 21:1001
+T I 13624f8 jmp 1 0 | <- s0:0 ->
+T L 8eb010
+T I 1362620 cmp 2 0 | cc=t72:9000 <- ecx=x$1:1004 3:1004
+T I 13626a0 _jcc 2 0 | <- s0:0 cc_zf=t72:9000 ->
+T I 13a3dc0 mov 2 0 | eax=t156:1004 <- gx:1004
+T I 1362870 lea 2 0 | eax=t159:1004 <- [eax=t156:1004+3]:1004 eax=t156:1004
+T I 1365f18 mov 2 0 | w3:1004 <- eax=t159:1004
+T I 13a3f60 mov 2 0 | eax=t153:1004 <- gy:1004
+T I 13629e0 lea 2 0 | eax=t160:1004 <- [eax=t153:1004+3]:1004 eax=t153:1004
+T I 137d6e0 mov 2 0 | w1:1004 <- eax=t160:1004
+T I 1362b70 lea 2 0 | rcx=t75:1008 <- a:1008
+T I 1362ac0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t75:1008 pas10:8000 rsp:1008
+T I 1362c40 mov 2 0 | b1:1001 <- 21:1001
+T I 1362cf0 jmp 2 0 | <- s0:0 ->
+T L 1362660
+T I 1362e00 mov 2 0 | w4:1004 <- 9:1004
+T L 1362cb0
+T I 1362f20 mov 2 0 | ecx=t76:1004 <- a:1004
+T I 1362e70 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t76:1004 pas10:8000 rsp:1008
+T I 1363070 mov 2 0 | ecx=t77:1004 <- 0:1004
+T I 1362ff0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t77:1004 pas10:8000 rsp:1008
+T I 13802e8 mov 2 0 | ecx=t78:1004 <- w4:1004
+T I 1380238 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t78:1004 pas10:8000 rsp:1008
+T I 13803a0 mov 2 0 | v1:1004 <- 3:1004
+T I 1380440 mov 2 0 | w1:1004 <- 4:1004
+T I 1380560 mov 2 0 | ecx=t79:1004 <- 2:1004
+T I 13804b0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t79:1004 pas10:8000 rsp:1008
+T I 1366048 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8eaa18 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+# thread 3
+E 192 0 2 2 8b2a28 8e5968 8b2a28 114fdfc 8e5968 8e5f68 114fdc4 | 8e5968
+# thread 2
+X 193 0 2 0 8eb4a0 | 0
+E 194 0 9 0 8d1710 8eb4a0 8d1710 134fdfc 8eb4a0 8ebaa0 134fdc4 | 8eb4a0
+# thread 1
+E 195 2 4 819e00 8e2448 1 8e57d8 124fd8c 8e55a8 8e2218 124fd40 | 1 8e55a8 8e2218 0 0
+# thread 3
+X 196 0 2 0 8e5968 | 0
+E 197 0 9 0 8b2a28 8e5968 8b2a28 114fdfc 8e5968 8e5f68 114fdc4 | 8e5968
+X 198 0 9 0 8e5968 | 0
+E 199 0 2 2 8b2a28 8e5e18 8b2a28 114fdfc 8e5e18 8e6088 114fdc4 | 8e5e18
+E 200 1 3 8e5e58 8b2a28 8db9b0 1 114fdc0 8e5ea0 8db9f8 114fd90 | 8db9b0 8e5e58 1
+E 201 2 6 13b 8db900 8e5da8 8db9b0 114fd8c 8db900 8e5da8 114fd3c | 8db900 8e5da8 ? ?
+# thread 0
+E 202 0 0 842b60 8b5a40 2 0 104fef4 843cd0 8b5a40 104feac | 2 "r2"
+E 203 0 1 104fe68 8b5a40 2 8b5a40 104fea8 1 0 104fe00 | "r2" IL
+T B 1384200
+T I 1365d18 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8ea620 mov 1 0 | a:1004 <- ecx=x$1:1004
+T I 8ea6f0 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8ea770 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 137d7b0 mov 1 0 | eax=t158:1004 <- gx:1004
+T I 8ea9a8 inc 1 0 | eax=t164:1004 cc_sozp:9000 <- eax=t164:1004
+T I 1362258 mov 1 0 | w1:1004 <- eax=t164:1004
+T I 137d4f0 mov 1 0 | eax=t155:1004 <- gy:1004
+T I 8eab48 inc 1 0 | eax=t163:1004 cc_sozp:9000 <- eax=t163:1004
+T I 13620e8 mov 1 0 | w2:1004 <- eax=t163:1004
+T I 8ead10 lea 1 0 | rcx=t67:1008 <- a:1008
+T I 8eac28 call 1 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas10:8000 rsp:1008
+T I 8eadf8 mov 1 0 | b1:1001 <- 21:1001
+T I 8eaea8 jmp 1 0 | <- s0:0 ->
+T L 8ea730
+T I 8eafd0 cmp 1 0 | cc=t68:9000 <- ecx=x$1:1004 2:1004
+T I 8eb050 _jcc 1 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 1350fb0 mov 1 0 | eax=t157:1004 <- gx:1004
+T I 8eb220 add 1 0 | eax=t162:1004 cc:9000 <- eax=t162:1004 2:1004
+T I 1383068 mov 1 0 | w2:1004 <- eax=t162:1004
+T I 13a3d40 mov 1 0 | eax=t154:1004 <- gy:1004
+T I 13621e8 add 1 0 | eax=t161:1004 cc:9000 <- eax=t161:1004 2:1004
+T I 1382f08 mov 1 0 | w3:1004 <- eax=t161:1004
+T I 1362378 lea 1 0 | rcx=t71:1008 <- a:1008
+T I 13622c8 call 1 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t71:1008 pas10:8000 rsp:1008
+T I 1362448 mov 1 0 | b1:1001 <- 21:1001
+T I 13624f8 jmp 1 0 | <- s0:0 ->
+T L 8eb010
+T I 1362620 cmp 2 0 | cc=t72:9000 <- ecx=x$1:1004 3:1004
+T I 13626a0 _jcc 2 0 | <- s0:0 cc_zf=t72:9000 ->
+T I 13a3dc0 mov 2 0 | eax=t156:1004 <- gx:1004
+T I 1362870 add 2 0 | eax=t159:1004 cc:9000 <- eax=t159:1004 3:1004
+T I 1365f18 mov 2 0 | w3:1004 <- eax=t159:1004
+T I 13a3f60 mov 2 0 | eax=t153:1004 <- gy:1004
+T I 13629e0 add 2 0 | eax=t160:1004 cc:9000 <- eax=t160:1004 3:1004
+T I 137d6e0 mov 2 0 | w1:1004 <- eax=t160:1004
+T I 1362b70 lea 2 0 | rcx=t75:1008 <- a:1008
+T I 1362ac0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t75:1008 pas10:8000 rsp:1008
+T I 1362c40 mov 2 0 | b1:1001 <- 21:1001
+T I 1362cf0 jmp 2 0 | <- s0:0 ->
+T L 1362660
+T I 1362e00 mov 2 0 | w4:1004 <- 9:1004
+T L 1362cb0
+T I 1362f20 mov 2 0 | ecx=t76:1004 <- a:1004
+T I 1362e70 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t76:1004 pas10:8000 rsp:1008
+T I 1363070 xor 2 0 | ecx=t77:1004 cc:9000 <- ecx=t77:1004 ecx=t77:1004
+T I 1362ff0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t77:1004 pas10:8000 rsp:1008
+T I 13802e8 mov 2 0 | ecx=t78:1004 <- w4:1004
+T I 1380238 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t78:1004 pas10:8000 rsp:1008
+T I 13803a0 mov 2 0 | v1:1004 <- 3:1004
+T I 1380440 mov 2 0 | w1:1004 <- 4:1004
+T I 1380560 mov 2 0 | ecx=t79:1004 <- 2:1004
+T I 13804b0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t79:1004 pas10:8000 rsp:1008
+T I 1366048 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8eaa18 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 204 0 11 0 8ea770 104fe68 0 104fdfc 8ea770 137d7b0 104fdbc | 8ea770
+# thread 3
+X 205 2 6 1 8db8b0 | 1
+E 206 2 6 18 8db780 8e5c28 8db9b0 114fd8c 8db780 8e5c28 114fd3c | 8db780 8e5c28 "f" "f"
+# thread 2
+X 207 0 9 0 8eb4a0 | 0
+E 208 0 2 2 8d1710 8eb950 8d1710 134fdfc 8eb950 8ebbc0 134fdc4 | 8eb950
+E 209 1 3 8eb990 8d1710 8eb338 1 134fdc0 8eb9d8 8eb380 134fd90 | 8eb338 8eb990 1
+E 210 2 6 13b 8eb288 8eb8e0 8eb338 134fd8c 8eb288 8eb8e0 134fd3c | 8eb288 8eb8e0 ? ?
+# thread 1
+E 211 2 5 0 8e57d8 0 c 124fd8c 86bd40 0 124fd40 | c 1
+# thread 3
+X 212 2 6 401 8dc560 | 401
+E 213 2 6 114 8db830 8e5cd8 8db9b0 114fd8c 8db830 8e5cd8 114fd3c | 8db830 8e5cd8 "" ""
+# thread 1
+X 214 1 3 0 0 | 0 0
+E 215 1 3 8e2448 8cd6f0 8e5168 1 124fdc0 8e2490 8e51b0 124fd90 | 8e5168 8e2448 1
+E 216 2 6 13b 8e50b8 8e2398 8e5168 124fd8c 8e50b8 8e2398 124fd3c | 8e50b8 8e2398 ? ?
+# thread 3
+X 217 2 6 1 8b0dac | 1
+E 218 2 6 13b 8db710 8e5bb8 8db9b0 114fd8c 8db710 8e5bb8 114fd3c | 8db710 8e5bb8 "" ""
+# thread 2
+X 219 2 6 1 8d99b8 | 1
+# thread 3
+X 220 2 6 8a7b01 136adc8 | 8a7b01
+# thread 1
+X 221 2 6 1 8e5050 | 1
+# thread 3
+E 222 2 6 13b 1361550 1369440 8db9b0 114fd8c 1361550 1369440 114fd3c | 1361550 1369440 ? ?
+# thread 1
+E 223 2 6 18 8e4ed0 8e2218 8e5168 124fd8c 8e4ed0 8e2218 124fd3c | 8e4ed0 8e2218 "f1" "f1"
+# thread 3
+X 224 2 6 1 8e6500 | 1
+E 225 2 6 13b 8db670 8e5b18 8db9b0 114fd8c 8db670 8e5b18 114fd3c | 8db670 8e5b18 ? ?
+# thread 2
+E 226 2 6 18 8d9888 8eb760 8eb338 134fd8c 8d9888 8eb760 134fd3c | 8d9888 8eb760 "f" "f"
+# thread 1
+X 227 2 6 401 136ce68 | 401
+# thread 2
+X 228 2 6 401 1368e90 | 401
+# thread 0
+E 229 1 6 8e68b8 137d7b0 8eafd0 104fe68 104fdb8 8e68b8 8e6df8 104fd84 | 137d7b0 8eafd0 "" ""
+# thread 1
+E 230 2 6 114 8e4fd0 8e22c8 8e5168 124fd8c 8e4fd0 8e22c8 124fd3c | 8e4fd0 8e22c8 "" ""
+# thread 2
+E 231 2 6 114 8d9938 8eb810 8eb338 134fd8c 8d9938 8eb810 134fd3c | 8d9938 8eb810 "" ""
+# thread 3
+X 232 2 6 ffffff00 0 | ffffff00
+E 233 2 4 ffffff00 8e5e58 5 8db9b0 114fd8c 8db670 8e5b18 114fd40 | 5 8db670 8e5b18 0 0
+# thread 1
+X 234 2 6 1 8cba74 | 1
+E 235 2 6 13b 8e4e60 8e21a8 8e5168 124fd8c 8e4e60 8e21a8 124fd3c | 8e4e60 8e21a8 "" ""
+# thread 0
+X 236 1 6 100 8eafd0 | 100
+# thread 1
+X 237 2 6 8b8901 8e2890 | 8b8901
+# thread 0
+E 238 1 6 8e6b40 8ead10 8eafd0 104fe68 104fdb8 8e6b40 8e6df8 104fd84 | 8ead10 8eafd0 "" ""
+# thread 3
+E 239 2 5 0 8db9b0 0 18 114fd8c 857818 0 114fd40 | 18 1
+# thread 2
+X 240 2 6 1 8c0c8c | 1
+E 241 2 6 13b 8d9818 8eb6f0 8eb338 134fd8c 8d9818 8eb6f0 134fd3c | 8d9818 8eb6f0 "" ""
+# thread 1
+E 242 2 6 13b 1351e38 1370478 8e5168 124fd8c 1351e38 1370478 124fd3c | 1351e38 1370478 ? ?
+# thread 0
+X 243 1 6 100 8eafd0 | 100
+# thread 1
+X 244 2 6 1 8e5108 | 1
+# thread 0
+X 245 0 11 0 0 | 0
+# thread 3
+X 246 1 3 1 0 | 1 0
+# thread 0
+E 247 0 6 80000000 8ea6f0 8eafd0 8eafd0 104fd5c 8ea6f0 8ea770 104fd4c | 8ea6f0 8eafd0 "" ""
+# thread 2
+X 248 2 6 8c2801 1370030 | 8c2801
+E 249 2 6 13b 1368fa0 1368638 8eb338 134fd8c 1368fa0 1368638 134fd3c | 1368fa0 1368638 ? ?
+# thread 1
+E 250 2 6 13b 8e4da8 8e2108 8e5168 124fd8c 8e4da8 8e2108 124fd3c | 8e4da8 8e2108 ? ?
+# thread 3
+E 251 1 3 8e5e58 8b2a28 8db340 1 114fdc0 8e5ea0 8db388 114fd90 | 8db340 8e5e58 1
+E 252 2 6 13b 8db290 8e5da8 8db340 114fd8c 8db290 8e5da8 114fd3c | 8db290 8e5da8 ? ?
+X 253 2 6 1 8db228 | 1
+# thread 2
+X 254 2 6 1 8d96e0 | 1
+# thread 3
+E 255 2 6 18 8db0a8 8e5c28 8db340 114fd8c 8db0a8 8e5c28 114fd3c | 8db0a8 8e5c28 "f" "f"
+# thread 0
+X 256 0 6 0 8ea6a0 | 0
+E 257 0 7 103 8eaea8 104fe68 0 104fdfc 8eaea8 8ea730 104fdbc | 8eaea8
+# thread 1
+X 258 2 6 ffffff00 0 | ffffff00
+E 259 2 4 ffffff00 8e2448 5 8e5168 124fd8c 8e4da8 8e2108 124fd40 | 5 8e4da8 8e2108 0 0
+E 260 2 5 0 8e5168 0 18 124fd8c 86bd40 0 124fd40 | 18 1
+# thread 2
+E 261 2 6 13b 8d9778 8eb650 8eb338 134fd8c 8d9778 8eb650 134fd3c | 8d9778 8eb650 ? ?
+# thread 0
+E 262 1 6 104fe68 1362e00 8eadf8 8e7398 104fdb8 8e6cf0 8eaea8 104fd94 | 1362e00 8eadf8 ? ?
+# thread 3
+X 263 2 6 401 136ae58 | 401
+E 264 2 6 114 8db1a8 8e5cd8 8db340 114fd8c 8db1a8 8e5cd8 114fd3c | 8db1a8 8e5cd8 "" ""
+# thread 2
+X 265 2 6 ffffff00 0 | ffffff00
+E 266 2 4 ffffff00 8eb990 5 8eb338 134fd8c 8d9778 8eb650 134fd40 | 5 8d9778 8eb650 0 0
+# thread 1
+X 267 1 3 1 0 | 1 0
+# thread 3
+X 268 2 6 1 8b0dac | 1
+E 269 2 6 13b 8db038 8e5bb8 8db340 114fd8c 8db038 8e5bb8 114fd3c | 8db038 8e5bb8 "" ""
+# thread 0
+X 270 1 6 0 8eadf8 | 0
+# thread 3
+X 271 2 6 8a7b01 8e62a0 | 8a7b01
+E 272 2 6 13b 8dc848 1369440 8db340 114fd8c 8dc848 1369440 114fd3c | 8dc848 1369440 ? ?
+# thread 2
+E 273 2 5 0 8eb338 0 15 134fd8c 8805f0 0 134fd40 | 15 1
+# thread 3
+X 274 2 6 1 8db2e0 | 1
+# thread 0
+X 275 0 7 0 8eadf8 | 0
+E 276 0 8 0 8eaea8 8eadf8 0 104fdfc 8eaea8 8ea730 104fdc4 | 8eaea8
+# thread 1
+X 277 0 2 1 8e2408 | 1
+E 278 0 2 2 8cd6f0 8e1f58 8cd6f0 124fdfc 8e1f58 8e2558 124fdc4 | 8e1f58
+# thread 0
+X 279 0 8 0 1 | 0
+E 280 0 2 2 8b5a40 8ea730 8b5a40 104fdfc 8ea730 8eafd0 104fdc4 | 8ea730
+# thread 2
+X 281 1 3 1 0 | 1 0
+# thread 0
+X 282 0 2 0 8ea730 | 0
+E 283 0 9 0 8b5a40 8ea730 8b5a40 104fdfc 8ea730 8eafd0 104fdc4 | 8ea730
+# thread 1
+X 284 0 2 0 8e1f58 | 0
+E 285 0 9 0 8cd6f0 8e1f58 8cd6f0 124fdfc 8e1f58 8e2558 124fdc4 | 8e1f58
+# thread 0
+X 286 0 9 0 8ea730 | 0
+E 287 0 11 0 8eb050 104fe68 0 104fdfc 8eb050 1350fb0 104fdbc | 8eb050
+# thread 2
+E 288 1 3 8eb990 8d1710 8d9448 1 134fdc0 8eb9d8 8d9490 134fd90 | 8d9448 8eb990 1
+E 289 2 6 13b 8d9398 8eb8e0 8d9448 134fd8c 8d9398 8eb8e0 134fd3c | 8d9398 8eb8e0 ? ?
+# thread 0
+E 290 1 6 8e68b8 1350fb0 1362620 104fe68 104fdb8 8e68b8 8e6df8 104fd84 | 1350fb0 1362620 "" ""
+# thread 3
+E 291 2 6 13b 8daf80 8e5b18 8db340 114fd8c 8daf80 8e5b18 114fd3c | 8daf80 8e5b18 ? ?
+# thread 1
+X 292 0 9 0 8e1f58 | 0
+# thread 3
+X 293 2 6 ffffff00 0 | ffffff00
+# thread 1
+E 294 0 2 2 8cd6f0 8e2408 8cd6f0 124fdfc 8e2408 8e2678 124fdc4 | 8e2408
+# thread 0
+X 295 1 6 100 1362620 | 100
+# thread 2
+X 296 2 6 1 8d9330 | 1
+E 297 2 6 18 8d91c8 8eb760 8d9448 134fd8c 8d91c8 8eb760 134fd3c | 8d91c8 8eb760 "f" "f"
+X 298 2 6 401 1368ec0 | 401
+E 299 2 6 114 8d92b0 8eb810 8d9448 134fd8c 8d92b0 8eb810 134fd3c | 8d92b0 8eb810 "" ""
+# thread 3
+E 300 2 4 ffffff00 8e5e58 5 8db340 114fd8c 8daf80 8e5b18 114fd40 | 5 8daf80 8e5b18 0 0
+E 301 2 5 14 8db340 14 2c 114fd8c 857818 0 114fd40 | 2c 1
+# thread 2
+X 302 2 6 1 8c0c8c | 1
+E 303 2 6 13b 8d9158 8eb6f0 8d9448 134fd8c 8d9158 8eb6f0 134fd3c | 8d9158 8eb6f0 "" ""
+# thread 0
+E 304 1 6 8e6b40 1362378 1362620 104fe68 104fdb8 8e6b40 8e6df8 104fd84 | 1362378 1362620 "" ""
+# thread 2
+X 305 2 6 8c2801 8ebf28 | 8c2801
+# thread 1
+E 306 1 3 8e2448 8cd6f0 8e57d8 1 124fdc0 8e2490 8e5820 124fd90 | 8e57d8 8e2448 1
+E 307 2 6 13b 8e5728 8e2398 8e57d8 124fd8c 8e5728 8e2398 124fd3c | 8e5728 8e2398 ? ?
+# thread 2
+E 308 2 6 13b 135e0c8 1368638 8d9448 134fd8c 135e0c8 1368638 134fd3c | 135e0c8 1368638 ? ?
+# thread 3
+X 309 1 3 1 0 | 1 0
+# thread 2
+X 310 2 6 1 1369080 | 1
+# thread 0
+X 311 1 6 100 1362620 | 100
+# thread 2
+E 312 2 6 13b 8d90a0 8eb650 8d9448 134fd8c 8d90a0 8eb650 134fd3c | 8d90a0 8eb650 ? ?
+# thread 1
+X 313 2 6 1 8e56d8 | 1
+E 314 2 6 18 8e55a8 8e2218 8e57d8 124fd8c 8e55a8 8e2218 124fd3c | 8e55a8 8e2218 "f2" "f1"
+# thread 3
+X 315 0 2 1 8e5e18 | 1
+E 316 0 2 2 8b2a28 8e5968 8b2a28 114fdfc 8e5968 8e5f68 114fdc4 | 8e5968
+# thread 2
+X 317 2 6 ffffff00 0 | ffffff00
+E 318 2 4 ffffff00 8eb990 5 8d9448 134fd8c 8d90a0 8eb650 134fd40 | 5 8d90a0 8eb650 0 0
+# thread 0
+X 319 0 11 0 0 | 0
+E 320 0 6 80000000 8eafd0 1362620 1362620 104fd5c 8eafd0 8eb050 104fd4c | 8eafd0 1362620 "" ""
+# thread 1
+X 321 2 6 819e00 8e5588 | 819e00
+# thread 0
+X 322 0 6 0 8eaf80 | 0
+# thread 1
+E 323 2 4 819e00 8e2448 1 8e57d8 124fd8c 8e55a8 8e2218 124fd40 | 1 8e55a8 8e2218 0 0
+E 324 2 5 0 8e57d8 0 c 124fd8c 86bd40 0 124fd40 | c 1
+# thread 0
+E 325 0 7 103 13624f8 104fe68 0 104fdfc 13624f8 8eb010 104fdbc | 13624f8
+# thread 2
+E 326 2 5 14 8d9448 14 29 134fd8c 8805f0 0 134fd40 | 29 1
+# thread 3
+X 327 0 2 0 8e5968 | 0
+E 328 0 9 0 8b2a28 8e5968 8b2a28 114fdfc 8e5968 8e5f68 114fdc4 | 8e5968
+# thread 2
+X 329 1 3 1 0 | 1 0
+# thread 0
+E 330 1 6 104fe68 1362e00 1362448 8e7398 104fdb8 8e6cf0 13624f8 104fd94 | 1362e00 1362448 ? ?
+# thread 2
+X 331 0 2 1 8eb950 | 1
+E 332 0 2 2 8d1710 8eb4a0 8d1710 134fdfc 8eb4a0 8ebaa0 134fdc4 | 8eb4a0
+# thread 3
+X 333 0 9 0 8e5968 | 0
+E 334 0 2 2 8b2a28 8e5e18 8b2a28 114fdfc 8e5e18 8e6088 114fdc4 | 8e5e18
+X 335 0 2 0 8e5e18 | 0
+# thread 1
+X 336 1 3 0 0 | 0 0
+# thread 3
+E 337 0 9 0 8b2a28 8e5e18 8b2a28 114fdfc 8e5e18 8e6088 114fdc4 | 8e5e18
+# thread 0
+X 338 1 6 0 1362448 | 0
+# thread 2
+X 339 0 2 0 8eb4a0 | 0
+E 340 0 9 0 8d1710 8eb4a0 8d1710 134fdfc 8eb4a0 8ebaa0 134fdc4 | 8eb4a0
+# thread 1
+X 341 0 2 0 8e2408 | 0
+E 342 0 9 0 8cd6f0 8e2408 8cd6f0 124fdfc 8e2408 8e2678 124fdc4 | 8e2408
+# thread 0
+X 343 0 7 0 1362448 | 0
+E 344 0 8 0 13624f8 1362448 0 104fdfc 13624f8 8eb010 104fdc4 | 13624f8
+# thread 1
+X 345 0 9 0 8e2408 | 0
+E 346 0 1 124fe68 8cd6f0 2 8cd6f0 124fea8 2 1 124fe00 | "c2" IL
+T B 1372170
+T I 1351f68 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e4ba0 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8e4c20 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8e4da8 mov 1 0 | w1:1004 <- 11:1004
+T I 8e5168 jmp 1 0 | <- s0:0 ->
+T L 8e4be0
+T I 8e5290 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8e5310 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8e5498 mov 1 0 | w2:1004 <- 11:1004
+T I 135b520 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e5538 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8e5658 lea 1 0 | rcx=t67:1008 <- gv:1008
+T I 8e55a8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas7:8000 rsp:1008
+T I 8e5728 mov 1 0 | b1:1001 <- 21:1001
+T I 8e57d8 jmp 1 0 | <- s0:0 ->
+T L 8e52d0
+T I 8e1f18 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8e1f98 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8e2108 mov 2 0 | w3:1004 <- 11:1004
+T L 8e4900
+T I 1370478 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 8e21a8 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 8e22c8 lea 2 0 | rcx=t69:1008 <- gv:1008
+T I 8e2218 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 8e2398 mov 2 0 | b1:1001 <- 21:1001
+T I 8e2448 jmp 2 0 | <- s0:0 ->
+T L 8e1f58
+T I 8e2558 mov 2 0 | w4:1004 <- 9:1004
+T L 8e2408
+T I 8e2678 xor 2 0 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 8e25c8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 8e27f8 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 8e2748 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 8e28b0 mov 2 0 | v1:1004 <- 3:1004
+T I 8e2950 mov 2 0 | w1:1004 <- 4:1004
+T I 8e2a70 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 8e29c0 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 1370398 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8e2b10 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 347 0 11 0 8e4c20 124fe68 0 124fdfc 8e4c20 8e4da8 124fdbc | 8e4c20
+# thread 3
+X 348 0 9 0 8e5e18 | 0
+E 349 0 1 114fe68 8b2a28 2 8b2a28 114fea8 2 1 114fe00 | "c1" IL
+T B 137f1d8
+T I 8dc978 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8dad78 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8dadf8 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8daf80 mov 1 0 | w1:1004 <- 11:1004
+T I 8db340 jmp 1 0 | <- s0:0 ->
+T L 8dadb8
+T I 8db468 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8db4e8 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8db670 mov 1 0 | w2:1004 <- 11:1004
+T I 8db9b0 jmp 1 0 | <- s0:0 ->
+T L 8db4a8
+T I 8e5928 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8e59a8 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8e5b18 mov 2 0 | w3:1004 <- 11:1004
+T L 8daad8
+T I 1369440 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 8e5bb8 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 8e5cd8 lea 2 0 | rcx=t69:1008 <- gv:1008
+T I 8e5c28 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 8e5da8 mov 2 0 | b1:1001 <- 21:1001
+T I 8e5e58 jmp 2 0 | <- s0:0 ->
+T L 8e5968
+T I 8e5f68 mov 2 0 | w4:1004 <- 9:1004
+T L 8e5e18
+T I 8e6088 xor 2 0 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 8e5fd8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 8e6208 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 8e6158 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 8e62c0 mov 2 0 | v1:1004 <- 3:1004
+T I 8e6360 mov 2 0 | w1:1004 <- 4:1004
+T I 8e6480 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 8e63d0 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 1369360 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8e6520 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 350 0 11 0 8dadf8 114fe68 0 114fdfc 8dadf8 8daf80 114fdbc | 8dadf8
+E 351 1 6 1354090 8daf80 8db468 114fe68 114fdb8 1354090 1354420 114fd84 | 8daf80 8db468 ? ""
+X 352 1 6 100 8db468 | 100
+X 353 0 11 0 0 | 0
+# thread 0
+X 354 0 8 0 1 | 0
+# thread 3
+E 355 0 6 80000000 8dad78 8db468 8db468 114fd5c 8dad78 8dadf8 114fd4c | 8dad78 8db468 "" ""
+X 356 0 6 0 8dacf0 | 0
+E 357 0 7 103 8db340 114fe68 0 114fdfc 8db340 8dadb8 114fdbc | 8db340
+E 358 1 6 114fe68 8e5b18 8daf80 1354480 114fdb8 13540f0 8db340 114fd94 | 8e5b18 8daf80 ? ?
+# thread 2
+X 359 0 9 0 8eb4a0 | 0
+E 360 0 2 2 8d1710 8eb950 8d1710 134fdfc 8eb950 8ebbc0 134fdc4 | 8eb950
+# thread 0
+E 361 0 2 2 8b5a40 8eb010 8b5a40 104fdfc 8eb010 1362620 104fdc4 | 8eb010
+# thread 2
+X 362 0 2 0 8eb950 | 0
+E 363 0 9 0 8d1710 8eb950 8d1710 134fdfc 8eb950 8ebbc0 134fdc4 | 8eb950
+# thread 3
+X 364 1 6 0 0 | 0
+# thread 0
+X 365 0 2 0 8eb010 | 0
+E 366 0 9 0 8b5a40 8eb010 8b5a40 104fdfc 8eb010 1362620 104fdc4 | 8eb010
+# thread 1
+E 367 1 6 139d480 8e4da8 8e5290 124fe68 124fdb8 139d480 139d810 124fd84 | 8e4da8 8e5290 ? ""
+# thread 3
+X 368 0 7 0 0 | 0
+E 369 0 8 0 8db340 0 0 114fdfc 8db340 8dadb8 114fdc4 | 8db340
+# thread 1
+X 370 1 6 100 8e5290 | 100
+# thread 0
+X 371 0 9 0 8eb010 | 0
+E 372 0 11 0 13626a0 104fe68 0 104fdfc 13626a0 13a3dc0 104fdbc | 13626a0
+# thread 2
+X 373 0 9 0 8eb950 | 0
+E 374 0 1 134fe68 8d1710 2 8d1710 134fea8 2 1 134fe00 | "r1" IL
+T B 137c1c0
+T I 1368438 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8d8dc8 mov 1 0 | a:1004 <- ecx=x$1:1004
+T I 8d8e98 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8d8f18 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8d90a0 mov 1 0 | w1:1004 <- 11:1004
+T I 8d9448 jmp 1 0 | <- s0:0 ->
+T L 8d8ed8
+T I 8d9570 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8d95f0 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8d9778 mov 1 0 | w2:1004 <- 11:1004
+T I 8eb338 jmp 1 0 | <- s0:0 ->
+T L 8d95b0
+T I 8eb460 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8eb4e0 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 8eb650 mov 2 0 | w3:1004 <- 11:1004
+T L 1368238
+T I 1368638 mov 2 0 | eax=t153:1004 <- 7:1004
+T I 8eb6f0 mov 2 0 | s1:1002 <- ax=t152:1002
+T I 8eb810 lea 2 0 | rcx=t69:1008 <- a:1008
+T I 8eb760 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas10:8000 rsp:1008
+T I 8eb8e0 mov 2 0 | b1:1001 <- 21:1001
+T I 8eb990 jmp 2 0 | <- s0:0 ->
+T L 8eb4a0
+T I 8ebaa0 mov 2 0 | w4:1004 <- 9:1004
+T L 8eb950
+T I 8ebbc0 mov 2 0 | ecx=t70:1004 <- a:1004
+T I 8ebb10 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas10:8000 rsp:1008
+T I 8ebd10 xor 2 0 | ecx=t71:1004 cc:9000 <- ecx=t71:1004 ecx=t71:1004
+T I 8ebc90 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas10:8000 rsp:1008
+T I 8ebe90 mov 2 0 | ecx=t72:1004 <- w4:1004
+T I 8ebde0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas10:8000 rsp:1008
+T I 8ebf48 mov 2 0 | v1:1004 <- 3:1004
+T I 8ebfe8 mov 2 0 | w1:1004 <- 4:1004
+T I 8ec108 mov 2 0 | ecx=t73:1004 <- 2:1004
+T I 8ec058 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t73:1004 pas10:8000 rsp:1008
+T I 8ec1a8 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 1368308 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 375 0 11 0 8d8f18 134fe68 0 134fdfc 8d8f18 8d90a0 134fdbc | 8d8f18
+# thread 1
+X 376 0 11 0 0 | 0
+# thread 3
+X 377 0 8 0 0 | 0
+# thread 1
+E 378 0 6 80000000 8e4ba0 8e5290 8e5290 124fd5c 8e4ba0 8e4c20 124fd4c | 8e4ba0 8e5290 "" ""
+# thread 2
+E 379 1 6 8d7a68 8d90a0 8d9570 134fe68 134fdb8 8d7a68 8d7df8 134fd84 | 8d90a0 8d9570 ? ""
+# thread 3
+E 380 0 2 2 8b2a28 8dadb8 8b2a28 114fdfc 8dadb8 8db468 114fdc4 | 8dadb8
+# thread 0
+E 381 1 6 8e68b8 13a3dc0 1362e00 104fe68 104fdb8 8e68b8 8e6df8 104fd84 | 13a3dc0 1362e00 "" ?
+# thread 1
+X 382 0 6 0 8e4b18 | 0
+# thread 0
+X 383 1 6 0 13627b0 | 0
+# thread 1
+E 384 0 7 103 8e5168 124fe68 0 124fdfc 8e5168 8e4be0 124fdbc | 8e5168
+# thread 3
+X 385 0 2 0 8dadb8 | 0
+# thread 1
+E 386 1 6 124fe68 8e2108 8e4da8 139d870 124fdb8 139d4e0 8e5168 124fd94 | 8e2108 8e4da8 ? ?
+# thread 3
+E 387 0 9 0 8b2a28 8dadb8 8b2a28 114fdfc 8dadb8 8db468 114fdc4 | 8dadb8
+# thread 0
+E 388 1 6 8e6b40 1362b70 1362e00 104fe68 104fdb8 8e6b40 8e6df8 104fd84 | 1362b70 1362e00 "" ?
+# thread 2
+X 389 1 6 100 8d9570 | 100
+# thread 0
+X 390 1 6 100 1362e00 | 100
+# thread 3
+X 391 0 9 0 8dadb8 | 0
+# thread 2
+X 392 0 11 0 0 | 0
+E 393 0 6 80000000 8d8e98 8d9570 8d9570 134fd5c 8d8e98 8d8f18 134fd4c | 8d8e98 8d9570 "" ""
+# thread 1
+X 394 1 6 0 0 | 0
+# thread 3
+E 395 0 11 0 8db4e8 114fe68 0 114fdfc 8db4e8 8db670 114fdbc | 8db4e8
+E 396 1 6 1354090 8db670 8e5928 114fe68 114fdb8 1354090 1354420 114fd84 | 8db670 8e5928 ? ""
+# thread 0
+X 397 0 11 0 0 | 0
+# thread 3
+X 398 1 6 100 8e5928 | 100
+# thread 0
+E 399 0 7 103 1362cf0 104fe68 0 104fdfc 1362cf0 1362660 104fdbc | 1362cf0
+# thread 3
+X 400 0 11 0 0 | 0
+# thread 1
+X 401 0 7 0 0 | 0
+E 402 0 8 0 8e5168 0 0 124fdfc 8e5168 8e4be0 124fdc4 | 8e5168
+# thread 3
+E 403 0 6 80000000 8db468 8e5928 8e5928 114fd5c 8db468 8db4e8 114fd4c | 8db468 8e5928 "" ""
+# thread 2
+X 404 0 6 0 8d8e48 | 0
+# thread 3
+X 405 0 6 0 8db418 | 0
+# thread 2
+E 406 0 7 103 8d9448 134fe68 0 134fdfc 8d9448 8d8ed8 134fdbc | 8d9448
+# thread 1
+X 407 0 8 0 0 | 0
+E 408 0 2 2 8cd6f0 8e4be0 8cd6f0 124fdfc 8e4be0 8e5290 124fdc4 | 8e4be0
+# thread 2
+E 409 1 6 134fe68 8eb650 8d90a0 8d7e58 134fdb8 8d7ac8 8d9448 134fd94 | 8eb650 8d90a0 ? ?
+# thread 3
+E 410 0 7 103 8db9b0 114fe68 0 114fdfc 8db9b0 8db4a8 114fdbc | 8db9b0
+# thread 2
+X 411 1 6 0 0 | 0
+# thread 3
+E 412 1 6 114fe68 8e5b18 8db670 1354480 114fdb8 13540f0 8db9b0 114fd94 | 8e5b18 8db670 ? ?
+# thread 0
+E 413 1 6 104fe68 1362e00 1362c40 8e6e58 104fdb8 8e6cf0 1362cf0 104fd94 | 1362e00 1362c40 ? ?
+# thread 2
+X 414 0 7 0 0 | 0
+E 415 0 8 0 8d9448 0 0 134fdfc 8d9448 8d8ed8 134fdc4 | 8d9448
+# thread 0
+X 416 1 6 0 1362c40 | 0
+# thread 3
+X 417 1 6 0 0 | 0
+# thread 0
+X 418 0 7 0 1362c40 | 0
+# thread 1
+X 419 0 2 0 8e4be0 | 0
+E 420 0 9 0 8cd6f0 8e4be0 8cd6f0 124fdfc 8e4be0 8e5290 124fdc4 | 8e4be0
+# thread 0
+E 421 0 8 0 1362cf0 1362c40 0 104fdfc 1362cf0 1362660 104fdc4 | 1362cf0
+# thread 2
+X 422 0 8 0 0 | 0
+E 423 0 2 2 8d1710 8d8ed8 8d1710 134fdfc 8d8ed8 8d9570 134fdc4 | 8d8ed8
+# thread 1
+X 424 0 9 0 8e4be0 | 0
+E 425 0 11 0 8e5310 124fe68 0 124fdfc 8e5310 8e5498 124fdbc | 8e5310
+E 426 1 6 139d480 8e5498 8e1f18 124fe68 124fdb8 139d480 139d810 124fd84 | 8e5498 8e1f18 ? ""
+# thread 0
+X 427 0 8 0 1 | 0
+# thread 1
+X 428 1 6 100 8e1f18 | 100
+# thread 0
+E 429 0 2 2 8b5a40 1362660 8b5a40 104fdfc 1362660 1362e00 104fdc4 | 1362660
+# thread 2
+X 430 0 2 0 8d8ed8 | 0
+# thread 1
+E 431 1 6 139d4e0 135b520 8e1f18 124fe68 124fdb8 139d4e0 139d810 124fd84 | 135b520 8e1f18 ? ""
+# thread 2
+E 432 0 9 0 8d1710 8d8ed8 8d1710 134fdfc 8d8ed8 8d9570 134fdc4 | 8d8ed8
+# thread 1
+X 433 1 6 100 8e1f18 | 100
+# thread 3
+X 434 0 7 0 0 | 0
+# thread 2
+X 435 0 9 0 8d8ed8 | 0
+# thread 1
+E 436 1 6 139d5a0 8e5658 8e1f18 124fe68 124fdb8 139d5a0 139d810 124fd84 | 8e5658 8e1f18 "" ""
+# thread 3
+E 437 0 8 0 8db9b0 0 0 114fdfc 8db9b0 8db4a8 114fdc4 | 8db9b0
+# thread 2
+E 438 0 11 0 8d95f0 134fe68 0 134fdfc 8d95f0 8d9778 134fdbc | 8d95f0
+# thread 3
+X 439 0 8 0 0 | 0
+E 440 0 2 2 8b2a28 8db4a8 8b2a28 114fdfc 8db4a8 8e5928 114fdc4 | 8db4a8
+# thread 0
+X 441 0 2 0 1362660 | 0
+# thread 1
+X 442 1 6 100 8e1f18 | 100
+# thread 2
+E 443 1 6 8d7a68 8d9778 8eb460 134fe68 134fdb8 8d7a68 8d7df8 134fd84 | 8d9778 8eb460 ? ""
+# thread 3
+X 444 0 2 0 8db4a8 | 0
+E 445 0 9 0 8b2a28 8db4a8 8b2a28 114fdfc 8db4a8 8e5928 114fdc4 | 8db4a8
+# thread 0
+E 446 0 9 0 8b5a40 1362660 8b5a40 104fdfc 1362660 1362e00 104fdc4 | 1362660
+# thread 3
+X 447 0 9 0 8db4a8 | 0
+# thread 2
+X 448 1 6 100 8eb460 | 100
+# thread 3
+E 449 0 11 0 8e59a8 114fe68 0 114fdfc 8e59a8 8e5b18 114fdbc | 8e59a8
+# thread 0
+X 450 0 9 0 1362660 | 0
+# thread 3
+E 451 1 6 1354090 8e5b18 8e5f68 114fe68 114fdb8 1354090 1354420 114fd84 | 8e5b18 8e5f68 ? ?
+# thread 0
+E 452 0 2 2 8b5a40 1362cb0 8b5a40 104fdfc 1362cb0 1362f20 104fdc4 | 1362cb0
+E 453 1 3 1362cf0 8b5a40 13624f8 1 104fdc0 1362d38 1362540 104fd90 | 13624f8 1362cf0 1
+E 454 2 6 13b 1362448 1362c40 13624f8 104fd8c 1362448 1362c40 104fd3c | 1362448 1362c40 ? ?
+# thread 3
+X 455 1 6 ffffff00 0 | ffffff00
+# thread 0
+X 456 2 6 1 13623f8 | 1
+E 457 2 6 18 13622c8 1362ac0 13624f8 104fd8c 13622c8 1362ac0 104fd3c | 13622c8 1362ac0 "f" "f"
+# thread 1
+X 458 0 11 0 0 | 0
+# thread 0
+X 459 2 6 401 1365958 | 401
+# thread 1
+E 460 0 6 80000000 8e5290 8e1f18 8e1f18 124fd5c 8e5290 8e5310 124fd4c | 8e5290 8e1f18 "" ""
+# thread 2
+X 461 0 11 0 0 | 0
+# thread 3
+X 462 0 11 0 0 | 0
+# thread 2
+E 463 0 6 80000000 8d9570 8eb460 8eb460 134fd5c 8d9570 8d95f0 134fd4c | 8d9570 8eb460 "" ""
+# thread 3
+E 464 0 2 2 8b2a28 8daad8 8b2a28 114fdfc 8daad8 1369440 114fdc4 | 8daad8
+E 465 1 3 8db9b0 8b2a28 8db340 1 114fdc0 8db9f8 8db388 114fd90 | 8db340 8db9b0 1
+E 466 2 6 13b 8daf80 8db670 8db340 114fd8c 8daf80 8db670 114fd3c | 8daf80 8db670 ? ?
+# thread 2
+X 467 0 6 0 8d9520 | 0
+E 468 0 7 103 8eb338 134fe68 0 134fdfc 8eb338 8d95b0 134fdbc | 8eb338
+E 469 1 6 134fe68 8eb650 8d9778 8d7e58 134fdb8 8d7ac8 8eb338 134fd94 | 8eb650 8d9778 ? ?
+# thread 3
+X 470 2 6 ffffff00 0 | ffffff00
+# thread 2
+X 471 1 6 0 0 | 0
+# thread 0
+E 472 2 6 114 1362378 1362b70 13624f8 104fd8c 1362378 1362b70 104fd3c | 1362378 1362b70 "" ""
+# thread 3
+E 473 2 4 ffffff00 8db9b0 0 8db340 114fd8c 8daf80 8db670 114fd40 | 0 8daf80 8db670 0 0
+# thread 1
+X 474 0 6 0 8e5240 | 0
+E 475 0 7 103 8e57d8 124fe68 0 124fdfc 8e57d8 8e52d0 124fdbc | 8e57d8
+# thread 3
+X 476 1 3 0 0 | 0 0
+# thread 0
+X 477 2 6 1 8a4fbc | 1
+E 478 2 6 13b 1382f08 137d6e0 13624f8 104fd8c 1382f08 137d6e0 104fd3c | 1382f08 137d6e0 "" ""
+# thread 3
+X 479 0 2 0 8daad8 | 0
+# thread 0
+X 480 2 6 0 0 | 0
+# thread 3
+E 481 0 9 0 8b2a28 8daad8 8b2a28 114fdfc 8daad8 1369440 114fdc4 | 8daad8
+# thread 2
+X 482 0 7 0 0 | 0
+E 483 0 8 0 8eb338 0 0 134fdfc 8eb338 8d95b0 134fdc4 | 8eb338
+# thread 0
+E 484 2 4 0 1362cf0 3 13624f8 104fd8c 1382f08 137d6e0 104fd40 | 3 1382f08 137d6e0 0 0
+# thread 2
+X 485 0 8 0 0 | 0
+# thread 1
+E 486 1 6 124fe68 8e2558 8e5728 139dc48 124fdb8 139d708 8e57d8 124fd94 | 8e2558 8e5728 ? ?
+# thread 2
+E 487 0 2 2 8d1710 8d95b0 8d1710 134fdfc 8d95b0 8eb460 134fdc4 | 8d95b0
+# thread 3
+X 488 0 9 0 8daad8 | 0
+E 489 0 7 103 8e5e58 114fe68 0 114fdfc 8e5e58 8e5968 114fdbc | 8e5e58
+# thread 0
+E 490 2 5 0 13624f8 0 15 104fd8c 843cd0 0 104fd40 | 15 1
+# thread 1
+X 491 1 6 0 8e5728 | 0
+# thread 3
+E 492 1 6 114fe68 8e5f68 8e5da8 1354480 114fdb8 1354378 8e5e58 114fd94 | 8e5f68 8e5da8 ? ?
+# thread 1
+X 493 0 7 0 8e5728 | 0
+E 494 0 8 0 8e57d8 8e5728 0 124fdfc 8e57d8 8e52d0 124fdc4 | 8e57d8
+# thread 3
+X 495 1 6 0 8e5da8 | 0
+# thread 0
+X 496 1 3 1 0 | 1 0
+# thread 2
+X 497 0 2 0 8d95b0 | 0
+E 498 0 9 0 8d1710 8d95b0 8d1710 134fdfc 8d95b0 8eb460 134fdc4 | 8d95b0
+# thread 3
+X 499 0 7 0 8e5da8 | 0
+E 500 0 8 0 8e5e58 8e5da8 0 114fdfc 8e5e58 8e5968 114fdc4 | 8e5e58
+# thread 2
+X 501 0 9 0 8d95b0 | 0
+# thread 0
+E 502 1 3 1362cf0 8b5a40 8eaea8 1 104fdc0 1362d38 8eaef0 104fd90 | 8eaea8 1362cf0 1
+E 503 2 6 13b 8eadf8 1362c40 8eaea8 104fd8c 8eadf8 1362c40 104fd3c | 8eadf8 1362c40 ? ?
+# thread 1
+X 504 0 8 0 1 | 0
+E 505 0 2 2 8cd6f0 8e52d0 8cd6f0 124fdfc 8e52d0 8e1f18 124fdc4 | 8e52d0
+# thread 2
+E 506 0 11 0 8eb4e0 134fe68 0 134fdfc 8eb4e0 8eb650 134fdbc | 8eb4e0
+E 507 1 6 8d7a68 8eb650 8ebaa0 134fe68 134fdb8 8d7a68 8d7df8 134fd84 | 8eb650 8ebaa0 ? ?
+# thread 0
+X 508 2 6 1 8ead90 | 1
+# thread 2
+X 509 1 6 ffffff00 0 | ffffff00
+# thread 0
+E 510 2 6 18 8eac28 1362ac0 8eaea8 104fd8c 8eac28 1362ac0 104fd3c | 8eac28 1362ac0 "f" "f"
+# thread 2
+X 511 0 11 0 0 | 0
+E 512 0 2 2 8d1710 1368238 8d1710 134fdfc 1368238 1368638 134fdc4 | 1368238
+# thread 0
+X 513 2 6 401 1365a18 | 401
+E 514 2 6 114 8ead10 1362b70 8eaea8 104fd8c 8ead10 1362b70 104fd3c | 8ead10 1362b70 "" ""
+# thread 3
+X 515 0 8 0 1 | 0
+# thread 0
+X 516 2 6 1 8a4fbc | 1
+E 517 2 6 13b 13620e8 137d6e0 8eaea8 104fd8c 13620e8 137d6e0 104fd3c | 13620e8 137d6e0 "" ""
+# thread 3
+E 518 0 2 2 8b2a28 8e5968 8b2a28 114fdfc 8e5968 8e5f68 114fdc4 | 8e5968
+# thread 0
+X 519 2 6 0 0 | 0
+E 520 2 4 0 1362cf0 3 8eaea8 104fd8c 13620e8 137d6e0 104fd40 | 3 13620e8 137d6e0 0 0
+E 521 2 5 14 8eaea8 14 29 104fd8c 843cd0 0 104fd40 | 29 1
+# thread 2
+E 522 1 3 8eb338 8d1710 8d9448 1 134fdc0 8eb380 8d9490 134fd90 | 8d9448 8eb338 1
+# thread 0
+X 523 1 3 1 0 | 1 0
+# thread 1
+X 524 0 2 0 8e52d0 | 0
+# thread 0
+X 525 0 2 1 1362cb0 | 1
+# thread 1
+E 526 0 9 0 8cd6f0 8e52d0 8cd6f0 124fdfc 8e52d0 8e1f18 124fdc4 | 8e52d0
+# thread 3
+X 527 0 2 0 8e5968 | 0
+E 528 0 9 0 8b2a28 8e5968 8b2a28 114fdfc 8e5968 8e5f68 114fdc4 | 8e5968
+# thread 2
+E 529 2 6 13b 8d90a0 8d9778 8d9448 134fd8c 8d90a0 8d9778 134fd3c | 8d90a0 8d9778 ? ?
+# thread 1
+X 530 0 9 0 8e52d0 | 0
+# thread 2
+X 531 2 6 ffffff00 0 | ffffff00
+# thread 1
+E 532 0 11 0 8e1f98 124fe68 0 124fdfc 8e1f98 8e2108 124fdbc | 8e1f98
+# thread 3
+X 533 0 9 0 8e5968 | 0
+# thread 1
+E 534 1 6 139d480 8e2108 8e2558 124fe68 124fdb8 139d480 139d810 124fd84 | 8e2108 8e2558 ? ?
+# thread 2
+E 535 2 4 ffffff00 8eb338 0 8d9448 134fd8c 8d90a0 8d9778 134fd40 | 0 8d90a0 8d9778 0 0
+# thread 3
+E 536 0 2 2 8b2a28 8e5e18 8b2a28 114fdfc 8e5e18 8e6088 114fdc4 | 8e5e18
+# thread 2
+X 537 1 3 0 0 | 0 0
+# thread 0
+E 538 0 2 2 8b5a40 1362660 8b5a40 104fdfc 1362660 1362e00 104fdc4 | 1362660
+# thread 3
+X 539 0 2 0 8e5e18 | 0
+E 540 0 9 0 8b2a28 8e5e18 8b2a28 114fdfc 8e5e18 8e6088 114fdc4 | 8e5e18
+# thread 1
+X 541 1 6 ffffff00 0 | ffffff00
+# thread 0
+X 542 0 2 0 1362660 | 0
+E 543 0 9 0 8b5a40 1362660 8b5a40 104fdfc 1362660 1362e00 104fdc4 | 1362660
+# thread 1
+X 544 0 11 0 0 | 0
+E 545 0 2 2 8cd6f0 8e4900 8cd6f0 124fdfc 8e4900 1370478 124fdc4 | 8e4900
+# thread 3
+X 546 0 9 0 8e5e18 | 0
+# thread 0
+X 547 0 9 0 1362660 | 0
+E 548 0 2 2 8b5a40 1362cb0 8b5a40 104fdfc 1362cb0 1362f20 104fdc4 | 1362cb0
+# thread 1
+X 549 0 2 0 8e4900 | 0
+E 550 0 9 0 8cd6f0 8e4900 8cd6f0 124fdfc 8e4900 1370478 124fdc4 | 8e4900
+# thread 0
+X 551 0 2 0 1362cb0 | 0
+E 552 0 9 0 8b5a40 1362cb0 8b5a40 104fdfc 1362cb0 1362f20 104fdc4 | 1362cb0
+# thread 1
+X 553 0 9 0 8e4900 | 0
+E 554 0 7 103 8e2448 124fe68 0 124fdfc 8e2448 8e1f58 124fdbc | 8e2448
+E 555 1 6 124fe68 8e2558 8e2398 139d870 124fdb8 139d768 8e2448 124fd94 | 8e2558 8e2398 ? ?
+# thread 2
+X 556 0 2 0 1368238 | 0
+E 557 0 9 0 8d1710 1368238 8d1710 134fdfc 1368238 1368638 134fdc4 | 1368238
+# thread 0
+X 558 0 9 0 1362cb0 | 0
+E 559 0 1 104fe68 8b5a40 2 8b5a40 104fea8 2 1 104fe00 | "r2" IL
+T B 1384200
+T I 1365d18 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8ea620 mov 1 0 | a:1004 <- ecx=x$1:1004
+T I 8ea6f0 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8ea770 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 137d7b0 mov 1 0 | eax=t158:1004 <- gx:1004
+T I 8ea9a8 inc 1 0 | eax=t164:1004 cc_sozp:9000 <- eax=t164:1004
+T I 1362258 mov 1 0 | w1:1004 <- eax=t164:1004
+T I 137d4f0 mov 1 0 | eax=t155:1004 <- gy:1004
+T I 8eab48 inc 1 0 | eax=t163:1004 cc_sozp:9000 <- eax=t163:1004
+T I 13620e8 mov 1 0 | w2:1004 <- eax=t163:1004
+T I 8eaea8 jmp 1 0 | <- s0:0 ->
+T L 8ea730
+T I 8eafd0 cmp 1 0 | cc=t68:9000 <- ecx=x$1:1004 2:1004
+T I 8eb050 _jcc 1 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 1350fb0 mov 1 0 | eax=t157:1004 <- gx:1004
+T I 8eb220 add 1 0 | eax=t162:1004 cc:9000 <- eax=t162:1004 2:1004
+T I 1383068 mov 1 0 | w2:1004 <- eax=t162:1004
+T I 13a3d40 mov 1 0 | eax=t154:1004 <- gy:1004
+T I 13621e8 add 1 0 | eax=t161:1004 cc:9000 <- eax=t161:1004 2:1004
+T I 1382f08 mov 1 0 | w3:1004 <- eax=t161:1004
+T I 13624f8 jmp 1 0 | <- s0:0 ->
+T L 8eb010
+T I 1362620 cmp 2 0 | cc=t72:9000 <- ecx=x$1:1004 3:1004
+T I 13626a0 _jcc 2 0 | <- s0:0 cc_zf=t72:9000 ->
+T I 13a3dc0 mov 2 0 | eax=t156:1004 <- gx:1004
+T I 1362870 add 2 0 | eax=t159:1004 cc:9000 <- eax=t159:1004 3:1004
+T I 1365f18 mov 2 0 | w3:1004 <- eax=t159:1004
+T I 13a3f60 mov 2 0 | eax=t153:1004 <- gy:1004
+T I 13629e0 add 2 0 | eax=t160:1004 cc:9000 <- eax=t160:1004 3:1004
+T I 137d6e0 mov 2 0 | w1:1004 <- eax=t160:1004
+T L 1365e48
+T I 1362b70 lea 2 0 | rcx=t75:1008 <- a:1008
+T I 1362ac0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t75:1008 pas10:8000 rsp:1008
+T I 1362c40 mov 2 0 | b1:1001 <- 21:1001
+T I 1362cf0 jmp 2 0 | <- s0:0 ->
+T L 1362660
+T I 1362e00 mov 2 0 | w4:1004 <- 9:1004
+T L 1362cb0
+T I 1362f20 mov 2 0 | ecx=t76:1004 <- a:1004
+T I 1362e70 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t76:1004 pas10:8000 rsp:1008
+T I 1363070 xor 2 0 | ecx=t77:1004 cc:9000 <- ecx=t77:1004 ecx=t77:1004
+T I 1362ff0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t77:1004 pas10:8000 rsp:1008
+T I 13802e8 mov 2 0 | ecx=t78:1004 <- w4:1004
+T I 1380238 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t78:1004 pas10:8000 rsp:1008
+T I 13803a0 mov 2 0 | v1:1004 <- 3:1004
+T I 1380440 mov 2 0 | w1:1004 <- 4:1004
+T I 1380560 mov 2 0 | ecx=t79:1004 <- 2:1004
+T I 13804b0 call 2 0 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t79:1004 pas10:8000 rsp:1008
+T I 1366048 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8eaa18 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 560 0 11 0 8ea770 104fe68 0 104fdfc 8ea770 137d7b0 104fdbc | 8ea770
+# thread 2
+X 561 0 9 0 1368238 | 0
+E 562 0 7 103 8eb990 134fe68 0 134fdfc 8eb990 8eb4a0 134fdbc | 8eb990
+# thread 0
+E 563 1 6 8e68b8 137d7b0 8eafd0 104fe68 104fdb8 8e68b8 8e6df8 104fd84 | 137d7b0 8eafd0 "" ""
+# thread 2
+E 564 1 6 134fe68 8ebaa0 8eb8e0 8d7e58 134fdb8 8d7d50 8eb990 134fd94 | 8ebaa0 8eb8e0 ? ?
+# thread 1
+X 565 1 6 0 8e2398 | 0
+X 566 0 7 0 8e2398 | 0
+E 567 0 8 0 8e2448 8e2398 0 124fdfc 8e2448 8e1f58 124fdc4 | 8e2448
+X 568 0 8 0 1 | 0
+E 569 0 2 2 8cd6f0 8e1f58 8cd6f0 124fdfc 8e1f58 8e2558 124fdc4 | 8e1f58
+# thread 0
+X 570 1 6 100 8eafd0 | 100
+X 571 0 11 0 0 | 0
+E 572 0 6 80000000 8ea6f0 8eafd0 8eafd0 104fd5c 8ea6f0 8ea770 104fd4c | 8ea6f0 8eafd0 "" ""
+# thread 1
+X 573 0 2 0 8e1f58 | 0
+E 574 0 9 0 8cd6f0 8e1f58 8cd6f0 124fdfc 8e1f58 8e2558 124fdc4 | 8e1f58
+# thread 0
+X 575 0 6 0 8ea6a0 | 0
+E 576 0 7 103 8eaea8 104fe68 0 104fdfc 8eaea8 8ea730 104fdbc | 8eaea8
+E 577 1 6 104fe68 137d6e0 13620e8 8e7068 104fdb8 8e6b40 8eaea8 104fd94 | 137d6e0 13620e8 "" ""
+# thread 1
+X 578 0 9 0 8e1f58 | 0
+E 579 0 2 2 8cd6f0 8e2408 8cd6f0 124fdfc 8e2408 8e2678 124fdc4 | 8e2408
+E 580 1 3 8e2448 8cd6f0 8e57d8 1 124fdc0 8e2490 8e5820 124fd90 | 8e57d8 8e2448 1
+E 581 2 6 13b 8e5728 8e2398 8e57d8 124fd8c 8e5728 8e2398 124fd3c | 8e5728 8e2398 ? ?
+# thread 0
+X 582 1 6 ffffff00 0 | ffffff00
+# thread 2
+X 583 1 6 0 8eb8e0 | 0
+X 584 0 7 0 8eb8e0 | 0
+E 585 0 8 0 8eb990 8eb8e0 0 134fdfc 8eb990 8eb4a0 134fdc4 | 8eb990
+# thread 1
+X 586 2 6 1 8e56d8 | 1
+E 587 2 6 18 8e55a8 8e2218 8e57d8 124fd8c 8e55a8 8e2218 124fd3c | 8e55a8 8e2218 "f2" "f1"
+X 588 2 6 819e00 8e5588 | 819e00
+E 589 2 4 819e00 8e2448 1 8e57d8 124fd8c 8e55a8 8e2218 124fd40 | 1 8e55a8 8e2218 0 0
+E 590 2 5 0 8e57d8 0 c 124fd8c 86bd40 0 124fd40 | c 1
+X 591 1 3 0 0 | 0 0
+X 592 0 2 0 8e2408 | 0
+E 593 0 9 0 8cd6f0 8e2408 8cd6f0 124fdfc 8e2408 8e2678 124fdc4 | 8e2408
+X 594 0 9 0 8e2408 | 0
+# thread 2
+X 595 0 8 0 1 | 0
+E 596 0 2 2 8d1710 8eb4a0 8d1710 134fdfc 8eb4a0 8ebaa0 134fdc4 | 8eb4a0
+# thread 3
+E 597 0 12 857818 8b2a28 1 8e6788 114fea8 8b2a28 8b2a28 114fe8c | "c1" IL
+T B 137f1d8
+T L 8e6520
+T I 8dc978 sub 0 4 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8dad78 cmp 1 3 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8dadf8 _jcc 1 2 | <- s0:0 cc_zf=t64:9000 ->
+T I 8daf80 mov 1 10 | w1:1004 <- 11:1004
+T I 8db340 jmp 1 2 | <- s0:0 ->
+T L 8dadb8
+T I 8db468 cmp 1 3 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8db4e8 _jcc 1 2 | <- s0:0 cc_zf=t66:9000 ->
+T I 8db670 mov 1 10 | w2:1004 <- 11:1004
+T I 8db9b0 jmp 1 2 | <- s0:0 ->
+T L 8db4a8
+T I 8e5928 cmp 2 3 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8e59a8 _jcc 2 2 | <- s0:0 cc_zf=t68:9000 ->
+T I 8e5b18 mov 2 10 | w3:1004 <- 11:1004
+T L 8daad8
+T I 1369440 mov 2 5 | eax=t140:1004 <- 7:1004
+T I 8e5cd8 lea 2 7 | rcx=t69:1008 <- gv:1008
+T I 8e5bb8 mov 2 7 | s1:1002 <- ax=t139:1002
+T I 8e5c28 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 8e5da8 mov 2 7 | b1:1001 <- 21:1001
+T I 8e5e58 jmp 2 2 | <- s0:0 ->
+T L 8e5968
+T I 8e5f68 mov 2 10 | w4:1004 <- 9:1004
+T L 8e5e18
+T I 8e6088 xor 2 2 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 8e5fd8 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 8e6208 mov 2 6 | ecx=t71:1004 <- w4:1004
+T I 8e6158 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 8e6480 mov 2 5 | ecx=t72:1004 <- 2:1004
+T I 8e62c0 mov 2 10 | v1:1004 <- 3:1004
+T I 8e6360 mov 2 10 | w1:1004 <- 4:1004
+T I 1369360 add 2 4 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8dc4e8 jmp 2 5 | <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008 ->
+T B 0
+# thread 2
+X 598 0 2 0 8eb4a0 | 0
+E 599 0 9 0 8d1710 8eb4a0 8d1710 134fdfc 8eb4a0 8ebaa0 134fdc4 | 8eb4a0
+# thread 0
+X 600 0 7 0 0 | 0
+E 601 0 8 0 8eaea8 0 0 104fdfc 8eaea8 8ea730 104fdc4 | 8eaea8
+# thread 2
+X 602 0 9 0 8eb4a0 | 0
+E 603 0 2 2 8d1710 8eb950 8d1710 134fdfc 8eb950 8ebbc0 134fdc4 | 8eb950
+# thread 0
+X 604 0 8 0 0 | 0
+E 605 0 2 2 8b5a40 8ea730 8b5a40 104fdfc 8ea730 8eafd0 104fdc4 | 8ea730
+# thread 1
+E 606 0 12 86bd40 8cd6f0 1 8e2d78 124fea8 8cd6f0 8cd6f0 124fe8c | "c2" IL
+T B 1372170
+T L 8e2b10
+T I 1351f68 sub 0 4 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e4ba0 cmp 1 3 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8e4c20 _jcc 1 2 | <- s0:0 cc_zf=t64:9000 ->
+T I 8e4da8 mov 1 10 | w1:1004 <- 11:1004
+T I 8e5168 jmp 1 2 | <- s0:0 ->
+T L 8e4be0
+T I 8e5290 cmp 1 3 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8e5310 _jcc 1 2 | <- s0:0 cc_zf=t66:9000 ->
+T I 135b520 mov 1 5 | eax=t140:1004 <- 7:1004
+T I 8e5658 lea 1 7 | rcx=t67:1008 <- gv:1008
+T I 8e5498 mov 1 10 | w2:1004 <- 11:1004
+T I 8e5538 mov 1 7 | s1:1002 <- ax=t139:1002
+T I 8e55a8 call 1 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t67:1008 pas7:8000 rsp:1008
+T I 8e5728 mov 1 7 | b1:1001 <- 21:1001
+T I 8e57d8 jmp 1 2 | <- s0:0 ->
+T L 8e52d0
+T I 8e1f18 cmp 2 3 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8e1f98 _jcc 2 2 | <- s0:0 cc_zf=t68:9000 ->
+T I 8e2108 mov 2 10 | w3:1004 <- 11:1004
+T L 8e4900
+T I 1370478 mov 2 5 | eax=t140:1004 <- 7:1004
+T I 8e22c8 lea 2 7 | rcx=t69:1008 <- gv:1008
+T I 8e21a8 mov 2 7 | s1:1002 <- ax=t139:1002
+T I 8e2218 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 8e2398 mov 2 7 | b1:1001 <- 21:1001
+T I 8e2448 jmp 2 2 | <- s0:0 ->
+T L 8e1f58
+T I 8e2558 mov 2 10 | w4:1004 <- 9:1004
+T L 8e2408
+T I 8e2678 xor 2 2 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 8e25c8 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 8e27f8 mov 2 6 | ecx=t71:1004 <- w4:1004
+T I 8e2748 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 8e2a70 mov 2 5 | ecx=t72:1004 <- 2:1004
+T I 8e28b0 mov 2 10 | v1:1004 <- 3:1004
+T I 8e2950 mov 2 10 | w1:1004 <- 4:1004
+T I 1370398 add 2 4 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 1351ad8 jmp 2 5 | <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008 ->
+T B 0
+# thread 0
+X 607 0 2 0 8ea730 | 0
+E 608 0 9 0 8b5a40 8ea730 8b5a40 104fdfc 8ea730 8eafd0 104fdc4 | 8ea730
+# thread 2
+X 609 0 2 0 8eb950 | 0
+E 610 0 9 0 8d1710 8eb950 8d1710 134fdfc 8eb950 8ebbc0 134fdc4 | 8eb950
+# thread 0
+X 611 0 9 0 8ea730 | 0
+E 612 0 11 0 8eb050 104fe68 0 104fdfc 8eb050 1350fb0 104fdbc | 8eb050
+E 613 1 6 8e68b8 1350fb0 1362620 104fe68 104fdb8 8e68b8 8e6df8 104fd84 | 1350fb0 1362620 "" ""
+# thread 2
+X 614 0 9 0 8eb950 | 0
+# thread 0
+X 615 1 6 100 1362620 | 100
+X 616 0 11 0 0 | 0
+E 617 0 6 80000000 8eafd0 1362620 1362620 104fd5c 8eafd0 8eb050 104fd4c | 8eafd0 1362620 "" ""
+X 618 0 6 0 8eaf80 | 0
+E 619 0 7 103 13624f8 104fe68 0 104fdfc 13624f8 8eb010 104fdbc | 13624f8
+E 620 1 6 104fe68 137d6e0 1382f08 8e7068 104fdb8 8e6b40 13624f8 104fd94 | 137d6e0 1382f08 "" ""
+X 621 1 6 ffffff00 0 | ffffff00
+X 622 0 7 0 0 | 0
+E 623 0 8 0 13624f8 0 0 104fdfc 13624f8 8eb010 104fdc4 | 13624f8
+X 624 0 8 0 0 | 0
+E 625 0 2 2 8b5a40 8eb010 8b5a40 104fdfc 8eb010 1362620 104fdc4 | 8eb010
+X 626 0 2 0 8eb010 | 0
+E 627 0 9 0 8b5a40 8eb010 8b5a40 104fdfc 8eb010 1362620 104fdc4 | 8eb010
+X 628 0 9 0 8eb010 | 0
+E 629 0 11 0 13626a0 104fe68 0 104fdfc 13626a0 13a3dc0 104fdbc | 13626a0
+E 630 1 6 8e68b8 13a3dc0 1362e00 104fe68 104fdb8 8e68b8 8e6df8 104fd84 | 13a3dc0 1362e00 "" ?
+# thread 2
+E 631 0 12 8805f0 8d1710 1 8ec250 134fea8 8d1710 8d1710 134fe8c | "r1" IL
+T B 137c1c0
+T L 8d9398
+T I 1368438 sub 0 4 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8d8dc8 mov 1 4 | a:1004 <- ecx=x$1:1004
+T I 8d8e98 cmp 1 3 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8d8f18 _jcc 1 2 | <- s0:0 cc_zf=t64:9000 ->
+T I 8d90a0 mov 1 10 | w1:1004 <- 11:1004
+T I 8d9448 jmp 1 2 | <- s0:0 ->
+T L 8d8ed8
+T I 8d9570 cmp 1 3 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8d95f0 _jcc 1 2 | <- s0:0 cc_zf=t66:9000 ->
+T I 8d9778 mov 1 10 | w2:1004 <- 11:1004
+T I 8eb338 jmp 1 2 | <- s0:0 ->
+T L 8d95b0
+T I 8eb460 cmp 2 3 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 8eb4e0 _jcc 2 2 | <- s0:0 cc_zf=t68:9000 ->
+T I 8eb650 mov 2 10 | w3:1004 <- 11:1004
+T L 1368238
+T I 1368638 mov 2 5 | eax=t153:1004 <- 7:1004
+T I 8eb810 lea 2 5 | rcx=t69:1008 <- a:1008
+T I 8eb6f0 mov 2 7 | s1:1002 <- ax=t152:1002
+T I 8eb760 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas10:8000 rsp:1008
+T I 8eb8e0 mov 2 7 | b1:1001 <- 21:1001
+T I 8eb990 jmp 2 2 | <- s0:0 ->
+T L 8eb4a0
+T I 8ebaa0 mov 2 10 | w4:1004 <- 9:1004
+T L 8eb950
+T I 8ebbc0 mov 2 4 | ecx=t70:1004 <- a:1004
+T I 8ebb10 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas10:8000 rsp:1008
+T I 8ebd10 xor 2 2 | ecx=t71:1004 cc:9000 <- ecx=t71:1004 ecx=t71:1004
+T I 8ebc90 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas10:8000 rsp:1008
+T I 8ebe90 mov 2 6 | ecx=t72:1004 <- w4:1004
+T I 8ebde0 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas10:8000 rsp:1008
+T I 8ec108 mov 2 5 | ecx=t73:1004 <- 2:1004
+T I 8ebf48 mov 2 10 | v1:1004 <- 3:1004
+T I 8ebfe8 mov 2 10 | w1:1004 <- 4:1004
+T I 8ec058 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t73:1004 pas10:8000 rsp:1008
+T I 8ec1a8 add 2 4 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 1368308 ret 2 1 | cc:9000 <- 0:1004
+T B 0
+# thread 0
+X 632 1 6 0 13627b0 | 0
+X 633 0 11 0 0 | 0
+E 634 0 2 2 8b5a40 1365e48 8b5a40 104fdfc 1365e48 1362b70 104fdc4 | 1365e48
+E 635 1 3 13624f8 8b5a40 8eaea8 1 104fdc0 1362540 8eaef0 104fd90 | 8eaea8 13624f8 1
+E 636 2 6 13b 13620e8 1382f08 8eaea8 104fd8c 13620e8 1382f08 104fd3c | 13620e8 1382f08 "" ""
+X 637 2 6 ffffff00 0 | ffffff00
+E 638 2 4 ffffff00 13624f8 0 8eaea8 104fd8c 13620e8 1382f08 104fd40 | 0 13620e8 1382f08 0 0
+X 639 1 3 0 0 | 0 0
+X 640 0 2 0 1365e48 | 0
+E 641 0 9 0 8b5a40 1365e48 8b5a40 104fdfc 1365e48 1362b70 104fdc4 | 1365e48
+X 642 0 9 0 1365e48 | 0
+E 643 0 7 103 1362cf0 104fe68 0 104fdfc 1362cf0 1362660 104fdbc | 1362cf0
+E 644 1 6 104fe68 1362e00 1362c40 8e6e58 104fdb8 8e6d50 1362cf0 104fd94 | 1362e00 1362c40 ? ?
+X 645 1 6 0 1362c40 | 0
+X 646 0 7 0 1362c40 | 0
+E 647 0 8 0 1362cf0 1362c40 0 104fdfc 1362cf0 1362660 104fdc4 | 1362cf0
+X 648 0 8 0 1 | 0
+E 649 0 2 2 8b5a40 1362660 8b5a40 104fdfc 1362660 1362e00 104fdc4 | 1362660
+X 650 0 2 0 1362660 | 0
+E 651 0 9 0 8b5a40 1362660 8b5a40 104fdfc 1362660 1362e00 104fdc4 | 1362660
+X 652 0 9 0 1362660 | 0
+E 653 0 2 2 8b5a40 1362cb0 8b5a40 104fdfc 1362cb0 1362f20 104fdc4 | 1362cb0
+X 654 0 2 0 1362cb0 | 0
+E 655 0 9 0 8b5a40 1362cb0 8b5a40 104fdfc 1362cb0 1362f20 104fdc4 | 1362cb0
+X 656 0 9 0 1362cb0 | 0
+E 657 0 12 843cd0 8b5a40 1 1380830 104fea8 8b5a40 8b5a40 104fe8c | "r2" IL
+T B 1384200
+T L 8eadf8
+T I 1365d18 sub 0 4 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8ea620 mov 1 4 | a:1004 <- ecx=x$1:1004
+T I 8ea6f0 cmp 1 3 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8ea770 _jcc 1 2 | <- s0:0 cc_zf=t64:9000 ->
+T I 137d7b0 mov 1 6 | eax=t158:1004 <- gx:1004
+T I 8ea9a8 inc 1 2 | eax=t164:1004 cc_sozp:9000 <- eax=t164:1004
+T I 1362258 mov 1 6 | w1:1004 <- eax=t164:1004
+T I 137d4f0 mov 1 6 | eax=t155:1004 <- gy:1004
+T I 8eab48 inc 1 2 | eax=t163:1004 cc_sozp:9000 <- eax=t163:1004
+T I 13620e8 mov 1 6 | w2:1004 <- eax=t163:1004
+T I 8eaea8 jmp 1 2 | <- s0:0 ->
+T L 8ea730
+T I 8eafd0 cmp 1 3 | cc=t68:9000 <- ecx=x$1:1004 2:1004
+T I 8eb050 _jcc 1 2 | <- s0:0 cc_zf=t68:9000 ->
+T I 1350fb0 mov 1 6 | eax=t157:1004 <- gx:1004
+T I 8eb220 add 1 2 | eax=t162:1004 cc:9000 <- eax=t162:1004 ecx:1004
+T I 1383068 mov 1 6 | w2:1004 <- eax=t162:1004
+T I 13a3d40 mov 1 6 | eax=t154:1004 <- gy:1004
+T I 13621e8 add 1 2 | eax=t161:1004 cc:9000 <- eax=t161:1004 ecx:1004
+T I 1382f08 mov 1 6 | w3:1004 <- eax=t161:1004
+T I 13624f8 jmp 1 2 | <- s0:0 ->
+T L 8eb010
+T I 1362620 cmp 2 3 | cc=t72:9000 <- ecx=x$1:1004 3:1004
+T I 13626a0 _jcc 2 2 | <- s0:0 cc_zf=t72:9000 ->
+T I 13a3dc0 mov 2 6 | eax=t156:1004 <- gx:1004
+T I 1362870 add 2 2 | eax=t159:1004 cc:9000 <- eax=t159:1004 ecx:1004
+T I 1365f18 mov 2 6 | w3:1004 <- eax=t159:1004
+T I 13a3f60 mov 2 6 | eax=t153:1004 <- gy:1004
+T I 13629e0 add 2 2 | eax=t160:1004 cc:9000 <- eax=t160:1004 ecx:1004
+T I 137d6e0 mov 2 6 | w1:1004 <- eax=t160:1004
+T L 1365e48
+T I 1362b70 lea 2 5 | rcx=t75:1008 <- a:1008
+T I 1362ac0 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 rcx=t75:1008 pas10:8000 rsp:1008
+T I 1362c40 mov 2 7 | b1:1001 <- 21:1001
+T I 1362cf0 jmp 2 2 | <- s0:0 ->
+T L 1362660
+T I 1362e00 mov 2 10 | w4:1004 <- 9:1004
+T L 1362cb0
+T I 1362f20 mov 2 4 | ecx=t76:1004 <- a:1004
+T I 1362e70 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t76:1004 pas10:8000 rsp:1008
+T I 1363070 xor 2 2 | ecx=t77:1004 cc:9000 <- ecx=t77:1004 ecx=t77:1004
+T I 1362ff0 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t77:1004 pas10:8000 rsp:1008
+T I 13802e8 mov 2 6 | ecx=t78:1004 <- w4:1004
+T I 1380238 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t78:1004 pas10:8000 rsp:1008
+T I 1380560 mov 2 5 | ecx=t79:1004 <- 2:1004
+T I 13803a0 mov 2 10 | v1:1004 <- 3:1004
+T I 1380440 mov 2 10 | w1:1004 <- 4:1004
+T I 13804b0 call 2 5 | pas10:8000 regset:0 cc:9000 <- s8192:1008 ecx=t79:1004 pas10:8000 rsp:1008
+T I 1366048 add 2 4 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8eaa18 ret 2 1 | cc:9000 <- 0:1004
+T B 0
+# thread 3
+E 658 0 0 0 8cd6f0 0 0 114fef4 857818 8cd6f0 114feac | 0 "c3"
+E 659 0 1 114fe68 8cd6f0 0 8cd6f0 114fea8 1 0 114fe00 | "c3" IL
+T B 8ce9f0
+T I 136f600 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e2720 mov 1 0 | ecx=x$1:1004 <- ecx=t138:1004
+T I 8e2198 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8e2218 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8e23a0 mov 1 0 | w1:1004 <- 11:1004
+T I 8e1ef8 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e2458 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8e25c8 mov 1 0 | rcx=t65:1008 <- gv:1008
+T I 8e24c8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t65:1008 pas7:8000 rsp:1008
+T I 8e26b0 mov 1 0 | b1:1001 <- 21:1001
+T I 8e2760 jmp 1 0 | <- s0:0 ->
+T L 8e21d8
+T I 8e2888 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8e2908 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8e2a90 mov 1 0 | w2:1004 <- 11:1004
+T I 136fb40 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e2b30 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 13515c0 mov 1 0 | rcx=t73:1008 <- gv:1008
+T I 13514a0 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t73:1008 pas7:8000 rsp:1008
+T I 8e2d20 mov 1 0 | b1:1001 <- 21:1001
+T I 8e2dd0 jmp 1 0 | <- s0:0 ->
+T L 8e28c8
+T I 13701e8 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 1370268 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 13703d8 mov 2 0 | w3:1004 <- 11:1004
+T I 8d22b0 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 1370478 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 1370598 mov 2 0 | rcx=t69:1008 <- gv:1008
+T I 13704e8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 1370668 mov 2 0 | b1:1001 <- 21:1001
+T I 1370718 jmp 2 0 | <- s0:0 ->
+T L 1370228
+T I 1370828 mov 2 0 | w4:1004 <- 9:1004
+T L 13706d8
+T I 1370948 mov 2 0 | ecx=t70:1004 <- 0:1004
+T I 1370898 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 1370ac8 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 1370a18 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 1370b80 mov 2 0 | v1:1004 <- 3:1004
+T I 1370c20 mov 2 0 | w1:1004 <- 4:1004
+T I 1370d40 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 1370c90 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 8d21d0 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 1370de0 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 660 0 0 8566a8 8cd6f0 2 0 114fef4 857818 8cd6f0 114feac | 2 "c3"
+E 661 0 1 114fe68 8cd6f0 2 8cd6f0 114fea8 1 0 114fe00 | "c3" IL
+T B 8b3d28
+T I 136f600 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e2198 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8e2218 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8e23a0 mov 1 0 | w1:1004 <- 11:1004
+T I 8e1ef8 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e2458 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 8e25c8 lea 1 0 | rcx=t65:1008 <- gv:1008
+T I 8e24c8 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t65:1008 pas7:8000 rsp:1008
+T I 8e26b0 mov 1 0 | b1:1001 <- 21:1001
+T I 8e2760 jmp 1 0 | <- s0:0 ->
+T L 8e21d8
+T I 8e2888 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8e2908 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8e2a90 mov 1 0 | w2:1004 <- 11:1004
+T I 136fb40 mov 1 0 | eax=t140:1004 <- 7:1004
+T I 8e2b30 mov 1 0 | s1:1002 <- ax=t139:1002
+T I 13515c0 lea 1 0 | rcx=t73:1008 <- gv:1008
+T I 13514a0 call 1 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t73:1008 pas7:8000 rsp:1008
+T I 8e2d20 mov 1 0 | b1:1001 <- 21:1001
+T I 8e2dd0 jmp 1 0 | <- s0:0 ->
+T L 8e28c8
+T I 13701e8 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 1370268 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 13703d8 mov 2 0 | w3:1004 <- 11:1004
+T I 8d22b0 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 1370478 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 1370598 lea 2 0 | rcx=t69:1008 <- gv:1008
+T I 13704e8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 1370668 mov 2 0 | b1:1001 <- 21:1001
+T I 1370718 jmp 2 0 | <- s0:0 ->
+T L 1370228
+T I 1370828 mov 2 0 | w4:1004 <- 9:1004
+T L 13706d8
+T I 1370948 xor 2 0 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 1370898 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 1370ac8 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 1370a18 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 1370b80 mov 2 0 | v1:1004 <- 3:1004
+T I 1370c20 mov 2 0 | w1:1004 <- 4:1004
+T I 1370d40 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 1370c90 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 8d21d0 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 1370de0 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 662 0 11 0 8e2218 114fe68 0 114fdfc 8e2218 8e23a0 114fdbc | 8e2218
+E 663 1 6 8cea00 8e23a0 8e2888 114fe68 114fdb8 8cea00 8ced90 114fd84 | 8e23a0 8e2888 ? ""
+X 664 1 6 100 8e2888 | 100
+E 665 1 6 8cea60 8e1ef8 8e2888 114fe68 114fdb8 8cea60 8ced90 114fd84 | 8e1ef8 8e2888 ? ""
+X 666 1 6 100 8e2888 | 100
+E 667 1 6 8ceb20 8e25c8 8e2888 114fe68 114fdb8 8ceb20 8ced90 114fd84 | 8e25c8 8e2888 "" ""
+X 668 1 6 100 8e2888 | 100
+X 669 0 11 0 0 | 0
+E 670 0 6 80000000 8e2198 8e2888 8e2888 114fd5c 8e2198 8e2218 114fd4c | 8e2198 8e2888 "" ""
+X 671 0 6 0 8e2110 | 0
+E 672 0 7 103 8e2760 114fe68 0 114fdfc 8e2760 8e21d8 114fdbc | 8e2760
+E 673 1 6 114fe68 1370828 8e26b0 8cf150 114fdb8 8cec88 8e2760 114fd94 | 1370828 8e26b0 ? ?
+X 674 1 6 0 8e26b0 | 0
+X 675 0 7 0 8e26b0 | 0
+E 676 0 8 0 8e2760 8e26b0 0 114fdfc 8e2760 8e21d8 114fdc4 | 8e2760
+X 677 0 8 0 1 | 0
+E 678 0 2 2 8cd6f0 8e21d8 8cd6f0 114fdfc 8e21d8 8e2888 114fdc4 | 8e21d8
+X 679 0 2 0 8e21d8 | 0
+E 680 0 9 0 8cd6f0 8e21d8 8cd6f0 114fdfc 8e21d8 8e2888 114fdc4 | 8e21d8
+X 681 0 9 0 8e21d8 | 0
+E 682 0 11 0 8e2908 114fe68 0 114fdfc 8e2908 8e2a90 114fdbc | 8e2908
+E 683 1 6 8cea00 8e2a90 13701e8 114fe68 114fdb8 8cea00 8ced90 114fd84 | 8e2a90 13701e8 ? ""
+X 684 1 6 100 13701e8 | 100
+E 685 1 6 8cea60 136fb40 13701e8 114fe68 114fdb8 8cea60 8ced90 114fd84 | 136fb40 13701e8 ? ""
+X 686 1 6 100 13701e8 | 100
+E 687 1 6 8ceb20 13515c0 13701e8 114fe68 114fdb8 8ceb20 8ced90 114fd84 | 13515c0 13701e8 "" ""
+X 688 1 6 100 13701e8 | 100
+X 689 0 11 0 0 | 0
+E 690 0 6 80000000 8e2888 13701e8 13701e8 114fd5c 8e2888 8e2908 114fd4c | 8e2888 13701e8 "" ""
+X 691 0 6 0 8e2838 | 0
+E 692 0 7 103 8e2dd0 114fe68 0 114fdfc 8e2dd0 8e28c8 114fdbc | 8e2dd0
+E 693 1 6 114fe68 1370828 8e2d20 8cf150 114fdb8 8cec88 8e2dd0 114fd94 | 1370828 8e2d20 ? ?
+X 694 1 6 0 8e2d20 | 0
+X 695 0 7 0 8e2d20 | 0
+E 696 0 8 0 8e2dd0 8e2d20 0 114fdfc 8e2dd0 8e28c8 114fdc4 | 8e2dd0
+X 697 0 8 0 1 | 0
+E 698 0 2 2 8cd6f0 8e28c8 8cd6f0 114fdfc 8e28c8 13701e8 114fdc4 | 8e28c8
+X 699 0 2 0 8e28c8 | 0
+E 700 0 9 0 8cd6f0 8e28c8 8cd6f0 114fdfc 8e28c8 13701e8 114fdc4 | 8e28c8
+X 701 0 9 0 8e28c8 | 0
+E 702 0 11 0 1370268 114fe68 0 114fdfc 1370268 13703d8 114fdbc | 1370268
+E 703 1 6 8cea00 13703d8 1370828 114fe68 114fdb8 8cea00 8ced90 114fd84 | 13703d8 1370828 ? ?
+X 704 1 6 ffffff00 0 | ffffff00
+E 705 1 6 8cea60 8d22b0 1370828 114fe68 114fdb8 8cea60 8ced90 114fd84 | 8d22b0 1370828 ? ?
+X 706 1 6 0 1370378 | 0
+E 707 1 6 8ceb20 1370598 1370828 114fe68 114fdb8 8ceb20 8ced90 114fd84 | 1370598 1370828 "" ?
+X 708 1 6 100 1370828 | 100
+X 709 0 11 0 0 | 0
+E 710 0 7 103 1370718 114fe68 0 114fdfc 1370718 1370228 114fdbc | 1370718
+E 711 1 6 114fe68 1370828 1370668 8cedf0 114fdb8 8cec88 1370718 114fd94 | 1370828 1370668 ? ?
+X 712 1 6 0 1370668 | 0
+X 713 0 7 0 1370668 | 0
+E 714 0 8 0 1370718 1370668 0 114fdfc 1370718 1370228 114fdc4 | 1370718
+X 715 0 8 0 1 | 0
+E 716 0 2 2 8cd6f0 1370228 8cd6f0 114fdfc 1370228 1370828 114fdc4 | 1370228
+X 717 0 2 0 1370228 | 0
+E 718 0 9 0 8cd6f0 1370228 8cd6f0 114fdfc 1370228 1370828 114fdc4 | 1370228
+X 719 0 9 0 1370228 | 0
+E 720 0 2 2 8cd6f0 13706d8 8cd6f0 114fdfc 13706d8 1370948 114fdc4 | 13706d8
+E 721 1 3 1370718 8cd6f0 8e2dd0 1 114fdc0 1370760 8e2e18 114fd90 | 8e2dd0 1370718 1
+E 722 2 6 13b 8e2d20 1370668 8e2dd0 114fd8c 8e2d20 1370668 114fd3c | 8e2d20 1370668 ? ?
+X 723 2 6 1 8e2cd0 | 1
+E 724 2 6 18 13514a0 13704e8 8e2dd0 114fd8c 13514a0 13704e8 114fd3c | 13514a0 13704e8 "f1" "f1"
+X 725 2 6 401 1351538 | 401
+E 726 2 6 114 13515c0 1370598 8e2dd0 114fd8c 13515c0 1370598 114fd3c | 13515c0 1370598 "" ""
+X 727 2 6 1 8cba74 | 1
+E 728 2 6 13b 8e2b30 1370478 8e2dd0 114fd8c 8e2b30 1370478 114fd3c | 8e2b30 1370478 "" ""
+X 729 2 6 8b8901 8e2ca0 | 8b8901
+E 730 2 6 13b 136fb40 8d22b0 8e2dd0 114fd8c 136fb40 8d22b0 114fd3c | 136fb40 8d22b0 ? ?
+X 731 2 6 1 1370dc0 | 1
+E 732 2 6 13b 8e2a90 13703d8 8e2dd0 114fd8c 8e2a90 13703d8 114fd3c | 8e2a90 13703d8 ? ?
+X 733 2 6 ffffff00 0 | ffffff00
+E 734 2 4 ffffff00 1370718 5 8e2dd0 114fd8c 8e2a90 13703d8 114fd40 | 5 8e2a90 13703d8 0 0
+E 735 2 5 0 8e2dd0 0 18 114fd8c 857818 0 114fd40 | 18 1
+X 736 1 3 1 0 | 1 0
+E 737 1 3 1370718 8cd6f0 8e2760 1 114fdc0 1370760 8e27a8 114fd90 | 8e2760 1370718 1
+E 738 2 6 13b 8e26b0 1370668 8e2760 114fd8c 8e26b0 1370668 114fd3c | 8e26b0 1370668 ? ?
+X 739 2 6 1 8e2648 | 1
+E 740 2 6 18 8e24c8 13704e8 8e2760 114fd8c 8e24c8 13704e8 114fd3c | 8e24c8 13704e8 "f1" "f1"
+X 741 2 6 401 136f130 | 401
+E 742 2 6 114 8e25c8 1370598 8e2760 114fd8c 8e25c8 1370598 114fd3c | 8e25c8 1370598 "" ""
+X 743 2 6 1 8cba74 | 1
+E 744 2 6 13b 8e2458 1370478 8e2760 114fd8c 8e2458 1370478 114fd3c | 8e2458 1370478 "" ""
+X 745 2 6 8b8901 1370b60 | 8b8901
+E 746 2 6 13b 8e1ef8 8d22b0 8e2760 114fd8c 8e1ef8 8d22b0 114fd3c | 8e1ef8 8d22b0 ? ?
+X 747 2 6 1 1351450 | 1
+E 748 2 6 13b 8e23a0 13703d8 8e2760 114fd8c 8e23a0 13703d8 114fd3c | 8e23a0 13703d8 ? ?
+X 749 2 6 ffffff00 0 | ffffff00
+E 750 2 4 ffffff00 1370718 5 8e2760 114fd8c 8e23a0 13703d8 114fd40 | 5 8e23a0 13703d8 0 0
+E 751 2 5 14 8e2760 14 2c 114fd8c 857818 0 114fd40 | 2c 1
+X 752 1 3 1 0 | 1 0
+X 753 0 2 1 13706d8 | 1
+E 754 0 2 2 8cd6f0 1370228 8cd6f0 114fdfc 1370228 1370828 114fdc4 | 1370228
+X 755 0 2 0 1370228 | 0
+E 756 0 9 0 8cd6f0 1370228 8cd6f0 114fdfc 1370228 1370828 114fdc4 | 1370228
+X 757 0 9 0 1370228 | 0
+E 758 0 2 2 8cd6f0 13706d8 8cd6f0 114fdfc 13706d8 1370948 114fdc4 | 13706d8
+X 759 0 2 0 13706d8 | 0
+E 760 0 9 0 8cd6f0 13706d8 8cd6f0 114fdfc 13706d8 1370948 114fdc4 | 13706d8
+X 761 0 9 0 13706d8 | 0
+E 762 0 1 114fe68 8cd6f0 2 8cd6f0 114fea8 2 1 114fe00 | "c3" IL
+T B 8b3d28
+T I 136f600 sub 0 0 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e2198 cmp 1 0 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8e2218 _jcc 1 0 | <- s0:0 cc_zf=t64:9000 ->
+T I 8e23a0 mov 1 0 | w1:1004 <- 11:1004
+T I 8e2760 jmp 1 0 | <- s0:0 ->
+T L 8e21d8
+T I 8e2888 cmp 1 0 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8e2908 _jcc 1 0 | <- s0:0 cc_zf=t66:9000 ->
+T I 8e2a90 mov 1 0 | w2:1004 <- 11:1004
+T I 8e2dd0 jmp 1 0 | <- s0:0 ->
+T L 8e28c8
+T I 13701e8 cmp 2 0 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 1370268 _jcc 2 0 | <- s0:0 cc_zf=t68:9000 ->
+T I 13703d8 mov 2 0 | w3:1004 <- 11:1004
+T L 8e2d90
+T I 8d22b0 mov 2 0 | eax=t140:1004 <- 7:1004
+T I 1370478 mov 2 0 | s1:1002 <- ax=t139:1002
+T I 1370598 lea 2 0 | rcx=t69:1008 <- gv:1008
+T I 13704e8 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 1370668 mov 2 0 | b1:1001 <- 21:1001
+T I 1370718 jmp 2 0 | <- s0:0 ->
+T L 1370228
+T I 1370828 mov 2 0 | w4:1004 <- 9:1004
+T L 13706d8
+T I 1370948 xor 2 0 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 1370898 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 1370ac8 mov 2 0 | ecx=t71:1004 <- w4:1004
+T I 1370a18 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 1370b80 mov 2 0 | v1:1004 <- 3:1004
+T I 1370c20 mov 2 0 | w1:1004 <- 4:1004
+T I 1370d40 mov 2 0 | ecx=t72:1004 <- 2:1004
+T I 1370c90 call 2 0 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008
+T I 8d21d0 add 2 0 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 1370de0 _eret 2 0 | cc:9000 <- 0:1004
+T B 0
+E 763 0 11 0 8e2218 114fe68 0 114fdfc 8e2218 8e23a0 114fdbc | 8e2218
+E 764 1 6 8cea00 8e23a0 8e2888 114fe68 114fdb8 8cea00 8ced90 114fd84 | 8e23a0 8e2888 ? ""
+X 765 1 6 100 8e2888 | 100
+X 766 0 11 0 0 | 0
+E 767 0 6 80000000 8e2198 8e2888 8e2888 114fd5c 8e2198 8e2218 114fd4c | 8e2198 8e2888 "" ""
+X 768 0 6 0 8e2110 | 0
+E 769 0 7 103 8e2760 114fe68 0 114fdfc 8e2760 8e21d8 114fdbc | 8e2760
+E 770 1 6 114fe68 13703d8 8e23a0 8cedf0 114fdb8 8cea60 8e2760 114fd94 | 13703d8 8e23a0 ? ?
+X 771 1 6 0 0 | 0
+X 772 0 7 0 0 | 0
+E 773 0 8 0 8e2760 0 0 114fdfc 8e2760 8e21d8 114fdc4 | 8e2760
+X 774 0 8 0 0 | 0
+E 775 0 2 2 8cd6f0 8e21d8 8cd6f0 114fdfc 8e21d8 8e2888 114fdc4 | 8e21d8
+X 776 0 2 0 8e21d8 | 0
+E 777 0 9 0 8cd6f0 8e21d8 8cd6f0 114fdfc 8e21d8 8e2888 114fdc4 | 8e21d8
+X 778 0 9 0 8e21d8 | 0
+E 779 0 11 0 8e2908 114fe68 0 114fdfc 8e2908 8e2a90 114fdbc | 8e2908
+E 780 1 6 8cea00 8e2a90 13701e8 114fe68 114fdb8 8cea00 8ced90 114fd84 | 8e2a90 13701e8 ? ""
+X 781 1 6 100 13701e8 | 100
+X 782 0 11 0 0 | 0
+E 783 0 6 80000000 8e2888 13701e8 13701e8 114fd5c 8e2888 8e2908 114fd4c | 8e2888 13701e8 "" ""
+X 784 0 6 0 8e2838 | 0
+E 785 0 7 103 8e2dd0 114fe68 0 114fdfc 8e2dd0 8e28c8 114fdbc | 8e2dd0
+E 786 1 6 114fe68 13703d8 8e2a90 8cedf0 114fdb8 8cea60 8e2dd0 114fd94 | 13703d8 8e2a90 ? ?
+X 787 1 6 0 0 | 0
+X 788 0 7 0 0 | 0
+E 789 0 8 0 8e2dd0 0 0 114fdfc 8e2dd0 8e28c8 114fdc4 | 8e2dd0
+X 790 0 8 0 0 | 0
+E 791 0 2 2 8cd6f0 8e28c8 8cd6f0 114fdfc 8e28c8 13701e8 114fdc4 | 8e28c8
+X 792 0 2 0 8e28c8 | 0
+E 793 0 9 0 8cd6f0 8e28c8 8cd6f0 114fdfc 8e28c8 13701e8 114fdc4 | 8e28c8
+X 794 0 9 0 8e28c8 | 0
+E 795 0 11 0 1370268 114fe68 0 114fdfc 1370268 13703d8 114fdbc | 1370268
+E 796 1 6 8cea00 13703d8 1370828 114fe68 114fdb8 8cea00 8ced90 114fd84 | 13703d8 1370828 ? ?
+X 797 1 6 ffffff00 0 | ffffff00
+X 798 0 11 0 0 | 0
+E 799 0 2 2 8cd6f0 8e2d90 8cd6f0 114fdfc 8e2d90 8d22b0 114fdc4 | 8e2d90
+E 800 1 3 8e2dd0 8cd6f0 8e2760 1 114fdc0 8e2e18 8e27a8 114fd90 | 8e2760 8e2dd0 1
+E 801 2 6 13b 8e23a0 8e2a90 8e2760 114fd8c 8e23a0 8e2a90 114fd3c | 8e23a0 8e2a90 ? ?
+X 802 2 6 ffffff00 0 | ffffff00
+E 803 2 4 ffffff00 8e2dd0 0 8e2760 114fd8c 8e23a0 8e2a90 114fd40 | 0 8e23a0 8e2a90 0 0
+X 804 1 3 0 0 | 0 0
+X 805 0 2 0 8e2d90 | 0
+E 806 0 9 0 8cd6f0 8e2d90 8cd6f0 114fdfc 8e2d90 8d22b0 114fdc4 | 8e2d90
+X 807 0 9 0 8e2d90 | 0
+E 808 0 7 103 1370718 114fe68 0 114fdfc 1370718 1370228 114fdbc | 1370718
+E 809 1 6 114fe68 1370828 1370668 8cedf0 114fdb8 8cece8 1370718 114fd94 | 1370828 1370668 ? ?
+X 810 1 6 0 1370668 | 0
+X 811 0 7 0 1370668 | 0
+E 812 0 8 0 1370718 1370668 0 114fdfc 1370718 1370228 114fdc4 | 1370718
+X 813 0 8 0 1 | 0
+E 814 0 2 2 8cd6f0 1370228 8cd6f0 114fdfc 1370228 1370828 114fdc4 | 1370228
+X 815 0 2 0 1370228 | 0
+E 816 0 9 0 8cd6f0 1370228 8cd6f0 114fdfc 1370228 1370828 114fdc4 | 1370228
+X 817 0 9 0 1370228 | 0
+E 818 0 2 2 8cd6f0 13706d8 8cd6f0 114fdfc 13706d8 1370948 114fdc4 | 13706d8
+X 819 0 2 0 13706d8 | 0
+E 820 0 9 0 8cd6f0 13706d8 8cd6f0 114fdfc 13706d8 1370948 114fdc4 | 13706d8
+X 821 0 9 0 13706d8 | 0
+E 822 0 12 857818 8cd6f0 1 1351730 114fea8 8cd6f0 8cd6f0 114fe8c | "c3" IL
+T B 8b3d28
+T L 1370de0
+T I 136f600 sub 0 4 | rsp:1008 cc:9000 <- rsp:1008 40:1008
+T I 8e2198 cmp 1 3 | cc=t64:9000 <- ecx=x$1:1004 1:1004
+T I 8e2218 _jcc 1 2 | <- s0:0 cc_zf=t64:9000 ->
+T I 8e23a0 mov 1 10 | w1:1004 <- 11:1004
+T I 8e2760 jmp 1 2 | <- s0:0 ->
+T L 8e21d8
+T I 8e2888 cmp 1 3 | cc=t66:9000 <- ecx=x$1:1004 2:1004
+T I 8e2908 _jcc 1 2 | <- s0:0 cc_zf=t66:9000 ->
+T I 8e2a90 mov 1 10 | w2:1004 <- 11:1004
+T I 8e2dd0 jmp 1 2 | <- s0:0 ->
+T L 8e28c8
+T I 13701e8 cmp 2 3 | cc=t68:9000 <- ecx=x$1:1004 3:1004
+T I 1370268 _jcc 2 2 | <- s0:0 cc_zf=t68:9000 ->
+T I 13703d8 mov 2 10 | w3:1004 <- 11:1004
+T L 8e2d90
+T I 8d22b0 mov 2 5 | eax=t140:1004 <- 7:1004
+T I 1370598 lea 2 7 | rcx=t69:1008 <- gv:1008
+T I 1370478 mov 2 7 | s1:1002 <- ax=t139:1002
+T I 13704e8 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 rcx=t69:1008 pas7:8000 rsp:1008
+T I 1370668 mov 2 7 | b1:1001 <- 21:1001
+T I 1370718 jmp 2 2 | <- s0:0 ->
+T L 1370228
+T I 1370828 mov 2 10 | w4:1004 <- 9:1004
+T L 13706d8
+T I 1370948 xor 2 2 | ecx=t70:1004 cc:9000 <- ecx=t70:1004 ecx=t70:1004
+T I 1370898 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t70:1004 pas7:8000 rsp:1008
+T I 1370ac8 mov 2 6 | ecx=t71:1004 <- w4:1004
+T I 1370a18 call 2 5 | pas7:8000 regset:0 cc:9000 <- s8192:1008 ecx=t71:1004 pas7:8000 rsp:1008
+T I 1370d40 mov 2 5 | ecx=t72:1004 <- 2:1004
+T I 1370b80 mov 2 10 | v1:1004 <- 3:1004
+T I 1370c20 mov 2 10 | w1:1004 <- 4:1004
+T I 8d21d0 add 2 4 | rsp:1008 cc:9000 <- rsp:1008 40:1004
+T I 8c0dd8 jmp 2 5 | <- s8192:1008 ecx=t72:1004 pas7:8000 rsp:1008 ->
+T B 0
+# end seq 823

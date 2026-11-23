@@ -311,16 +311,20 @@ def load_export(path):
 
 def predict_report(fns, show=8):
     """--predict: the DAG, latencies, units, static priorities and schedule from the IL against the trace, with
-    the alias facts the compiler answered (ItfPasInterf / ItfIsMemberOfPas) and with the IL-only guess."""
-    for alias in (True, False):
-        c, bad = compare_dag(fns, alias=alias)
+    the alias facts the compiler answered (ItfPasInterf / ItfIsMemberOfPas), with those facts derived from the IL
+    (ILAlias, 6.2) and with the older IL-only guess (pas_guess)."""
+    bad = []
+    for alias in (True, "il", False):
+        c, b = compare_dag(fns, alias=alias)
+        bad = bad or b
         if not c["regions"]:
             print("predict: no regions with IL (trace with --il / --predict)")
             return
         print("predict (%s): %d regions; edges %d of %d traced reproduced (%d predicted; type and latency equal %d); "
               "DAG exact %d; node latency %d, unit %d, height %d, static priority %d of %d; issue order exact: "
               "%d with the predicted DAG, %d with the traced one" % (
-                  "IL + alias facts" if alias else "IL only", c["regions"], c["edges both"], c["edges traced"],
+                  {True: "IL + alias facts", "il": "IL only, alias facts from the IL",
+                   False: "IL only, PAS guess"}[alias], c["regions"], c["edges both"], c["edges traced"],
                   c["edges predicted"], c["edges same type+lat"], c["dag exact"], c["lat"], c["unit"],
                   c["height"], c["static"], c["nodes"], c["order predicted dag"], c["order traced dag"]))
     for fn, k, r, te, pe in bad[:show]:
@@ -1154,6 +1158,215 @@ def memb_interf(sym, pas, facts=None):
     return pas in (7, 10, 13, 15)
 
 
+# ------------------------------------------------------------------------- the alias facts from the IL (6.2)
+# ItfPasInterf (0x100de4f0) on two derived sets (index >= [TLS+0xec48]): each is a record of [TLS+0xec1c] (16
+# bytes: parent set, key, size, offset; ItfNewPASAux 0x10055470, ItfNewPAS 0x101724a0 makes a sibling at another
+# offset, ItfNewValuePas 0x10172510 one with a fresh key). The same key: they interfere iff [offset, offset +
+# size) overlap; other keys: the parents are compared (up the chain) and in the end the base sets' bit vectors.
+# The IL does not carry the records, so ILAlias rebuilds them from the region's memory leaves: a set's key is the
+# base the access goes through (a variable, after the region's copies `mov x, y` and `lea x, [y + d]` are folded
+# in; a local array's SYM, the leaf's +0x2c; the frame register), its range the leaves' [disp, disp + size).
+ARGREGS = {"rcx", "rdx", "r8", "r9", "ecx", "edx", "r8d", "r9d"}
+# key alias_il (env C2SCHED17_ALIAS_IL=0 turns it off): predict_dag(alias=True) on a region without logged alias
+# answers derives them from the IL instead of pas_guess. On by default: on zlib (12 files, /O2 and /O2
+# /favor:ATOM) and every tests/data/sched17 export it is equal or better than pas_guess in every file (6.2).
+ALIAS_IL = os.environ.get("C2SCHED17_ALIAS_IL", "1") != "0"
+
+
+def _rvar(l):
+    """(register, variable) of a REG leaf's text `reg=var:type`."""
+    reg, eq, var = l["text"].split(":")[0].partition("=")
+    return reg, (var if eq else None)
+
+
+def fn_alias_info(fn):
+    """Function-level inputs of ILAlias: the SYMs whose address the IL takes anywhere (kind-3 leaves: a `lea` of a
+    local, an address constant; such a local can be reached through a pointer), and the variables that hold an
+    incoming argument (read in rcx / rdx / r8 / r9 before a definition in the first region, their copies there,
+    X$k for a parameter X: a kind-2 leaf of SYM kind 5). A pointer argument cannot point at this function's
+    locals (zlib: every answer between a parameter's set and a local's is 0). And the arrays reached by symbol
+    (+0x2c) the function stores to: a table it only reads is taken for a global."""
+    esc, params, pnames, stored = set(), set(), set(), set()
+    for k, r in enumerate(fn["regions"]):
+        defined = set()
+        for n in sorted(r.get("nodes") or [], key=lambda n: n["lex"]):
+            t = il_tuple(n)
+            for l in t["dst"]:
+                if l["kind"] == 6 and l.get("w2c"):
+                    stored.add(l["w2c"])
+            for l in t["src"] + t["dst"]:
+                if l["kind"] == 3 and l.get("w24"):
+                    esc.add(l["w24"])
+                if l["kind"] == 2 and l.get("symkind") == 5:
+                    pnames.add(l["text"].split(":")[0])
+            if k:
+                continue
+            for l in t["src"]:
+                if l["kind"] == 1:
+                    reg, var = _rvar(l)
+                    if var and reg in ARGREGS and var not in defined:
+                        params.add(var)
+            if t["op"] == "mov" and t["dst"] and t["dst"][0]["kind"] == 1 and t["src"] and t["src"][0]["kind"] == 1 \
+                    and _rvar(t["src"][0])[1] in params and _rvar(t["dst"][0])[1]:
+                params.add(_rvar(t["dst"][0])[1])
+            for l in t["dst"]:
+                if l["kind"] == 1 and _rvar(l)[1]:
+                    defined.add(_rvar(l)[1])
+    return dict(esc=esc, params=params, pnames=pnames, stored=stored)
+
+
+class ILAlias:
+    """The answers of ItfPasInterf / ItfIsMemberOfPas for one region, from its IL (and fn_alias_info): `pas` and
+    `memb` have the `.get((a, b))` of the logged fact dicts, so pas_interf / memb_interf take them as `facts`.
+
+    Two derived sets (>= 16) whose keys meet interfere iff an index is involved or their ranges overlap; other
+    keys: a local (frame register, a local array's SYM) against another local or against a set reached through a
+    pointer argument does not interfere, anything else does. A small set (7, 10, 13, 15: calls, escaping memory)
+    meets a local array only when the array's address is taken. A variable (ItfIsMemberOfPas) is in a set when it
+    is a global (SYM kind other than 3..5), or its address is taken and the set is not reached through a pointer
+    argument; set 6 holds none."""
+
+    def __init__(self, tups, info=None):
+        info = info or dict(esc=set(), params=set(), pnames=set(), stored=set())
+        self.info = info
+        par = {}
+
+        def find(x):
+            o = 0
+            while par.get(x, (x, 0))[0] != x:
+                p, d = par[x]
+                o += d
+                x = p
+            return x, o
+
+        def union(x, y, d):          # x = y + d
+            rx, ox = find(x)
+            ry, oy = find(y)
+            if rx != ry:
+                par[rx] = (ry, oy + d - ox)
+        self._find = find
+        variant, per, self.root, self.skind = set(), {}, {}, {}
+        for t in tups:
+            for l in t["src"] + t["dst"]:
+                if l["kind"] == 2 and l.get("symid") is not None:
+                    self.root[l["symid"]], self.skind[l["symid"]] = l.get("root"), l.get("symkind")
+            d0 = t["dst"][0] if t["dst"] and t["dst"][0]["kind"] == 1 else None
+            s0 = t["src"][0] if t["src"] else None
+            dv = _rvar(d0)[1] if d0 else None
+            if dv and s0 and t["op"] == "mov" and s0["kind"] == 1 and _rvar(s0)[1] and s0["type"] & 0xff == 8:
+                union(dv, _rvar(s0)[1], 0)              # a copy: the same pointer
+            elif dv and s0 and t["op"] == "lea" and s0["kind"] in (5, 6) and self._parts(s0)[0] not in (None, dv) \
+                    and not self._parts(s0)[2] and self._parts(s0)[3] is not None:
+                union(dv, self._parts(s0)[0], self._parts(s0)[3])     # lea x, [y + d]: x = y + d
+            else:
+                for l in t["dst"]:     # a variable redefined from itself (add r, 3): its accesses get fresh keys
+                    v = _rvar(l)[1] if l["kind"] == 1 else None
+                    if v and any(s["kind"] == 1 and _rvar(s)[1] == v for s in t["src"]):
+                        variant.add(v)
+            for l in t["src"] + t["dst"]:
+                if l["kind"] == 6 and l.get("pas") is not None:
+                    per.setdefault(l["pas"], []).append(l)
+        for p, L in per.items():        # one set reached through two variables at one displacement: one pointer
+            vs = [(v, d) for v, _r, ix, d, _s in map(self._parts, L) if v and not ix and d is not None]
+            for v, d in vs[1:]:
+                if d == vs[0][1]:
+                    union(v, vs[0][0], 0)
+        self.variant, self.per, self._keys = variant, per, {}
+        self.pas, self.memb = _Facts(self.pas_answer), _Facts(self.memb_answer)
+
+    @staticmethod
+    def _parts(l):
+        """A memory leaf -> (base variable, base register, indexed, displacement, symbol part)."""
+        body = l["text"][1:].split("]")[0].split("+")
+        b = [x for x in body[:-1] if "*" not in x and ":" in x]
+        try:
+            disp = int(body[-1])
+        except ValueError:
+            disp = None
+        reg, var = _rvar(dict(text=b[0])) if b else (None, None)
+        return var, reg, any("*" in x for x in body[:-1]), disp, l.get("w2c") or None
+
+    def key(self, p):
+        """A set's (keys, ranges, indexed, kind): kind 'local' (frame / local array), 'param' (through pointer
+        arguments only), 'ptr' (other pointers), or None when a key is unknown."""
+        if p in self._keys:
+            return self._keys[p]
+        ks, spans, idx, kinds = set(), [], False, set()
+        for l in self.per.get(p, ()):
+            var, reg, ix, disp, sym = self._parts(l)
+            sz = l["type"] & 0xff
+            idx |= ix
+            if sym:
+                k, o = ("sym", sym), 0
+                kinds.add("glob" if sym not in self.info["stored"] else "local" if sym not in self.info["esc"]
+                          else "esc")
+            elif var:
+                if var in self.variant:
+                    self._keys[p] = None
+                    return None
+                k, o = self._find(var)
+                kinds.add("param" if var in self.info["params"] or k in self.info["params"] or
+                          ("$" in var and var.split("$")[0] in self.info["pnames"]) else "ptr")
+            elif reg:
+                k, o = ("frame", reg), 0
+                kinds.add("frame")
+            else:
+                self._keys[p] = None
+                return None
+            ks.add(k)
+            if disp is not None and not ix:
+                spans.append((o + disp, o + disp + sz))
+        r = (ks, spans, idx, kinds.pop() if len(kinds) == 1 else "mixed") if ks else None
+        self._keys[p] = r
+        return r
+
+    def pas_answer(self, a, b):
+        if a < 16 and b < 16:
+            return None
+        if a < 16 or b < 16:
+            small, d = (a, b) if a < 16 else (b, a)
+            k = self.key(d)
+            if small in (7, 10, 13, 15) and k is not None and k[3] == "local":
+                return False                    # a local array whose address is never taken
+            return None
+        ka, kb = self.key(a), self.key(b)
+        if ka is None or kb is None:
+            return True
+        if ka[0] & kb[0]:
+            if ka[2] or kb[2] or not ka[1] or not kb[1]:
+                return True
+            return any(x1 < y2 and x2 < y1 for x1, y1 in ka[1] for x2, y2 in kb[1])
+        loc = ("local", "frame", "esc")
+        if ka[3] in loc + ("glob",) and kb[3] in loc + ("glob",):
+            return False                        # two locals / arrays
+        if (ka[3] in loc and kb[3] == "param") or (kb[3] in loc and ka[3] == "param"):
+            return False                        # a local and memory reached through an argument
+        if "local" in (ka[3], kb[3]):
+            return False                        # a local array whose address is never taken
+        return True
+
+    def memb_answer(self, sym, pas):
+        if pas == 6:
+            return False
+        if self.skind.get(sym) not in (3, 4, 5, None):
+            return True                         # a global
+        e = sym in self.info["esc"] or self.root.get(sym) in self.info["esc"]
+        if e and pas >= 16:
+            k = self.key(pas)
+            if k is not None and k[3] == "param":
+                return False
+        return e
+
+
+class _Facts:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def get(self, ab, default=None):
+        r = self.fn(*ab)
+        return default if r is None else r
+
+
 def mem_interf(e, c, facts=None):
     """ItfPartialInterf 0x100ddb70 for the memory lists (leaf kinds 6 memory, 11 memory set, 2 address-taken
     variable): by PAS (+0x28 of a memory leaf, +0x24 of a memory-set leaf) and set membership; a memory set marked
@@ -1176,7 +1389,7 @@ def mem_interf(e, c, facts=None):
     return pas_interf(e.get("pas"), c.get("pas"), pf, e, c)
 
 
-def predict_dag(region, alias=True, model="k8"):
+def predict_dag(region, alias=True, model="k8", info=None):
     """DagBuildGraph + SchmdFindCBranchDep + SchComputeStaticPriority from the region's IL -> list of nodes
     (lexical order, the entry node 0 and the exit node N+1 included) with succ = [(to lex, type, lat)] in
     creation order, lat, unit, decoder, height, B/L/S/C flags, static priority. model "atom": OpSchedInfoAtom's
@@ -1192,9 +1405,15 @@ def predict_dag(region, alias=True, model="k8"):
                 l["w2c"], l["w8"] = srcw[k + 1][i][2:4]
     N = len(tups)
     facts = None
-    if alias and region.get("alias") is not None:
+    if alias == "il":       # the alias facts from the IL (6.2); info: fn_alias_info of the region's function
+        x = ILAlias(tups, info)
+        facts = dict(pas=x.pas, memb=x.memb)
+    elif alias and region.get("alias") is not None:
         facts = dict(pas={(a, b): r for a, b, r in region["alias"]["pas"]},
                      memb={(a, b): r for a, b, r in region["alias"]["memb"]})
+    elif alias and ALIAS_IL:  # no logged answers (a trace without the alias probes): derive them (key alias_il)
+        x = ILAlias(tups, info)
+        facts = dict(pas=x.pas, memb=x.memb)
     nodes = [dict(lex=0, t=None, succ=[], pred=[], flags=0x20, lat=0)]
     for k, t in enumerate(tups):
         f = (4 if any(l["kind"] in (6, 2) for l in t["src"]) else 0) | \
@@ -1208,6 +1427,7 @@ def predict_dag(region, alias=True, model="k8"):
         nodes.append(dict(lex=k + 1, t=t, succ=[], pred=[], flags=f, lat=k8_latency(t) if t["instr"] else 0,
                           u=k8_unit(t), dec=k8_dec(t)))     # a non-instruction tuple: latency 0 (0x100e3e67)
     edge = {}
+    fwd = [None]      # the forward pass's current node: an edge made then from an earlier node is `late`
 
     def mk(a, b, ty, lat=0, update=True):
         """DagMakeDep / DagMakeOrUpdateDep: one edge per pair (the producer is found in b's predecessor list)."""
@@ -1216,6 +1436,10 @@ def predict_dag(region, alias=True, model="k8"):
             e["type"] |= ty
             return e
         e = dict(frm=a, to=b, type=ty, lat=lat)
+        if fwd[0] is not None:   # after the heights: not in any height
+            e["fwd"] = True
+            if a < fwd[0]:
+                e["late"] = True     # after a's nsucc and priority were computed too
         edge[(a, b)] = e
         nodes[a]["succ"].append(e)
         nodes[b]["pred"].append(e)
@@ -1433,6 +1657,7 @@ def predict_dag(region, alias=True, model="k8"):
     for nd in nodes:
         nd["nbreak"] = 0
     for nd in nodes[:-1]:
+        fwd[0] = nd["lex"]
         for e in list(nd["succ"]):
             dep_is_breakable(nodes, e, mk, model)
         if nd["lex"] and len(nd["pred"]) == nd["nbreak"]:
@@ -1691,7 +1916,8 @@ def predicted_sel(region, nodes=None, model="k8"):
                         height=nd["height"], lat=nd["lat"], u=nd["u"], flags=nd["flags"], opc=t["opc"],
                         srck=_kinds(t, "src"), dstk=_kinds(t, "dst"), dec=nd["dec"],
                         succ=[(e["to"], e["lat"] | e.get("brk", 0) << 16) for e in nd["succ"]],
-                        etype=[e["type"] for e in nd["succ"]]))
+                        etype=[e["type"] for e in nd["succ"]], late=[e.get("late", False) for e in nd["succ"]],
+                        fwd=[e.get("fwd", False) for e in nd["succ"]]))
         if "port" in nd:
             out[-1].update(port=nd["port"], thr=nd["thr"])
     return out
@@ -1704,11 +1930,12 @@ def compare_dag(fns, show=0, alias=True):
     c = collections.Counter()
     bad = []
     for f in fns:
+        info = fn_alias_info(f) if alias == "il" else None
         for k, r in enumerate(f["regions"]):
             if len(r["sel"]) < 2 or not r.get("nodes") or any("etype" not in s for s in r["sel"]):
                 continue
             model = f.get("model", "k8")
-            nodes = predict_dag(r, alias, model)
+            nodes = predict_dag(r, alias, model, info)
             pr = {s["lex"]: s for s in predicted_sel(r, nodes, model)}
             tr = {s["lex"]: s for s in r["sel"]}
             lexof = {s["node"]: s["lex"] for s in r["sel"]}

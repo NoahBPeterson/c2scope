@@ -10,8 +10,9 @@ usage: realize.py edit    <tu.cpp> --func F EDIT [EDIT..] [--want-regs v=reg,..]
        realize.py measure <base.cpp> <variant.cpp> --func F [--keys] [--slots] [--scratch] [-- <cl args>]
        realize.py pairs   <probes.cpp> [--keys] [--slots] [--scratch] [--only RE] [--diff] [-- <cl args>]
    --c2 13.10 / 13.10.3052 / 15.00 as on every tool. --c2 17.00 (a build table with arch x64): NColor, predicted with
-   ncolsim: edits +app:V:B[:N] / -app:V:B[:N] / ref / unref / before:A:B, `--from-ncol --want-regs v=reg`, measure
-   (docs/c2/ncolor.md 10).
+   ncolsim: edits +app:V:B[:N] / -app:V:B[:N] / ref / unref / before:A:B, `--from-ncol --want-regs v=reg`, measure,
+   pairs (probe files), and a pair search over ncolsim edits (--pairs, --pair-compiles, --pair-top; docs/c2/ncolor.md
+   10, docs/c2/realize.md "cl 17.00 x64").
    --asm-func DECORATED: the function of our listing scored
    against --asm-vs when it is not --func itself (as tsweep's; default --func).
 
@@ -1888,7 +1889,7 @@ def _cond_vars(c, limit=3):
     """Values to test in equal arms without a memory read: `this` and int / pointer variables that Color put in a
     callee-saved register for their whole life in the base (the test is then register-only on every build)."""
     out = []
-    keep = ("esi", "edi", "ebx", "ebp")
+    keep = ("esi", "edi", "ebx", "ebp", "rsi", "rdi", "rbx", "rbp", "r12", "r13", "r14", "r15")   # x64: effectmine
     cand = (["this"] if c.cls else []) + [v for v in c.B.vars if v != "this"]
     for v in cand:
         regs = c.base.regs.get(v) or []
@@ -3274,8 +3275,11 @@ class X64Ctx:
                 return (len(sh), -pos if sh and min(sh) < b else pos)
             return sorted(sel, key=rank)
         if f[0] == "before":
-            return [c for c in self.constructs() if c[0] in ("swap", "split", "alias", "eqif", "wrap")
-                    and self.mentions(c, f[1:3])]
+            # the statement / declaration order first: it moves the first references (the lifetime index) and is
+            # code-neutral more often than the wrappers
+            fam = ("swap", "split", "alias", "eqif", "wrap")
+            return sorted([c for c in self.constructs() if c[0] in fam and self.mentions(c, f[1:3])],
+                          key=lambda c: fam.index(c[0]))
         if f[0] == "bucket":                     # bucket:V=..: the box of V
             v = f[1].split("=")[0]
             return [c for c in self.constructs() if c[0] == "box" and c[1].split()[0] == v]
@@ -3387,6 +3391,7 @@ def x64_cmd_edit(c, a):
     print("blocks -> source lines: %s" % "  ".join("B%d:%s" % (b, ",".join(map(str, sorted(c.text_lines(b))))) for b in
                                                   sorted(c.base.lines) if c.base.lines[b]))
     stats = dict(n=0, exact=0, req_ok=0, req_n=0, meas_ok=0, meas_n=0)
+    meas, tried = [], {}
     for s, e in reqs:
         pred = N.predict(c.base.f, e)
         print("## %s  (ncolsim: %s)" % (s, " ".join("%s=%s" % (k, pred[k]) for k in pred if N.named(k) and
@@ -3412,6 +3417,10 @@ def x64_cmd_edit(c, a):
             m["want_list"] = {x: N.bucket_edit(c.base.f, N.lists_of(c.base.f), x)[1] for x in e if x.startswith("bucket:")}
             m["lea_folds0"] = x64_lea_folds(c.base.f)
             v, also = x64_verdict(e, m)
+            m.update(src_edits=list(k[2]), tag=tag, desc="%s %s" % (k[0], k[1]), verdict=v)
+            m["for"] = s
+            tried[tuple(sorted(k[2]))] = m
+            meas.append(m)
             if v == "no" and not a.all_variants and m["regs"] == 0 and not m["d"]["edits"]:
                 continue
             okreq, okm = x64_show(c, tag, "%s %s" % (k[0], k[1]), m, v, also, pred if v == "exact" else None)
@@ -3427,6 +3436,25 @@ def x64_cmd_edit(c, a):
         print("summary: %d variants shown, %d exact; predicted registers of the requested edit = traced on %d of %d "
               "exact variants; of the measured edits on %d of %d variants that moved an input or a register" % (
                   stats["n"], stats["exact"], stats["req_ok"], stats["req_n"], stats["meas_ok"], stats["meas_n"]))
+    if not a.list and len(reqs) >= 2 and a.pairs:
+        # several edits: their realisations combined (one per requested edit), ranked by ncolsim (x64_pair_search)
+        want = c.rw.parse_want_regs(a.want_regs) if a.want_regs else {}
+
+        def build(tag, edits):
+            key = tuple(sorted(edits))
+            if key not in tried:
+                try:
+                    m = c.measure(tag, edits)
+                    m["src_edits"], m["tag"] = list(edits), tag
+                except (Exception, SystemExit) as ex:
+                    print("  %-8s failed: %s" % (tag, str(ex)[-100:]))
+                    m = None
+                tried[key] = m
+            return tried[key]
+        r = x64_pair_search(c, a, [m for m in meas if m["verdict"] in ("exact", "yes")], want, build, lim=a.pair_code)
+        stats["pair"] = r and r["path"]
+        if r is not None:
+            print("FOUND (pair search): %s -> %s" % (r["desc"], r["path"]))
     return stats
 
 
@@ -3441,7 +3469,11 @@ def x64_pipeline(c, a):
         sys.exit("realize (x64): --from-ncol needs --want-regs v=reg,..")
     print("base: registers %s; wanted %s" % (" ".join("%s=%s" % kv for kv in c.breg.items() if N.named(kv[0])),
                                              " ".join("%s=%s" % kv for kv in want.items())))
-    answers = N.need(c.base.f, want, limit=a.max_answers)
+    # order answers (before: / index:, the lifetime index) first: a statement or declaration order realises them
+    # code-neutrally and ncolsim predicts them exactly, while an appearance edit (+app / -app) had no code-neutral
+    # construct in the lever benchmarks (docs/c2/ncolor.md 10.3); need() ranks by edit count alone
+    answers = N.need(c.base.f, want, limit=8 * max(a.max_answers, 12))
+    answers = sorted(answers, key=lambda x: sum(e[:5] in ("+app:", "-app:") for e in x[0]))[:a.max_answers]
     if not answers:
         print("NOT FOUND: ncolsim has no appearance / order edit (singles, pairs) that gives the wanted registers")
         return dict(answers=0, compiled=0, found=None, pred=(0, 0))
@@ -3463,11 +3495,26 @@ def x64_pipeline(c, a):
             m = c.measure(tag, edits)
         except (Exception, SystemExit):
             m = None
+        if m is not None:
+            m["src_edits"], m["tag"] = list(edits), tag
         tried[key] = m
         return m
 
-    def hit(m):
-        return m is not None and m["shape"] == 0 and all(m["got"].get(k) == v for k, v in want.items())
+    def build(tag, edits):                  # combinations of an answer's realisations and the pair search's
+        key = tuple(sorted(edits))          # compiles: outside --max-compiles (one per answer, --pair-compiles)
+        if key not in tried:
+            try:
+                m = c.measure(tag, edits)
+                m["src_edits"], m["tag"] = list(edits), tag
+            except (Exception, SystemExit) as ex:
+                print("  %-8s failed: %s" % (tag, str(ex)[-100:]))
+                m = None
+            tried[key] = m
+        return tried[key]
+
+    def hit(m):                              # code-neutral with the wanted registers, or the original's bytes
+        return m is not None and (m["shape"] == 0 and all(m["got"].get(k) == v for k, v in want.items()) or
+                                  m["sc"] is not None and m["sc"][1] == 0)
 
     for ai, (ed, got, side) in enumerate(answers):
         units = []                               # (edit of one appearance / one order, count)
@@ -3478,6 +3525,9 @@ def x64_pipeline(c, a):
         for u, _n in units:
             real[u] = []
             for k in c.select(u):
+                if len(real[u]) >= 3 or any(v_ == "exact" and m_["shape"] == 0 for _k, m_, _g, v_ in real[u]):
+                    break                    # realised (exactly and code-neutrally, or three times): the budget goes
+                    #                          to the next unit and the combination
                 c.n += 1
                 m = run("v%04d" % c.n, k[2])
                 if m is None:
@@ -3489,7 +3539,7 @@ def x64_pipeline(c, a):
                         _s, var, b, _one = u.split(":")
                         gained = sum(int(x.split(":")[3]) for x in m["d"]["edits"]
                                      if x.split(":")[:3] == [u[:4], var, b])
-                    real[u].append((k, m, gained))
+                    real[u].append((k, m, gained, v))
                     if len(ed) == 1 and _n == 1:
                         pr = N.predict(c.base.f, ed)
                         ok = all(pr[q] == m["got"].get(q, pr[q]) for q in pr if N.named(q))
@@ -3505,7 +3555,7 @@ def x64_pipeline(c, a):
             pick = []
             for u, n in units:
                 acc, got_n = [], 0
-                for k, m, g in sorted(real[u], key=lambda x: (x[1]["shape"], -x[2])):
+                for k, m, g, _v in sorted(real[u], key=lambda x: (x[1]["shape"], -x[2])):
                     if g <= 0 or any(c.rw.overlap(k[2], q[2]) for q in pick + acc):
                         continue
                     acc.append(k)
@@ -3515,7 +3565,7 @@ def x64_pipeline(c, a):
                 pick += acc
             if pick and (len(pick) > 1 or len(units) > 1 or units[0][1] > 1):
                 c.n += 1
-                m = run("c%04d" % c.n, [e for k in pick for e in k[2]])
+                m = build("c%04d" % c.n, [e for k in pick for e in k[2]])     # one per answer, beyond --max-compiles
                 if m is not None:
                     pr = N.predict(c.base.f, ed)
                     v, also = x64_verdict(ed, m)
@@ -3530,9 +3580,171 @@ def x64_pipeline(c, a):
                         return dict(answers=len(answers), compiled=compiled, found=m["path"], pred=(pok, pn))
         else:
             print("  answer %d: no construct realises %s" % (ai, ", ".join(u for u, _n in units if not real[u])))
+    descs = {}
+    for ed in answers:
+        for e in ed[0]:
+            f = e.split(":")
+            u = "%s:%s:%s:1" % (f[0], f[1], f[2]) if f[0] in ("+app", "-app") else e
+            for k in c.select(u):
+                descs.setdefault(tuple(sorted(k[2])), "%s %s" % (k[0], k[1]))
+    pool = [dict(m, desc=descs.get(key, m["tag"])) for key, m in tried.items() if m is not None]
+    r = x64_pair_search(c, a, pool, want, build)
+    if r is not None:
+        print("FOUND (pair search): %s; measured %s -> %s" % (r["desc"], x64_inputs(c, r), r["path"]))
+        return dict(answers=len(answers), compiled=compiled, found=r["path"], pred=(pok, pn))
     print("NOT FOUND: %d answers, %d compiles; predictions of the realised answers: %d of %d as traced" % (
         len(answers), compiled, pok, pn))
     return dict(answers=len(answers), compiled=compiled, found=None, pred=(pok, pn))
+
+
+def x64_pair_search(c, a, pool, want, build, lim=None):
+    """Pairs (--pairs 2: and triples) of the variants measured so far, as on the x86 builds (pair_search), ranked by
+    ncolsim: a member that kept the block structure contributes the NColor edits it measurably made (run_delta), and
+    the pair's registers are predicted by adding them up and simulating from the base (predict); members that changed
+    the blocks are ranked by what they did on their own. Pool: variants that moved an input or a register, changed at
+    most --pair-code instructions with --asm-vs (0 without: the target is a code-neutral variant) and were no worse
+    than the base (rdiff + --pair-slack). Ranking: wanted registers predicted (or measured), then the members' summed
+    rdiff gain, then fewest other registers moved. The best --pair-compiles are compiled; FOUND is a code-neutral
+    variant with the wanted registers, or bdiff 0 against the original. Members realising the same requested edit
+    (the `for` key) are alternatives and never paired. -> the found variant (m, with desc) or None."""
+    import itertools
+    N = c.N
+    if not a.pairs or a.pair_compiles <= 0:
+        return None
+    want = want or {}
+    b0 = (tsweep.rdiff(c.base.instrs, c.orig), tsweep.bdiff(c.base.instrs, c.orig)) if c.orig is not None else None
+    named_chg = lambda got: [k for k in c.breg if N.named(k) and k in got and got[k] != c.breg[k]]
+    if lim is None:
+        lim = a.pair_code if c.orig is not None else 0
+    P, seen = [], set()
+    for m in sorted(pool, key=lambda m: ((m["sc"] or (0, 0)), m["shape"], m["tag"])):
+        key = tuple(sorted(m["src_edits"]))
+        if key in seen or m["shape"] > lim or not (m["d"]["edits"] or named_chg(m["got"])):
+            continue
+        if b0 is not None and m["sc"][0] > b0[0] + a.pair_slack:
+            continue
+        seen.add(key)
+        P.append(m)
+    whit = lambda got: sum(got.get(k) == v for k, v in want.items())
+    P.sort(key=lambda m: (-(whit(m["got"]) - whit(c.breg)), (m["sc"] or (0, 0)), m["shape"]))
+    P = P[:a.pair_top]
+    combos = []
+    for n in (2, 3)[:a.pairs]:
+        for ms in itertools.combinations(P, n):
+            if any(c.rw.overlap(x["src_edits"], y["src_edits"]) for x, y in itertools.combinations(ms, 2)):
+                continue
+            fors = [m.get("for") for m in ms if m.get("for")]
+            if len(set(fors)) < len(fors):
+                continue
+            pred = None
+            if not any(m["d"]["blocks"] for m in ms):
+                try:
+                    pred = N.predict(c.base.f, [e for m in ms for e in m["d"]["edits"]])
+                except SystemExit:
+                    pred = None
+            if pred is not None:
+                nw = whit(pred)
+                side = sum(1 for k in pred if N.named(k) and k not in want and pred[k] != c.breg.get(k))
+            else:                         # measured only: a wanted register any member got on its own
+                nw = sum(any(m["got"].get(k) == v for m in ms) for k, v in want.items())
+                side = len({k for m in ms for k in named_chg(m["got"]) if k not in want})
+            gain = sum(b0[0] - m["sc"][0] for m in ms) if b0 is not None else 0
+            combos.append(((-nw, -gain, side, pred is None, n, sum(m["shape"] for m in ms)), ms, pred))
+    combos.sort(key=lambda t: t[0])
+    print("## pair search: %d combinations of the %d closest variants (%d predicted by ncolsim), compiling the best %d" % (
+        len(combos), len(P), sum(1 for t in combos if t[2] is not None), min(a.pair_compiles, len(combos))))
+    st = dict(n=0, ok=0, pn=0)
+    for k, (_key, ms, pred) in enumerate(combos[:a.pair_compiles]):
+        m = build("pr%03d" % k, [e for x in ms for e in x["src_edits"]])
+        st["n"] += 1
+        if m is None:
+            continue
+        got = m["got"]
+        ok = None if pred is None else all(pred[q] == got.get(q, pred[q]) for q in pred if N.named(q))
+        if ok is not None:
+            st["pn"] += 1
+            st["ok"] += ok
+        print("  %-6s code %d regs %d%s  pred %-4s  %s  | %s" % (
+            "pr%03d" % k, m["shape"], m["regs"], "" if m["sc"] is None else "  rdiff %d bdiff %d" % m["sc"],
+            {True: "ok", False: "MISS", None: "-"}[ok],
+            " ".join("%s:%s->%s" % (q, c.breg[q], got[q]) for q in named_chg(got)) or "(registers unchanged)",
+            " + ".join(x["desc"] for x in ms)))
+        if (want and m["shape"] == 0 and all(got.get(q) == v for q, v in want.items())) or \
+                (m["sc"] is not None and m["sc"][1] == 0):
+            print("  pair search: %d compiled, ncolsim's registers for the pair = traced on %d of %d" % (st["n"], st["ok"], st["pn"]))
+            return dict(m, desc=" + ".join(x["desc"] for x in ms))
+    if combos:
+        print("  pair search: %d compiled, ncolsim's registers for the pair = traced on %d of %d; no match" % (
+            st["n"], st["ok"], st["pn"]))
+    return None
+
+
+def x64_cmd_pairs(a, cl):
+    """`pairs PROBES.cpp` on x64: one traced compile of the probe file (ncolsim's hooks, every function), and every
+    function X__base against each X__<variant>: NColor's inputs moved (run_delta), the registers, whether ncolsim
+    predicts the variant's registers from those edits, and the code cost."""
+    import rwsweep, c2ncol, ncolsim as N
+    d = a.keep or tempfile.mkdtemp(prefix="realize_x64p_")
+    os.makedirs(d, exist_ok=True)
+    _i, _h, rc, out, text = c2trace.run_trace(a.src, N.trace_hooks(), cl or ["/O2"], keep=d, quiet=True)
+    asm = os.path.join(d, os.path.splitext(os.path.basename(a.src))[0] + ".asm")
+    fns = {}
+    for f in c2ncol.parse_all(text):
+        if not f["cands"] or not f["func"] or f["func"] in fns:
+            continue
+        f.setdefault("regsets", [])
+        f["il_fn"] = N.il_fn_lines(text, f["func"])
+        fns[f["func"]] = f
+    if not fns:
+        err = " ".join(re.findall(r"error C\d+:[^\n]*", out))[:200]
+        sys.exit("realize (x64) pairs: %s" % (("compile error: " + err) if err else "no function allocated by NColor"))
+    by = {}
+    for name, f in fns.items():
+        m = re.search(r"\??_?(\w+?)__(\w+?)(?:@|$)", name)
+        if m:
+            by.setdefault(m.group(1), {})[m.group(2)] = f
+    rx = re.compile(a.only) if a.only else None
+    code = lambda f: (lambda ins: ([rwsweep._mask(x) for x in ins], [tsweep._key(x) for x in ins], ins))(
+        tsweep.listing_instrs(asm, f["func"]) if os.path.exists(asm) else [])
+    stats = dict(n=0, moved=0, pn=0, pok=0, blocks=0)
+    for ctx in by:
+        base = by[ctx].get("base")
+        if base is None or (rx and not rx.search(ctx)):
+            continue
+        cb = code(base)
+        ga = N.regs_of(base)
+        print("## %s: %d candidates, %d instructions; registers %s" % (
+            ctx, len(base["cands"]), len(cb[2]), " ".join("%s=%s" % kv for kv in ga.items() if N.named(kv[0]))))
+        for v, f in by[ctx].items():
+            if v == "base":
+                continue
+            dl = N.run_delta(base, f)
+            gb = N.regs_of(f)
+            chg = " ".join("%s:%s->%s" % (k, ga[k], gb[k]) for k in ga if N.named(k) and k in gb and ga[k] != gb[k])
+            cv = code(f)
+            pred = "-"
+            if dl["blocks"]:
+                stats["blocks"] += 1
+            elif dl["edits"] or chg:
+                pm = N.predict(base, dl["edits"])
+                ok = all(pm[k] == gb.get(k, pm[k]) for k in pm if N.named(k))
+                pred = "ok" if ok else "MISS"
+                stats["pn"] += 1
+                stats["pok"] += ok
+            stats["n"] += 1
+            stats["moved"] += bool(dl["edits"] or chg or dl["blocks"])
+            flags = ",".join(k for k in ("blocks", "ranges", "live", "new", "gone") if dl[k]) or "-"
+            print("  %-10s code %d (regs %d, %+d instr)  inputs %s  [%s]  pred %-4s  %s" % (
+                v, adiff(cb[0], cv[0]), adiff(cb[1], cv[1]), len(cv[2]) - len(cb[2]),
+                " ".join(dl["edits"]) or "(no appearance / order change)", flags, pred, chg or "(registers unchanged)"))
+            if a.diff and adiff(cb[1], cv[1]):
+                for ln in difflib.unified_diff(["%s %s" % x for x in cb[2]], ["%s %s" % x for x in cv[2]], lineterm="", n=1):
+                    print("        " + ln)
+    print("summary: %d variants, %d moved an input or a register (%d the block structure); ncolsim's registers from "
+          "the measured edits = traced on %d of %d" % (stats["n"], stats["moved"], stats["blocks"], stats["pok"], stats["pn"]))
+    if not a.keep:
+        shutil.rmtree(d, ignore_errors=True)
+    return stats
 
 
 def x64_cmd_measure(a, cl):
@@ -3568,7 +3780,7 @@ def main_x64(a, cl):
             sys.exit("usage: realize.py measure BASE.cpp VARIANT.cpp --func F")
         return x64_cmd_measure(a, cl)
     if a.cmd == "pairs":
-        sys.exit("realize (x64): pairs is not ported (use measure, or rwsweep)")
+        return x64_cmd_pairs(a, cl)
     c = X64Ctx(a, cl)
     if a.from_ncol or a.from_rasim:
         return x64_pipeline(c, a)
@@ -3618,6 +3830,8 @@ def main():
                     "0 off, 1 pairs, 2 pairs and triples (default 1)")
     ap.add_argument("--pair-code", type=int, default=4, help="pair search: largest code change of a member (default 4)")
     ap.add_argument("--pair-slack", type=int, default=0, help="pair search: a member may be this much worse than the base")
+    ap.add_argument("--pair-compiles", type=int, default=8, help="x64 pair search: its own budget of compiles (default 8)")
+    ap.add_argument("--pair-top", type=int, default=10, help="x64 pair search: the closest variants combined (default 10)")
     ap.add_argument("--from", dest="from_model", choices=("slots", "scratch"),
                     help="answers from the slot model (c2slots search, single edits and model-ranked pairs) or the "
                          "scratch model (rasim scratch --target scan, singles and pairs); needs --asm-vs")

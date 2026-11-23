@@ -16,6 +16,37 @@ import c2build as _c2b
 # what a build cannot run (table key `lacks`: feature -> reason; 13.00.9044, the VC6 front end: docs/c2/port-1300.md);
 # a test that needs one prints a skip line instead (not counted)
 LACKS = dict((_c2b.get("lacks") or {}) if _c2b.table() is not None else {})
+X64 = _c2b.table() is not None and _c2b.get("arch") == "x64"
+X64_TESTS = re.compile(r"17|x64|ncol|alias_il")    # test functions that run on an x64 build (cl 17.00)
+if X64 and __name__ == "__main__":   # _X64_FILTER: the top-level checks below are x86 (Color, RegAssign, x87, 32-bit)
+    import ast
+    _src = open(__file__).read()
+    _body, _started = [], False
+    for _n in ast.parse(_src).body:
+        _txt = ast.get_source_segment(_src, _n) or ""
+        if "_X64_FILTER" in _txt:
+            continue
+        if not _started:
+            if _txt.startswith('print("regression tests'):
+                _started = True
+                _body.append(ast.parse('print("regression tests, x64 build: the x64 and build-independent test '
+                                       'functions (the x86 top-level checks are skipped)")').body[0])
+            else:
+                _body.append(_n)
+            continue
+        if isinstance(_n, (ast.FunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+            _body.append(_n)
+        elif (isinstance(_n, ast.Expr) and isinstance(_n.value, ast.Call) and isinstance(_n.value.func, ast.Name)
+              and _n.value.func.id.endswith("_tests") and X64_TESTS.search(_n.value.func.id)):
+            _body.append(_n)
+        elif isinstance(_n, ast.Assign) and all(isinstance(t, ast.Name) and t.id.isupper() for t in _n.targets):
+            _body.append(_n)                     # module constants (paths, BUILD, expected values): no compile
+        elif isinstance(_n, ast.If) and 'get("arch") == "x64"' in _txt:
+            _body.append(_n)                     # an arch dispatch (loadcse17 / ltcgstub17)
+        elif _txt.startswith('print("%d of %d passed"') or _txt.startswith("sys.exit(0 if all(results)"):
+            _body.append(_n)
+    exec(compile(ast.Module(body=_body, type_ignores=[]), __file__, "exec"), dict(globals(), __name__="__x64__"))
+    sys.exit(0)   # the exec'd module exits with the result
 
 
 def lacking(*feats):
@@ -1369,6 +1400,57 @@ def ncolsim_walk_tests():
           (59, 60))
 
 
+def ncolsim_split_tests():
+    """ncolsim's split regions and the rest of IL_SIM (docs/c2/ncolor.md 4.9, 12.6), offline, on our own sources
+    tests/data/ncol/split (vm.c, tok.c, sortx.c, lz.c, fmt.c, hmap.c: switch loops, two switches in one loop, recursion,
+    parameters copied from memory, macro-local values; `c2ncol.py --export --il --cov`, gzipped, with the kept / rest
+    probes of NColSeparateProcessedRegion): NColRangesToMinTupleRegions / NColMinimizeRangeLiveness against the probes,
+    the zone depth at a switch, and replay / sim / ilfull with WALK_READ + IL_FOLD against WALK_FULL + IL_SIM."""
+    import gzip, json, io, contextlib, ncolsim as N
+    d = os.path.join(HERE, "tests", "data", "ncol", "split")
+    fs = lambda: [f for n in ("vm", "tok", "sortx", "lz", "fmt", "hmap")
+                  for f in json.loads(gzip.open(os.path.join(d, n + ".json.gz")).read())["functions"]]
+    lines = lambda b: [ln.split(":")[1].split("single")[0].strip() for ln in b.getvalue().splitlines() if " of " in ln]
+    saved = N.WALK
+    got = {}
+    try:
+        for tag, walk, use in (("before", N.WALK_READ, N.IL_FOLD), ("after", N.WALK_FULL, N.IL_FOLD + N.IL_SIM)):
+            N.WALK = walk
+            b = io.StringIO()
+            with contextlib.redirect_stdout(b):
+                N.cmd_replay(fs(), 0)
+                N.cmd_sim(fs(), 0)
+                N.cmd_ilfull(fs(), 0, N.IL_USE + N.IL_MODEL + N.IL_READ + use)
+            got[tag] = lines(b)
+        N.WALK = N.WALK_FULL
+        nk = ok = okr = 0
+        for f in fs():
+            for c in f["cands"]:
+                cur = [tuple(x) for x in c.get("ranges") or []]
+                for s in c.get("separate") or []:
+                    if "kept" in s and len(s["ranges"]) >= s["n"]:
+                        N._drop_loaded_mem(f, c)
+                        kept, rest = N.separate(f, c, cur, [list(w[:6]) for w in s["ranges"]])
+                        nk += 1
+                        ok += kept == [tuple(x) for x in s["kept"]]
+                        okr += (rest or None) == ([tuple(x) for x in s.get("rest") or []] or None)
+                    cur = [tuple(x) for x in s.get("rest") or []]
+        zn = z0 = z1 = 0
+        for f in fs():
+            x0, x1 = N.il_inputs(f), N.il_inputs(dict(f, zoneswitch=True, swlive=True))
+            for b in range(len(x0["depth"]) - 1):
+                zn += 1
+                z0 += x0["depth"][b] == N.depth(f["state"], b)
+                z1 += x1["depth"][b] == N.depth(f["state"], b)
+    finally:
+        N.WALK = saved
+    check("ncolsim split: replay, sim, ilfull (replay, sim) of tests/data/ncol/split, WALK_READ + IL_FOLD / WALK_FULL + "
+          "IL_SIM", (got["before"], got["after"]),
+          (["634 of 635", "620 of 635", "629 of 635", "593 of 635"], ["635 of 635", "631 of 635", "635 of 635", "635 of 635"]))
+    check("ncolsim split: NColSeparateProcessedRegion's kept pieces and rest (min_regions) as probed; zone depth per "
+          "block (the size bound / the switch dominance)", (ok, okr, nk, z0, z1, zn), (48, 48, 48, 641, 724, 724))
+
+
 def sched17_predict_tests():
     """tools/c2sched17.py --predict offline: each region's DAG, latencies, units and static priorities built from
     its IL (tests/data/sched17/il/*.json: `c2sched17.py --il --export` of tests/data/ncol's c1 / c2 / sum and zlib's
@@ -1467,6 +1549,86 @@ def sched17_atom_break_tests():
           kinds(fn["gen_bitlen"]["regions"][18], 1), [(2, 1, 6), (2, 2, None)])
 
 
+def sched17_alias_il_tests():
+    """c2sched17's alias facts from the IL (ILAlias, docs/c2/sched17.md 6.2) offline on tests/data/sched17/il and
+    atom: the compiler's logged answers (ItfPasInterf / ItfIsMemberOfPas) reproduced, and --predict with them in
+    place of the logged ones (the logged-facts and PAS-guess numbers of sched17_predict_tests stay as they are)."""
+    import glob
+    os.environ.setdefault("C2_BUILD", "14.00")
+    import c2sched17 as S
+    if not S.have_c2_1700():
+        print("  sched17 alias il: skipped (reads OpSchedInfoK8 from the 17.00 c2.dll, which is not set up here)")
+        return
+    got = []
+    for d in ("il", "atom"):
+        fns = []
+        for p in sorted(glob.glob(os.path.join(HERE, "tests", "data", "sched17", d, "*.json"))):
+            fns += S.load_export(p)
+        right = [0, 0, 0, 0]
+        for f in fns:
+            info = S.fn_alias_info(f)
+            for r in f["regions"]:
+                if not r.get("nodes") or not r.get("alias"):
+                    continue
+                x = S.ILAlias([S.il_tuple(n) for n in sorted(r["nodes"], key=lambda n: n["lex"])], info)
+                for a, b, t in r["alias"]["pas"]:
+                    right[bool(S.pas_interf(a, b, x.pas)) != bool(t)] += 1
+                for a, b, t in r["alias"]["memb"]:
+                    right[2 + (bool(S.memb_interf(a, b, x.memb)) != bool(t))] += 1
+        c, _ = S.compare_dag(fns, alias="il")
+        got.append((tuple(right), (c["edges both"], c["static"], c["order predicted dag"], c["dag exact"])))
+    check("sched17 alias il: answers right / wrong (pas, member) and predict (edges, static, order, DAG exact), K8",
+          got[0], ((43, 6, 40, 1), (1241, 563, 89, 89)))
+    check("sched17 alias il: the same on the Atom exports",
+          got[1], ((84, 6, 43, 1), (1836, 875, 132, 125)))
+    # the rules on a hand-made region: s->a / s->b through one pointer, q[0] through another argument, a local
+    # array t[] whose address is never taken
+    t = [S.il_tuple(dict(opc=0, kind=0, tflags=1, cc=0, type=0, lex=k + 1, src=[], dst=[], il=il)) for k, il in
+         enumerate(["I 1 mov 1 0 | [rcx=s$1:1008+0]@20:1004 <- r8d=x$1:1004 rcx=s$1:1008",
+                    "I 2 mov 1 0 | [rcx=s$1:1008+4]@21:1004 <- r8d=x$1:1004 rcx=s$1:1008",
+                    "I 3 mov 1 0 | [rdx=q$1:1008+0]@22:1004 <- r9d=y$1:1004 rdx=q$1:1008",
+                    "I 4 mov 1 0 | [rcx=s$1:1008+2]@23:1004 <- r8d=x$1:1004 rcx=s$1:1008"])]
+    x = S.ILAlias(t, dict(esc=set(), params={"s$1", "q$1"}, pnames=set(), stored=set()))
+    check("sched17 alias il: disjoint fields of one pointer / two pointer arguments / overlapping fields",
+          (x.pas.get((0x20, 0x21)), x.pas.get((0x20, 0x22)), x.pas.get((0x21, 0x23)), x.pas.get((0x20, 7))),
+          (False, True, True, None))
+
+
+def sched17_schedwant_tests():
+    """schedwant.py on the x64 scheduler (C2_BUILD=17.00 only; docs/c2/sched.md, sched17.md 6.3): our own compile of
+    tests/data/sched17/schedwant17b.c is the original, schedwant17.c the same function with q[0] = y above the
+    store to s->b. Auto mode finds the region through our listing, the replay is the traced order, and the one
+    perturbation that gives the original's order is that statement moved back (move:2>6); with the K8 and the
+    Atom model. Against its own listing every region is in the original's order."""
+    if _c2b.get("arch") != "x64":
+        skip("schedwant x64: a moved store found again (K8, Atom)", "x64 builds only (C2_BUILD=17.00)")
+        return
+    d = tempfile.mkdtemp()
+    a = os.path.join(HERE, "tests", "data", "sched17", "schedwant17.c")
+    b = os.path.join(HERE, "tests", "data", "sched17", "schedwant17b.c")
+    sw = [sys.executable, os.path.join(HERE, "tools", "schedwant.py")]
+    for model, flags in (("k8", ["/O2"]), ("atom", ["/O2", "/favor:ATOM"])):
+        kb, ka = os.path.join(d, "b" + model), os.path.join(d, "a" + model)
+        subprocess.run(sw + [b, "--func", "swmove", "--region", "0", "--want-lex", "1", "--keep", kb, "--"] + flags,
+                       capture_output=True, text=True, cwd=HERE)
+        orig = orig_from_listing(os.path.join(kb, "schedwant17b.asm"), "swmove", os.path.join(d, model + ".s"))
+        r = subprocess.run(sw + [a, "--func", "swmove", "--asm-vs", orig, "--keep", ka, "--"] + flags,
+                           capture_output=True, text=True, cwd=HERE).stdout
+        if VERBOSE:
+            print(r[-3000:])
+        m = re.search(r"^\s+wanted\s+: (.*)$", r, re.M)
+        check("schedwant x64 (%s): region through our listing, replay = traced, wanted, the move that gives it" % model,
+              ("(x64, %s model)" % model in r, "matched through our listing" in r, "(= traced)" in r,
+               m.group(1).split() if m else None, re.findall(r"^\s+WANTED\s+(\S+)", r, re.M)),
+              (True, True, True, "3 1 4 5 6 2 7".split(), ["move:2>6"]))
+        own = orig_from_listing(os.path.join(ka, "schedwant17.asm"), "swmove", os.path.join(d, model + "_own.s"))
+        r = subprocess.run(sw + [a, "--func", "swmove", "--asm-vs", own, "--from-keep", ka],
+                           capture_output=True, text=True, cwd=HERE).stdout
+        check("schedwant x64 (%s): against our own listing every region is in the original's order" % model,
+              bool(re.search(r"^# (\d+) regions with 2\+ instructions: \1 in the original's order, 0 differ", r, re.M)),
+              True)
+
+
 def symkeys17_tests():
     """symkeys on cl 17.00 x64 from an export (tests/data/symkeys17/symkeys.json: `symkeys.py export` of
     tests/data/symkeys.cpp under --c2 17.00, docs/c2/symkeys.md 10): replay without a compile, x64 spellings."""
@@ -1515,6 +1677,56 @@ def slots17_frames_tests():
 slots17_frames_tests()
 
 
+def slots17_orig_tests():
+    """The x64 original-side frame walk (docs/c2/slots.md 6.2), no compile: our own 17.00 compile as "the original"
+    (tests/data/slots17orig/NAME.s: capstone of its listing's bytes), the perturbed source's snapshot and listing
+    (NAME.json, NAME.lst) as ours. `c2slots.py search` runs under C2_BUILD=17.00 (the listing's bytes decode as x64)
+    whatever the build of this run. Plus orig_slots64 on hand-written prologues."""
+    import c2slots as C
+    D = os.path.join(HERE, "tests", "data", "slots17orig")
+    env = dict(os.environ, C2_BUILD="17.00")
+
+    def search(n, *extra):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2slots.py"), "search", os.path.join(D, n + ".json"),
+                            "--asm", os.path.join(D, n + ".lst"), "--orig", os.path.join(D, n + ".s")] + list(extra),
+                           capture_output=True, text=True, cwd=HERE, env=env)
+        if VERBOSE:
+            print(r.stdout[-3000:], r.stderr[-2000:])
+        m = re.search(r"^# (\d+) of (\d+) elements seen in both", r.stdout, re.M)
+        cols = dict((a, int(b)) for a, b in re.findall(r"^(\S+)\s+\d+\s+\d+\s+-?\d+\s+(-?\d+) \d+/\d+", r.stdout, re.M))
+        top = re.search(r"^\s+\+(\d+)\s+(\d+)\s+(\S+)", r.stdout, re.M)
+        return (m.groups() if m else None), cols, (top.groups() if top else None), r.stdout
+    # gen.py seed 1 f46, a second read of v7 (`ext(0); g += v7;`): 8 of 16 elements moved; one edit puts all back
+    m, _, top, _ = search("gen_use_f46")
+    check("slots17 --search: one more use of v7 (gen.py f46): uses:v7=2 puts 16 of 16 back", (m, top),
+          (("8", "16"), ("8", "16", "uses:#5=2")))
+    # zlib inflate_table with a `volatile char` in front: 7 of 12 moved; the original's offsets (its own trace)
+    _, cols, _, out = search("inftrees_pad")
+    want = {"this$": 0, "low$1$": 4, "sym$2$": 8, "used$1$": 12, "base$1$": 16, "type$1$": 24, "bits$": 40,
+            "extra$1$": 32, "work$": 48, "mask$1$": 40, "count$": 80, "offs$": 112}
+    check("slots17 --orig: zlib inflate_table padded, the original's offset of all 12 elements", cols, want)
+    # genframes seed 1 f76 (alloca + dynamic alignment: rbp aligned, r13, B < A) padded; gzprintf (__chkstk, va_start)
+    m1, _, _, out1 = search("gf_padarr_f76")
+    m2, _, _, out2 = search("gzprintf_id")
+    check("slots17 --orig: alloca + dynamic alignment (r13, aligned rbp) 5/5; gzprintf (__chkstk 0x1030) 2/2",
+          (m1, "frame registers r13 rbp" in out1, m2, "sub rsp 4144" in out2), (("5", "5"), True, ("2", "2"), True))
+
+    def ins(lines):
+        return [(4 * k, l.split(" ", 1)[0], l.split(" ", 1)[1] if " " in l else "") for k, l in enumerate(lines)]
+    a = C.orig_slots64(ins(["mov qword ptr [rsp + 8], rbx", "push rdi", "sub rsp, 0x30", "mov dword ptr [rsp + 0x20], eax",
+                            "mov dword ptr [rsp + 0x50], ecx", "add rsp, 0x30", "pop rdi", "ret"]))
+    b = C.orig_slots64(ins(["push rbp", "mov eax, 0x1010", "call 0x100", "sub rsp, rax", "lea rbp, [rsp + 0x20]",
+                            "mov dword ptr [rbp + 0x10], eax", "lea rsp, [rbp + 0xff0]", "pop rbp", "ret"]))
+    c = C.orig_slots64(ins(["push rbp", "sub rsp, 0x80", "lea rbp, [rsp + 0x5f]", "and rbp, 0xffffffffffffffc0",
+                            "mov dword ptr [rbp + 4], eax", "mov dword ptr [rsp + 0x98], ecx", "add rsp, 0x80", "pop rbp", "ret"]))
+    check("slots17 orig_slots64: home save / push + sub; __chkstk + rbp = rsp + 0x20; aligned rbp",
+          ([k for _, k in a[0]], a[1]["body"], dict(b[0]).get(5), b[1]["body"], dict(c[0]).get(4), dict(c[0]).get(5)),
+          ([[8], [-24], [24]], 56, [-4072], 4120, [C.ALIGNED + 4], [16]))
+
+
+slots17_orig_tests()
+
+
 def x64_refusal_tests():
     """Tools without an x64 version refuse under --c2 17.00 with one line naming the replacement (docs/c2/port-1700.md,
     tool status); no compile runs (each exits before it)."""
@@ -1522,17 +1734,19 @@ def x64_refusal_tests():
     src = os.path.join(HERE, "tests", "data", "tailmerge.c")
     runs = {"regs": ["c2trace.py", "regs", src, "--func", "c1"], "scratch": ["c2trace.py", "scratch", src, "--func", "c1"],
             "regmap": ["c2trace.py", "regmap", src, "--func", "c1", "--asm-vs", "x", "--asm-func", "y"],
-            "merges": ["c2trace.py", "merges", src, "--func", "c1"], "x87": ["c2x87.py", src, "--func", "c1"],
-            "judge": ["judge.py", src, "--func", "c1", "--asm-vs", "x"], "ltcgstub": ["ltcgstub.py", "facts", "x.exe", "1"]}
-    want = {"regs": "c2ncol.py", "scratch": "c2ncol.py", "regmap": "c2ncol.py", "merges": "not ported",
-            "x87": "uses SSE", "judge": "x86-only", "ltcgstub": "c2ltcg.py"}
+            "x87": ["c2x87.py", src, "--func", "c1"],
+            "judge": ["judge.py", src, "--func", "c1", "--asm-vs", "x"]}
+    # merges is ported to 17.00 (c2merges.py; x64_merges_tests) and no longer refuses
+    # ltcgstub is ported to x64 images (ltcgstub17_tests) and no longer refuses
+    want = {"regs": "c2ncol.py", "scratch": "c2ncol.py", "regmap": "c2ncol.py",
+            "x87": "uses SSE", "judge": "x86-only"}
     got = {}
     for k, argv in runs.items():
         r = subprocess.run([sys.executable, os.path.join(HERE, "tools", argv[0])] + argv[1:], capture_output=True,
                            text=True, cwd=HERE, env=env)
         last = (r.stderr.strip().splitlines() or [""])[-1]
         got[k] = r.returncode != 0 and want[k] in last
-    check("x64 refusals: regs, scratch, regmap, merges, c2x87, judge, ltcgstub name their replacement",
+    check("x64 refusals: regs, scratch, regmap, c2x87, judge name their replacement",
           sorted(k for k, v in got.items() if not v), [])
 
 
@@ -1649,11 +1863,14 @@ ncol_levers_tests()
 sched17_tests()
 sched17_predict_tests()
 sched17_atom_tests()
+sched17_alias_il_tests()
+sched17_schedwant_tests()
 ncolsim_il_tests()
 ncolsim_ilmodel_tests()
 ncolsim_ilread_tests()
 ncolsim_fold_tests()
 ncolsim_walk_tests()
+ncolsim_split_tests()
 symkeys17_tests()
 
 
@@ -1877,10 +2094,112 @@ def loadcse_tests():
           "unalias ref &re = x.e removed" in r.stdout and "(2 uses)" in r.stdout, True)
 
 
+def loadcse17_tests():
+    """loadcse.py on cl 17.00 x64 (docs/c2/loadcse.md 8): every verdict checked against the /FAsc listing. The pass
+    entries (V = the last GdfInsertArtificialAssigns entry before sweep 2, S2 = the GoptLocalCopyPropagation entry
+    after it), the x64 memory leaf's hash symbol, sweep 1 rejoining the alias classes (no R2 in twolevel),
+    OpeqBitAssigns, and the kills a call at an arm's head, a memcpy intrinsic and a moved pointer make."""
+    d = tempfile.mkdtemp()
+
+    def rep(src, fn_):
+        js = os.path.join(d, re.sub(r"\W", "_", fn_) + ".json")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "loadcse.py"), os.path.join(HERE, "tests", "data", src),
+                            "--func", fn_, "--json", js, "--", "/TP", "/MT", "/GS", "/EHsc", "/Gy", "/O2"],
+                           capture_output=True, text=True, cwd=HERE)
+        if VERBOSE:
+            print(r.stdout[-3000:], r.stderr[-2000:])
+        return json.load(open(js)) if os.path.exists(js) else {"locations": [], "rmw": []}
+
+    def loads(j):
+        return [(ld["status"], ld["why"]) for loc in j["locations"] for ld in loc["loads"]]
+
+    j = rep("loadcse.cpp", "drain0")
+    check("loadcse17: drain0: one end pointer for read and decrement: no RMW (M2), as 14.00",
+          [("M2" in r["status"], r["status"].startswith("NOT FORMED")) for r in j["rmw"]], [(True, True)])
+    j = rep("loadcse.cpp", "drain1")
+    check("loadcse17: drain1: RMW formed through the sub-object accessor (`add [rbx+360], -8`)",
+          [r["status"] for r in j["rmw"]], ["FORMED"])
+    j = rep("loadcse.cpp", "::twolevel")
+    check("loadcse17: twolevel: one load each (sweep 1 rejoins the arm's alias class; 14.00: R2)",
+          (any(s_.startswith("RELOADED") for s_, _ in loads(j)), sum("sweep 1 rejoined" in w for _, w in loads(j)),
+           [loc["final"] for loc in j["locations"]]), (False, 3, [1, 1]))
+    j = rep("loadcse.cpp", "::twolevel_local")
+    check("loadcse17: twolevel_local: nothing reloaded", any(s_.startswith("RELOADED") for s_, _ in loads(j)), False)
+    j = rep("loadcse.cpp", "::refmember")
+    check("loadcse17: refmember: x.e read through `re` in both arms (R3), 3 loads in the code",
+          (sum(s_.startswith("RELOADED R3") and "through re" in w for s_, w in loads(j)),
+           [loc["final"] for loc in j["locations"] if loc["location"] == "[x+8]"]), (2, [3]))
+    j = rep("loadcse.cpp", "::killcall")
+    check("loadcse17: killcall: reloaded after the call (R5), 2 loads in the code",
+          ([s_ for s_, _ in loads(j)], [loc["final"] for loc in j["locations"]]), (["FIRST", "RELOADED R5 kill"], [2]))
+    j = rep("loadcse.cpp", "::samechain")
+    check("loadcse17: samechain: `or [m], ..`", [r["status"] for r in j["rmw"]], ["FORMED"])
+    j = rep("loadcse17.cpp", "::bit_and_or")
+    check("loadcse17: (m & ~1) | 2 is two RMWs (OpeqBitAssigns)",
+          [(r["status"], "bit-assign" in r.get("code", "")) for r in j["rmw"]], [("FORMED", True)])
+    j = rep("loadcse17.cpp", "::bit_loaded_ptr")
+    check("loadcse17: the same through a loaded pointer is load / op / store (M6)",
+          [r["status"] for r in j["rmw"]], ["NOT FORMED M6 mixed-chain"])
+    j = rep("loadcse17.cpp", "::call_arm")
+    check("loadcse17: reads after a call at the arm's head: R5 (the call), both locations",
+          sum(s_.startswith("RELOADED R5") and "call ?h@" in w for s_, w in loads(j)), 2)
+    j = rep("loadcse17.cpp", "::intrin_kill")
+    check("loadcse17: a memcpy intrinsic between the reads: R5",
+          [s_ for s_, w in loads(j) if "intrinsic" in w], ["RELOADED R5 kill"])
+    j = rep("loadcse17.cpp", "::moved")
+    check("loadcse17: `*++s` twice: the address moved (R5, not a missed CSE)",
+          sorted(w.split(" (")[0] for s_, w in loads(j) if s_.startswith("RELOADED")),
+          ["assignment to m", "assignment to s"])
+
+
 if lacking("loadcse"):
     skip("loadcse: load reuse / RMW rules on loadcse.cpp (8 checks)", lacking("loadcse"))
+elif c2build.get("arch") == "x64":
+    loadcse17_tests()                   # the x86 verdicts (R2 in twolevel, `_re`) are not 17.00's
 else:
     loadcse_tests()
+
+
+def ltcgstub17_tests():
+    """ltcgstub.py on an x64 /LTCG image (docs/c2/ltcg.md 12, cl 17.00): the facts of the callees in
+    tests/data/ltcg17_b.cpp (Win64 kill sets, entry registers, a dead parameter), stubs generated from them, and the
+    callers rebuilt with the stubs instead of the bodies: byte-exact, every stub's facts the original's."""
+    import c2ltcg
+    d = tempfile.mkdtemp()
+    A, B = (os.path.join(HERE, "tests", "data", f) for f in ("ltcg17_a.cpp", "ltcg17_b.cpp"))
+    script("c2ltcg.py", "asm", A, "--with", B, "--out", d)
+    dll = os.path.join(d, "ltcg.dll")
+    va = {re.sub(r"^\?|@@.*$", "", n): v for n, v, _ in c2ltcg.read_map(os.path.join(d, "ltcg.map"))}
+    if "fdiv" not in va:
+        check("ltcgstub17: the LTCG image builds", sorted(va), ["..."])
+        return
+    out = script("ltcgstub.py", "facts", dll, *("%x" % va[n] for n in ("fdiv", "fshl", "fx", "fxmm", "f12")))
+    got = [(m.group(1), m.group(2)) for m in re.finditer(r"entry regs (\S+)\s+kill (\S+)", out)]
+    check("ltcgstub17 facts: Win64 kill sets and entry registers (f12's dead parameter not read)", got,
+          [("rcx,rdx", "rax,rdx,r8"), ("rcx,rdx", "rax,rcx"), ("rcx", "rax,rcx,rdx,r8,r9,r10,r11"),
+           ("rcx,rdx", "xmm0,rax,rdx,r8,r9"), ("rdx", "rax,rdx")])
+    protos = os.path.join(d, "protos")
+    with open(protos, "w") as f:
+        for n, decl in (("f12", "int f12(int unused, int b)"), ("kc", "int kc(int a, int k)"), ("kv", "int kv(int a, int k)"),
+                        ("fdiv", "int fdiv(int a, int b)"), ("fshl", "int fshl(int a, int b)"), ("fx", "int fx(int a)"),
+                        ("fxmm", "int fxmm(double *p, int n)")):
+            f.write("%x  %s\n" % (va[n], decl))
+    stubs = os.path.join(d, "stubs.cpp")
+    script("ltcgstub.py", "stubs", dll, "--protos", protos, "--out", stubs, "--vary")
+    res, okn = [], None
+    for fn_ in ("cdiv", "cx", "cxm", "ck1"):
+        out = script("ltcgstub.py", "cmp", dll, "%x" % va[fn_], A, "--with", stubs, "--func", fn_, "--quiet",
+                     *(["--check-stubs", protos] if fn_ == "cdiv" else []), "--", "/TP")
+        res.append("BYTE-EXACT" in out)
+        if fn_ == "cdiv":
+            okn = (len(re.findall(r"^  stub .*  ok$", out, re.M)), len(re.findall(r"^  stub ", out, re.M)))
+    check("ltcgstub17 cmp: cdiv, cx, cxm, ck1 rebuilt against stubs are byte-exact", res, [True] * 4)
+    check("ltcgstub17 cmp --check-stubs: stubs with the original's kill set, entry registers (f12, fxmm differ)",
+          okn, (5, 7))
+
+
+if c2build.get("arch") == "x64":
+    ltcgstub17_tests()
 
 
 def sulever_tests():
@@ -2161,6 +2480,13 @@ def incsnap_tests():
     shutil.copytree(os.path.join(HERE, "tests", "data", "incsnap"), live)
     tu, sysd = os.path.join(live, "unit.cpp"), os.path.join(live, "sys")
     cl = ["/TP", "/O2", "/I" + sysd]
+    far = os.path.join(HERE, "tests", "data", "incsnap", "inc")   # headers in the checkout, the unit in the temp dir:
+    ftu = os.path.join(d, "far.c")                                 # the common root is "/" (each header must still be
+    open(ftu, "w").write('#include "a.h"\nint f(void) { return A; }\n')   # copied, not mapped to itself)
+    fs = incsnap.Snapshot(ftu, ["/I" + far], os.path.join(d, "farsnap"))
+    check("incsnap: headers on another root than the unit (common root /) are copied into the snapshot",
+          (len(fs.map) >= 1, all(v.startswith(os.path.join(d, "farsnap") + os.sep) for v in fs.map.values())),
+          (True, True))
 
     def breakit():
         for h in ("inc/a.h", "inc/b.h", "sys/c.h"):
@@ -2927,6 +3253,198 @@ def unit_tests():
 
 
 unit_tests()
+
+
+def x64_mine_pairs_tests():
+    """cl 17.00 x64 (NColor): effectmine mine / query read every variant through ncolsim (docs/c2/effectmine.md 8) and
+    realize pairs / the x64 pair search (docs/c2/realize.md, "cl 17.00 x64"). On every build: the x64 effect types
+    (offline). Under an x64 build table: effectmine on tests/data/effectmine.cpp (a copy is one candidate more live,
+    an unused local one frame key, both code-neutral), the recovery of tests/data/effectmine17/pert_alias.cpp against
+    effectmine.cpp's own compile (unalias: bdiff 0; query finds it in the database), `realize pairs` on
+    tests/data/realize17/probes.cpp and the pair search of `realize edit` on realize17/pert.cpp against orig.cpp."""
+    em = [sys.executable, os.path.join(HERE, "tools", "effectmine.py")]
+    r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import effectmine as E; print(' '.join("
+                        "E.etype('R', s) for s in sys.argv[1:]))" % os.path.join(HERE, "tools"), "+app:n:1:2", "-app:s:3:1",
+                        "live:3:-1", "live:1:+2", "index:p=5", "bucket:v=0", "blocks:9>12", "range:a", "new:rz_c",
+                        "reg:n:rbx>rsi", "before:s:a"], capture_output=True, text=True, cwd=HERE)
+    check("effectmine: the x64 effect strings' types (ncolsim's vocabulary)", r.stdout.split(),
+          ["R.app+", "R.app-", "R.live-", "R.live+", "R.index", "R.bucket", "R.blocks", "R.range", "R.new", "R.reg",
+           "R.before"])
+    if _c2b.get("arch") != "x64":
+        skip("effectmine / realize pairs on NColor (5 checks)", "x64 only")
+        return
+    import ncolsim, tsweep, c2trace
+
+    def orig_of(src, func, flags, d):          # our own compile as the original: capstone of the listing's bytes
+        run = ncolsim.NRun(src, c2trace.func_decl(func), flags, d)
+        lst = tsweep.listing_instrs(run.asm, run.func)
+        p = os.path.join(d, func + ".s")
+        with open(p, "w") as f:
+            for a_, (mn, ops) in zip(lst.addrs, tsweep.cs_text(lst)):
+                f.write("+0x%x  %s  %s\n" % (a_, mn, ops))
+        return p
+    env = dict(os.environ, EFFECTMINE_DIR=tempfile.mkdtemp(prefix="em17test_"))
+    EMS = os.path.join(HERE, "tests", "data", "effectmine.cpp")
+    r = subprocess.run(em + ["mine", EMS, "--func", "em__base", "--features", "regs,keys", "--eager-feats", "keys",
+                             "--classes", r"^(copy|pad\.init\.top|decl\.extvar\.before)$", "--max-compiles", "40",
+                             "--depth", "1", "--pairs", "0", "--jobs", "1"] + FLAGS,
+                       capture_output=True, text=True, cwd=HERE, env=env)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    dbp = os.path.join(env["EFFECTMINE_DIR"], "effects.jsonl")
+    db = [json.loads(l) for l in open(dbp)] if os.path.exists(dbp) else []
+    cp = [x for x in db if x["cls"] == "copy" and x["ok"]]
+    pad = [x for x in db if x["cls"] == "pad.init.top" and x["meta"].get("n") == 1 and x["ok"]]
+    dec = [x for x in db if x["cls"] == "decl.extvar.before" and x["ok"]]
+    check("effectmine x64: a copy is a new candidate kept live (live:B:+1), code 0; 1 unused local = 1 frame key; "
+          "declarations before the function: null",
+          (any("new:rz_c" in x["eff"]["R"] and any(re.match(r"live:\d+:\+1$", e) for e in x["eff"]["R"])
+               and x["code"]["code"] == 0 for x in cp),
+           [("keys:frame:+1" in x["eff"].get("K", []), x["code"]["ident"]) for x in pad],
+           bool(dec) and all(x["null"] for x in dec)), (True, [(True, 0)], True))
+    d = tempfile.mkdtemp(prefix="em17orig_")
+    orig = orig_of(EMS, "em__base", FLAGS[1:], d)
+    PA = os.path.join(HERE, "tests", "data", "effectmine17", "pert_alias.cpp")
+    r = subprocess.run(em + ["mine", PA, "--func", "em__base", "--asm-vs", orig, "--want", "bdiff", "--features", "regs",
+                             "--classes", r"^unalias$", "--max-compiles", "10", "--depth", "1", "--pairs", "0",
+                             "--jobs", "1"] + FLAGS, capture_output=True, text=True, cwd=HERE, env=env)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    db = [json.loads(l) for l in open(dbp)] if os.path.exists(dbp) else []
+    un = [x for x in db if x["cls"] == "unalias" and x["ok"] and x["src"] == PA]
+    m = re.search(r"base rdiff (\d+), bdiff (\d+)\)", r.stdout)
+    check("effectmine x64: the alias perturbation recovered against our own compile (unalias, bdiff 0)",
+          (m and int(m.group(2)) > 0, any(x["code"].get("bdo") == 0 and "C.match" in x["types"] for x in un)), (True, True))
+    r = subprocess.run(em + ["query", PA, "--func", "em__base", "--asm-vs", orig, "--want", "bdiff", "--features",
+                             "regs"] + FLAGS, capture_output=True, text=True, cwd=HERE, env=env)
+    check("effectmine x64 query: the database's unalias record answers --want bdiff",
+          bool(re.search(r"^\s+unalias\s+code\s+\d+ bag\s+\d+ rdiff 0 bdiff 0", r.stdout, re.M)), True)
+    RZ = os.path.join(HERE, "tests", "data", "realize17")
+    rz = [sys.executable, os.path.join(HERE, "tools", "realize.py")]
+    r = subprocess.run(rz + ["pairs", os.path.join(RZ, "probes.cpp"), "--", "/O2", "/EHsc"], capture_output=True,
+                       text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    rows = dict(re.findall(r"^  (\w+)\s+code \d+ .*?inputs ((?:index:\S+ ?)+)\s+\[", r.stdout, re.M))
+    check("realize pairs x64: declaration swaps are lifetime-index edits; ncolsim's registers = traced (3 of 3)",
+          (rows.get("ps", "").split(), bool(re.search(r"traced on 3 of 3$", r.stdout, re.M))),
+          (["index:s=4", "index:p=6"], True))
+    d = tempfile.mkdtemp(prefix="rz17_")
+    orig = orig_of(os.path.join(RZ, "orig.cpp"), "pr2", ["/O2", "/EHsc"], d)
+    r = subprocess.run(rz + ["edit", os.path.join(RZ, "pert.cpp"), "--func", "pr2", "before:p:s", "before:q:t",
+                             "--constructs", "swap,split", "--want-regs", "p=rdi,s=rsi,q=r14,t=r15", "--asm-vs", orig,
+                             "--keep", os.path.join(d, "k"), "--", "/O2", "/EHsc"], capture_output=True, text=True, cwd=HERE)
+    if VERBOSE:
+        print(r.stdout[-3000:], r.stderr[-2000:])
+    check("realize edit x64, two order edits: the pair search combines both swaps, predicted, bdiff 0 (pert -> orig)",
+          (bool(re.search(r"^  pr\d+\s+code \d+ regs \d+  rdiff 0 bdiff 0  pred ok ", r.stdout, re.M)),
+           "FOUND (pair search)" in r.stdout), (True, True))
+
+
+x64_mine_pairs_tests()
+
+
+def x64_merges_tests():
+    """c2merges.py on cl 17.00 x64 from a kept log (tests/data/merges17/tailmerge.log: `C2TRACE_FUNC= c2trace.py merges
+    tests/data/tailmerge.c --func c1 --keep DIR -- /O2` under --c2 17.00; the worker threads' events interleave and are
+    demuxed by `# thread N`); docs/c2/il_fg.md 7.5, port-1700.md 6."""
+    env = dict(os.environ, C2_BUILD="17.00")
+    log = os.path.join(HERE, "tests", "data", "merges17", "tailmerge.log")
+    got = {}
+    for fn_ in ("c1", "c2", "c3", "r1", "r2"):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2trace.py"), "merges", "--from", log,
+                            "--func", fn_], capture_output=True, text=True, cwd=HERE, env=env)
+        m = re.search(r"^tail \S+: (\d+) pair\(s\)(?:, (\d+) merged)?", r.stdout, re.M)
+        got[fn_] = (int(m.group(2) or 0) if m else None, r.stdout)
+    check("merges x64: merged pairs per function (c1 c2 c3 r1 r2; r1: `lea rcx` is fixed by the convention)",
+          [got[k][0] for k in ("c1", "c2", "c3", "r1", "r2")], [2, 1, 2, 2, 2])
+    check("merges x64: twins f1/f2 stop the walk at the call; the size rule's total read at its probe",
+          ("1 matched: stop: call target f2 / f1; size 12 <= 20" in got["c2"][1],
+           "5 matched: merged; size 24 > 20" in got["c1"][1]), (True, True))
+
+
+x64_merges_tests()
+
+
+def symkeys17_levers_tests():
+    """symkeys levers on cl 17.00 x64, checked against compiles (docs/c2/symkeys.md 10.3): tests/data/symkeys17_levers/
+    *.cpp are tests/data/symkeys.cpp with the top lever applied as a source change, *.json their exports; the base is
+    tests/data/symkeys17/symkeys.json. No compile."""
+    env = dict(os.environ, C2_BUILD="17.00")
+    base = os.path.join(HERE, "tests", "data", "symkeys17", "symkeys.json")
+    L = os.path.join(HERE, "tests", "data", "symkeys17_levers")
+
+    def sk(*args):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py")] + list(args), capture_output=True,
+                           text=True, cwd=HERE, env=env)
+        return r.stdout + r.stderr
+    rates = []
+    for fn_, edits in (("kparams", ["add:frame@r:28"]), ("kx87", ["add:frame@s:1", "add:frame@q:4"]),
+                       ("kdead", ["sub:frame@r:1"])):
+        out = sk("compare", "--from", base, "--func", fn_, *edits, "--vs", os.path.join(L, fn_ + ".json"))
+        k = re.search(r"keys: (\d+) symbols in both; predicted = traced for (\d+)", out)
+        s_ = re.search(r"sorts .*?: (\d+); predicted order = traced for (\d+)", out)
+        rates.append(bool(k and s_ and k.group(1) == k.group(2) and s_.group(1) == s_.group(2)))
+    check("symkeys17 levers: every key and pass-2 order of the 3 applied levers predicted (kparams, kx87, kdead)",
+          rates, [True, True, True])
+    out = sk("levers", "--from", base, "--func", "kparams", "--var", "r", "--above", "40", "--max", "30")
+    traced = sk("keys", "--from", os.path.join(L, "kparams.json"), "--func", "kparams", "--brief")
+    check("symkeys17 levers --var: 28 dead locals before r move it to the next frame block (128), as compiled",
+          (bool(re.search(r"^add:frame@r:28\n    -> r key 128 ", out, re.M)), " r:128 " in traced), (True, True))
+    out = sk("levers", "--from", base, "--func", "kdead", "--var", "r", "--below", "4", "--max", "3")
+    check("symkeys17 levers: a sub edit names the local it removes (kdead: the dead `float d = 0;`)",
+          bool(re.search(r"^sub:frame@r:1\n.*\n.*\n    removes: d ", out, re.M)), True)
+    out = sk("levers", "--from", base, "--func", "kx87", "--site", "1:s>[p", "--max", "4", "--top", "3")
+    check("symkeys17 levers --site: no edit set removes a symbol the code reads (kx87: s, p, q are operands)",
+          (bool(re.search(r"^# \d+ sub edits dropped", out, re.M)), bool(re.search(r"^1/1 sites", out, re.M)),
+           "removes:" in out), (True, True, False))
+
+
+symkeys17_levers_tests()
+
+
+def x64_compile_tests():
+    """cl 17.00 x64 tools that need a traced compile (local wine or the compile server): c2ltcg regs routed to
+    c2ncol inside link.exe (docs/c2/ltcg.md), icount's pass attribution (docs/c2/icount.md 17.00)."""
+    if _c2b.get("arch") != "x64":
+        skip("ltcg regs / icount on cl 17.00 x64 (4 checks)", "x64 builds only (C2_BUILD=17.00)")
+        return
+    env = dict(os.environ, C2_BUILD="17.00")
+
+    def run17(*args):
+        r = subprocess.run([sys.executable] + [os.path.join(HERE, "tools", args[0])] + list(args[1:]),
+                           capture_output=True, text=True, cwd=HERE, env=env)
+        if VERBOSE:
+            print(r.stdout[-3000:], r.stderr[-2000:])
+        return r.stdout + r.stderr
+    KA, KB = (os.path.join(HERE, "tests", "data", f) for f in ("ltcg_kill_a.c", "ltcg_kill_b.c"))
+    reg = {}
+    for fn_ in ("c_eax", "c_ext"):
+        out = run17("c2ltcg.py", "regs", KA, "--with", KB, "--func", fn_)
+        m = re.search(r"^\s+\d+\s+a\$1\s+prio \d+\s+\S+\s+-> (\w+)", out, re.M)
+        reg[fn_] = m.group(1) if m else None
+    check("ltcg regs x64 (NColor in link.exe): a in a volatile register across k_eax (uses only eax), esi across k_ext",
+          (reg["c_eax"] in ("ecx", "edx", "r8d", "r9d", "r10d", "r11d"), reg["c_ext"]), (True, "esi"))
+    d = tempfile.mkdtemp()
+
+    def classes(src, p):
+        js = os.path.join(d, p + ".json")
+        run17("icount.py", os.path.join(HERE, "tests", "data", src), "--func", "::%s_ours" % p, "--vs-func",
+              "::%s_orig" % p, "--allow-local", "--json", js, "--", "/TP", "/O2")
+        j = json.load(open(js)) if os.path.exists(js) else {}
+        return j.get("ours", 0) - j.get("orig", 0), sorted(j.get("classes", {}))
+    dl, cl = classes("icount17.cpp", "kill")
+    check("icount x64: a reload after a store through another pointer: kept:kill (the load SizeOpt re-made)",
+          (dl, "kept:kill" in cl), (2, True))
+    dl, cl = classes("icount.cpp", "tail")
+    check("icount x64: equal tails merged (the 17.00 merge events): merged:FgDoLateFlowOpts",
+          "merged:FgDoLateFlowOpts" in cl, True)
+    dl, cl = classes("icount.cpp", "dead")
+    check("icount x64: the first of two stores is dead: removed-by:GlobalOptimize/DeadStores",
+          (dl, cl), (-1, ["removed-by:GlobalOptimize/DeadStores"]))
+
+
+x64_compile_tests()
 
 
 def probe_modules():

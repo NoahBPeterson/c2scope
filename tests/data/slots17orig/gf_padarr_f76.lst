@@ -1,0 +1,233 @@
+p0$GSCopy$ = 32
+v3$ = 36
+v2$ = 40
+v1$ = 48
+v0$ = 64
+v4$ = 96
+__$ArrayPad$ = 128
+p0$ = 224
+?f76@@YAHH@Z PROC					; f76, COMDAT
+
+; 1099 : int f76(int p0) {
+
+$LN5:
+  00000	41 55		 push	 r13
+  00002	55		 push	 rbp
+  00003	41 54		 push	 r12
+  00005	41 56		 push	 r14
+  00007	41 57		 push	 r15
+  00009	48 81 ec a0 01
+	00 00		 sub	 rsp, 416		; 000001a0H
+  00010	4c 8d ac 24 f0
+	00 00 00	 lea	 r13, QWORD PTR [rsp+240]
+  00018	49 89 9d e8 00
+	00 00		 mov	 QWORD PTR [r13+232], rbx
+  0001f	49 89 b5 f0 00
+	00 00		 mov	 QWORD PTR [r13+240], rsi
+  00026	49 89 bd f8 00
+	00 00		 mov	 QWORD PTR [r13+248], rdi
+  0002d	48 8d ac 24 10
+	01 00 00	 lea	 rbp, QWORD PTR [rsp+272]
+  00035	48 83 e5 e0	 and	 rbp, -32		; ffffffffffffffe0H
+  00039	48 8b 05 00 00
+	00 00		 mov	 rax, QWORD PTR __security_cookie
+  00040	49 33 c5	 xor	 rax, r13
+  00043	48 89 85 80 00
+	00 00		 mov	 QWORD PTR __$ArrayPad$[rbp], rax
+  0004a	89 4d 20	 mov	 DWORD PTR p0$GSCopy$[rbp], ecx
+
+; 1100 :     V32 v0;
+; 1101 :     ext(&v0);
+
+  0004d	48 8d 4d 40	 lea	 rcx, QWORD PTR v0$[rbp]
+  00051	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1102 :     g += v0.v[2];
+
+  00056	8b 45 48	 mov	 eax, DWORD PTR v0$[rbp+8]
+
+; 1103 :     double v1;
+; 1104 :     ext(&v1);
+
+  00059	48 8d 4d 30	 lea	 rcx, QWORD PTR v1$[rbp]
+  0005d	01 05 00 00 00
+	00		 add	 DWORD PTR ?g@@3HA, eax	; g
+  00063	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1105 :     double v2;
+; 1106 :     ext(&v2);
+
+  00068	48 8d 4d 28	 lea	 rcx, QWORD PTR v2$[rbp]
+  0006c	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1107 :     g += (int)v2;
+; 1108 :     char v3;
+; 1109 :     ext(&v3);
+
+  00071	48 8d 4d 24	 lea	 rcx, QWORD PTR v3$[rbp]
+  00075	f2 0f 2c 45 28	 cvttsd2si eax, QWORD PTR v2$[rbp]
+  0007a	01 05 00 00 00
+	00		 add	 DWORD PTR ?g@@3HA, eax	; g
+  00080	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1110 :     V32 v4;
+; 1111 :     ext(&v4);
+
+  00085	48 8d 4d 60	 lea	 rcx, QWORD PTR v4$[rbp]
+  00089	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1112 :     g += v4.v[2];
+; 1113 :     int *a = (int *)_alloca(p0 * 4 + 4);
+
+  0008e	8b 45 20	 mov	 eax, DWORD PTR p0$GSCopy$[rbp]
+  00091	8b 15 00 00 00
+	00		 mov	 edx, DWORD PTR ?g@@3HA	; g
+  00097	03 55 68	 add	 edx, DWORD PTR v4$[rbp+8]
+  0009a	8d 04 85 04 00
+	00 00		 lea	 eax, DWORD PTR [rax*4+4]
+  000a1	48 63 c8	 movsxd	 rcx, eax
+  000a4	89 15 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, edx	; g
+  000aa	48 8d 41 0f	 lea	 rax, QWORD PTR [rcx+15]
+  000ae	48 3b c1	 cmp	 rax, rcx
+  000b1	77 0a		 ja	 SHORT $LN3@f76
+  000b3	48 b8 f0 ff ff
+	ff ff ff ff 0f	 mov	 rax, 1152921504606846960 ; 0ffffffffffffff0H
+$LN3@f76:
+  000bd	48 83 e0 f0	 and	 rax, -16
+  000c1	e8 00 00 00 00	 call	 __chkstk
+  000c6	48 2b e0	 sub	 rsp, rax
+  000c9	48 8d 8c 24 10
+	01 00 00	 lea	 rcx, QWORD PTR [rsp+272]
+
+; 1114 :     a[0] = g;
+
+  000d1	89 11		 mov	 DWORD PTR [rcx], edx
+
+; 1115 :     ext(a);
+
+  000d3	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1116 :     ext(&p0);
+
+  000d8	48 8d 4d 20	 lea	 rcx, QWORD PTR p0$GSCopy$[rbp]
+  000dc	e8 00 00 00 00	 call	 ?ext@@YAXPEAX@Z		; ext
+
+; 1117 :     g += many(p0 + 0, p0 + 1, p0 + 2, p0 + 3, p0 + 4, p0 + 5, p0 + 6, p0 + 7, p0 + 8, p0 + 9, p0 + 10, p0 + 11, p0 + 12, p0 + 13, p0 + 14, p0 + 15, p0 + 16, p0 + 17, p0 + 18, p0 + 19, p0 + 20, p0 + 21, p0 + 22, p0 + 23, p0 + 24, p0 + 25, p0 + 26, p0 + 27, p0 + 28, p0 + 29, p0 + 30, p0 + 31, p0 + 32, p0 + 33);
+
+  000e1	44 8b 45 20	 mov	 r8d, DWORD PTR p0$GSCopy$[rbp]
+  000e5	8b 55 20	 mov	 edx, DWORD PTR p0$GSCopy$[rbp]
+  000e8	41 8d 40 21	 lea	 eax, DWORD PTR [r8+33]
+  000ec	41 8d 48 20	 lea	 ecx, DWORD PTR [r8+32]
+  000f0	45 8d 50 1f	 lea	 r10d, DWORD PTR [r8+31]
+  000f4	89 84 24 08 01
+	00 00		 mov	 DWORD PTR [rsp+264], eax
+  000fb	89 8c 24 00 01
+	00 00		 mov	 DWORD PTR [rsp+256], ecx
+  00102	8b 4d 20	 mov	 ecx, DWORD PTR p0$GSCopy$[rbp]
+  00105	44 89 94 24 f8
+	00 00 00	 mov	 DWORD PTR [rsp+248], r10d
+  0010d	45 8d 58 1e	 lea	 r11d, DWORD PTR [r8+30]
+  00111	41 8d 58 1d	 lea	 ebx, DWORD PTR [r8+29]
+  00115	44 89 9c 24 f0
+	00 00 00	 mov	 DWORD PTR [rsp+240], r11d
+  0011d	89 9c 24 e8 00
+	00 00		 mov	 DWORD PTR [rsp+232], ebx
+  00124	41 8d 78 1c	 lea	 edi, DWORD PTR [r8+28]
+  00128	89 bc 24 e0 00
+	00 00		 mov	 DWORD PTR [rsp+224], edi
+  0012f	41 8d 70 1b	 lea	 esi, DWORD PTR [r8+27]
+  00133	45 8d 70 1a	 lea	 r14d, DWORD PTR [r8+26]
+  00137	89 b4 24 d8 00
+	00 00		 mov	 DWORD PTR [rsp+216], esi
+  0013e	44 89 b4 24 d0
+	00 00 00	 mov	 DWORD PTR [rsp+208], r14d
+  00146	45 8d 78 19	 lea	 r15d, DWORD PTR [r8+25]
+  0014a	44 89 bc 24 c8
+	00 00 00	 mov	 DWORD PTR [rsp+200], r15d
+  00152	45 8d 60 18	 lea	 r12d, DWORD PTR [r8+24]
+  00156	8d 41 17	 lea	 eax, DWORD PTR [rcx+23]
+  00159	44 89 a4 24 c0
+	00 00 00	 mov	 DWORD PTR [rsp+192], r12d
+  00161	89 84 24 b8 00
+	00 00		 mov	 DWORD PTR [rsp+184], eax
+  00168	8d 41 16	 lea	 eax, DWORD PTR [rcx+22]
+  0016b	89 84 24 b0 00
+	00 00		 mov	 DWORD PTR [rsp+176], eax
+  00172	8d 41 15	 lea	 eax, DWORD PTR [rcx+21]
+  00175	45 8d 48 03	 lea	 r9d, DWORD PTR [r8+3]
+  00179	89 84 24 a8 00
+	00 00		 mov	 DWORD PTR [rsp+168], eax
+  00180	8d 41 14	 lea	 eax, DWORD PTR [rcx+20]
+  00183	41 83 c0 02	 add	 r8d, 2
+  00187	89 84 24 a0 00
+	00 00		 mov	 DWORD PTR [rsp+160], eax
+  0018e	8d 41 13	 lea	 eax, DWORD PTR [rcx+19]
+  00191	ff c2		 inc	 edx
+  00193	89 84 24 98 00
+	00 00		 mov	 DWORD PTR [rsp+152], eax
+  0019a	8d 41 12	 lea	 eax, DWORD PTR [rcx+18]
+  0019d	89 84 24 90 00
+	00 00		 mov	 DWORD PTR [rsp+144], eax
+  001a4	8d 41 11	 lea	 eax, DWORD PTR [rcx+17]
+  001a7	89 84 24 88 00
+	00 00		 mov	 DWORD PTR [rsp+136], eax
+  001ae	8d 41 10	 lea	 eax, DWORD PTR [rcx+16]
+  001b1	89 84 24 80 00
+	00 00		 mov	 DWORD PTR [rsp+128], eax
+  001b8	8d 41 0f	 lea	 eax, DWORD PTR [rcx+15]
+  001bb	89 44 24 78	 mov	 DWORD PTR [rsp+120], eax
+  001bf	8d 41 0e	 lea	 eax, DWORD PTR [rcx+14]
+  001c2	89 44 24 70	 mov	 DWORD PTR [rsp+112], eax
+  001c6	8d 41 0d	 lea	 eax, DWORD PTR [rcx+13]
+  001c9	89 44 24 68	 mov	 DWORD PTR [rsp+104], eax
+  001cd	8d 41 0c	 lea	 eax, DWORD PTR [rcx+12]
+  001d0	89 44 24 60	 mov	 DWORD PTR [rsp+96], eax
+  001d4	8d 41 0b	 lea	 eax, DWORD PTR [rcx+11]
+  001d7	89 44 24 58	 mov	 DWORD PTR [rsp+88], eax
+  001db	8d 41 0a	 lea	 eax, DWORD PTR [rcx+10]
+  001de	89 44 24 50	 mov	 DWORD PTR [rsp+80], eax
+  001e2	8d 41 09	 lea	 eax, DWORD PTR [rcx+9]
+  001e5	89 44 24 48	 mov	 DWORD PTR [rsp+72], eax
+  001e9	8d 41 08	 lea	 eax, DWORD PTR [rcx+8]
+  001ec	89 44 24 40	 mov	 DWORD PTR [rsp+64], eax
+  001f0	8d 41 07	 lea	 eax, DWORD PTR [rcx+7]
+  001f3	89 44 24 38	 mov	 DWORD PTR [rsp+56], eax
+  001f7	8d 41 06	 lea	 eax, DWORD PTR [rcx+6]
+  001fa	89 44 24 30	 mov	 DWORD PTR [rsp+48], eax
+  001fe	8d 41 05	 lea	 eax, DWORD PTR [rcx+5]
+  00201	89 44 24 28	 mov	 DWORD PTR [rsp+40], eax
+  00205	8d 41 04	 lea	 eax, DWORD PTR [rcx+4]
+  00208	89 44 24 20	 mov	 DWORD PTR [rsp+32], eax
+  0020c	e8 00 00 00 00	 call	 ?many@@YAHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH@Z ; many
+  00211	8b 0d 00 00 00
+	00		 mov	 ecx, DWORD PTR ?g@@3HA	; g
+  00217	03 c8		 add	 ecx, eax
+  00219	89 0d 00 00 00
+	00		 mov	 DWORD PTR ?g@@3HA, ecx	; g
+
+; 1118 :     return g;
+
+  0021f	8b c1		 mov	 eax, ecx
+
+; 1119 : }
+
+  00221	48 8b 8d 80 00
+	00 00		 mov	 rcx, QWORD PTR __$ArrayPad$[rbp]
+  00228	49 33 cd	 xor	 rcx, r13
+  0022b	e8 00 00 00 00	 call	 __security_check_cookie
+  00230	49 8b 9d e8 00
+	00 00		 mov	 rbx, QWORD PTR [r13+232]
+  00237	49 8b b5 f0 00
+	00 00		 mov	 rsi, QWORD PTR [r13+240]
+  0023e	49 8b bd f8 00
+	00 00		 mov	 rdi, QWORD PTR [r13+248]
+  00245	49 8d a5 b0 00
+	00 00		 lea	 rsp, QWORD PTR [r13+176]
+  0024c	41 5f		 pop	 r15
+  0024e	41 5e		 pop	 r14
+  00250	41 5c		 pop	 r12
+  00252	5d		 pop	 rbp
+  00253	41 5d		 pop	 r13
+  00255	c3		 ret	 0
+?f76@@YAHH@Z ENDP					; f76

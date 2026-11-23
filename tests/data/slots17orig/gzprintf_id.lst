@@ -1,0 +1,94 @@
+buf$ = 32
+__$ArrayPad$ = 4128
+file$ = 4160
+format$ = 4168
+gzprintf PROC						; COMDAT
+
+; 600  : {
+
+$LN8:
+  00000	48 89 54 24 10	 mov	 QWORD PTR [rsp+16], rdx
+  00005	4c 89 44 24 18	 mov	 QWORD PTR [rsp+24], r8
+  0000a	4c 89 4c 24 20	 mov	 QWORD PTR [rsp+32], r9
+  0000f	53		 push	 rbx
+  00010	b8 30 10 00 00	 mov	 eax, 4144		; 00001030H
+  00015	e8 00 00 00 00	 call	 __chkstk
+  0001a	48 2b e0	 sub	 rsp, rax
+  0001d	48 8b 05 00 00
+	00 00		 mov	 rax, QWORD PTR __security_cookie
+  00024	48 33 c4	 xor	 rax, rsp
+  00027	48 89 84 24 20
+	10 00 00	 mov	 QWORD PTR __$ArrayPad$[rsp], rax
+  0002f	48 8b d9	 mov	 rbx, rcx
+
+; 601  :     char buf[Z_PRINTF_BUFSIZE];
+; 602  :     va_list va;
+; 603  :     int len;
+; 604  : 
+; 605  :     buf[sizeof(buf) - 1] = 0;
+; 606  :     va_start(va, format);
+; 607  : #ifdef NO_vsnprintf
+; 608  : #  ifdef HAS_vsprintf_void
+; 609  :     (void)vsprintf(buf, format, va);
+; 610  :     va_end(va);
+; 611  :     for (len = 0; len < sizeof(buf); len++)
+; 612  :         if (buf[len] == 0) break;
+; 613  : #  else
+; 614  :     len = vsprintf(buf, format, va);
+; 615  :     va_end(va);
+; 616  : #  endif
+; 617  : #else
+; 618  : #  ifdef HAS_vsnprintf_void
+; 619  :     (void)vsnprintf(buf, sizeof(buf), format, va);
+; 620  :     va_end(va);
+; 621  :     len = strlen(buf);
+; 622  : #  else
+; 623  :     len = vsnprintf(buf, sizeof(buf), format, va);
+
+  00032	4c 8b c2	 mov	 r8, rdx
+  00035	4c 8d 8c 24 50
+	10 00 00	 lea	 r9, QWORD PTR format$[rsp+8]
+  0003d	48 8d 4c 24 20	 lea	 rcx, QWORD PTR buf$[rsp]
+  00042	ba 00 10 00 00	 mov	 edx, 4096		; 00001000H
+  00047	c6 84 24 1f 10
+	00 00 00	 mov	 BYTE PTR buf$[rsp+4095], 0
+  0004f	e8 00 00 00 00	 call	 _vsnprintf
+
+; 624  :     va_end(va);
+; 625  : #  endif
+; 626  : #endif
+; 627  :     if (len <= 0 || len >= (int)sizeof(buf) || buf[sizeof(buf) - 1] != 0)
+
+  00054	8d 50 ff	 lea	 edx, DWORD PTR [rax-1]
+  00057	81 fa fe 0f 00
+	00		 cmp	 edx, 4094		; 00000ffeH
+  0005d	77 1c		 ja	 SHORT $LN1@gzprintf
+  0005f	80 bc 24 1f 10
+	00 00 00	 cmp	 BYTE PTR buf$[rsp+4095], 0
+  00067	75 12		 jne	 SHORT $LN1@gzprintf
+
+; 629  :     return gzwrite(file, buf, (unsigned)len);
+
+  00069	48 8d 54 24 20	 lea	 rdx, QWORD PTR buf$[rsp]
+  0006e	44 8b c0	 mov	 r8d, eax
+  00071	48 8b cb	 mov	 rcx, rbx
+  00074	e8 00 00 00 00	 call	 gzwrite
+  00079	eb 02		 jmp	 SHORT $LN3@gzprintf
+$LN1@gzprintf:
+
+; 628  :         return 0;
+
+  0007b	33 c0		 xor	 eax, eax
+$LN3@gzprintf:
+
+; 630  : }
+
+  0007d	48 8b 8c 24 20
+	10 00 00	 mov	 rcx, QWORD PTR __$ArrayPad$[rsp]
+  00085	48 33 cc	 xor	 rcx, rsp
+  00088	e8 00 00 00 00	 call	 __security_check_cookie
+  0008d	48 81 c4 30 10
+	00 00		 add	 rsp, 4144		; 00001030H
+  00094	5b		 pop	 rbx
+  00095	c3		 ret	 0
+gzprintf ENDP

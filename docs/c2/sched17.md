@@ -739,15 +739,98 @@ register; memory = a leaf of kind 6, 3, 4 or 2, so a call or a jump to a code ad
 
 The same replay from the traced DAG: 1152 [71] (as in 6), 1153 [71] with `breaks=True`. The 15 traced edges not
 predicted are all control edges SchmdBreakDep adds during scheduling (above), not edges of the built DAG; a traced
-breakable edge the traced order broke is not in the trace and is not counted against the prediction. Still read
-from the trace with `--predict`: the alias facts (the IL-only line shows their weight); every other input of the
-DAG, its latencies, units, heights and priorities comes from the IL and the DLL's tables.
+breakable edge the traced order broke is not in the trace and is not counted against the prediction. With the
+logged alias facts every input but those answers comes from the IL and the DLL's tables; the answers themselves
+can now be derived from the IL as well (6.2: 1151 regions, against 1124 with the PAS guess).
 
 Not done: the lea split's issue-time folding (SchmdHasFoldableAGI; it changes operands, not the order) and
 `SchmdBreakDep`'s operand rewrites (1.6.1; the replay only removes the edge), the kind-4 case that writes no kind;
 kind 9 is predicted on K8 too now (none in zlib's K8 DAGs; on Atom 3, all broken); a switch's case edges and
 opcode 0x51b / the CurFunc+0x58 register / int, cli, sti control points (not reached by zlib); `ItfStackLocIsMemberOfPas` (TLS+0xebdc never seen set). Offline test:
 `sched17_predict_tests` (tests/data/sched17/il/*.json: c1, c2, sum, adler32, compress, uncompr, zutil, inftrees).
+
+### 6.2 The alias facts from the IL (`ILAlias`, key `alias_il`, 2026-11-22)
+
+**How the compiler answers** **[C]**: `ItfPasInterf(a, b)` 0x100de4f0 (after the 2 / 3 / equal / 1 cases of 6.1):
+a set index >= [TLS+0xec48] is a *derived* set, a 16-byte record of [TLS+0xec1c]: +0 parent set, +4 key, +8 size,
++0xc offset (`ItfNewPASAux` 0x10055470 writes them: ecx = key, edx = size, [ebp+8] = offset, [ebp+0xc] = parent;
+`ItfNewPAS` 0x101724a0 makes a sibling with the same parent and key at offset + delta, size from the leaf's type
+(`ItfUpdatePasIndex` 0x10172440: type & 0xfff); `ItfNewValuePas` 0x10172510 one with a fresh key, counter
+[TLS+0xec9c], called from loop unrolling / `LurProcessIndirInterf`; `ItfNewSymPAS` 0x10047180 keys by a SYM). Two
+derived sets with **the same key** (and [TLS+0xec7c] set) interfere iff `[off, off + size)` overlap; otherwise each
+is replaced by its parent (the walk repeats while an index is derived) and the base sets' bit vectors [TLS+0xebf4]
+are intersected; an intersection is refined by `ItfIndirPasIsPtr` when [TLS+0xec0c][set] == 1, an empty one by the
+`StkGetOverlayedSyms` walk when [TLS+0xebdc] is set (never seen). The bit vectors come from the optimiser's
+points-at analysis (`ComputePointsAtSets`, `MapPointsAtSets`), not from anything the IL dump shows.
+
+**What ILAlias rebuilds** (`c2sched17.ILAlias(tuples, fn_alias_info(fn))`, the `.pas` / `.memb` objects take the
+place of the logged fact dicts): a derived set's key is the base its leaves go through: a variable, after the
+region's copies (`mov x, y`, 64-bit) and `lea x, [y + d]` are folded into one pointer with an offset, and after two
+variables seen in one set at one displacement are joined; a local array's SYM (the memory leaf's +0x2c, an address
+`[i*s + d]` with a symbol part); the frame register (`[r11 - 88]`); a variable redefined from itself in the region
+(`add r8, 3`: a pointer advanced in an unrolled loop) has no key. Its range is the union of its leaves' `[disp, disp
++ size)` in the key's coordinates. Then, both sets derived:
+
+- keys meet: interfere iff an index is involved or the ranges overlap;
+- else: two locals (frame, local arrays, also an array the function only reads, taken for a global table) do not;
+  a local and memory reached only through a pointer argument do not (an argument is a variable read in rcx / rdx /
+  r8 / r9 before a definition in the function's first region, its copies there, or `X$k` for a kind-5 SYM X); a
+  local array whose address the function never takes (no kind-3 leaf of it anywhere) meets nothing; anything else
+  interferes.
+- a small set 7 / 10 / 13 / 15 (calls, escaping memory) against a never-addressed local array: no; other small
+  sets: the rules of pas_guess.
+- `ItfIsMemberOfPas(var, set)`: a global (SYM kind not 3..5) is in every set; a local is in a set iff its address
+  (or its root's) is taken somewhere in the function, and not in a derived set reached only through a pointer
+  argument; set 6 holds none.
+
+**Measured** (zlib 1.2.1, 12 files; the logged answers as the reference; [Atom, /O2 /favor:ATOM]):
+
+| | logged facts | ILAlias | PAS guess (6.1) |
+|---|---|---|---|
+| ItfPasInterf answers right | (3434) [3420] | 3414 [3400] | 2077 [2065] |
+| ItfIsMemberOfPas answers right | (187) [188] | 186 [187] | 119 [119] |
+| traced edges reproduced (of 20043 [20028]) | 20028 [20014] | 20007 [19985] | 19929 [19907] |
+| DAG exact | 1158 [1148] | 1146 [1134] | 1073 [1060] |
+| static priority (of 8450 [8394]) | 8450 [8394] | 8429 [8360] | 8269 [8194] |
+| regions in the traced order (of 1173 [1162]) | **1155** [1162] | **1151** [1157] | 1124 [1125] |
+
+Equal or better than the PAS guess in every file of both runs and of every tests/data/sched17 export, so the key
+is on: `predict_dag(region, alias=True)` on a region without logged answers uses ILAlias (env
+`C2SCHED17_ALIAS_IL=0` turns it off), `predict_dag(.., alias="il")` always does, `alias=False` keeps the PAS guess;
+`--predict` prints all three lines. The logged answers stay the default where they are logged (they are exact).
+
+Still wrong (20 of 3434 ItfPasInterf answers on /O2): trees.c's constant-index arrays inside `s` (`s->bl_tree[REP_3_6]`
+at s+2780, `s->heap[1]`): the compiler answers 1 against `s->pending` / `s->bi_buf` although the ranges are disjoint
+(the array access got its own key, a pointer `tree` / `heap` inlined and folded to `s + offset`; the IL shows only
+`[s + 2780]`); gzsetparams / inflate 100 (two pointers the compiler proved disjoint: points-at results, not
+visible); inflate_table 22 (one local array, two disjoint index ranges); gen_codes 1 (pas 7 against `next_code`,
+whose address is taken). One ItfIsMemberOfPas: compress2's `stream` against set 7. Offline test:
+`sched17_alias_il_tests`.
+
+### 6.3 schedwant on x64 (2026-11-22)
+
+`schedwant.py SRC --func F --asm-vs ORIG.s` (or `--want-src`, `--region K --want-lex ..`) under `--c2 17.00` runs on
+this model (docs/c2/sched.md, "How to move an instruction from source"): the trace is c2sched17's (`hooks(il=True)`)
+plus the final IL at `@Encode@4` (the build's IL spec) to place each tuple in our listing; per region the DAG is the
+one predicted from the IL (with the logged alias answers) when its replay gives the traced order, else the traced
+DAG. A perturbation edits the edge list; heights, successor counts and the critical-path bit are recomputed as
+SchComputeStaticPriority does (1.5: edges made in the forward pass count in no height, those made after the
+producer's priority, `late`, not in its nsucc; the fields are added, so 32 successors carry into L), B / L / S kept;
+the replay is `simulate(.., breaks=True)` with the function's model. On zlib this recomputation gives every static
+priority of the 1155 predicted K8 regions (8450 of 8450 nodes) and of the 1162 Atom regions but one (8393 of 8394,
+compress_block region 3: a height); 1155 [1162] regions replay to the traced order. Perturbations: those of the x86
+tool (`unalias:X`, `alias:X`, `cut:X>Y`, `ns:X±1`, pairs) and, new, **`move:X<Y` / `move:X>Y`**: X's tuple moved in
+the IL to just before / after Y and the DAG rebuilt by predict_dag (only moves that cross no true register
+dependence of X; the allocation's anti / output edges between X and the crossed nodes are dropped, another
+allocation would not have them): a statement moved in the source. The listing match adds, x64 only, an alignment
+on whole instruction text first and a same-mnemonic match nearby (another allocation in a reordered stretch).
+
+Checked: every function of zlib's trees.c against its own listing: all regions in the original's order;
+inflate.c's inflateReset with `strm->msg = Z_NULL` moved below `state->bits = 0` as the original: region 1 found
+(14 of 14 matched through our listing), replay = traced, wanted order reached by `move:5>9` (the edit) and
+`unalias:5` (and pairs), K8 and Atom alike; tests/data/sched17/schedwant17.c against schedwant17b.c (q[0] = y moved
+below s->b's store): `move:2>6` is the only answer (`sched17_schedwant_tests`, both models). Moves cost one DAG
+build each: about 2 s for an 81-node region (moves limited to 13 nodes there, 40 otherwise).
 
 ---------------------------------------------------------------------------------------------------
 

@@ -403,11 +403,12 @@ rest is processed as a new region; the STORE probe's R+0x24 / R+0x28 are the reg
   regions with R+0x1c in that set whose window [R+0x2c, R+0x30] (or a range, once the owner is fully
   processed) contains [begin, end] and that have no def and no use inside it; hot zones flagged by
   `NColZoneIsProblematic` are excluded; keeps the cheapest (initial best = 0x7fffffff).
-* `NColSeparateProcessedRegion` (0x100c7a20; ecx = L, edx = R, stack: next, nRanges): keeps in R the
-  ranges of f668 (`NColRangesToMinTupleRegions`, 0x100c7bb0, **not read**: on inflate_fast state$1 it keeps less than
-  the pieces, measured: dmask$1, processed three candidates later, finds rdi free over [52, 177] where state$1's
-  pieces run [8, 60], [61, 61] .. [162, 174]), moves the rest (`NColSubtractRangesFromTupRegions`) with their
-  defs/uses into a new region and returns it.
+* `NColSeparateProcessedRegion` (0x100c7a20; ecx = L, edx = R, stack: next, nRanges) **[C]**: keeps in R
+  `NColRangesToMinTupleRegions(L, f668, n, 1)` (0x100c7bb0, read: 4.9), R's ranges minus those
+  (`NColSubtractRangesFromTupRegions` 0x100c8860) become, if `NColFillInRangesAppears` finds an appearance in them,
+  the next region with `NColRangesToMinTupleRegions(L, rest, k, 0)` and the defs / uses outside R
+  (`NColTupInRegion`); returned as the remainder. (inflate_fast state$1 keeps [8, 51], [484, 485] .. [552, 556] of its
+  pieces [8, 60], [61, 61] .. [552, 556]: dmask$1 finds rdi free over [52, 177].)
 * `NColSplitRegion` (0x10222880; ecx = R, edx = tup#): split at a tuple whose register constraints
   emptied the useable set.
 * **A fold extends the sources processed before** **[C]**: `NColFoldAwayRegion` calls `NColInsertUse(source,
@@ -479,7 +480,8 @@ the CLI and of `il_predict` (the functions' module default stays the earlier wal
 | an earlier split candidate's kept pieces (replay's state) | 1 | inflate t2580 (flush$1) |
 
 Left (2): inflate_fast dmask$1 and inflate t1992, both NColBestCoverage on a state where an earlier split candidate
-(state$1; t1992's predecessors in inflate) holds less than its pieces (NColRangesToMinTupleRegions, 4.5, not read).
+(state$1; t1992's predecessors in inflate) holds less than its pieces: NColRangesToMinTupleRegions, read in 4.9
+(`minreg`, with each switch's own cases, `swcase`): replay 2669 / 2669.
 
 **NColBestCoverage against its probes** (c2ncol `--cov`: every register's score at 0x1006a348, the new bests at
 0x1006aeb3, the kept pieces at NColSeparateProcessedRegion's entry): zlib, the first call of each of the 88 candidates
@@ -505,12 +507,110 @@ inflateBack's block 133 and the model does not (in_desc$1: 145 against 129). tes
 il_predict on the eqif / copies variants: 20 / 20, 12 / 12 (every candidate: 139 / 139, 88 / 88) either way.
 Offline test: `ncolsim_walk_tests` (tests/run_tests.py).
 
-**Not modelled**: NColRangesToMinTupleRegions (what a split region keeps of its pieces); NColTryToImproveAllocation,
+**Not modelled** (as of 4.8; 4.9 closed the first, the `remainder` and `foldext` points): NColRangesToMinTupleRegions (what a split region keeps of its pieces); NColTryToImproveAllocation,
 NColSearchForRegionWithGap and NColMakePhysregAvail (a region without a register: simulate takes the trace's
 regions for it); the remainder of a partly covered region in simulate (`remainder`, measured worse without the
 above); `foldext` still decides with the earlier candidates' traced registers (the folds change the lists of the
 candidates processed after the folded one, which il_model_state computes before simulate runs; deciding them in
 simulate's order means recomputing those lists there); the PGO weights of NColBestCoverage.
+
+### 4.9 Split regions as read, and the rest of the walk (`walk` keys minreg, swcase, remainder, uniq, loadedmem; 2026-11-22)
+
+**NColRangesToMinTupleRegions (0x100c7bb0; ecx = L, edx = NCOLRANGE array, stack: n, flag) [C].** The entries are
+NColBestCoverage's pieces (f668, 0x18 bytes: begin, end, first / last appearance, weight, word 5 = 1 for a piece that
+stops inside its block, NColCopyClusterToRangesArray 0x1018d6a0) after `NColFillInRangesAppears` (0x100c8980: per piece
+the first and last appearance of L+0x1c inside it and the weight, `1 << f674[t]` per appearance when favoring speed).
+Pieces all in one block that do not start or end at a loop-depth change (f670[begin - 1], f670[end + 1]) take
+`NColCheapRangesToMinTupleRegions` (0x100c9200): flag 1, the heaviest piece's [first, last appearance]; flag 0, every
+piece with appearances its own. Otherwise f68c (0x10 bytes per block) is cleared and `NColMinimizeRangeLiveness`
+(0x100c7f00) marks it:
+
+1. per piece: +8 the block is entered (the piece covers its first tuple, or comes from the block before), +9 it is
+   left (covers the last tuple and word 5 is 0, or goes on); a piece beginning / ending inside a block records begin - 1
+   / end + 1 in +0 (first such) and +4 (last); the heaviest piece is remembered (returned);
+2. a piece that ends where the value is not live on (word 5, the last piece, or a gap after it) inside a loop
+   (BLOCK+0xac, then its parents) whose header block it entered, and that is not the loop's last tuple: if no
+   appearance lies in the loop (back from the piece: the last appearance of the nearest piece that has one must be at or
+   before the header's first tuple, skipping one-block pieces that begin with an instruction; on: the next piece with
+   an appearance must start after the loop's last tuple, skipping the same kind), the loop's blocks lose +8 and the
+   header's +0 = its first tuple: the value waits in memory over the loop;
+3. the lifetime's definitions (L+0x14) and uses (L+0x18) between the first piece's begin and the last one's end: a
+   definition raises +4 to itself (and sets +0xc, the exit value touched, when the block is left) and lowers +0 to
+   d + 1; a use in an entered block before +0 sets +0xd (the entry value used), one after +4 in a left block +0xc;
+4. backward to a fixpoint: a left block a successor of which uses its entry value is exit-kept (+0xb); an entered
+   block without +0 and without its own +0xd passes it on (+0xd); forward: an entered block a predecessor of which
+   touched its exit is entry-kept (+0xa), a left one without +0 passes it on (+0xc); a depth-1 block exit-kept, followed
+   by a depth-0 block that uses its entry value, whose loop start (NColGetLoopStart 0x100c86c0) is entry-kept and
+   uses it, touches its exit;
+5. +0xa &= +0xd, +0xb &= +0xc.
+
+Then each piece becomes the tuples from its first appearance, or the first tuple of an entry-kept block / the last
+tuple of an exit-kept one when earlier, to its last appearance in that block, on into the next block while this one is
+exit-kept and the next entry-kept (then from the next block's first tuple); a piece without either goes. With flag 1
+a one-block piece that is exactly its range's [first, last appearance] goes too, unless it is the heaviest or ends at
+its block's exit-kept last tuple. **Model** `ncolsim.min_regions`, `separate`, `fill_appears`; replay
+(`region_ranges_min`: the traced separations in order, each region the smallest kept / rest set holding its first and
+last appearance) and simulate (the kept part cut, the rest as the next region). **Probes** (`c2ncol --cov`):
+MINKEPT_HOOK 0x100c7a55 (eax = the kept NCOLTUPRGN list) and MINREST_HOOK 0x100c7acb (esi = the rest's list), both 6
+bytes, nothing branches inside (hookchk); the export's `separate` entries get `kept` / `rest`; SEPARATE_HOOK now reads
+400 entries. Measured: zlib **173 / 173** kept and rest (with `swcase` and `loadedmem`), tests/data/ncol/split 48 / 48.
+
+**Each switch's own case labels** (`swcase`; `swlive` in the IL's liveness, 12.6) **[I, measured]**: a LABEL tuple's
+word 9 (+0x24) is set for the labels a switch reaches (inflate 29 against the 28 labels no branch names, which missed
+one that a goto also names: inflate t1992's kept piece [116, 122] needed it); with two switches in a function (tok.c's
+expr) each gets the labels after it up to the next. In NColBestCoverage's flow graph it also closes the cluster of
+inflateBack in_desc$1 (block 133): NColBestCoverage on zlib, every candidate's first call, winner **88 / 88** (72),
+scores 87 / 88 (31), registers 1252 / 1253; on our sources winners 36 / 36. Left: inflateBack out_desc$1's rdi (the
+trace has no cluster, the model one of score 0).
+
+**NColCheckCanUseLoadedMemOpr (0x10066cc0) [C for the path modelled]** (`loadedmem`): NColProcessCandidate calls it
+when the candidate is not recalculated (one definition, NColMdIsFoldableDef, NColCanRecalc and every use's
+NColMdNoFoldBenefit finite). After `NColAttemptToReuseParamHome` (0x10065930: a variable copied from an incoming
+argument register at the entry tuple f6a4 whose name, less `$N`, is a parameter's: that parameter's home becomes L+0x30,
+L+0x4c |= 0x80; read, not modelled): when every definition is a copy of the candidate's whole SYM from one kind-2
+symbol leaf S (a local or parameter, the same size, S no candidate) and S is not written in the lifetime
+(`NColMemOprModifiedInLife` 0x100dd150 for a kind-2 leaf: an instruction of the ranges with a destination interfering
+with S, ItfPartialInterf, other than a store of the candidate itself, or a lifetime homed at S that stores there per its
+BV L'+0x20; for a kind-6 leaf it is ItfKilledInRange over the ranges, not read), S becomes the home L+0x30, S+0x40 = 2,
+and each such definition leaves L+0x14 and L+0x1c (NColRemoveFromTupList; L+0x40 follows), its tuple is removed
+(NColTupRemove) and a load at it goes to L+0x34. So NColBestCoverage starts no cluster at the copy, and the region's
+first appearance is the first use (merge_runs out$1, qsort_int moves$1: the 5th parameter; deflateInit2_'s
+parameters). Modelled: `loaded_mem_defs` (the recalculation test by the shapes of `_can_mem` and a register copy; a
+static symbol, SYM kind 7, is excluded, MscAvoidGlobalRefetching [I]): 38 of 39 zlib + our candidates as the trace.
+
+**Candidates named alike** (`uniq`): two lifetimes of one name (deflate_stored len$2, send_bits' val$1 / len$1 in
+compress_block, send_tree, send_all_trees, _tr_flush_block, gzseek, deflate_slow: 35 in zlib) shared one priority, list
+and given register in everything keyed by name; `_uniq_names` gives the second on `#k` (il_predict's short names drop
+it). This was every remaining ilfull sim miss of zlib.
+
+**`remainder`** now (with minreg) gains: zlib sim +1, our sources +2 (it lost 3 with the unminimized rest).
+
+**Numbers** (WALK_FULL = WALK_READ + minreg, swcase, remainder, uniq, loadedmem; IL_SIM, 12.6, in ilfull; each key
+measured on top of the others and left out in turn: none loses anywhere):
+
+| | replay int | sim | ilfull replay | ilfull sim |
+|---|---|---|---|---|
+| zlib 1.2.1 /O2 (97 functions) WALK_READ + IL_FOLD | 2667 / 2669 | 2656 / 2690 | 2667 | 2672 |
+| zlib WALK_FULL + IL_SIM | **2669** | **2670** | **2669** | **2690** |
+| our sources (vm, lz, sortx, tok, mat, walk, fold, calls, xmm re-exported with --cov) before | 706 / 706 | 754 / 769 | 701 | 730 |
+| the same after | 706 | 763 | **706** | **769** |
+| held out (hmap.c, fmt.c, written after the rules) before | 224 / 225 | 222 / 225 | 224 | 216 |
+| the same after | **225** | **225** | **225** | **225** |
+| fixtures (ncol, il, ilpre, xmm, calls, flags, fold, bucket, walk) | equal or better: xmm sim 315 / 315, fold 375 / 375, ncol sim 290 / 291 | | | |
+
+tests/data/ncol/split (vm, tok, sortx, lz, fmt, hmap; 635 candidates): replay 634 -> 635, sim 620 -> 631, ilfull 629 /
+593 -> 635 / 635 (`ncolsim_split_tests`). Traced-input sim is left at 2670 on zlib by inputs read at processing (the
+traced lists of scan_tree, gen_bitlen, gen_codes), not by the walk.
+
+**Measured worse, not default**: `constfold` (a constant definition folded by the loads' cost test, the constant path
+of NColMdNoFoldBenefit not read): zlib ilfull sim 2690 -> 2680; 42 of 45 such folds are right, but 144 folded
+constants have a register free (another criterion).
+
+**Not modelled**: NColTryToImproveAllocation, NColSearchForRegionWithGap, NColMakePhysregAvail: in zlib and our sources
+(about 3900 regions) one region whose NColDeterminePhysregAvail found nothing gets a register (qsort_int s24, r10) and
+one partly covered region gets another (heapsort_recs t469, r13d): too few to check a model against.
+NColMdCanReplaceCandWithMemWithAlignment (NColMdCanReplaceCandWithMem 0x100cb900, a 2.4 KB switch on the opcode, then
+MscCheckSymAlignmentConstraint): the shapes of 12.4. The PGO weights of NColBestCoverage.
 
 ---------------------------------------------------------------------------------------------------
 
@@ -686,6 +786,8 @@ them on the original stack.
 | 0x1006a348 (BestCoverage, one register done) | 6 | `c2ncol.COVREG_HOOK` (`--cov`): ecx = the register's best cluster score, [ebp-0x20] = P, [ebp-0x98] = best so far, [ebp-0x4c] = its clusters (+0x10 / +0x14 begin / end, +0x18 / +0x1c benefit / cost, +8 / +0xc blocks). The displaced cmp feeds the jg after it |
 | 0x1006aeb3 (BestCoverage, new best) | 9 | `c2ncol.COVBEST_HOOK`: ecx = score, edx = the cluster |
 | 0x100c7a20 (NColSeparateProcessedRegion entry) | 6 | `c2ncol.SEPARATE_HOOK`: [esp+8] = nRanges, edx = R (+0x24 / +0x28 first / last appearance), TLS+0xf668 the pieces (0x18 bytes each: begin, end, first / last appearance, count, flag) |
+| 0x100c7a55 (NColSeparateProcessedRegion, after the first NColRangesToMinTupleRegions) | 6 | `c2ncol.MINKEPT_HOOK`: eax = the NCOLTUPRGN list the region keeps (4.9) |
+| 0x100c7acb (NColSeparateProcessedRegion, the rest into the new region) | 6 | `c2ncol.MINREST_HOOK`: esi = the rest's NCOLTUPRGN list, eax = the new region |
 | 0x10069635, 0x10069750, 0x100699d0, 0x10069a35, 0x100699fb (DPA order loop) | 5 / 7 / 5 / 5 / 5 | `c2ncol.DPA_HOOKS` (`--dpa`): the rows above as events per candidate (`dpa`: try / cover / C (with the gap) / B / A); 0x1006988e cannot be used (c2trace refuses to displace the `ret 0x18`) |
 
 Avoid: 0x100697bf (the "next register" join in DPA) -- 0x100697c2 is a branch target inside; and
@@ -704,7 +806,9 @@ region with the useable set), 0x10068877 (register per region), 0x100ca950 (regi
   instructions (`NColStartAvailability`, `NColTerminateAvailability`) was not read.
 * `NColBestCoverage`: cluster growth across blocks is described from a partial reading; the exact
   cost of entry/exit edges is not pinned down.
-* `NColSearchForRegionWithGap`: victim cost function not read past the head.
+* `NColSearchForRegionWithGap`: victim cost function not read past the head (not modelled: 4.9).
+* `NColMdCanReplaceCandWithMem` (0x100cb900, a switch on the opcode) and `ItfKilledInRange`, `NColBuildHotZones`: not
+  read (4.9, 12.6).
 * `NColBuildSpillAvoid` / TLS+0xf688 and `NColSelectPhysregToMakeAvail`: only callee lists seen.
 * `NColSubsumption`, `NColFoldTooCheap`, `NColCanon`, `NColCalcFixupCodeForLifetime`: described from
   names and callee lists.
@@ -809,7 +913,8 @@ their class; an edit that adds a tuple inside a local's range moves all locals a
   with the wanted registers (FOUND; any variant compiled on the way counts, also one that changed blocks).
   `store` is used by `edit` and, with `--with-store`, by the pipeline (a diagnosis: never code-neutral).
   `measure BASE VARIANT --func F`: the inputs moved, registers, priorities, whether ncolsim explains them.
-  `pairs` is not ported.
+  `pairs`: one compile of a probe file, each `X__base` against its `X__variant`s; pairs or triples of measured
+  variants predicted by adding their edits (`--pair-compiles`, `--pair-top`; realize.md, x64).
 - **rwsweep.py**: the same families and variants; every single compiled; per single the measured edits, the
   flags, whether ncolsim's registers from those edits are the traced ones (`predicted ok / MISS`); combinations of
   the code-neutral singles predicted by adding their edits and simulating, ranked by `--want-regs` (new option) and
@@ -873,7 +978,8 @@ realises it with one instruction and is the diagnosis (the original references V
 - need() proposes `+app` / `-app` / `before` only, not liveness or range edits; it searches singles and pairs.
 - Block -> line: from the IL's line words; a statement that shares a source line with another block (one-line
   `if (c) { .. }`, a braceless loop body under its `for`) may land in the wrong block (the verdict says so).
-- realize `pairs`, `--from slots|scratch`, key edits (`add:frame@..`) and the load levers are x86 only here;
+- realize `--from slots|scratch`, key edits (`add:frame@..`) and the load levers are x86 only here (`pairs` is
+  ported, above);
   symkeys and slots have their own x64 paths (symkeys.md 10, slots.md 6).
 - Offline test: `ncol_levers_tests` (tests/run_tests.py) replays the stores' fixture
   tests/data/ncol_levers/levers.json on any build.
@@ -1313,3 +1419,35 @@ them); NColMemOprModifiedInLife and
 NColMdCanReplaceCandWithMemWithAlignment are approximated by shapes; the blocks' +0xac (as loop depth); the +0x2c SYM kind
 of the frame score's unknown leaves (read by the probe instead); constant folds (simulate takes them from the trace);
 IL_SUB's float coalescing; inflateBack have$1's ranges and gen_bitlen base$1's appearances at processing.
+(Since: 12.6 decides the folds in simulate's order; 4.9 reads NColMemOprModifiedInLife's kind-2 path.)
+
+### 12.6 IL_SIM: the folds in simulate's order, FUNC+0xe8, the zone at a switch, each switch's cases (2026-11-22)
+
+`ncolsim.py ilfull` / `ilmodel` (and il_predict) now add **IL_SIM** = (`foldsim`, `e8regs`, `zoneswitch`, `swlive`);
+`ilfull-fold` / `ilmodel-fold` are the IL_FOLD runs of 12.5, the functions' defaults are unchanged.
+
+- **`foldsim`** **[C for the tests, I for the size checks]**: il_model_state keeps the processing-time folds
+  (il_proc_folds) undecided; simulate decides each when it reaches the folded candidate, with its own registers and
+  availability: NColLoadCanBeRecalcd (0x100c7640) per use u and source q processed before: q's region covering u has a
+  register (NColGetPhysregAssignedAtAppear), else NColCanExtendAlreadyProcessed (0x100c8a70): the region whose range
+  ends last before u (NColRegionPrior 0x100c8b90) has a register P, the blocks at that end and at u have the same
+  BLOCK+0xac, no predecessor of the blocks between enters from outside the window and the region's ranges
+  (NColExternalFlowEntersRange 0x100c8bd0), the first available range of P overlapping [end, u] spans it, P is none of
+  the candidate's extra registers (f6dc) (NColPhysregUseInRange of the folded lifetime: none processed yet). A source not
+  processed passes; one processed without a register fails. After a fold the later sources' lists, preference sources
+  and anti-preference sets are rebuilt (`_foldsim_relist`: il_apply_folds with the folds made so far). zlib: the 257
+  decisions as the trace (247 folded); results equal to `foldext`'s everywhere, now without the trace's registers.
+- **`e8regs`** **[C]**: NColMdPerFuncInit (0x10092669) subtracts TLS+0x119b4..0x119c0 (r12..r15 per size) from the
+  initial sets instead of adding them when FUNC+0xe8 & 0x1000 (c2ncol's PERFUNC probe, `perfunc.e8`): set in our
+  recursive functions (sortx.c qsort_int, tok.c atom / expr; none in zlib) **[I for the meaning]**. Useable sets 836 / 836
+  of our sources (781 without).
+- **`zoneswitch`** **[I, measured]**: the zone depth (blockinfo +0x2c) of a loop's blocks that a switch of that loop
+  strictly dominates is one less (blocks of inner loops keep it); this replaces the 100-block bound of section 11
+  (inflate's and inflateBack's loops have the switch at the header). Zone depth per block: zlib 2431 / 2431 (unchanged),
+  our sources 726 / 726 (669 with the bound), held out (fmt.c's 146-block format loop keeps its zone before the switch
+  and on its latch path) 296 / 296. NColBuildHotZones itself is not read.
+- **`swlive`**: il_blocks' switch successors by 4.9's case labels for the liveness and the live counts (a value used
+  by a second switch's cases was live into the first: tok.c expr rhs$1).
+
+zlib: unchanged (ilfull replay 2669 / 2669, sim 2690 / 2690 with WALK_FULL); our sources ilfull replay 705 -> 706, sim
+763 -> 769 (e8regs +4 / +1, zoneswitch +13 sim, swlive +1 / +3).

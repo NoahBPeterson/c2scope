@@ -1018,6 +1018,72 @@ def find(f, name):
     return hits[0]
 
 
+def _sub_drop(ops, at, cls, n):
+    """sub:CLS@..:n -> the op indices it drops: the last n allocations of cls before `at` not freed before `at`."""
+    freed_before = {op[2] for op in ops[:at] if op[0] == "f"}
+    out = set()
+    for i in range(at - 1, -1, -1):
+        op = ops[i]
+        if op[0] == "a" and op[1] == cls and op[2] is not None and op[2].key not in freed_before:
+            out.add(i)
+            if len(out) == n:
+                break
+    return out
+
+
+def sub_drops(f, edits):
+    """The symbols the sub: edits of an edit set remove (what the source change has to delete)."""
+    ops = stream(f)
+    pos = {id(op[2]): i for i, op in enumerate(ops) if op[0] == "a" and op[2] is not None}
+    out = []
+    for e in edits:
+        m = re.match(r"sub:(frame|tmp|glob|other|hash)@(#?)(.+?)(?::(\d+))?$", e)
+        if not m:
+            continue
+        cls, ev, where, n = m.group(1), m.group(2), m.group(3), int(m.group(4) or 1)
+        if ev:
+            at = sum(1 for x in f.events[:int(where)] if x[0] in ("alloc", "free"))
+        else:
+            at = pos.get(id(find(f, where)))
+            if at is None:
+                continue
+        out += [ops[i][2] for i in sorted(_sub_drop(ops, at, cls, n))]
+    return out
+
+
+def used_syms(f):
+    """id()s of the symbols an operand sort reads (either pass): a source change cannot remove them."""
+    if getattr(f, "_used", None) is None:
+        u = set()
+        for e in f.events:
+            if e[0] != "sort":
+                continue
+            for o in e[4]:
+                for k in ("sym", "dsym", "dsym2"):
+                    if o.get(k) is not None:
+                        u.add(id(o[k]))
+                for k in ("mem", "mem2"):
+                    if o.get(k) and o[k][2] is not None:
+                        u.add(id(o[k][2]))
+        f._used = u
+    return f._used
+
+
+def realizable(f, edits, keep=()):
+    """False when a sub: edit would remove a named symbol the function still reads (an operand of a sort, or one
+    of `keep`): no source change deletes a variable that is used (docs/c2/symkeys.md 10.3)."""
+    used = used_syms(f) | {id(x) for x in keep}
+    for s_ in sub_drops(f, edits):
+        if s_.creator == "SymInit" or id(s_) in used and s_.name and not s_.name.startswith("$"):
+            return False          # SymInit's dummy, or a symbol a sort reads
+    return True
+
+
+def named_drops(f, edits):
+    """The named symbols an edit set removes: each must be dead in the source (an initialised, unread local)."""
+    return [x for x in sub_drops(f, edits) if x.name and not x.name.startswith("$")]
+
+
 def apply_edits(f, edits):
     """-> list of ops (with ('a', cls, None) for inserted symbols) after the edits."""
     ops = stream(f)
@@ -1040,19 +1106,7 @@ def apply_edits(f, edits):
             if sign == "+":
                 ins.append((at, [["a", cls, None] for _ in range(n)]))
             else:
-                # drop the last n allocations of cls before `at` that are not freed before `at`
-                freed_before = set()
-                for op in ops[:at]:
-                    if op[0] == "f":
-                        freed_before.add(op[2])
-                k = 0
-                for i in range(at - 1, -1, -1):
-                    op = ops[i]
-                    if op[0] == "a" and op[1] == cls and op[2] is not None and op[2].key not in freed_before:
-                        drop.add(i)
-                        k += 1
-                        if k == n:
-                            break
+                drop |= _sub_drop(ops, at, cls, n)
             continue
         m = re.match(r"swap:(.+),(.+)$", e)
         if m:
@@ -1322,7 +1376,9 @@ def candidate_points(f, target, inline_too=True, opt_too=False):
                 k = ("v", label(s))
                 if k not in seen:
                     seen.add(k)
-                    pts.append(("@" + label(s), "before the first reference of %s" % label(s), opi))
+                    pts.append(("@" + label(s), ("before parameter %s (parameters take keys last to first: a frame "
+                                                 "symbol here is one more parameter after it)" % label(s))
+                                if s.kind == 5 and s.inl is None else "before the first reference of %s" % label(s), opi))
         elif e[0] == "inl+" and inline_too:
             pts.append(("@#%d" % i, "at the start of inline %s" % short("%s#%d" % (e[1], e[2])), opi))
         if e[0] == "alloc" and opt_too and e[1].phase == "opt" and e[1].cls == "hash":
@@ -1350,6 +1406,8 @@ CONSTRUCT = {
             "through a `double` local (+1, 13.10 +3); a `bool` flag for a float compare: +1 here, +2 assignment "
             "entries after the walk, +1 later); repeated spellings of one value add nothing",
 }
+SWAP_CONSTRUCT = ("declare it with an initialiser, or give it a dead store (`x = 0;`, removed by the optimiser), before "
+                  "that local's first use: a local takes its key at its first reference")
 UNCONSTRUCT = {
     "frame": "one frame symbol fewer: reuse an existing local instead of a new one, drop a dead initialised local or "
              "a reference local",
@@ -1416,13 +1474,28 @@ def levers(f, a):
                 for n in ns:
                     k1 = _prefix_key(ops, at, cls, n, sign, tidx)
                     if k1 is not None and target_ok(a, k1):
+                        if sign == "-" and not realizable(f, ["sub:%s%s:%d" % (cls, anchor, n)], [tgt]):
+                            break       # it removes a symbol the code reads: no source change does that
                         hits.append((anchor, where, cls, sign, n, k1))
                         break
     if a.match:
         return levers_match(f, a, pts, ops, tgt, ns)
+    # the target first referenced before another named local of the function (17.00 measurement, symkeys.md 10.3)
+    if tgt.user and tgt.cls == "frame" and tgt.kind == 4 and tgt.inl is None:
+        for w in f.syms:
+            if w.idx < tgt.idx and w.user and w.cls == "frame" and w.kind == 4 and w.inl is None and w.name and \
+                    not w.name.startswith("$"):
+                try:
+                    k1 = keys_after(f, apply_edits(f, ["swap:%s,%s" % (label(tgt), label(w))])).get(id(tgt))
+                except (SystemExit, KeyError):
+                    continue
+                if k1 is not None and target_ok(a, k1):
+                    hits.append((label(w), "%s first referenced just before %s" % (label(tgt), label(w)), "frame",
+                                 "swap", 1, k1))
     res = []
     for anchor, where, cls, sign, n, k1 in hits:
-        e = "%s:%s%s:%d" % ("add" if sign == "+" else "sub", cls, anchor, n)
+        e = ("swap:%s,%s" % (label(tgt), anchor) if sign == "swap" else
+             "%s:%s%s:%d" % ("add" if sign == "+" else "sub", cls, anchor, n))
         newkey = keys_after(f, apply_edits(f, [e]))
         moved = [(s, s.key, newkey[id(s)]) for s in f.syms if s is not tgt and interesting(f, s) and id(s) in newkey
                  and newkey[id(s)] != s.key]
@@ -1440,7 +1513,11 @@ def levers(f, a):
     for no, nb, nm, n, e, where, cls, sign, k1, moved, fixed, other in res[:a.top]:
         print("%s\n    -> %s key %d (hash %04x); %d target sorts change, %d other sorts flip, %d other keys move%s" % (
             e, label(tgt), k1, h16(k1), len(fixed), no, nm, (", %d of --keep" % nb) if keep else ""))
-        print("    %s: %s" % (where, (CONSTRUCT if sign == "+" else UNCONSTRUCT)[cls]) + (" (x%d)" % n if n > 1 else ""))
+        print("    %s: %s" % (where, SWAP_CONSTRUCT if sign == "swap" else (CONSTRUCT if sign == "+" else UNCONSTRUCT)[cls])
+              + (" (x%d)" % n if n > 1 else ""))
+        if sign == "-" and named_drops(f, [e]):
+            print("    removes: %s (each must be an unread local in the source)" % ", ".join(
+                label(x) for x in named_drops(f, [e])))
         if other:
             print_flips(other, 4)
     return res
@@ -1562,6 +1639,23 @@ def levers_sites(f, a):
     for cls in classes:
         kp, _ = prune_points(f, pts, cls)
         cand += [("%s:%s%s:%d" % (sign, cls, anchor, n), n) for anchor, where, _ in kp for sign in ("add", "sub") for n in ns]
+    # a sub that removes a symbol the code still reads is no source change (the sites' own operands included)
+    keep = [s_ for s_ in f.syms if id(s_) in deps]
+    nc = len(cand)
+    cand = [c for c in cand if not c[0].startswith("sub:") or realizable(f, [c[0]], keep)]
+    # first references in another order: each named local of the function the sites depend on, moved before an
+    # earlier named local (declare / first use it earlier)
+    locs = [s_ for s_ in f.syms if s_.user and s_.cls == "frame" and s_.kind == 4 and s_.inl is None and s_.name
+            and not s_.name.startswith("$")]
+    for v in locs:
+        if id(v) not in deps:
+            continue
+        for w in locs:
+            if w.idx < v.idx:
+                cand.append(("swap:%s,%s" % (label(v), label(w)), 1))
+    if nc != len(cand):
+        print("# %d sub edits dropped (they remove a symbol the code reads), %d swaps added" % (
+            nc - sum(1 for c in cand if not c[0].startswith("swap:")), sum(1 for c in cand if c[0].startswith("swap:"))))
     global _SW
     _SW = score
     njobs = a.jobs or min(8, os.cpu_count() or 1)
@@ -1587,17 +1681,22 @@ def levers_sites(f, a):
                 ea, eb = pool[i][3][0], pool[j][3][0]
                 if ea.rsplit(":", 1)[0] == eb.rsplit(":", 1)[0]:
                     continue                    # the same edit with another n: covered by the n list
+                if (ea.startswith("sub:") or eb.startswith("sub:")) and not realizable(f, [ea, eb], keep):
+                    continue
                 combos.append([ea, eb])
         if a.depth >= 3:
             top3 = pool[:max(6, a.pool // 3)]
             for i in range(len(top3)):
                 for j in range(i + 1, len(top3)):
                     for k in range(j + 1, len(top3)):
-                        combos.append([top3[i][3][0], top3[j][3][0], top3[k][3][0]])
+                        c3 = [top3[i][3][0], top3[j][3][0], top3[k][3][0]]
+                        if any(x.startswith("sub:") for x in c3) and not realizable(f, c3, keep):
+                            continue
+                        combos.append(c3)
         for c in combos:
             r = score(c)
             if r is not None:
-                res.append((r[0], 0, -sum(int(x.rsplit(":", 1)[1]) for x in c), c, r))
+                res.append((r[0], 0, -sum(1 if x.startswith("swap:") else int(x.rsplit(":", 1)[1]) for x in c), c, r))
         print("# %d combinations of the %d best singles in %.1f s" % (len(combos), len(pool), time.time() - t0))
     # other operand orders: a whole replay, for the best candidates only
     res.sort(key=lambda x: (x[0], -len(x[3]), x[2]), reverse=True)
@@ -1609,21 +1708,25 @@ def levers_sites(f, a):
         seen0.add(key)
         rr = score(r[3], full=True)
         if rr is not None:
-            best.append((rr[0], -len(rr[2]), r[2], r[3], rr))
+            best.append((rr[0], -len(named_drops(f, r[3])), -len(rr[2]), r[2], r[3], rr))
         if len(best) >= max(3 * a.top, 30):
             break
     full = sum(1 for r in res if r[0] == len(evs))
     res = best
-    res.sort(key=lambda x: (x[0], x[1], -len(x[3]), x[2]), reverse=True)
-    print("# %d edit sets satisfy all %d sorts; best (sites satisfied, then fewest other flips, then fewest edits):" % (full, len(evs)))
+    res.sort(key=lambda x: (x[0], x[1], x[2], -len(x[4]), x[3]), reverse=True)
+    print("# %d edit sets satisfy all %d sorts; best (sites satisfied, then fewest named symbols removed, fewest other "
+          "flips, fewest edits):" % (full, len(evs)))
     seen = set()
     shown = 0
-    for nsat, nfl, nn, edits, (sat, st, other) in res:
+    for nsat, _nd, nfl, nn, edits, (sat, st, other) in res:
         key = tuple(sorted(edits))
         if key in seen:
             continue
         seen.add(key)
         print("%d/%d sites  %3d other flips  %s" % (sat, len(evs), len(other), " ".join(edits)))
+        gone = [label(x) for x in named_drops(f, edits)]
+        if gone:
+            print("    removes: %s (each must be an unread local in the source)" % ", ".join(gone))
         if sat < len(evs):
             print("    unsatisfied: %s" % ", ".join("%s (%s)" % (x[0]["text"], s_) for x, s_ in zip(evs, st) if s_ != "ok"))
         if other:
@@ -1953,9 +2056,16 @@ def main(argv=None):
         fb = [g for g in from_json(json.load(open(a.vs))) if g.name and c2trace.func_match(a.func, g.name)]
         for f in sel:
             g = [x for x in fb if x.name == f.name]
-            print("#### %s  edits: %s" % (f.name, " ".join(a.edits) or "(none)"))
+            if not g:      # the edit changed the signature (added / removed parameters): the same undecorated name
+                base = re.sub(r"^\?([^@]+)@.*$", r"\1", f.name)
+                g = [x for x in fb if re.sub(r"^\?([^@]+)@.*$", r"\1", x.name) == base]
+                g = g if len(g) == 1 else []
+            print("#### %s  edits: %s%s" % (f.name, " ".join(a.edits) or "(none)",
+                                           "  (vs %s)" % g[0].name if g and g[0].name != f.name else ""))
             if g:
                 compare(f, a.edits, g[0])
+            else:
+                print("# %s not in %s" % (f.name, a.vs))
         return 0
     for f in sel:
         if a.cmd == "keys":

@@ -778,3 +778,54 @@ helpersweep.py predict with ncolsim instead of rasim / c2regs: the edits are `+a
 (appearances per block), `before:A:B` (lifetime index, the tie-break), measured `live:B:+K`; `realize.py edit` and
 `--from-ncol --want-regs`, rwsweep and helpersweep with `--want-regs`. The lever classes, the measured numbers and
 what is not covered are in docs/c2/ncolor.md section 10 (shared by the three tools).
+
+### `pairs` and the pair search on x64 (2026-11-22)
+
+`realize.py pairs PROBES.cpp -- FLAGS` works on x64: one compile of the probe file with ncolsim's hooks (every
+function; c2ncol --export plus the IL at NColor's entry), and every `X__base` against each `X__<variant>`: the NColor
+inputs moved (`ncolsim.run_delta`: `+app` / `-app` / `index:` / `live:` / `bucket:`, flags blocks / ranges / live /
+new / gone), the registers, `pred ok|MISS` (ncolsim's registers from those edits = traced) and the code cost (`code`
+masked, `regs` with registers). tests/data/realize17/probes.cpp: three declaration exchanges are lifetime-index edits
+only, predicted 3 of 3:
+
+```text
+## pr2: 8 candidates, 45 instructions; registers a=rcx m=r8 n=rbx p=rdi s=rsi q=r14 t=r15
+  qt         code 2 (regs 14, +0 instr)  inputs index:t=7 index:q=9  [ranges]  pred ok    q:r14->r15 t:r15->r14
+  ps         code 0 (regs 24, +0 instr)  inputs index:s=4 index:p=6  [-]  pred ok    p:rdi->rsi s:rsi->rdi
+  both       code 2 (regs 32, +0 instr)  inputs index:s=4 index:p=6 index:t=7 index:q=9  [ranges]  pred ok    ...
+```
+
+**Pair search** (`x64_pair_search`, the x86 `--pairs` / `--pair-code` / `--pair-slack`, plus `--pair-compiles N`, its
+own budget, default 8, and `--pair-top N`, default 10): pairs (`--pairs 2`: and triples) of the variants measured so
+far. A member that kept the block structure contributes the NColor edits it measurably made, and the pair's
+registers are *predicted* by adding them up and simulating from the base (`ncolsim.predict`); members that changed the
+blocks (eqif, cflow) are ranked by what they did alone. Pool: variants that moved an input or a register, changed at
+most `--pair-code` instructions with `--asm-vs` (none without: the target is then a code-neutral variant) and were no
+worse than the base by rdiff (+ `--pair-slack`); members realising the same requested edit are alternatives and are
+not paired. Ranking: wanted registers (predicted, else measured), summed rdiff gain, fewest other registers moved.
+FOUND: a code-neutral variant with `--want-regs`, or bdiff 0 against `--asm-vs`. It runs in `edit` with two or more
+edits (their realisations combined) and in `--from-ncol` when no answer matched.
+
+Also changed in the x64 pipeline: (1) need()'s answers are re-ranked, order-only answers (`before:` / `index:`)
+first, since a declaration or statement order realises them code-neutrally and exactly predicted, while `+app` had no
+code-neutral construct in the lever benchmarks (ncolor.md 10.3); before, 12 `+app:p ..` pairs filled `--max-answers`
+on realize17/pert.cpp; (2) for `before:A:B` the swap / split constructs are tried first; (3) a unit stops being
+realised once it has an exact code-neutral realisation or three realisations (the budget went to one unit's ~100
+wrappers before); (4) the combination of an answer's realisations and the pair compiles are outside
+`--max-compiles`; (5) with `--asm-vs` a variant with bdiff 0 is FOUND too (it may change code against the perturbed
+base).
+
+**Recovery tests** (our own compile as the original, a perturbed source, the tool must get back to bdiff 0):
+tests/data/realize17/pert.cpp is orig.cpp with both declaration pairs (p / s, q / t: equal priorities, the lifetime
+index decides) exchanged: each exchange back fixes two of the four registers, only both give the original.
+`edit pert.cpp before:p:s before:q:t --constructs swap,split --want-regs p=rdi,s=rsi,q=r14,t=r15 --asm-vs orig.s`:
+10 compiles, the pair search's first combination is both swaps, predicted `ok`, rdiff 0 bdiff 0 (FOUND).
+`--from-ncol` with the same wants: answer 0 `before:p:s before:q:t`, realised and combined, bdiff 0 (FOUND, 99
+compiles). zlib 1.2.1 trees.c (tests/data/zlib17/trees.c, /TP /O2): scan_tree with `max_count` / `min_count`
+declared the other way round (index tie: their registers rax / r11 exchange, 4 instructions): `edit
+before:max_count:min_count --constructs swap,split` finds the swap back, bdiff 0 (ncolsim's registers for it: MISS
+on this function, a model gap); `--from-ncol` there: need() has no answer (its prediction of scan_tree is off). The
+seven zlib perturbations of effectmine.md 8 (equal arms, head / tail duplication, aliases) through `--from-ncol`: 0
+of 6 with a register change (5: no need() answer, 1: 12 answers, 60 compiles, none realised), against 7 of 7 for
+effectmine: the x64 constructs have no inverse families (uneqif, headhoist, tailhoist, unalias is there but need()
+never asks for it).

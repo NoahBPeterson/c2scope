@@ -2,6 +2,7 @@
 """Every tail and head merge of the late flow optimiser, and why each candidate pair stopped.  Doc: docs/c2/il_fg.md §7.5
 
 usage: c2trace.py merges <src> --func SUBSTR [--pairs] [--off HEX,..] [--all] [--keep DIR] [--max N] [-- <cl args>]
+       c2trace.py merges --from DIR/c2trace.log --func SUBSTR [...]   (a log kept by --keep: no compile)
        c2trace.py il <src> --func SUBSTR --merges [...]          (the same report)
 
 FgDoLateFlowOpts (dop2_FinalFlowOpts, mode 2) tries, over the final machine instructions:
@@ -14,6 +15,7 @@ FgDoLateFlowOpts (dop2_FinalFlowOpts, mode 2) tries, over the final machine inst
 For each tail pair it prints the two jumps (tuple, block number in the dump at the pass, source line relative to
 the function, listing offset in the final code or `gone`), how many instructions matched, and the verdict:
   merged                      the duplicate was removed (`size` = the size rule's count + credit when it ran)
+                              (17.00: `(roles swapped: J2's copy removed)` when J1's walk reached J2's label)
   stop: call target f2 / f1   the first differing instruction is a call to another symbol (the compare is by
                               symbol, not by body: two functions that /OPT:ICF folds later still differ here)
   stop: register ecx / eax    the instructions differ only in a register (scratch rotation, allocation)
@@ -28,7 +30,7 @@ the function, listing offset in the final code or `gone`), how many instructions
 call/register stop, which are the ones a source edit can change); --off keeps the pairs and merges that involve an
 instruction at one of these listing offsets (a jump, or a compared instruction: what to pass for one case of a big
 switch); --all also prints FgDoLateFlowOpts runs other than mode 2.
-Builds: 14.00 (default), 13.10.3077, 13.10.3052, 15.00.
+Builds: 14.00 (default), 13.10.3077, 13.10.3052, 15.00, 17.00 x64.
 """
 import argparse, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -69,23 +71,45 @@ BUILDS["15.00.30729.1"] = dict(
     tryhead="?FgTryCommonHeadMerge@@YIHPAUtagTUPLE@@@Z=edx/xeax",
     dohead="?FgDoCommonHeadMerge@@YIHPAUtagTUPLE@@0@Z=s1,s2/xeax",
     jcchead="?FgTryHeadMerge@@YIHPAUtagTUPLE@@PAUtagFGDAGGRAPH@@1PAH@Z=s1/xeax")
+# 17.00 x64 (PDB names; plain fastcall: ecx, edx, then the stack; tuples: +4 next, +0x18 prev, +8 opcode, +0xc kind):
+# FgDoCommonTailMerge(ecx = FUNC, edx = B (J1, its copy is removed), [esp+4] = A (J2), [pass, &out]), `ret 0xc`.
+# The walk (from B in esi, from A in edi, both via +0x18) ends at 0x100b4fb0 (every stop: the compare failed, the
+# other jump or a label reached, a branch / return on J1's side): [ebp-8] matches, esi / edi, [ebp-0x30] / [ebp-0x34]
+# the whole-block point; the size rule at 0x100b5140: ebx = csize total + the larger credit (+0x24), Speed = TLS +0xdd08.
+# At the exit *out (a3) is 1 when the roles swapped (J1's walk reached J2's label: J2's copy is the one removed)
+_F17 = "?%s@@YI%sZ"
+BUILDS["17.00.61030-x64"] = dict(
+    late=_F17 % ("FgDoLateFlowOpts", "XPAUtagFUNC@@W4FG_MERGE_ENUM@@@") + "=edx,ecx>0>4$",
+    once=_F17 % ("FgDoLateFlowOptsOnce", "HPAUtagFUNC@@W4FG_MERGE_ENUM@@PAUtagFGDAGGRAPH@@2PAH@"),
+    trytail=_F17 % ("FgTryCommonTailMerge", "HPAUtagFUNC@@PAVTuple@@@") + "=edx/xeax",
+    dotail=_F17 % ("FgDoCommonTailMerge", "HPAUtagFUNC@@PAVTuple@@1KPAH@") + "=edx,s1,s2/xeax,a3>0",   # + *out
+    walk="100b4fb0=ebp>-8,esi,edi,ebp>-0x30,ebp>-0x34", size="100b5140=ebx,esi>0xdd08",
+    match=_F17 % ("FgMdInstrsMatch", "EPAVTuple@@0@") + "=ecx,edx,ecx>0x30>0x24>4$,edx>0x30>0x24>4$/xeax",
+    ftail=_F17 % ("FgTryTailMerge", "HPAVTuple@@PAUtagFGDAGGRAPH@@1PAH@") + "=ecx/xeax",
+    cross=_F17 % ("FgCrossJumpRemove", "PAVTuple@@PAV1@@") + "=ecx/xeax",
+    tryhead=_F17 % ("FgTryCommonHeadMerge", "HPAUtagFUNC@@PAVTuple@@@") + "=edx/xeax",
+    dohead=_F17 % ("FgDoCommonHeadMerge", "HPAUtagFUNC@@PAVTuple@@1@") + "=edx,s1/xeax",
+    jcchead=_F17 % ("FgTryHeadMerge", "HPAVTuple@@PAUtagFGDAGGRAPH@@1PAH@") + "=ecx/xeax")
 KEYS = ["late", "once", "trytail", "dotail", "walk", "size", "match", "ftail", "cross", "tryhead", "dohead",
         "jcchead", "final"]
 REGS = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "al", "cl", "dl", "bl", "ah", "ch", "dh", "bh",
         "ax", "cx", "dx", "bx", "si", "di", "bp", "sp"}
+# x64 (17.00): the 64-bit names, r8..r15 with their d / w / b parts, the byte registers of rsi .. rsp, xmm0..15
+REGS |= {"r" + x for x in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp")} | {"sil", "dil", "bpl", "spl"} | \
+    {"r%d%s" % (n, w) for n in range(8, 16) for w in ("", "d", "w", "b")} | {"xmm%d" % n for n in range(16)}
+MEMREG = re.compile(r"\b(e[abcd]x|e[sd]i|e[bs]p|r[abcd]x|r[sd]i|r[bs]p|r(?:8|9|1[0-5])[dwb]?)\b")
 ILINE = re.compile(r"^I (\S+) (\S+) (\d+) (\d+) \|(.*?)(?: ; (.*))?$")
 
 
 def hooks_for(build):
     b = BUILDS.get(build)
-    if not b and c2build.get("arch") == "x64":
-        sys.exit("merges: not ported to %s (FgDoCommonTailMerge's walk / size probes are not mapped; the late flow "
-                 "optimiser's IL is visible with `c2trace.py il --at @dop2_FinalFlowOpts@4`)" % build)
     if not b:
-        sys.exit("merges: c2 build %s not ported (14.00, 13.10.3077, 13.10.3052, 15.00.30729.1)" % build)
+        sys.exit("merges: c2 build %s not ported (14.00, 13.10.3077, 13.10.3052, 15.00.30729.1, 17.00.61030-x64)" % build)
     h = dict(b)
     h["once"] = b["once"] + c2il.SPEC                 # name + IL dump at each FgDoLateFlowOptsOnce
-    h["final"] = c2scratch.HOOKS[3]                    # @Encode@4: the final IL with encoded lengths (offsets)
+    # @Encode@4: the final IL with encoded lengths (offsets); on x64 the scratch hooks are not ported, so the same
+    # event is written from the build's IL spec
+    h["final"] = "@Encode@4" + c2il.SPEC if c2build.get("arch") == "x64" else c2scratch.HOOKS[3]
     return [h[k] for k in KEYS]
 
 
@@ -99,12 +123,27 @@ def _ints(vals):
     return out
 
 
+def _demux(log):
+    """The log's lines, one thread after the other: cl 17.00's c2 compiles functions on worker threads and the
+    tracer writes `# thread N` before an event of another thread (tracer.md); a function's events, from
+    FgDoLateFlowOpts to Encode, stay on one thread. A single-threaded log comes back as it is."""
+    if "\n# thread " not in log:
+        return log.splitlines()
+    per, thr = {}, "0"
+    for ln in log.splitlines():
+        if ln.startswith("# thread "):
+            thr = ln.split()[2]
+            continue
+        per.setdefault(thr, []).append(ln)
+    return [ln for t in per for ln in per[t]]
+
+
 def parse(log, hooks):
     """-> list of functions: {name, base, dumps: {tuple: (line, block#)}, final: {tuple: off}, events: [...]}."""
     kind = {i: k for i, k in enumerate(KEYS)}
     funcs, cur, il, ildst = [], None, None, None
     stack = []                                         # open entries: (kind, record)
-    for ln in log.splitlines():
+    for ln in _demux(log):
         if ln.startswith("T "):
             if ildst is not None:
                 ildst.append(ln[2:])
@@ -156,6 +195,7 @@ def parse(log, hooks):
                 stack.pop()
             if stack and stack[-1]["depth"] == d and stack[-1]["kind"] == k:
                 stack[-1]["ret"] = int(vals[0], 16) if vals and vals[0] != "?" else None
+                stack[-1]["xvals"] = vals
                 stack.pop()
     for g in funcs:
         lines, blk = {}, 0
@@ -226,8 +266,8 @@ def classify(a, b, names=None):
             return "register", "%s / %s" % (bx, by)
         if call and x != y and "[" not in x and not x.startswith(("s", "t", "k")) or call and bx != by and "[" not in x:
             return "call target", "%s / %s" % (bx, by)
-        mx = re.findall(r"\b(e[abcd]x|e[sd]i|e[bs]p)\b", x)
-        my = re.findall(r"\b(e[abcd]x|e[sd]i|e[bs]p)\b", y)
+        mx = MEMREG.findall(x)
+        my = MEMREG.findall(y)
         if mx != my and mx and my:
             return "register", "%s / %s" % (x, y)
         return "operand", "%s / %s" % (x, y)
@@ -235,8 +275,8 @@ def classify(a, b, names=None):
         return "operand", "%d / %d operands" % (len(ta), len(tb))
     if na != nb:
         return "operand", "%s / %s" % (na or "-", nb or "-")
-    if re.search(r"\besp\b", a["ops"]):
-        return "same text", "(uses esp: refused under _FCantMergeStackRef, or a field the dump does not show)"
+    if re.search(r"\b[er]sp\b", a["ops"]):
+        return "same text", "(uses esp / rsp: refused under _FCantMergeStackRef, or a field the dump does not show)"
     return "same text", "(a field the dump does not show: type bits +0xa, +0x3e)"
 
 
@@ -268,6 +308,8 @@ def tail_pair(g, r):
     last = cmps[-1] if cmps else None
     if r["ret"]:
         verdict = "merged"
+        if len(r.get("xvals") or []) > 1 and r["xvals"][1] == "1":     # *out (17.00's hook): the roles swapped
+            verdict = "merged (roles swapped: J2's copy removed)"
     elif last is not None and last["ret"] is not None and not last["ret"] & 0xff:
         why, det = classify(g["lines"].get("%x" % last["args"][0]), g["lines"].get("%x" % last["args"][1]),
                             last["args"][2:4])
@@ -360,13 +402,18 @@ def main(argv):
     ap.add_argument("--keep")
     ap.add_argument("--max", type=int)
     ap.add_argument("--merges", action="store_true", help=argparse.SUPPRESS)   # `il --merges` forwards here
+    ap.add_argument("--from", dest="fromlog", action="store_true",
+                    help="SRC is a c2trace.log kept (--keep) by this tool: report it without compiling")
     ap.add_argument("src")
     argv, cl = c2trace.split_cl(argv)
     a = ap.parse_args(argv)
-    hk_texts = hooks_for(c2build.name())
-    img, hk, rc, out, log = c2trace.run_trace(a.src, hk_texts, cl, maxn=a.max, keep=a.keep)
-    if rc:
-        sys.stdout.write(out)
+    if a.fromlog:
+        rc, log, hk = 0, open(a.src, errors="replace").read(), None
+    else:
+        hk_texts = hooks_for(c2build.name())
+        img, hk, rc, out, log = c2trace.run_trace(a.src, hk_texts, cl, maxn=a.max, keep=a.keep)
+        if rc:
+            sys.stdout.write(out)
     funcs = [g for g in parse(log, hk) if c2trace.func_match(a.func, g["name"])]
     if not funcs:
         sys.exit("function %r not seen at FgDoLateFlowOpts" % a.func)
