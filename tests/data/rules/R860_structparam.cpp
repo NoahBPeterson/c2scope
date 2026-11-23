@@ -12,7 +12,12 @@ typedef const char* NA;
 typedef NameArg NA;
 #define S(n) n.s
 #endif
-static __declspec(noinline) int find(NA n, int x)
+#if _MSC_VER < 1300
+#define NOINLINE
+#else
+#define NOINLINE __declspec(noinline)
+#endif
+static NOINLINE int find(NA n, int x)
 {
 #ifdef ENTRY
     if (*S(n) == 0) return -2;

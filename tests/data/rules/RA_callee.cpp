@@ -5,12 +5,17 @@
 // /DAFTER: the same callee defined after the caller (c2 compiles bottom-up, so it is still seen).
 // /DEXT: the callee is only declared (the kill set is eax ecx edx). /DSTATIC: the callee is static (private
 // convention possible, ltcg.md 2.5).
+#if _MSC_VER < 1300
+#define NOINLINE
+#else
+#define NOINLINE __declspec(noinline)
+#endif
 #if defined(EXT) || defined(AFTER)
 int leaf(int *p);
 #elif defined(STATIC)
-static __declspec(noinline) int leaf(int *p) { return *p + 1; }
+static NOINLINE int leaf(int *p) { return *p + 1; }
 #else
-__declspec(noinline) int leaf(int *p) { return *p + 1; }
+NOINLINE int leaf(int *p) { return *p + 1; }
 #endif
 
 int caller(int *p, int *q)
@@ -21,5 +26,5 @@ int caller(int *p, int *q)
 }
 
 #ifdef AFTER
-__declspec(noinline) int leaf(int *p) { return *p + 1; }
+NOINLINE int leaf(int *p) { return *p + 1; }
 #endif

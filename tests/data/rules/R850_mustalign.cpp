@@ -10,7 +10,12 @@ float UseA16(float f) { A16 a; a.x = f; a.y = f; return a.x + a.y; }
 #endif
 extern int g[100];
 void ext(int);
-static __declspec(noinline) int helper(int* p, int n, int k, int m)
+#if _MSC_VER < 1300
+#define NOINLINE
+#else
+#define NOINLINE __declspec(noinline)
+#endif
+static NOINLINE int helper(int* p, int n, int k, int m)
 {
     int s = 0;
     for (int i = 0; i < n; i++) { s += p[i] * k; ext(m); s ^= m; }

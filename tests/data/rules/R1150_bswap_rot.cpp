@@ -4,8 +4,10 @@
 #include <stdlib.h>
 unsigned shiftswap(unsigned x) { return (x >> 24) | ((x >> 8) & 0xff00) | ((x << 8) & 0xff0000) | (x << 24); }
 unsigned maskswap(unsigned x) { return ((x & 0xff000000) >> 24) | ((x & 0xff0000) >> 8) | ((x & 0xff00) << 8) | ((x & 0xff) << 24); }
+#if _MSC_VER >= 1300
 unsigned bsw(unsigned x) { return _byteswap_ulong(x); }
 unsigned short bsw16(unsigned short* p) { return _byteswap_ushort(*p); }
+#endif
 unsigned short sw16(unsigned short x) { return (unsigned short)((x >> 8) | (x << 8)); }
 unsigned rotl8(unsigned x) { return _rotl(x, 8); }
 unsigned rotsh(unsigned x) { return (x << 8) | (x >> 24); }

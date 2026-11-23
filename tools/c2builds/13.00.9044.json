@@ -640,6 +640,36 @@
    "medium",
    "cross-jump removal, cold copies at 0x76ba1.. (3077 0xb719a)"
   ],
+  "@MdmFlexParams@4": [
+   "d947",
+   32,
+   "medium",
+   "dop2_CodegenUpdate ce05: calls MscInlineAsmAssumesCallingConvention 06367"
+  ],
+  "@CmdPostspill@4": [
+   "d58c",
+   123,
+   "medium",
+   "RegSimpleAssign: spills callee-saved regs with REGSYM+0x34 <= 2 (match9044 0.67)"
+  ],
+  "@UndoRegCandidate@12": [
+   "30ddc",
+   371,
+   "medium",
+   "Enterloads: undoes single-use imm/var candidates via 0642d (the RF immcand b8/b9 check reads its hooks)"
+  ],
+  "@GrgChangeRegToImmed@12": [
+   "642d",
+   71,
+   "medium",
+   "replaces a register immediate operand back with TupMakeIntConst"
+  ],
+  "@GoptSingleUseCopyPropLegal@8": [
+   "3407b",
+   417,
+   "medium",
+   "GoptSingleUseCprop: builds 0x2a0 check tuple via TupQuerySideEffectHelper 04dbd"
+  ],
   "@SymInit@0": [
    "190df",
    175,
@@ -854,6 +884,7 @@
   "1070d305": "scratch ev12",
   "1070d332": "scratch ev13",
   "1070d41a": "scratch ev10",
+  "1070d5b7": "@CmdPostspill@4+cmp",
   "10714faa": "sched edge",
   "107150d4": "sched edge kind",
   "107280be": "@GrgIdentifyCandidates@4+cand",
@@ -870,6 +901,7 @@
   "1073e173": "plgo.SizeOpt",
   "1073e186": "plgo.28d53",
   "1073e199": "plgo.28eed",
+  "10740558": "@GoptSingleUseCopyPropLegal@8+call1",
   "10742eb1": "@Spill@8+needlives",
   "10744a54": "@NewLiveRanges@4+piece",
   "10745043": "@RewriteSplitGlobregs@12+usepiece",
@@ -903,6 +935,7 @@
   "10767368": "@FPAddToPriorityList@8+fpins",
   "10767449": "@FPSpillWorthless@12+drop",
   "10768b09": "@FPRemoveSplitGlobregs@8+fprm",
+  "1077b8df": "@ReachingOccurGenKill@8+enter",
   "10794aec": "@CmdUpdateCost@12+imm1",
   "10794b3d": "@CmdUpdateCost@12+two",
   "10797e6f": "@FPSpillWorthless@12+fpkeep"
@@ -1292,13 +1325,10 @@
   "merges": "merges.py has no 13.00.9044 events",
   "loadcse": "loadcse needs the PAS-index dump (GdfInsertArtificialAssigns), not mapped for 13.00.9044",
   "gopt": "icount's pass attribution needs the GlobalOptimize sub-pass hooks, not mapped for 13.00.9044",
-  "rules": "no 13.00.9044 expectations measured for the rule probes yet",
-  "probe:frame.py": "no 13.00.9044 expectations measured for the rule probes yet",
-  "probe:frontend.py": "no 13.00.9044 expectations measured for the rule probes yet",
-  "probe:misc.py": "no 13.00.9044 expectations measured for the rule probes yet",
-  "probe:opt.py": "no 13.00.9044 expectations measured for the rule probes yet",
-  "probe:regalloc.py": "no 13.00.9044 expectations measured for the rule probes yet",
-  "probe:regalloc_cost.py": "no 13.00.9044 expectations measured for the rule probes yet"
+  "probe:misc.py": "this probe has no 13.00.9044 arm (its _all4 has 14.00 / 15.00 / 13.10 only)",
+  "probe:opt.py": "this probe has no 13.00.9044 arm (its _all4 has 14.00 / 15.00 / 13.10 only)",
+  "probe:regalloc.py": "this probe has no 13.00.9044 arm (its _all4 has 14.00 / 15.00 / 13.10 only)",
+  "probe:regalloc_cost.py": "this probe has no 13.00.9044 arm (its _all4 has 14.00 / 15.00 / 13.10 only)"
  },
  "sched_hwt": [
   -1,

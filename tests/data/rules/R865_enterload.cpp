@@ -5,7 +5,11 @@
 void ext1();
 int ext2(int);
 #ifdef STATIC
+#if _MSC_VER < 1300
+static
+#else
 static __declspec(noinline)
+#endif
 #endif
 int late(int a, int* info)
 {

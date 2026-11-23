@@ -3012,42 +3012,52 @@ def rules_calls_tests():
     """T02-T04: R850 (_FHasMustAlign), R860 (struct parameter), R865 (entry enter-loads), R1050 (null test after a copy)."""
     regp = lambda proc: dict(re.findall(r"^; _(\w+)\$ = (\w+)$", proc, re.M))
     # R850: does m (loaded into ebx at helper's entry) arrive in ebx?  14.00/15.00: module-wide _FHasMustAlign (any
-    # compiled function with an aligned local, or /arch:SSE2); 13.10: only callers with an aligned local (CGNODE 0x1000)
+    # compiled function with an aligned local, or /arch:SSE2); 13.10: only callers with an aligned local (CGNODE 0x1000);
+    # 13.00.9044: without LTCG (0x107b110c == 0) SSR+0x14 bit 0x2000 is set on every function, disabling MdmFlexParams
     hp = "?helper@@YAHPAHHHH@Z"
     got = tuple(regp(rule_proc(rule_compile("R850_mustalign.cpp", *f), hp)).get("m")
                 for f in ([], ["/DBEFORE"], ["/DAFTER"], ["/DCALLER"], ["/arch:SSE2"]))
     want = {"14.00": ("ebx", None, None, None, None), "15.00": ("ebx", None, None, None, None),
-            "13.10.3077": ("ebx", "ebx", "ebx", None, "ebx"), "13.10.3052": ("ebx", "ebx", "ebx", None, "ebx")}
+            "13.10.3077": ("ebx", "ebx", "ebx", None, "ebx"), "13.10.3052": ("ebx", "ebx", "ebx", None, "ebx"),
+            "13.00.9044": (None,) * 5}
     check("R850: ebx register parameter: declared / before / after / caller / SSE2", got, want[RKEY])
     hook = {"14.00": "@MdmFlexParams@4=g10d08fe0>0", "15.00": "512306d0=g512470d8>0",        # _FHasMustAlign
-            "13.10.3077": "1074b268=eax>0x99>0x50", "13.10.3052": "1074c0c7=eax>0x99>0x50"}  # CGNODE+0x50
+            "13.10.3077": "1074b268=eax>0x99>0x50", "13.10.3052": "1074c0c7=eax>0x99>0x50",  # CGNODE+0x50
+            "13.00.9044": "@MdmFlexParams@4=ecx>0>0x14"}                                     # SSR+0x14 (0x2000 = no flex)
     ev = [rule_trace("R850_mustalign.cpp", "?helper@@", hook[RKEY], f) for f in ("/DAFTER", "/DCALLER")]
     val = [int(e[0].rsplit("=", 1)[1], 16) if e else None for e in ev]
     if RKEY.startswith("13.10"):
         got = [v & 0x1000 if v is not None else None for v in val]
         check("R850 trace: CGNODE+0x50 bit 0x1000 (caller has must-align): after 0, caller set", got, [0, 0x1000])
+    elif RKEY == "13.00.9044":
+        got = [v & 0x2000 if v is not None else None for v in val]
+        check("R850 trace: SSR+0x14 bit 0x2000 at MdmFlexParams (no private convention without LTCG)", got, [0x2000, 0x2000])
     else:
         check("R850 trace: _FHasMustAlign at MdmFlexParams: after 1, caller 1", val, [1, 1])
-    # R860: a one-pointer struct parameter stays on the stack (all builds); the scalar arrives in ebx
+    # R860: a one-pointer struct parameter stays on the stack (all builds); the scalar arrives in ebx (9044: stack)
     got = tuple(regp(rule_proc(rule_compile("R860_structparam.cpp", *f), p)).get("n")
                 for f, p in (([], "?find@@YAHUNameArg@@H@Z"), (["/DSCALAR"], "?find@@YAHPBDH@Z"),
                              (["/DENTRY"], "?find@@YAHUNameArg@@H@Z")))
-    check("R860: struct n on the stack (loop use, entry use), scalar n in ebx", got, (None, "ebx", None))
+    check("R860: struct n on the stack (loop use, entry use), scalar n in ebx", got,
+          (None, None, None) if RKEY == "13.00.9044" else (None, "ebx", None))
     # R860/R865: ReachingOccurGenKill calls CmdInsertEnter (the entry enter-load) for each register-typed parameter
-    # of a may-be-flexible function (SSR+0xb4); probe on that call
-    site = {"14.00": "10b56fb0", "15.00": "510a55ae", "13.10.3077": "1077e8e7", "13.10.3052": "10782217"}[RKEY]
+    # of a may-be-flexible function (SSR+0xb4); probe on that call (9044: 0 without LTCG)
+    site = {"14.00": "10b56fb0", "15.00": "510a55ae", "13.10.3077": "1077e8e7", "13.10.3052": "10782217",
+            "13.00.9044": "1077b8df"}[RKEY]
     got = (len(rule_trace("R860_structparam.cpp", "?find@@", site)),
            len(rule_trace("R860_structparam.cpp", "?find@@", site, "/DSCALAR")),
            len(rule_trace("R865_enterload.cpp", "?late@@", site)),
            len(rule_trace("R865_enterload.cpp", "?late@@", site, "/DSTATIC")))
-    check("R860/R865 trace: entry enter-loads: struct 1, scalar 2, extern 0, static 2", got, (1, 2, 0, 2))
+    check("R860/R865 trace: entry enter-loads: struct 1, scalar 2, extern 0, static 2", got,
+          (0, 0, 0, 0) if RKEY == "13.00.9044" else (1, 2, 0, 2))
     # R865: info's load in the entry block (static, becomes a register parameter) or in the loop's preheader (extern)
     ext = rule_proc(rule_compile("R865_enterload.cpp"), "?late@@")
     st = rule_proc(rule_compile("R865_enterload.cpp", "/DSTATIC"), "?late@@")
     early = re.findall(r"^\s+0000[0-9a-f]\s.*\smov\s+(\w+), DWORD PTR _info\$", st, re.M)   # in the first 16 bytes
     got = (bool(re.search(r"mov\s+\w+, DWORD PTR _info\$", ext)), regp(st).get("info") or "load " + "".join(early))
     want = {"14.00": (True, "ebx"), "13.10.3077": (True, "ebx"), "13.10.3052": (True, "ebx"),
-            "15.00": (True, "load ebp")}     # 15.00 unrolls the loop: ebp at the top, never a register parameter
+            "15.00": (True, "load ebp"),    # 15.00 unrolls the loop: ebp at the top, never a register parameter
+            "13.00.9044": (True, "load ")}  # 9044: static is like extern without LTCG (loaded in the preheader)
     check("R865: extern loads info at its use; static: ebx parameter (15.00: early ebp load)", got, want[RKEY])
     # R1050: which copy forms delete `if (c)` (no test left in the function)
     asm = rule_compile("R1050_nonnull_copy.cpp")
@@ -3055,7 +3065,7 @@ def rules_calls_tests():
              "memcpy4", "memset4", "memcpyv")
     got = " ".join(f for f in forms if re.search(r"\stest\s", rule_proc(asm, "?x_%s@@" % f)))
     same = "memcopy memcopyf memset memsetw memset4 memcpyv"
-    want = {"14.00": same, "15.00": same, "13.10.3077": same, "13.10.3052": same}
+    want = {"14.00": same, "15.00": same, "13.10.3077": same, "13.10.3052": same, "13.00.9044": same}
     check("R1050: null test kept after (inline size-parameter memcpy, memset, call)", got, want[RKEY])
 
 
@@ -3100,7 +3110,7 @@ def rules_question_tests():
     pieces = lambda f: [(int(p), r) for blk in parts if blk.startswith("?" + f)
                         for p, r in re.findall(r"^\s+\d+\s+i\s+local\s+(-?\d+)\s+\S+\s+\S+\s+\S+\s+(\S+)", blk, re.M)]
     pc = ([(40, "eax"), (15, "spill/defer")], [(40, "eax"), (25, "ecx")])
-    want = {"14.00": pc, "15.00": pc, "13.10.3077": pc, "13.10.3052": pc}
+    want = {"14.00": pc, "15.00": pc, "13.10.3077": pc, "13.10.3052": pc, "13.00.9044": pc}
     check("R871: i's pieces (prio, reg): shared 40 eax / 15 spill, arms 40 eax / 25 ecx",
           (pieces("row_shared")[:2], pieces("row_arms")[:2]), want[RKEY])
     asm = open(os.path.join(kd, "R871_branchrow.asm"), errors="replace").read() if \
@@ -3109,27 +3119,28 @@ def rules_question_tests():
     got = (bool(re.search(r"imul\s+eax, DWORD PTR _i\$", sh)), bool(re.search(r"xor\s+ecx, ecx", ar)),
            len(re.findall(r"imul\s+eax, ecx", ar)))
     want = {"14.00": (True, True, 1), "15.00": (True, True, 1),       # FgTryHeadMerge merges the arms after Color
-            "13.10.3077": (True, True, 2), "13.10.3052": (True, True, 2)}  # the scheduled arms differ at the imul
+            "13.10.3077": (True, True, 2), "13.10.3052": (True, True, 2),  # the scheduled arms differ at the imul
+            "13.00.9044": (True, True, 2)}
     check("R871 listing: shared imul [i]; arms xor ecx,ecx, imul eax,ecx (13.10: in both arms)", got, want[RKEY])
     out = tool("il", os.path.join(RULES, "R871_branchrow.cpp"), "--func", "row_arms", "--at", "@Color@4",
                "--count", "imul", "--", "/TP", "/O2")
     m = re.search(r"@Color@4\s+(\d+)", out)
-    want = {"14.00": 2, "15.00": 2, "13.10.3077": 2, "13.10.3052": 2}
+    want = {"14.00": 2, "15.00": 2, "13.10.3077": 2, "13.10.3052": 2, "13.00.9044": 2}
     check("R871 il: two imuls of i in row_arms at Color (no CSE across the arms)", int(m.group(1)) if m else None,
           want[RKEY])
-    # R1100: completely unrolled unless a call, do-while, `!=` exit test or no integer counter (all builds)
+    # R1100: completely unrolled unless a call, do-while, `!=` exit test or no integer counter (9044: none unrolled)
     asm = listing("R1100_unroll3.cpp")
     fs = ("u_glob", "u_param", "scale@V3", "u_dbl", "u_call", "u_sink", "u_do", "u_ptr", "u_ne", "u_end", "u_copy")
     got = " ".join(f for f in fs if looped(rule_proc(asm, "?" + f + "@")))
     kept = "u_call u_sink u_do u_ne u_end"
-    want = {"14.00": kept, "15.00": kept, "13.10.3077": kept, "13.10.3052": kept}
+    want = {"14.00": kept, "15.00": kept, "13.10.3077": kept, "13.10.3052": kept, "13.00.9044": " ".join(fs)}
     check("R1100: loops kept: call, call use, do-while, `!=` test, pointer end test", got, want[RKEY])
     # R900: a float local's home round trip (fstp/fld or a store across a call)
     asm = listing("R900_floatlocal.cpp")
     fs = ("fx_expr", "dx_expr", "fx_load", "dx_load", "fx_member", "fx_loadcall", "dx_loadcall", "fx_param")
     got = " ".join(f for f in fs if re.search(r"(?:fstp|mov)\s+[DQ]WORD PTR _[ks]\$", rule_proc(asm, "?" + f + "@")))
     new, old = "fx_expr fx_load fx_member fx_loadcall dx_loadcall", "fx_loadcall dx_loadcall"
-    want = {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old}
+    want = {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old, "13.00.9044": old}
     check("R900: locals stored to their home (float: expression or load; 13.10 and double: only across a call)",
           got, want[RKEY])
     # R460: an ebp base with scale 1 becomes the SIB index (LoRewriteEBPOpindexed); scale 4 keeps ebp as the base
@@ -3137,15 +3148,16 @@ def rules_question_tests():
     got = tuple((re.findall(r"DWORD PTR (\[[^\]]*ebp[^\]]*\])", rule_proc(asm, "?" + f + "@")) or [None])[0]
                 for f in ("ebp_idx", "ebp_idx0", "ebp_idx4"))
     sib = ("[esi+ebp+12]", "[esi+ebp]", "[ebp+esi*4+12]")
-    want = {"14.00": sib, "15.00": sib, "13.10.3077": sib, "13.10.3052": sib}
+    want = {"14.00": sib, "15.00": sib, "13.10.3077": sib, "13.10.3052": sib, "13.00.9044": sib}
     check("R460: [esi+ebp+12], [esi+ebp], [ebp+esi*4+12]", got, want[RKEY])
-    # R200/R450: memory leaf [p+0] hashes d + 8 + (h(p) << 8); a member at d != 0 is OPADD(p, d): h(p) + 2d + 0x31
+    # R200/R450: memory leaf [p+0] hashes d + (OPLOAD - OPILLEGAL) + (h(p) << 8); a member at d != 0 is OPADD(p, d)
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "sites",
                         os.path.join(RULES, "R200_memhash.cpp"), "--func", "mh_", "--", "/TP", "/O2"],
                        capture_output=True, text=True, cwd=HERE)
     hs = re.findall(r"^pass 2 line\s+\d+ OPMUL\s+1st .*\bh([0-9a-f]{4})\n\s+2nd .*\bh([0-9a-f]{4})", r.stdout, re.M)
     new, old = [("4008", "2008"), ("0081", "0059")], [("4008", "2008"), ("007e", "0056")]
-    want = {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old}
+    want = {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old,
+            "13.00.9044": [("4007", "2007"), ("0077", "004f")]}
     check("R200/R450: OPMUL sort hashes [p+0]/[q+0] 4008/2008; p->c, q->b 81/59 (13.10: 7e/56)", hs, want[RKEY])
 
 
@@ -3212,17 +3224,17 @@ def rules_misc_tests():
         ins, labels = instrs(proc)
         for k, lab in labels:
             back = any(t.startswith("j") and x.split()[-1] == lab for _, _, t, x in ins[k:])
-            cand = lab.startswith(("$LL", "$LC")) if not RKEY.startswith("13.10") else back
+            cand = lab.startswith(("$LL", "$LC")) if not RKEY.startswith(("13.10", "13.00")) else back
             if not back or not cand or k == 0 or k >= len(ins):
                 continue
             pad = int(ins[k - 1][3].split()[1]) if ins[k - 1][2] == "npad" else 0
             o = ins[k][0] - pad
-            pred = bool(o & 15) and pad_wins(o & 15, [(x[1], x[2]) for x in ins[k:]])
+            pred = False if RKEY == "13.00.9044" else (bool(o & 15) and pad_wins(o & 15, [(x[1], x[2]) for x in ins[k:]]))
             rows.append((bool(pad), pred, (-o) & 15))
     check("R1300: AlignmentWins model = every candidate loop head's npad (>= 150 heads)",
           (len(rows) >= 150, sum(p != q for p, q, _ in rows)), (True, 0))
     check("R1300: needs of 9 to 15 are padded too (not only <= 7 / 8)", len({n for p, _, n in rows if p and n >= 9}) >= 3,
-          True)
+          False if RKEY == "13.00.9044" else True)
 
     # R420: OPCMP narrowing (OptPeeps -> OptDoubleConstMakeSingle) reads the 80-bit constant's significand as a double
     # in its +-FLT_MAX check: on 14.00/15.00 a float constant on the right narrows iff its significand < 1+0x47f/2048
@@ -3237,7 +3249,7 @@ def rules_misc_tests():
         if not m or m.group(1) not in vals or not w:
             continue
         bits = struct.unpack("<I", struct.pack("<f", float(vals[m.group(1)])))[0]
-        narrow = RKEY.startswith("13.10") or (bits & 0x7fffff) >> 12 <= 0x47e
+        narrow = RKEY.startswith(("13.10", "13.00")) or (bits & 0x7fffff) >> 12 <= 0x47e
         if (w.group(1) == "DWORD") != narrow:
             bad.append(vals[m.group(1)])
     check("R420: every right-hand constant's width follows the significand rule (13.10: all DWORD)",
@@ -3246,21 +3258,26 @@ def rules_misc_tests():
     width = lambda f: (re.findall(r"(?:fld|fcomp|fmul)\s+(DWORD|QWORD) PTR __real@", p.get(f, "")) or ["-"])[0]
     got = tuple(width(f) for f in ("?l99@@YAHXZ", "?m99@@YAHPAUP@@@Z", "?m100@@YAHPAUP@@@Z", "?mul6@@YAMPAUP@@@Z"))
     want = {"14.00": ("QWORD", "DWORD", "QWORD", "QWORD"), "15.00": ("QWORD", "DWORD", "QWORD", "QWORD"),
-            "13.10.3077": ("DWORD",) * 4, "13.10.3052": ("DWORD",) * 4}
+            "13.10.3077": ("DWORD",) * 4, "13.10.3052": ("DWORD",) * 4, "13.00.9044": ("DWORD",) * 4}
     check("R420: constant on the left / member 99 / member 100 / multiply", got, want[RKEY])
 
-    # R1270: is the res store (+24) issued right before the call (sunk) or right after the size store (pinned)?
+    # R1270: is the res store (+24) issued right before the call (sunk) or before the size store (pinned)?
+    # On 13.00.9044 `push -1` issues before `mov [esi+24], 15`, so +24 precedes +20 (not after +20).
     p = procs(listing("R1270_store_index.cpp"))
     def pinned(f):
         ins = [x[3] for x in instrs(next((v for k, v in p.items() if k.startswith("?%s@@" % f)), ""))[0]]
         k = next((i for i, t in enumerate(ins) if "+24], 15" in t), None)
+        s = next((i for i, t in enumerate(ins) if "+20]" in t), None)
+        if RKEY == "13.00.9044":
+            return k is not None and s is not None and k + 1 == s
         return k is not None and k > 0 and "+20]" in ins[k - 1]
     fs = ("a_plain", "a_rev", "a_const", "a_eos", "b_inplace", "b_var", "b_reread", "b_ptr")
     got = " ".join(f for f in fs if pinned(f))
     new, old = "b_inplace b_var b_reread b_ptr", "b_var b_reread b_ptr"
     check("R1270: res store pinned after the size store by a non-literal index / pointer copy",
-          got, {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old}[RKEY])
+          got, {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old, "13.00.9044": old}[RKEY])
     # R1275: the vtable store issues before the EH state store when a member has its own inlined constructor
+    # (9044's P5 scheduler pairs the member store +12/+16 with the state store, so vtable issues after on all five)
     p = procs(listing("R1275_member_ctor.cpp", "/EHsc"))
     def early(cls):
         ins = [x[3] for x in instrs(p.get("??0%s@@QAE@PAX@Z" % cls, ""))[0]]
@@ -3268,7 +3285,8 @@ def rules_misc_tests():
         s = next((i for i, t in enumerate(ins) if "__$EHRec$" in t and t.startswith("mov DWORD PTR __$EHRec$")), -1)
         return v < s
     check("R1275: vtable store above the state store: WithH, WithH2 yes; Plain, WithZ (Zero(int&)), WithC (Clear()) no",
-          [early(c) for c in ("WithH", "WithH2", "Plain", "WithZ", "WithC")], [True, True, False, False, False])
+          [early(c) for c in ("WithH", "WithH2", "Plain", "WithZ", "WithC")],
+          [False] * 5 if RKEY == "13.00.9044" else [True, True, False, False, False])
 
     # schedwant alias:X (sched.md rule 4a): the order of the pinned variant, asked of the plain one, is one alias edit
     def sched_order(src, func, *flags):
@@ -3290,10 +3308,18 @@ def rules_misc_tests():
         if VERBOSE:
             print(r[-3000:])
         return bool(re.search(r"^\s+WANTED\s+alias:\d+\s*$", r, re.M)) if want != have else "same order"
-    got = (alias_wanted("R1270_store_index.cpp", "a_plain", "b_var"),
-           alias_wanted("R1275_member_ctor.cpp", "??0Plain@@", "??0WithH@@", "/EHsc"))
-    check("schedwant: alias:X alone gives the pinned order (R1270 b_var from a_plain, R1275 WithH from Plain)",
-          got, (True, True))
+    if lacking("schedwant"):
+        skip("schedwant: alias:X alone gives the pinned order", lacking("schedwant"))
+    else:
+        got = (alias_wanted("R1270_store_index.cpp", "a_plain", "b_var"),
+               alias_wanted("R1275_member_ctor.cpp", "??0Plain@@", "??0WithH@@", "/EHsc"))
+        check("schedwant: alias:X alone gives the pinned order (R1270 b_var from a_plain, R1275 WithH from Plain)",
+              got, (True, True) if RKEY != "13.00.9044" else
+              # 9044: the P5 scheduler pairs the member store +12/+16 with the state store (the R1275
+              # vtable check above is [False]*5 here too), so the pinned-order question for WithH is
+              # not an alias edit yet — R1270's store-index alias answers. The rules lane enabled this
+              # check by removing "rules" from the build's lacks; schedwant's P5 model is next.
+              (True, False))
 
     # R1276: the zero-trip guard tests the head's register (f_hlive: test edi; mov esi, edi), the lever swaps the copy
     p = procs(listing("R1276_guard_copyprop.cpp"))
@@ -3320,14 +3346,15 @@ def rules_misc_tests():
           (j.get("ours", 0) - j.get("orig", 0), any(c.startswith("structure") for c in j.get("classes", {}))), (1, True))
 
     # R310: the copy's +0 field view is made in the first operator= expansion; +12/+24 by the optimiser (13.10: all
-    # elements get reader-time views first)
+    # elements get reader-time views first; 9044: each operator= expansion makes its element's view)
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "keys", os.path.join(RULES, "R310_copy_elem0.cpp"),
                         "--func", "?g@@", "--", "/TP", "/O2"], capture_output=True, text=True, cwd=HERE).stdout
     first = {}
-    for m in re.finditer(r"^\s+(\d+) frame \d+\s+_m\+(0|12|24)(?:\.f4)?\s+(\S*)", r, re.M):
+    for m in re.finditer(r"^\s+(\d+) frame \d+\s+_m\+(0|12|24)(?:\.\w+)?\s+(\S*)", r, re.M):
         first.setdefault(m.group(2), (int(m.group(1)), m.group(3)))
     got = (first.get("0", (0, ""))[1].startswith("V::operator=#1"), first.get("0", (99,))[0] < first.get("12", (0,))[0])
-    want = {"14.00": (True, True), "15.00": (True, True), "13.10.3077": (False, True), "13.10.3052": (False, True)}
+    want = {"14.00": (True, True), "15.00": (True, True), "13.10.3077": (False, True), "13.10.3052": (False, True),
+            "13.00.9044": (False, True)}
     check("R310: element 0's view made in operator=#1 with a lower key than element 1's", got, want[RKEY])
     # R470: the double accumulator's first add sorts the accumulator first by count
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "sites", os.path.join(RULES, "R470_double_acc.cpp"),
@@ -3347,14 +3374,15 @@ def rules_misc_tests():
         keys.append(tuple(map(int, m.groups())) if m else None)
     check("R480: the bit test: +1 symbol before OptFuncExpr, +7 keys", (keys[1][0] - keys[0][0], keys[1][1] - keys[0][1])
           if None not in keys else keys, (1, 7))
-    # R1150: bswap / rol
+    # R1150: bswap / rol (VC6 has no _byteswap_ulong / _byteswap_ushort intrinsic)
     p = procs(listing("R1150_bswap_rot.cpp"))
     has = lambda f, mn: any(x[2] == mn for x in instrs(next((v for k, v in p.items() if k.startswith("?%s@@" % f)), ""))[0])
     got = (has("shiftswap", "bswap"), has("maskswap", "bswap"), has("bsw", "bswap"), has("rotl8", "rol"),
            has("rotsh", "rol"), has("rotr", "ror"))
     new, old = (False, False, True, True, True, True), (False, False, True, True, False, False)
     check("R1150: shift swaps no bswap; intrinsic bswap; _rotl rol; shift rotates rol/ror (13.10: no)", got,
-          {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old}[RKEY])
+          {"14.00": new, "15.00": new, "13.10.3077": old, "13.10.3052": old,
+           "13.00.9044": (False, False, False, True, False, False)}[RKEY])
     # R1250: two tag temporaries are two loads, one tag twice one load
     p = procs(listing("R1250_tag_temps.cpp", "/EHsc"))
     loads = lambda f: sum(1 for x in instrs(next((v for k, v in p.items() if k.startswith("?%s@@" % f)), ""))[0]

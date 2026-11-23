@@ -4,7 +4,13 @@
 // a use after a loop, a use in an if arm inside a loop. k64: 64-bit constants (only the low dword is hashed).
 // dnest: K in a nested if arm and after the outer join: where does the load go (2.4, AvoidAirlocks)?
 void g(int); void g2(int, int); int h(void);
+#if _MSC_VER < 1300
+struct L { __int64 v; int w; };
+#define I64(x) x##i64
+#else
 struct L { long long v; int w; };
+#define I64(x) x##LL
+#endif
 void l_for(int n) { for (int i = 0; i < n; i++) g(1000); }
 void l_while(int n) { while (n--) g(1000); }
 void l_do(int n) { do g(1000); while (--n); }
@@ -13,10 +19,10 @@ void l_nested(int n, int m) { for (int i = 0; i < n; i++) { for (int j = 0; j < 
 void l_after(int n) { for (int i = 0; i < n; i++) g(i); g(1000); }
 void l_ifin(int n) { for (int i = 0; i < n; i++) if (i & 1) g(1000); }
 void l_none(int n) { g(1000); }
-void k64a(L* p) { p->v = 0x0000000700000007LL; }
-void k64b(L* p) { p->v = 0x0000000500000007LL; p->w = 7; }
-void k64c(L* p, L* q) { p->v = 0x0000000500000007LL; q->v = 0x0000000600000007LL; }
-void k64d(L* p) { p->v = 0x0000000700000005LL; p->w = 7; }
+void k64a(L* p) { p->v = I64(0x0000000700000007); }
+void k64b(L* p) { p->v = I64(0x0000000500000007); p->w = 7; }
+void k64c(L* p, L* q) { p->v = I64(0x0000000500000007); q->v = I64(0x0000000600000007); }
+void k64d(L* p) { p->v = I64(0x0000000700000005); p->w = 7; }
 void dnest(int a, int b) { if (a) { h(); if (b) g(1000); } h(); g(1000); }
 // 2.5: b9 (once in each arm: no candidate left) against b8 (an arm and after the join: kept). Which pass drops b9's?
 void b8(int n) { if (n) g(1000); h(); g(1000); }
