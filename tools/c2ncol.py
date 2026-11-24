@@ -2,7 +2,7 @@
 """The x64 register allocator NColor (cl 17.00 x86_amd64), traced: which register every candidate got, and in which
 order.  Doc: docs/c2/ncolor.md
 
-usage: c2ncol.py SRC --func F [--why] [--raw] [--keep DIR] [-- <cl args>]     (needs --c2 17.00)
+usage: c2ncol.py SRC --func F [--why] [--absent] [--raw] [--keep DIR] [-- <cl args>]     (needs --c2 17.00)
 
 NColor is not the x86 back end's graph colourer (Color / Spillcosts / ChoosePhysReg, docs/c2/regalloc.md): it takes
 the candidates (lifetimes of temporaries and variables) one at a time in priority order, and gives each the first
@@ -12,12 +12,15 @@ region of its own and the rest is processed again. The report lists, in processi
   #  candidate (variable or tN)  priority  tuples first..last  ->  register per region  [first choice]  notes
 and, after allocation, the callee-saved registers NColPostspill gave back. --why adds per region the registers the
 order walk looked at and what each was (full cover / fallback classes / rejected): the probes of the build table's
-hooks.ncol_why.
+hooks.ncol_why. --absent adds the absent-candidate report (T25): every local and parameter with NO row, and why —
+from GrgIdentifyCandidates' leaf walk (the identify-time refusals: volatile, the enregister test, the leaves it
+turned into candidates that NColor never saw) and the IL at dop2_PreLowerGlobalOpts' entry (the references
+GlobalOptimize removed, with their def sites and the value's carrier). Needs hooks.regs_cand (17.00).
 
 Hook points: tools/c2builds/<build>.json hooks.ncol (entries: candidate, first choice, region store, spill-back,
 rewrite); read off the code in work/port1700/ncolor_map.md.
 """
-import os, sys
+import os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c2build   # noqa: E402  (--c2 is taken out of argv here)
@@ -81,6 +84,21 @@ def why_specs():
             "ecx>4"]                                          # its SYM (--il: the root of the IL leaves' symbols)
 
 
+def absent_hooks():
+    """The T25 absent-candidate probes (hooks.regs_cand in the build table; 17.00 only) plus the IL dump at
+    dop2_PreLowerGlobalOpts' entry — before GlobalOptimize, where every source local still has operands
+    (the references its copy propagation removes are only visible there). None when the table has no regs_cand."""
+    rc = c2build.hooks("regs_cand", None)
+    if not rc:
+        return None
+    il = c2build.hooks("il_spec", "")
+    if il.startswith("="):
+        il = il[1:]
+    if il.endswith("%"):
+        il += "+"                       # the extended dump: the sN=/dN= notes ('&' = the address is taken)
+    return list(rc) + ["@dop2_PreLowerGlobalOpts@4=" + il]
+
+
 def hooks():
     h = c2build.hooks("ncol", None)
     if h is None:
@@ -113,14 +131,18 @@ def parse(text):
     return f["cands"], f["given"], f["state"]
 
 
-def parse_all(text, fn_flags=False):
+def parse_all(text, fn_flags=False, absent0=None):
     """Events -> one record per NColor run: {func, cands, given, state} (state and per-candidate apps / ranges /
     avail only with --why / --export). c2 17.00 compiles functions on worker threads: the log's "# thread N" lines
-    say whose events follow, and each thread has its own current function and candidate."""
+    say whose events follow, and each thread has its own current function and candidate. absent0: the first kind
+    index of the --absent hooks (the leaf walk, the enregister-test passes, the candidate stores, the pre-
+    GlobalOptimize IL); their events fire in phase 3, before the function's FN event, so they buffer per thread
+    and attach to the record the next FN event opens."""
     fns = []
     ctx = {}            # thread -> {"fn": record, "cur": candidate}
     th = 0
     ilrec = {}          # thread -> the record whose STATE event the following T lines (--il) belong to
+    pend = {}           # thread -> the phase-3 (pre-NColor) data of the function whose FN event follows
 
     def fn_of(t):
         c = ctx.setdefault(t, {"fn": None, "cur": None})
@@ -145,9 +167,32 @@ def parse_all(text, fn_flags=False):
         head, _, rest = ln.partition("|")
         f = head.split()
         kind, v = int(f[3]), c2trace._split(rest)
+        if absent0 is not None and kind >= absent0:      # T25: phase-3 events, before the FN event
+            k2 = kind - absent0
+            p = pend.setdefault(th, {})
+            if k2 == 0 and len(v) >= 6:                 # GrgIdentifyCandidates' leaf walk
+                p.setdefault("cand", []).append(dict(leaf=hx(v[0]), flags=hx(v[1]), sym=hx(v[2]),
+                                                     kw=hx(v[3]), name=unq(v[4]),
+                                                     ty=hx(v[5]) if len(v) > 5 else None))
+            elif k2 == 1 and len(v) >= 2:               # a leaf TyMdCanEnReg passed
+                s = p.setdefault("ctype", [])
+                if hx(v[1]) not in s:
+                    s.append(hx(v[1]))
+            elif k2 == 2 and len(v) >= 2:               # a leaf turned into a candidate (SetKind(1))
+                s = p.setdefault("cstore", [])
+                if hx(v[1]) not in s:
+                    s.append(hx(v[1]))
+            elif k2 == 3:                               # the pre-GlobalOptimize IL follows (T lines)
+                if v:
+                    p["func_pg"] = unq(v[0])
+                ilrec[th] = (p, "il_pg")
+            continue
         if kind == FN:
             c = ctx.setdefault(th, {"fn": None, "cur": None})
+            pd = pend.pop(th, None)
             c["fn"] = dict(func=v[0].strip('"') if v else "?", cands=[], given=[], state=None)
+            if pd:
+                c["fn"].update(pd)       # this function's phase-3 data, buffered above
             if fn_flags and len(v) > 1 and v[-1] not in ("?", ""):
                 c["fn"]["fflags"] = hx(v[-1])          # FUNC+0xe4 at NColor's entry (FN_FLAGS, the last spec)
             c["cur"] = None
@@ -277,7 +322,134 @@ def prio_terms(c, st):
     return terms, total
 
 
-def report(cands, given, state=None):
+KIND = {3: "temp", 4: "local", 5: "param", 0xd: "imm"}
+_DOLLAR = re.compile(r"\$\d+$")
+_IL17 = re.compile(r"(?<![\w?@$])([A-Za-z_$][\w$]*):[0-9a-fA-F]+")
+_TMP17 = re.compile(r"^(?:[stk]|pas)\d+$")   # t/k<N> temps and immediates, pas<N>: the extended dump's
+                                             # per-side PAS annotation (17.00); a user local with one of
+                                             # these exact names is filtered from the early scan too
+
+
+def basename(nm):
+    """The leaf / pre-IL name form of a candidate's base: NColor names its lifetimes p$1 (the enter-load and
+    replacement syms take the next SSR slot of the name), the phase-3 leaf walk and the pre-IL say p."""
+    return _DOLLAR.sub("", nm or "")
+
+
+def absent_rows(rec):
+    """[(name, kind, reason)] for every local and parameter with no row in the NColor candidate table
+    (T25 --absent): from GrgIdentifyCandidates' leaf walk (the identify-time refusals: the volatile flag,
+    the enregister test, the kind gate; and the candidates it made that NColor never saw) and the IL at
+    dop2_PreLowerGlobalOpts' entry (the references GlobalOptimize removed, with their def sites and the
+    value's carrier). The join key is the base name: the leaf/pre-IL names are bare, NColor's carry $N."""
+    rows = {}                      # base name -> the row's NColor name (p$1)
+    for c in rec.get("cands") or []:
+        rows.setdefault(basename(c["name"]), c["name"])
+    leaves, lorder = {}, []
+    for lf in rec.get("cand") or []:
+        e = leaves.get(lf["sym"])
+        if e is None:
+            e = leaves[lf["sym"]] = dict(sym=lf["sym"], name=lf["name"], kw=lf["kw"], flags=[], ty=lf.get("ty"))
+            lorder.append(lf["sym"])
+        e["flags"].append(lf["flags"])
+    ctype = set(rec.get("ctype") or [])
+    cstore = set(rec.get("cstore") or [])
+    # the pre-GlobalOptimize IL: every named operand, per side (dst = a def), with the & notes ('s0=&':
+    # that operand's ADDRESS is what flows — the address-taken family the leaf walk never sees)
+    src = {}
+    for ln in rec.get("il_pg") or []:
+        if not ln.startswith("I "):
+            continue
+        head, _, ops = ln.partition("|")
+        hf = head.split()
+        if len(hf) < 4:
+            continue
+        op, line = hf[2], hf[3]
+        dst, _, srct = ops.partition("<-")
+        dtoks, stoks = dst.split(), srct.split()
+        addrof = set()
+        for side, idx in re.findall(r"([sd])(\d+)=&", ops):
+            toks = stoks if side == "s" else dtoks
+            if int(idx) < len(toks):
+                addrof.update(basename(m.group(1)) for m in _IL17.finditer(toks[int(idx)]))
+        call = "call" in op.lower()
+        for side, toks in ((0, dtoks), (1, stoks)):
+            for i, tok in enumerate(toks):
+                for m in _IL17.finditer(tok):
+                    nm = m.group(1)
+                    if nm.startswith("__") or _TMP17.match(nm) or (call and side == 1 and i == 0):
+                        continue                     # compiler names, temps/immediates, the call target
+                    e = src.setdefault(nm, dict(defs=[], uses=0, addrs=0, dsts=set(), rhs=set()))
+                    if side == 0:
+                        e["defs"].append((line, op))
+                        e["rhs"].update(basename(x.group(1)) for x in (_IL17.search(t) for t in stoks) if x)
+                    else:
+                        e["uses"] += 1
+                        if nm in addrof:
+                            e["addrs"] += 1
+                    e["dsts"].update(basename(x.group(1)) for x in (_IL17.search(t) for t in dtoks) if x)
+
+    def carrier(nm):
+        """The candidate(s) the value lives in: the RHS of its defs and the dsts of its uses, that have
+        rows (found's `found = p` def, head's `p = head` use). None, the name, or a short list."""
+        e = src.get(nm)
+        if not e:
+            return None
+        got = {}
+        for nm2 in (e["rhs"] | e["dsts"]):
+            if nm2 in rows and nm2 != basename(nm):
+                got[nm2] = got.get(nm2, 0) + 1
+        if not got or len(got) > 3:
+            return None
+        return ", ".join(rows[k] for k in sorted(got, key=got.get, reverse=True))
+    out, seen = [], set()
+
+    def emit(nm, kd, why):
+        key = basename(nm)
+        if key in seen or key in rows:
+            return
+        seen.add(key)
+        out.append((nm, kd, why))
+
+    lnames = {}
+    for sym in lorder:
+        lnames.setdefault(basename(leaves[sym]["name"]), leaves[sym])
+    for nm, e in lnames.items():
+        k = e["kw"] & 0xff
+        if e["sym"] in cstore:
+            why = ("a register candidate before NColor whose references NColor never saw (NColCanon's "
+                   "replacement syms, or a copy into it was coalesced)")
+            c = carrier(nm)
+            if c:
+                why += "; its value lives in %s" % c
+        elif any(f & 0x100 for f in e["flags"]):
+            why = "volatile (leaf flag 0x100): GrgIdentifyCandidates leaves it in memory"
+        elif e["sym"] not in ctype:
+            why = "its type is not enregisterable (TyMdCanEnReg refused it)"
+        elif k == 0xa:
+            why = "the candidate test refused it (sym kind 0xa)"
+        else:
+            why = "the optimizer gates refused it (TLS+0x123f4, or global optimisation is off)"
+        emit(nm, KIND.get(k, "kind %d" % k), why)
+    for nm, e in src.items():
+        if basename(nm) in lnames:
+            continue
+        if e["addrs"]:
+            why = ("only its address is used (&%s, or an aggregate whose fields are separate locals): "
+                   "it lives in memory" % nm)
+        else:
+            why = ("every reference was removed before GrgIdentifyCandidates, by GlobalOptimize (copy or "
+                   "constant propagation, CSE, dead stores)")
+            if e["defs"]:
+                why += " (defs at +%s; %d use(s) also removed)" % (", +".join(d[0] for d in e["defs"]), e["uses"])
+            c = carrier(nm)
+            why += "; its value lives in %s" % c if c else \
+                ": its value lives in the values it was copied into"
+        emit(nm, "?", why)
+    return out
+
+
+def report(cands, given, state=None, absent=None):
     out = []
     w = max([len(c["name"]) for c in cands] + [9])
     for i, c in enumerate(cands):
@@ -300,6 +472,11 @@ def report(cands, given, state=None):
                     "B%d:%s%+d" % (b, "%dx(%d-%d)" % (k, state["maxlive"] + 4, live) if k else "live%d" % live, t)
                     + ("<<%d" % (2 * d) if d and state["speed"] else "") for b, k, live, d, t in pt[0])
                     + "  = %d%s" % (pt[1], "" if pt[1] == c["prio"] else "  (traced %s: model off)" % c["prio"]))
+    if absent:
+        out.append("  not in the table (locals and parameters with no NColor row):")
+        w2 = max([len(nm) for nm, _, _ in absent] + [5])
+        for nm, kd, why in absent:
+            out.append("    %-*s  %-5s  %s" % (w2, nm, kd, why))
     if given:
         out.append("given back by NColPostspill: %s" % ", ".join(given))
     if state is not None:
@@ -315,6 +492,9 @@ def main(argv):
     ap.add_argument("--func")
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--why", action="store_true", help="appearances per block and the priority formula per candidate")
+    ap.add_argument("--absent", action="store_true",
+                    help="also report every local and parameter with no NColor row, and why (T25: GrgIdentifyCandidates' "
+                         "leaf walk + the IL before GlobalOptimize; needs hooks.regs_cand: 17.00)")
     ap.add_argument("--export", help="JSON of every function's NColor run (candidates, liveness, initial "
                     "availability): rasim's input; --func optional (empty: all functions)")
     ap.add_argument("--il", action="store_true", help="with --export: also the IL after prioritization, with raw "
@@ -332,7 +512,8 @@ def main(argv):
     if not a.func and not a.export:
         sys.exit("c2ncol: --func is required (or --export)")
     hk = list(hooks())
-    if a.why or a.export:
+    absent0 = None
+    if a.why or a.export or a.absent:
         hk[CAND] += "," + ",".join(why_specs())
         st = c2build.hooks("ncol_state", None) % dict(nblk=NBLK, ntup=NTUP, ninfo=13 * NBLK)
         if a.export:
@@ -355,6 +536,19 @@ def main(argv):
                 hk += [COVREG_HOOK, COVBEST_HOOK, SEPARATE_HOOK, MINKEPT_HOOK, MINREST_HOOK]
             if a.dpa:
                 hk += DPA_HOOKS
+        if a.absent:                       # T25: the leaf walk, the enregister-test passes, the candidate
+            ah = absent_hooks()            # stores, and the pre-GlobalOptimize IL — appended last (after
+            if ah is None:                 # the --il/--cov/--dpa hooks, whose kind indexes are constants)
+                sys.exit("c2ncol: --absent needs hooks.regs_cand in the build table (17.00)")
+            absent0 = len(hk)
+            hk += ah
+            hk.append(PRE_HOOK)
+            hk.append(REGSET_HOOK)
+            hk.append(PERFUNC_HOOK)
+            if a.cov or a.dpa:
+                hk += [COVREG_HOOK, COVBEST_HOOK, SEPARATE_HOOK, MINKEPT_HOOK, MINREST_HOOK]
+            if a.dpa:
+                hk += DPA_HOOKS
     img, hk, rc, out, text = c2trace.run_trace(a.src, hk, cl or ["/O2"], keep=a.keep,
                                                func=a.func if a.func else (False if a.export else None))
     if rc:
@@ -365,17 +559,22 @@ def main(argv):
         return 0
     if a.export:
         import json
-        fns = [f for f in parse_all(text, fn_flags=a.il) if f["cands"]]
+        fns = [f for f in parse_all(text, fn_flags=a.il, absent0=absent0) if f["cands"]]
         if a.il:
             for f in fns:                     # the REGSET probe ran: a function without an event has no such leaf
                 f.setdefault("regsets", [])
+        if a.absent:
+            for f in fns:                     # T25: the absent candidates ride along in the export
+                f["absent"] = absent_rows(f)
         json.dump(dict(c2=c2build.name(), src=os.path.basename(a.src), functions=fns), open(a.export, "w"))
         print("%d functions, %d candidates -> %s" % (len(fns), sum(len(f["cands"]) for f in fns), a.export))
         return 0
-    cands, given, state = parse(text)
+    fns = parse_all(text, absent0=absent0)
+    f = fns[-1] if len(fns) > 1 and not fns[0]["cands"] else fns[0]
+    cands, given, state = f["cands"], f["given"], f["state"]
     if not cands:
         sys.exit("c2ncol: no NColor events for %s (wrong --func, or the function was not optimized)" % a.func)
-    sys.stdout.write(report(cands, given, state))
+    sys.stdout.write(report(cands, given, state, absent=absent_rows(f) if a.absent else None))
     return 0
 
 

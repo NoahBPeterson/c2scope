@@ -563,6 +563,11 @@
   ],
   "ncol_state": "1006650f=tf698>0,tf67c>0,tf69c>0#%(nblk)d,tf650>0#%(ntup)d,tf648>0#%(ninfo)d,tdd08>0",
   "ncol_fn": "@NColor@4=tdccc>0>0>4$",
+  "regs_cand": [
+   "100de863=esi,esi>0x1c,esi>0x24,esi>0x24>8,esi>0x24>4>4$,esi>0x10",
+   "100de8a0=esi,ebx,ebx>8,ebx>4>4$",
+   "100de8d3=esi,esi>0x24,esi>0x24>8,esi>0x24>4>4$"
+  ],
   "ncol_pref": "100686b2=s15*16:0x20:0x38:0x34,edi>4>0x44,eax>0#4",
   "slots": [
    "100e1b40=tdccc>0>0>4$,s1,ecx>8,ecx>0x2c,s2",

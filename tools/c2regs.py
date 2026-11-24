@@ -168,8 +168,8 @@ _CAND14 = ["10b56361=esi,esi>0x14,esi>0xa,esi>0x18,esi>0x18>4,esi>0x18>8>0,esi>0
            "10b563c2=esi>0x18"]
 CAND0 = None
 _cand = _CAND14 if c2trace.c2build.name() == c2trace.c2build.DEFAULT else (c2trace.c2build.get("hooks") or {}).get("regs_cand")
-if _cand:
-    CAND0 = len(HOOKS)
+if _cand and HOOKS:          # HOOKS is Unported (empty) on a partial build without regs events: c2regs is
+    CAND0 = len(HOOKS)       # x86-only, and c2ncol --absent reads the same table key on x64 (T25)
     _c0 = HOOKS[0].partition("=")[2].split(",")
     HOOKS = HOOKS + list(_cand) + ["@dop2_PreLowerGlobalOpts@4=%s,%s" % (_c0[0], [x for x in _c0 if x.endswith("%")][0])]
 CAND_XCLASS = int(c2trace.c2build.get("regs_cand_xclass") or "5000", 16)
