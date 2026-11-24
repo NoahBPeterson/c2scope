@@ -102,9 +102,15 @@ MdmInsertEntryExit();
      `AllocateAutomatics` 0x10becf60 in `_LocalSyms` order, downward from ebp, each with its own slot (disjoint
      block locals don't share). That order is **neither declaration order nor first use: it follows the names**
      (`RF_odorder.cpp`: `y w z x` and `x z w y` declared, `z x w y` first used, give `w x y z` and `w y x z` from
-     ebp-4 down; 16 one-letter names in three shuffled declaration orders keep one fixed order except among
-     `c d r`, whose relative order follows the declarations: a hash table) [M, same on all four builds; the hash
-     itself was not read].
+     ebp-4 down — x before y in the first, y before x in the second: the pair collides and the one declared
+     LATER wins). 16 one-letter names in three shuffled declaration orders keep one fixed order except within
+     the hash-collision classes, whose internal order is REVERSED declaration order — later-declared first
+     (`RF_oddecl.cpp`, the de-confounded battery, 15.00: reversing ALL declarations flips exactly the colliding
+     classes `{g b}`, `{r d c}`, `{n2 e}`, `{o m j}` and nothing else; exchanging `c`<->`r` in the declarations
+     flips exactly `{c d r}`; reversing the statements moves nothing — statement order has no effect; and in the
+     real-word set, moving `fillPair`'s declaration across `dst`/`i` moves nothing while crossing `sum2`'s
+     declaration swaps `{fillPair sum2}`): a hash table) [M, same on all four builds; the hash itself was not
+     read].
 3. `EhFuncletStackAlloc` when `FUNC.flags & 0x40000`.
 
 **Tooling note (the /Od boundary, verified live on 15.00.30729.1).** `StackPacking` runs only on the
