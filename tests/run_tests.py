@@ -1220,6 +1220,57 @@ def callform_tests():
           ("2 calls, 2 forms" in run(plus), "call [reg] (slot 0)" in run(plus)), (True, True))
 
 
+def odslots_tests():
+    """tools/odslots.py (the /Od frame report): the allotemp log's parse on synthetic text, the
+    orig side-by-side, and one live-trace compile under 15.00 (the hook fires only there)."""
+    import io, contextlib, odslots as O
+    # the raw line shape is c2trace.py's own printf: `E seq depth id eax ecx edx ebx ebp esi edi esp |`
+    # regs in hex, spec args after `|`. allotemp on 15.00: entry eax=align, ecx=size; X eax=offset.
+    log = ("# fename 1\n"
+           "E 0 0 0 4 4 7b258408 1 26ebc8 1079070 4 26eb94 | 4 7b258408\n"
+           "X 1 0 0 fffffffc fffffffc | fffffffc\n"
+           "E 2 0 0 8 f0 7b258408 1 26ebc8 10790e4 f0 26eb94 | 8 7b258408\n"
+           "X 3 0 0 ffffff08 ffffff0c | ffffff08\n"
+           "E 4 0 0 1 1 7b258408 1 26ebc8 1079158 1 26eb94 | 1 7b258408\n"
+           "X 5 0 0 fffffff7 fffffff7 | fffffff7\n"
+           "E 6 0 0 4 4 7b258408 1 26ebc8 10791cc 4 26eb94 | 4 7b258408\n"
+           "X 7 0 0 fffffff8 fffffff8 | fffffff8\n")
+    a = O.parse_log(log)
+    check("odslots: every E/X pair parses (entry align=eax, size=ecx; X's eax is the offset)",
+          [(x["seq"], x["size"], x["align"], x["offset"]) for x in a[:2]],
+          [(0, 4, 4, -4), (2, 240, 8, -248)])
+    check("odslots: an entry without its exit survives (--max cut it)",
+          (len(a), a[1]["offset"] is None, a[-1]["offset"]), (4, False, -8))
+    d = tempfile.mkdtemp()
+    omap = os.path.join(d, "orig.txt")
+    open(omap, "w").write("  -424   15 refs\n  -420    4 refs\n   -8    3 refs\n")
+    lp = os.path.join(d, "log.txt")
+    open(lp, "w").write(log)
+    b = io.StringIO()
+    with contextlib.redirect_stdout(b):
+        try:
+            O.main(["--parse", lp, "--orig", omap])
+        except SystemExit:
+            pass
+    out = b.getvalue()
+    check("odslots: the walk-order report prints size x align per allocation",
+          ("240 x 8" in out, "4 x 4" in out), (True, True))
+    check("odslots: --orig matches retail offsets against ours (a shared offset is a =, "
+          "a retail-only slot a <)",
+          ("-424" in out and "<  (no ours)" in out, "= refs" in out), (True, True))
+    if os.environ.get("C2TRACE_REMOTE") != "0":
+        check("odslots live: skipped (traced compiles run local only)", True, True)
+        return
+    src = os.path.join(d, "odprobe.c")
+    open(src, "w").write("int Sink(void*, int);\nint Probe(int n) {\n    int a = n + 1;\n"
+                         "    char b = 1;\n    return a + b + Sink(&a, n);\n}\n")
+    env = dict(os.environ, C2_BUILD="15.00", C2TRACE_REMOTE="0")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "odslots.py"), src,
+                        "--func", "Probe"], capture_output=True, text=True, env=env, timeout=600)
+    check("odslots live: the traced compile prints both automatics in walk order",
+          ("2 automatics" in r.stdout, r.stdout.count("x 4") >= 1), (True, True))
+
+
 def ncolsim_splitwhatif_tests():
     """ncolsim.py's `split:` whatif lever (docs/c2/ncolor.md 9): a candidate's lifetime cut into pieces
     that each get their own order-walk choice. Offline, on the fixtures."""
@@ -2070,6 +2121,8 @@ ncolsim_tests()
 ncolspill_tests()
 callform_tests()
 xdata_tests()
+odslots_tests()
+odslots_tests()
 ncolsim_splitwhatif_tests()
 ncol_levers_tests()
 sched17_tests()

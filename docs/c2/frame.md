@@ -107,6 +107,17 @@ MdmInsertEntryExit();
      itself was not read].
 3. `EhFuncletStackAlloc` when `FUNC.flags & 0x40000`.
 
+**Tooling note (the /Od boundary, verified live on 15.00.30729.1).** `StackPacking` runs only on the
+globopt branch (`_Globopt_flag && !_FWvmSafe`), so `c2slots.py`'s what-if and `--search` have no /Od
+application: their hooks (`ColorStackElements` 0x51139920 on 15.00) fire 7x at /O2 and 0x at /Od on the
+same source. The /Od instrument is the `allotemp` hook instead — `0x51228020=eax,edx/xeax` (entry
+eax = align, ecx = size, exit eax = the offset; the raw `E`/`X` line carries all eight registers) —
+wrapped by `tools/odslots.py`: it prints every automatic in the walk order (size x align, offset)
+and, with `--orig FILE`, matches the live frame against a retail map (`offset refs` lines or
+`[ebp-N]` listing operands) slot by slot. The walk the probe shows agrees with the /Od rules above:
+named automatics land in name order (first-reference order for temporaries, per-statement release),
+a 0xf0-byte struct sorts inline with int locals by name order and only stretches the offsets below it.
+
 `StkInitAllocation` 0x10becc50 (called from `Init` 0x10be8e10 and from the /Od path) [C]:
 
 ```
