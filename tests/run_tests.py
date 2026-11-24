@@ -1220,6 +1220,64 @@ def callform_tests():
           ("2 calls, 2 forms" in run(plus), "call [reg] (slot 0)" in run(plus)), (True, True))
 
 
+def swdiff_tests():
+    """tools/swdiff.py (T27): the per-case convergence driver — the case attribution walk, the fix
+    classifiers (register / shape / spill / call-shape / vtable), the shared-tail map, the vtable
+    table and the region counts, on a synthetic f4check --full-diff fixture. No compile."""
+    import io, contextlib, swdiff as S
+    # the fixture rendered with f4check's own row format ('%s %-8s %-40s | %s'), so the test also
+    # validates the real column widths; ours rows carry a dummy offset (the real ours column prints
+    # mnem+ops only, '%s %s' % y[1:] of a (off, mnem, ops) row)
+    rows = [
+        ("!", ("+0x0000", "mov", "rax, rsp"), ("", "mov", "rbp, rsp")),
+        ("!", ("+0x0003", "mov", "qword ptr [rsp + 8], rcx"), ("", "mov", "qword ptr [rbp + 8], rcx")),
+        ("!", ("+0x0007", "mov", "rax, qword ptr [rcx + 8]"), ("", "mov", "qword ptr [rbp - 8], rax")),
+        ("!", ("+0x0020", "mov", "rbx, rax"), ("", "mov", "r12, rax")),
+        ("!", ("+0x0023", "mov", "rdx, r8"), ("", "mov", "rdx, r9")),
+        (" ", ("+0x0026", "call", "FUN_1401549f0"), ("", "call", "FUN_1401549f0")),
+        ("!", ("+0x002b", "je", "+0x60"), ("", "je", "+0x80")),
+        ("!", ("+0x0030", "mov", "eax, dword ptr [rbx]"), ("", "mov", "eax, dword ptr [r12]")),
+        (" ", ("+0x0034", "mov", "qword ptr [rsp + 0x20], rax"), ("", "mov", "qword ptr [rsp + 0x20], rax")),
+        ("!", ("+0x003c", "call", "qword ptr [rax + 0x198]"), ("", "call", "qword ptr [rcx + 0x198]")),
+        ("!", ("+0x0042", "jmp", "+0x90"), ("", "jmp", "+0x90")),
+        (" ", ("+0x0050", "test", "rax, rax"), ("", "test", "rax, rax")),
+        ("!", ("+0x0053", "je", "+0x60"), ("", "je", "+0x80")),
+        (" ", ("+0x0059", "call", "FUN_1401549f0"), ("", "call", "FUN_1401549f0")),
+        ("!", ("+0x005e", "jmp", "+0x60"), ("", "jmp", "+0x80")),
+        ("!", ("+0x0060", "mov", "rcx, qword ptr [rsp + 0x20]"), None),
+        ("!", ("+0x0065", "call", "?Release@NiRefObject@@QEAAXXZ"), None),
+        ("!", ("+0x006b", "jmp", "+0x90"), None),
+        ("!", None, ("", "mov", "rcx, qword ptr [rsp + 0x20]")),
+        ("!", None, ("", "call", "?Release@NiRefObject@@QEAAXXZ")),
+        (" ", ("+0x0090", "xor", "eax, eax"), ("", "xor", "eax, eax")),
+        (" ", ("+0x0095", "ret", ""), ("", "ret", "")),
+    ]
+    diff = "\n".join("%s %-8s %-40s | %s" % (
+        mark,
+        o[0] if o else "",
+        ("%s %s" % o[1:]) if o else "",
+        ("%s %s" % y[1:]) if y else "") for mark, o, y in rows) + "\n"
+    df = os.path.join(tempfile.mkdtemp(), "diff.txt")
+    open(df, "w").write(diff)
+    cf = os.path.join(os.path.dirname(df), "cases.txt")
+    open(cf, "w").write("=== case +0x20\n=== case +0x50\n")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        S.main(["--diff", df, "--cases", cf])
+    out = buf.getvalue()
+    check("swdiff: the header names the cases, the diffs and the modal common exit",
+          ("2 cases" in out, "common exit +0x90" in out), (True, True))
+    check("swdiff: the case rows group by ownership with the class mix",
+          ("== case +0x20:" in out, "== case +0x50:" in out, "[register]" in out), (True, True, True))
+    check("swdiff: a call-through-[reg+imm] diff is a vtable-call, a stack-frame mismatch a spill",
+          ("[vtable-call]" in out, "[spill]" in out), (True, True))
+    check("swdiff: the shared-tail map separates the original's shared block from ours' inlined copy",
+          ("+0x60..+0x6b  cases +0x20, +0x50" in out,
+           "ours: NOT shared" in out), (True, True))
+    check("swdiff: the vtable table groups by slot with the owning cases",
+          ("[rax+0x198]" in out, "cases +0x20" in out), (True, True))
+    check("swdiff: the region table counts exact instructions per 0x100 block",
+          ("R0 " in out, "exact" in out), (True, True))
 def odslots_tests():
     """tools/odslots.py (the /Od frame report): the allotemp log's parse on synthetic text, the
     orig side-by-side, and one live-trace compile under 15.00 (the hook fires only there)."""
@@ -2122,7 +2180,7 @@ ncolspill_tests()
 callform_tests()
 xdata_tests()
 odslots_tests()
-odslots_tests()
+swdiff_tests()
 ncolsim_splitwhatif_tests()
 ncol_levers_tests()
 sched17_tests()
