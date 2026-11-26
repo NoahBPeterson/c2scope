@@ -139,6 +139,8 @@ class Lifter:
             rn.discard(full(self.md.reg_name(i.operands[0].reg)))        # xor r, r reads nothing
         if m == "cdq":
             wn.discard("eax")                          # capstone lists eax as written; cdq only sets edx
+        if m in ("test", "cmp"):                       # capstone drops the register of `test [m], r` (M&B 00403ab0)
+            rn |= {full(self.md.reg_name(op.reg)) for op in i.operands if op.type == X.X86_OP_REG}
         if m == "ret":
             rn.add("eax")                              # the return value: returned when defined in the function
         if m == "call" or self.is_tailjmp(i):
@@ -572,6 +574,10 @@ class Lifter:
     def frame_name(self, off, ty):
         if off >= 4:
             self.args_read.add(off)
+            # the first use's type, except that a float read wins over an integer copy of the same size (pushed
+            # on to a callee first, `fadd [esp+x]` after: the argument is a float, M&B 0048e5d0)
+            if self.arg_types.get(off) == "1004" and ty == F4:
+                self.arg_types[off] = ty
             self.arg_types.setdefault(off, ty)
             return "_a%d:%s" % (off, ty)
         return "_l%d:%s" % (-off, ty)
@@ -619,6 +625,17 @@ class Lifter:
             return self.frame_name(ebp + m.disp, ty)
         if not base and not idx:
             return "?g_%08x@@3HA:%s" % (m.disp & 0xFFFFFFFF, ty)          # a named global, read as an operand
+        if idx and (base == "esp" or (base == "ebp" and ebp is not None)):
+            # a local array indexed by a register (`mov eax, [esp + esi*4 + 0xc]`, M&B 00403ab0): the slot's
+            # address, then the index; the slots from there to the frame's top are one object (cl keeps their
+            # layout only for an array)
+            o = (esp if base == "esp" else ebp) + m.disp
+            if o >= 0:
+                raise Unsupported("an indexed argument")
+            t = self.temp()
+            self.emit(k, "OPASSIGN", [t], [self.frame_name(o, "1004")], "s0=&")
+            self.aggregates.add((o, -o))
+            return "[%s+%s:1004%s]:%s" % (t, self.var_read(k, full(idx)), "*%d" % m.scale if m.scale > 1 else "", ty)
         terms = []
         if base:
             terms.append("%s:1004" % self.var_read(k, full(base)))
@@ -731,6 +748,7 @@ class Lifter:
         self.pro = pro
         self.find_tls()
         self.divs = self.find_divs()
+        self.strlens = self.find_strlens()
         self.pair_end = set()
         self.pair_pieces = set()                       # instructions folded into an __int64 add / sub
         self.call64 = set()                            # calls whose edx:eax an __int64 add / sub reads
@@ -747,6 +765,12 @@ class Lifter:
         # function is void, and the eax of a call before another ret is that call's leftover
         if self.fn_value and any(i.mnemonic == "ret" and any(d[0] in ("entry", "undef") for d in
                                                               self.reach_defs.get((k, "eax"), ()))
+                                 for k, i in enumerate(self.ins)):
+            self.fn_value = False
+        # a ret that eax can reach holding a piece of an __int64 stored to memory (`sbb eax, edx; mov [esi+0xc], eax; ret`):
+        # the leftover of a void function's store, and the other paths' eax is no value either (M&B 00432da0)
+        if self.fn_value and any(i.mnemonic == "ret" and self.reach_defs.get((k, "eax")) and
+                                 any(d[0] in self.pair_pieces for d in self.reach_defs[(k, "eax")])
                                  for k, i in enumerate(self.ins)):
             self.fn_value = False
         esp, ebp = 0, None
@@ -787,6 +811,14 @@ class Lifter:
                         if k in self.skip or i.mnemonic in ("adc", "sbb", "mov"):
                             continue
                     if k in self.skip:
+                        continue
+                    if k in self.strlens:
+                        kl, p = self.strlens[k]
+                        t = self.temp()
+                        self.emit(k, "OPARG", [t], ["%s:1004" % self.var_read(kl, p)])
+                        self.emit(k, "OPCALL", ["%s:1004" % self.var_written(k, p)],
+                                  ["?__lift_strlen@@YAXXZ:1004", t], "s0=?__lift_strlen@@YAXXZ")
+                        flags = ("%s:1004" % self.var_written(k, p), "0:1004")   # the sub's ZF: length == 0
                         continue
                     if k in self.divs:
                         xop, dvs, sg, kend, dreg = self.divs[k]
@@ -1295,17 +1327,81 @@ class Lifter:
             self.bv_block[off] = c * unit
             return
         self.note_aggregate(k, ("esi", "edi"), n, unit)
-        if c and c > 0:                                    # a constant count: the literal byte size, so cl
+        nb = self.var_tail(k, unit, c)
+        if nb is not None:                                 # memcpy(d, s, n) of a variable n: one copy
+            n, unit = nb, 1
+        elif c and c > 0:                                  # a constant count: the literal byte size, so cl
             n, unit = "%d:1004" % (c * unit), 1               # inlines the copy again (`mov ecx, 9; rep movsd`)
         if unit > 1:
             t = self.temp()
             self.emit(k, "shl", [t], [n, "2:1004"])
             n = t
         a = [self.temp(), self.temp(), self.temp()]
+        n0 = len(self.lines)
         self.emit(k, "OPARG", [a[0]], ["%s:1004" % self.var_read(k, "edi")])
         self.emit(k, "OPARG", [a[1]], ["%s:1004" % self.var_read(k, "esi")])
         self.emit(k, "OPARG", [a[2]], [n])
         self.emit(k, "OPCALL", [], ["?__lift_memcpy@@YAXXZ:1004"] + a, "s0=?__lift_memcpy@@YAXXZ")
+        if unit == 1 and len(self.lines) == n0 + 4:
+            self.hoist_copy(n0)
+
+    def copy_root(self, k, r):
+        """The value r holds at k, through register copies (`mov eax, ecx`): the first non-copy definition."""
+        for _ in range(8):
+            d = self.one_def(k, r)
+            if d is None:
+                return None
+            i = self.ins[d]
+            if i.mnemonic == "mov" and i.operands[1].type == X.X86_OP_REG and i.operands[1].size == 4:
+                k, r = d, self.md.reg_name(i.operands[1].reg)
+                continue
+            return (d, r)
+        return None
+
+    def var_tail(self, k, unit, c):
+        """cl's memcpy of a variable byte count n: `shr ecx, 2; rep movsd; [mov ecx, n;] and ecx, 3; rep movsb`
+        (ecx = n both times). -> n's IL token, the tail in self.skip; None when it is not that shape."""
+        if unit != 4 or c:
+            return None
+        ds = self.one_def(k, "ecx")
+        if ds is None or self.ins[ds].mnemonic != "shr" or self.ins[ds].op_str != "ecx, 2":
+            return None
+        root = self.copy_root(ds, "ecx")
+        for j in range(k + 1, min(k + 4, len(self.ins))):
+            i = self.ins[j]
+            if i.mnemonic == "and" and i.op_str == "ecx, 3":
+                nx = self.ins[j + 1] if j + 1 < len(self.ins) else None
+                if root is None or self.copy_root(j, "ecx") != root or nx is None or \
+                        "movsb" not in nx.mnemonic + " " + nx.op_str:
+                    return None
+                if any("esi" in self.regs(self.ins[x])[1] or "edi" in self.regs(self.ins[x])[1]
+                       for x in range(k + 1, j)):
+                    return None
+                self.skip.update(range(k + 1, j + 2))
+                return "%s:1004" % self.var_read(ds, "ecx")
+            if i.mnemonic != "mov" or i.operands[0].type != X.X86_OP_REG:
+                return None
+        return None
+
+    def hoist_copy(self, n0):
+        """The copy's IL (lines n0..) goes up to just after its operands' last definition: cl schedules a loop's
+        pointer increments and the count's `mov ecx, N` ahead of `rep movsd`, but the source copies first
+        (`*d = *s; ++s; ++d;`: M&B 0040fcf0), and the copy's place in the source decides that order. Only past
+        register arithmetic in the same block: no label, branch, call or memory operand."""
+        used = set()
+        for l in self.lines[n0:n0 + 3]:
+            used |= set(re.findall(r"([A-Za-z_?$@][\w?$@]*):[0-9a-f]+", l.split("<-", 1)[1].split(";")[0]))
+        j = n0
+        while j > 0:
+            l = self.lines[j - 1]
+            if not l.startswith("I ") or "[" in l or re.match(r"^I \w+ (OPCALL|OPBRANCH|OPRET|OPARG|OPCMP)", l):
+                break
+            ds = set(re.findall(r"([A-Za-z_?$@][\w?$@]*):[0-9a-f]+", l.split("|", 1)[1].split("<-", 1)[0]))
+            if ds & used or not ds:
+                break
+            j -= 1
+        if j < n0:
+            self.lines[j:n0 + 4] = self.lines[n0:n0 + 4] + self.lines[j:n0]
 
     def ret_width(self, k):
         """The width of the writes reaching the ret at k in eax: 1 when every one writes al (`mov al, 1`, `xor al,
@@ -1774,6 +1870,46 @@ class Lifter:
             return 0
         return None
 
+    def find_strlens(self):
+        """cl's strlen intrinsic: `lea d, [p+1]; L: mov c8, byte [p]; inc p (add p, 1); test c8, c8; jne L;
+        sub p, d` -> p = strlen(p). -> {index of the sub: (index of the lea, p)}; the lea and the loop go in
+        self.skip (the loop's label stays, unused). Refused when d, the 0 left in c8 or the pointer past the
+        terminator is read anywhere else."""
+        out = {}
+        ins = self.ins
+        for b in self.bl:
+            if len(b) != 4:
+                continue
+            k0 = b[0]
+            i0, i1, i2, i3 = (ins[k] for k in b)
+            if not (i0.mnemonic == "mov" and len(i0.operands) == 2 and i0.operands[0].type == X.X86_OP_REG and
+                    i0.operands[0].size == 1 and i0.operands[1].type == X.X86_OP_MEM and i0.operands[1].size == 1):
+                continue
+            mm = i0.operands[1].mem
+            if not mm.base or mm.index or mm.disp:
+                continue
+            p, c = self.md.reg_name(mm.base), self.md.reg_name(i0.operands[0].reg)
+            if not ((i1.mnemonic == "inc" and i1.op_str == p) or (i1.mnemonic == "add" and i1.op_str == p + ", 1")) \
+                    or i2.mnemonic != "test" or i2.op_str != "%s, %s" % (c, c) or i3.mnemonic != "jne" or \
+                    i3.operands[0].type != X.X86_OP_IMM or i3.operands[0].imm != i0.address or b[-1] + 1 >= len(ins):
+                continue
+            ks = b[-1] + 1
+            sb = ins[ks]
+            if sb.mnemonic != "sub" or not sb.op_str.startswith(p + ", ") or sb.operands[1].type != X.X86_OP_REG:
+                continue
+            dreg = self.md.reg_name(sb.operands[1].reg)
+            kl = self.one_def(ks, dreg)
+            if kl is None or kl >= k0 or ins[kl].mnemonic != "lea" or ins[kl].op_str != "%s, [%s + 1]" % (dreg, p):
+                continue
+            if any(p in self.regs(ins[j])[1] for j in range(kl + 1, k0)):     # p moves between the lea and the loop
+                continue
+            if set(self.readers((kl, dreg))) != {ks} or [x for x in self.readers((k0, full(c))) if x != b[2]] or \
+                    [x for x in self.readers((b[1], p)) if x not in (k0, b[1], ks)]:
+                continue
+            out[ks] = (kl, p)
+            self.skip.update([kl] + b)
+        return out
+
     def readers(self, d):
         """Instructions that read the value defined at d = (index, reg); a partial write (`fnstsw ax`,
         `mov al, 1`) keeps the rest of the register but does not read the value."""
@@ -2074,7 +2210,9 @@ class Lifter:
                     return False
                 return any(u.mnemonic == "mov" and u.operands[0].type == X.X86_OP_MEM and
                            u.op_str.endswith(", " + reg) for u in self.ins[j + 1:j + 8])
-            return any(x[0] not in ("entry", "undef") and self.ins[x[0]].mnemonic != "call" and not arg_only(x[0])
+            # `fnstsw ax` / `lahf`: a float compare's status word, never a return value (M&B 0048e5d0)
+            return any(x[0] not in ("entry", "undef") and self.ins[x[0]].mnemonic not in ("call", "fnstsw", "lahf")
+                       and not arg_only(x[0])
                        and not zero_for_stores(x[0]) and x[0] not in self.pair_pieces for x in defs)   # (folded
             #                                                         into an __int64 store: not a return value)
         root = self.find(d)

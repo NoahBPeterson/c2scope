@@ -35,6 +35,7 @@ class LiftEmitter(il2c.Emitter):
         self.argty = {}                      # OPARG temporary -> the type code of the value it carries
         self.copyof = {}                     # temporary -> the temporary it copies (`mov ecx, esi`)
         self.tls = set()                     # __declspec(thread) offsets read or written
+        self.ptypes = {}                     # parameter name -> its C type (unit() fills it)
 
     def name_of(self, n):
         if n == "_this":
@@ -65,6 +66,8 @@ class LiftEmitter(il2c.Emitter):
         nm = self.name_of(n)
         if nm == "self":
             return "(%s)(self)" % CTYPE.get(ty, "int")
+        if n.startswith("_a") and ty in ("1004", "2004") and self.ptypes.get(nm) in ("float",):
+            return "(%s)(*(%s*)&%s)" % (CTYPE[ty], CTYPE[ty], nm)     # a float argument's bits, copied as a dword
         return super().var(n, ty)
 
     def lvalue(self, tok):
@@ -281,6 +284,9 @@ class LiftEmitter(il2c.Emitter):
             rty = self.ctype_of(d[0]) if d else "void"
             e = "((%s (__cdecl*)(...))(*(int*)g_%08x))(%s)" % (rty, g, ", ".join(argv))
             return ("%s = (%s)%s;" % (self.lvalue(d[0]), rty, e)) if d else e + ";"
+        if tgt == "?__lift_strlen@@YAXXZ":       # lift2il's inlined strlen loop: the strlen intrinsic
+            self.needs_string = True
+            return "%s = (int)strlen((const char*)(%s));" % (self.lvalue(d[0]), self.rvalue(srcs[1], L))
         if tgt == "?__lift_memcpy@@YAXXZ":       # lift2il's block copy (rep movsd): the memcpy intrinsic
             argv = [self.rvalue(a, L) for a in srcs[1:]]
             self.needs_string = True
@@ -1259,6 +1265,7 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
     em.this_alias = this_alias
     em.partial = partial
     em.self_va = va
+    em.ptypes = {p: CTYPE.get(lf.arg_types.get(int(p[1:]), "1004"), "int") for p in params}
     typed0 = ["%s %s" % (CTYPE.get(lf.arg_types.get(int(p[1:]), "1004"), "int") if
                          lf.arg_types.get(int(p[1:]), "1004")[0] in "45e" else "int", p) for p in params]
     if lf.eh:
@@ -1297,9 +1304,63 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
         body = re.sub(r"\breturn;", "return 0;", body)
     sig = '%s%s %s FUN_%08x(%s)\n' % (ext, ret if not (lang_c and ret == "bool") else "unsigned char", conv, va,
                                      ", ".join(plist) or "void")
+    body = inline_x87(body)
     if lang_c:
         body = body.replace("(bool)", "(unsigned char)")
+    elif ret == "bool":
+        body = bool_flags(body)
     return "\n".join(head) + ("\n\n" if head else "") + sig + body + "\n", lf
+
+
+def inline_x87(body):
+    """An x87 value the lift held in a float temp (`t2 = (float)(a * b); t1007 = (int)(t2);`) that the code kept
+    on the FPU stack: the source had no float variable there, and the temp's store / reload (`fstp; fld`) is
+    the rounding cl adds for one (M&B 00432da0; on 13.10 even a `(float)` cast of the value rounds it).
+    One use: inlined past plain temp assignments. Two uses (`m = v < m ? m : v`, a max macro: M&B 0048e5d0):
+    the expression at both, which cl merges again, when no call, label or loop falls between and its operands
+    are not redefined."""
+    lines = body.split("\n")
+    for x in sorted(set(re.findall(r"(?m)^    (?:float|double) (t\d{1,3});$", body)), key=lambda t: int(t[1:])):
+        occ = [n for n, l in enumerate(lines) if re.search(r"\b%s\b" % x, l)]
+        if len(occ) not in (3, 4):
+            continue
+        a, us = occ[1], occ[2:]
+        m = re.match(r"^(\s*)%s = \((?:float|double)\)(\(.*\));$" % x, lines[a])
+        if not m or re.search(r"\b(FUN_|__lift|memcpy|memset|strlen)\w*\(|->", m.group(2)):
+            continue
+        mid = lines[a + 1:us[-1]]
+        if len(us) == 1:
+            if any(not re.match(r"^\s*t\d+ = \(\w+\)\([^;]*\);$", l) or re.search(r"FUN_|->|__lift|\bg_\w+\)\(", l)
+                   for l in mid):
+                continue
+        elif any(re.search(r"FUN_|->|__lift|\bg_\w+\)\(|memcpy|memset|strlen|^\s*L\w+:|\b(while|do|for|goto)\b", l)
+                 for l in mid):
+            continue
+        names = set(re.findall(r"\b(t\d+|a\d+|v_l\d+|self)\b", m.group(2)))      # not redefined in between
+        if names and any(re.match(r"^\s*(%s) = " % "|".join(names), l) for l in mid):
+            continue
+        if any(len(re.findall(r"\b%s\b" % x, lines[u])) != 1 or re.match(r"^\s*%s = " % x, lines[u]) for u in us):
+            continue                                   # (a second assignment is no use)
+        for u in us:
+            lines[u] = re.sub(r"\b%s\b" % x, lambda _m: m.group(2), lines[u])
+        del lines[a]
+        lines = [l for l in lines if l.strip() not in ("float %s;" % x, "double %s;" % x)]
+    return "\n".join(lines)
+
+
+def bool_flags(body):
+    """A byte variable that holds only 0 and 1 and is only returned (`mov al, 1 ... xor al, al ... ret` from a bool
+    function): the source's `return true/false` through one register. As unsigned char, `return (bool)(x)` costs
+    cl a `test; setne` (M&B 0049cee0); as bool it is free."""
+    for x in set(re.findall(r"\breturn \(bool\)\((t\d+|v_l\d+)\);", body)):
+        uses = re.findall(r"[^\n]*\b%s\b[^\n]*" % x, body)
+        dec = "    unsigned char %s;" % x
+        sets = re.compile(r"^\s*%s = \(unsigned char\)\(\(int\)([01])\);$" % x)
+        if all(u == dec or sets.match(u) or u.strip() == "return (bool)(%s);" % x for u in uses) and dec in uses:
+            body = body.replace(dec, "    bool %s;" % x)
+            body = re.sub(r"\b%s = \(unsigned char\)\(\(int\)([01])\);" % x,
+                          lambda m: "%s = %s;" % (x, "true" if m.group(1) == "1" else "false"), body)
+    return body
 
 
 INTRIN = {
