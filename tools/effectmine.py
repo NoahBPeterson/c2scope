@@ -61,6 +61,9 @@ EFFECT (--want), as the models print them:
   pref:V:REG  before:A:B  A>B  tie:A>B        a register preference / colouring order (A coloured before B)
   reg:V=REG                 V ends in REG
   add:frame@V:n  sub:frame@V:n  keys:frame:+n     symbol keys (symkeys levers)
+  site[@P]:LINE:A>B         the pass-P (default 2) operand sort at LINE (as `symkeys sites` prints it, LO-HI, or *)
+                            puts the operand matching A before the one matching B, judged on each variant's own
+                            trace: `$o`/`$T` numbers that change between compiles don't matter (symkeys --site syntax)
   sched:A>B                 instruction A issued before B (substrings of the scheduler's instruction text)
   load:LOC:N                N loads of LOC in the final code (loadcse location, e.g. [_this+16])
   bdiff                     fewer bytes against --asm-vs
@@ -105,8 +108,10 @@ _LOCAL = []
 
 def _guarded_run_tool(args, trace=True, extra_env=None):
     """c2trace.run_trace calls this only when the compile server declined (or none is configured): the compile would
-    run under wine here. Refused when a server is configured, unless EFFECTMINE_ALLOW_LOCAL=1."""
-    if trace and os.environ.get("EFFECTMINE_ALLOW_LOCAL") != "1" and c2trace.remote_configured():
+    run under wine here. Refused when a server is configured, unless EFFECTMINE_ALLOW_LOCAL=1 or C2S_OFF=1 (local
+    compiles asked for: the test suite's own setting; any tool importing this module in-process inherits the guard)."""
+    if trace and os.environ.get("EFFECTMINE_ALLOW_LOCAL") != "1" and os.environ.get("C2S_OFF") != "1" and \
+            c2trace.remote_configured():
         _LOCAL.append(1)
         raise RemoteDeclined("the compile server declined a traced compile (it would run under wine here): refused; "
                              "C2TRACE_REMOTE_DEBUG=1 says why; EFFECTMINE_ALLOW_LOCAL=1 compiles here")
@@ -1213,12 +1218,29 @@ def slot_effects(sa, sb):
     return eff
 
 
+SITE_WANTS = []      # site[@P]:LINE:A>B wants: judged on each variant's own trace (key_effects)
+
+
+def site_states(f):
+    """For each wanted site, how the VARIANT's traced sort ordered the two operands: ok (A first in every matching
+    sort), no, or absent (no sort there matches A and B). Judged on the trace itself, so a $o / $T temp is found
+    by the operand text the site names, not by a symbol number that changes between compiles."""
+    import symkeys
+    out = []
+    for st in SITE_WANTS:
+        hits = symkeys.site_events(f, st, st["pass"])
+        state = "absent" if not hits else ("ok" if all(ia < ib for _e, ia, ib in hits) else "no")
+        out.append("site:%s:%s" % (st["text"], state))
+    return out
+
+
 def key_effects(fa, fb):
     r = realize.key_delta_f(fa, fb)
     eff = ["keys:%s:%+d" % kv for kv in sorted(r["counts"].items())]
     eff += ["key:%s:%+d" % (n.split("~")[0], kb - ka) for n, ka, kb in r["moved"][:30]]
     if r["flips"]:
         eff.append("flips:%d" % r["flips"])
+    eff += site_states(fb)
     return eff
 
 
@@ -1742,6 +1764,13 @@ def parse_want(s):
     m = re.fullmatch(r"keys:(\w+):([+-]\d+)", s)
     if m:
         return dict(m="K", kind="count", cls=m.group(1), n=int(m.group(2)), text=s, feat="keys")
+    m = re.fullmatch(r"site(?:@(\d))?:(.+>.+)", s)
+    if m:
+        import symkeys
+        st = symkeys.parse_site(m.group(2))
+        st["pass"] = int(m.group(1) or 2)
+        SITE_WANTS.append(st)
+        return dict(m="K", kind="site", site=st, text=s, feat="keys")
     m = re.fullmatch(r"sched:(.+?)>(.+)", s)
     if m:
         return dict(m="Q", kind="order", x=m.group(1).strip(), y=m.group(2).strip(), text=s, feat="sched")
@@ -1780,6 +1809,8 @@ def want_type(w, miner=None):
     if w["m"] == "R":
         return {"pref": "R.pref+", "reg": "R.reg", "order": "R.before", "ref": "R.ref+", "unref": "R.unref",
                 "extend": "R.extend", "drop": "R.drop", "var": "R.var", "P": "R.P" + ("+" if w.get("n", 1) > 0 else "-")}[k]
+    if w["m"] == "K" and k == "site":
+        return "K.flips"                     # a sort-order change: the class of edits that flip pass-2 sorts
     if w["m"] == "K":
         return "K.%s%s" % (w["cls"], "+" if w["n"] > 0 else "-")
     if w["m"] == "Q":
@@ -1856,6 +1887,9 @@ def want_hit(w, rec, miner):
         return bool(hit), " ".join(hit[:2])
     if m == "K":
         K = eff.get("K", [])
+        if k == "site":
+            t = "site:%s:ok" % w["site"]["text"]
+            return (t in K), (t if t in K else "")
         if k == "count":
             return ("keys:%s:%+d" % (w["cls"], w["n"]) in K), ""
         x = _strip_var(w["x"])

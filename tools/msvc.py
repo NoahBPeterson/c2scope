@@ -124,12 +124,19 @@ def ensure_wine(e):
             start_keeper(e)
 
 
-def run(tool, args, capture=False):
+def run(tool, args, capture=False, timeout=None):
+    """timeout (seconds): a compile still running then is killed and fails with rc -9 (2026-11-25: one cl.exe under
+    wine ran 2 hours and held a 19,000-function run)"""
     e = env()
     ensure_wine(e)
     with tempfile.TemporaryFile() as out:
-        rc = subprocess.run(["wine", str(tc("VC/Bin/" + tool + ".exe"))] + convert(args), env=e,
-                            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT).returncode
+        try:
+            rc = subprocess.run(["wine", str(tc("VC/Bin/" + tool + ".exe"))] + convert(args), env=e,
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                timeout=timeout).returncode
+        except subprocess.TimeoutExpired:
+            rc = -9
+            out.write(b"\nTIMEOUT: %s ran over %d s\n" % (tool.encode(), timeout))
         out.seek(0)
         text = out.read().decode("latin-1")
     if capture:

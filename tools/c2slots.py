@@ -876,8 +876,14 @@ def resolve(s, name):
     hits = [i for i in s["elems"] if ename(s, i) == name]
     if not hits:
         hits = [i for i in s["elems"] if (s["elems"][i].get("name") or "") == name or ename(s, i).split("$")[0] == name]
+    if not hits and re.fullmatch(r"L\S+", name):      # L<line>: the element(s) whose source line is that
+        hits = [i for i in s["elems"] if eline(s, i) == name]
     if len(hits) != 1:
-        sys.exit("what-if: %r names %d elements%s" % (name, len(hits), (": " + ", ".join("#%d=%s" % (i, ename(s, i)) for i in hits[:8])) if hits else ""))
+        hint = ""
+        if not hits and name.startswith("$T"):
+            hint = (" ($T numbers can change between compiles of the same source: "
+                    "name the element by its idx column, #N, or by its source line, L<line>)")
+        sys.exit("what-if: %r names %d elements%s%s" % (name, len(hits), (": " + ", ".join("#%d=%s" % (i, ename(s, i)) for i in hits[:8])) if hits else "", hint))
     return hits[0]
 
 
@@ -955,6 +961,15 @@ def what(s, edits, out=sys.stdout):
     out.write("# what-if %s: T %d -> %d, %d colours -> %d%s; %d elements moved\n" % (
         " ".join(edits), base["T"], res["T"], len(base["cols"]), len(res["cols"]),
         "" if base["sort"] == res["sort"] else " (sorted %s -> %s)" % (base["sort"], res["sort"]), len(moved)))
+    # the elements the edits name by number, spelled out (the source edit should not need the ranked list)
+    for i in sorted({int(t[1:]) for ed in edits for t in re.findall(r"#\d+", ed)}):
+        e = s["elems"].get(i)
+        if e is None:
+            out.write("  #%-3d (no such element)\n" % i)
+            continue
+        ln = eline(s, i)
+        out.write("  #%-3d = %s  (size %s, uses %s%s%s)\n" % (i, ename(s, i), e.get("size"), e.get("uses"),
+                  ", param" if e.get("param") else "", ", " + ln if ln else ""))
     for i, a, b in moved:
         out.write("  %-28s %6s -> %s\n" % (ename(s, i) if i in s["elems"] or i in s["listing"] else "#%d" % i, a, b))
     return res
@@ -1711,7 +1726,7 @@ def offline(argv):
     if not a.asm:
         sys.exit("search needs --asm OUR.asm (the listing the snapshot was made from; c2trace.py slots --keep DIR)")
     ins = read_orig(a.orig, a.image, int(a.va, 16) if a.va else None)
-    om, oi = orig_map(s, a.asm, ins)
+    om, oi = orig_map(s, a.asm, ins, image_callee_pop(a.image) if a.image else None)
     print_orig_info(oi)
     res = model_of(s).run(base_order(s), record=True)
     side_by_side(s, om, res)

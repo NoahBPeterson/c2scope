@@ -445,6 +445,18 @@ def absent_rows(rec):
             c = carrier(nm)
             why += "; its value lives in %s" % c if c else \
                 ": its value lives in the values it was copied into"
+            if e["defs"]:
+                shifted = any(d[1].upper() in ("OPSHR", "OPSHL") for d in e["defs"])
+                divided = any(d[1].upper() == "OPDIV" for d in e["defs"])
+                if shifted or divided:
+                    # 24 Nov 2026 (an x64 library function): a shift/divide whose single use was the
+                    # zero-test is the mask fold (`test reg,-2/-4`) or the sdiv idiom; the original's bare
+                    # `sub; sar 1; jne` needs a zero-code use to keep the idiom's sar.
+                    why += ("; a removed %s whose only use was the compare is the mask fold (test reg,-2/-4) "
+                            "or the sdiv idiom (cdq;sub;sar): to reproduce a bare `sub; sar 1; jne`, keep the "
+                            "pointer-difference idiom and add a zero-code use - `__assume(v >= 0)` on a named "
+                            "local of the difference (library L0550)"
+                            % ("shift" if shifted else "division"))
         emit(nm, "?", why)
     return out
 

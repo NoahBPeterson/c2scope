@@ -143,6 +143,9 @@ model: reproduces the trace exactly (decisions, colour order, offsets)
    4     4  160     2     2  _s$ L19                    new 3@-160     2:size 1:size 0:size
 ```
 
+The inverse, from a wanted layout (the original's, or `with:A,B` / `frame=N` ...) to verified source edits (scope,
+size, one variable for two), is `tools/slotwant.py` (docs/c2/slotwant.md).
+
 `made` is the creation number (`p` = a parameter colour), `lst` the listing's reference count, `L` the first source
 line in the listing; `$T` temporaries are named from SSR+0x28 (their number), `tv` temporaries from SYM.key. The
 element's LiveOnDef is read as up to 12 bit-vector nodes (sparse chunks of 64 elements on 14.00/15.00, 32 on 13.10);

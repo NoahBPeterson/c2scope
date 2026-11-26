@@ -2852,7 +2852,7 @@ def incsnap_tests():
           (bool(re.search(r"^baseline: \d+ instructions", o, re.M)), m and int(m.group(1)) >= 2, m and m.group(2)),
           (True, True, "0"))
     restore()
-    env = dict(os.environ, EFFECTMINE_DIR=os.path.join(d, "em"))
+    env = dict(os.environ, EFFECTMINE_DIR=os.path.join(d, "em"), EFFECTMINE_ALLOW_LOCAL="1")   # wine is fine for a test
     em = subprocess.Popen([sys.executable, os.path.join(HERE, "tools", "effectmine.py"), "mine", tu, "--func", "sum_pair",
                            "--features", "regs", "--classes", r"^copy$", "--max-compiles", "3", "--depth", "1", "--jobs", "1", "--"] + cl,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=HERE, env=env)

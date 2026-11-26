@@ -109,9 +109,30 @@ Pass compiler flags literally after `--`; in zsh a `$FLAGS` variable holding sev
 | `tools/rwsweep.py` | general search over mechanical source rewrites (identity helpers, aliases, dead uses, swaps): which ones move registers without changing code | tracer.md |
 | `tools/c2sched.py` | the instruction scheduler's decisions and a model check | docs/c2/sched.md |
 | `tools/ccache.py` | content cache behind every traced compile (`stats`, `clear`; `CCACHE=0` bypasses it) | tracer.md |
+| `tools/slotwant.py` | frame-colouring inverse: a wanted slot layout (`with:A,B`, `frame=N`, ...) -> source edits (scope, share, array size), each verified by a traced compile | docs/c2/slotwant.md |
+| `tools/il2c_lift.py lift` | lift one function of a retail x86 binary to C++ that cl should compile back to its bytes (`--partial` drafts, `--outline` per block) | docs/c2/lift2il.md |
 
 Worked example: `docs/c2/frontend.md`, "Applied to 0x008e7d40", is the full story of a Fallout 3 function that
 went from 98 differing instructions to byte-exact, and `helpersweep` finds that match automatically in 11 compiles.
+
+## Lift a function from a binary (x86 only)
+
+`lift2il` reads a function's machine code from a 32-bit PE built by MSVC 7.1 / 8 / 9 (c2 13.10, 14.00, 15.00)
+and writes C++ for it; compile that at the binary's flags and it should give the same bytes back.
+
+```
+uv run python tools/il2c_lift.py lift game.exe 4d5940 --size 54 --c2 13.10.3052 > FUN_004d5940.cpp
+uv run python tools/il2c_lift.py lift game.exe 448eb0 --size 11648 --c2 13.10.3052 --partial   # a draft of a big one
+uv run python tools/il2c_lift.py lift game.exe 531800 --size 3277 --c2 13.10.3052 --outline    # its shape per block
+```
+
+The output is a matching draft, not readable source: names are addresses (`FUN_<va>`, `g_<va>`), types are what the
+instructions show (int, float, double, pointers as char*), and the control flow is what cl's code implies. Hit rate
+on three games' functions (lbench, a fixed sample of 300-400 functions per game): 30% of
+Fallout 3's, 22% of Mount & Blade's and 23% of Spore's recompile byte-identical (the largest so far: 5,237 bytes,
+1,778 instructions with 312 branches), most of them under 256 bytes; many
+more lift and compile but differ in register allocation, scheduling or frame layout, which the tools above explain.
+What it does and does not lift: docs/c2/lift2il.md. Not for x64.
 
 ## License
 

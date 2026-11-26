@@ -4,8 +4,11 @@ import struct
 REL_SIZES = {0x06: 4, 0x07: 4, 0x14: 4, 0x0A: 2, 0x0B: 4}
 
 
-def parse_coff(path):
-    """sections [{name, data, relocs[(off, symidx, type)], comdat}], symbols {name: (secidx0, value)}."""
+def parse_coff(path, sizes=False):
+    """sections [{name, data, relocs[(off, symidx, type)], comdat}], symbols {name: (secidx0, value)}.
+
+    sizes=True: symbols are (secidx0, value, length), the length read from the function aux record
+    (0 when the object has none; cl writes it under /Z7)."""
     b = open(path, "rb").read()
     mach, nsec, _ts, symoff, nsym, opt, _ch = struct.unpack_from("<HHIIIHH", b, 0)
     strtab = symoff + nsym * 18
@@ -15,6 +18,7 @@ def parse_coff(path):
             o = strtab + struct.unpack_from("<I", raw, 4)[0]
             return b[o:b.index(b"\0", o)].decode("latin-1")
         return raw.rstrip(b"\0").decode("latin-1")
+
     secs = []
     for i in range(nsec):
         h = 20 + opt + i * 40
@@ -36,6 +40,10 @@ def parse_coff(path):
         nm = name8(raw)
         idx2name[i] = nm
         if sec > 0 and cls in (2, 3) and (typ & 0x20) and secs[sec - 1]["code"]:   # function symbols
-            syms.setdefault(nm, (sec - 1, val))
+            if sizes:
+                sz = struct.unpack_from("<I", b, o + 18 + 4)[0] if naux >= 1 else 0   # aux: TagIndex, TotalSize
+                syms.setdefault(nm, (sec - 1, val, sz))
+            else:
+                syms.setdefault(nm, (sec - 1, val))
         i += 1 + naux
     return secs, syms, idx2name

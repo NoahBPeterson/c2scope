@@ -1262,11 +1262,14 @@ class Run:
     def __init__(self, src, func, cl, work, keep=False):
         _, _, _, out, log = c2trace.run_trace(src, c2regs.HOOKS, cl, keep=os.path.join(work, "r"), quiet=True)
         fns = c2regs.parse(log, func)
-        if not fns:
-            raise RuntimeError(("compile error: " + " ".join(re.findall(r"error C\d+:[^\n]*", out))[:160])
-                               if "error" in out else "function not register-allocated")
-        self.snap = c2regs.export(fns[0])
         asm = os.path.join(work, "r", os.path.splitext(os.path.basename(src))[0] + ".asm")
+        if not fns and "error" in out:
+            raise RuntimeError("compile error: " + " ".join(re.findall(r"error C\d+:[^\n]*", out))[:160])
+        if not fns and not any(f.lower() == "/od" for f in cl):
+            raise RuntimeError("function not register-allocated")
+        # /Od: c2 has no global register allocator to trace, but the listing still scores a variant against the
+        # original (rdiff, bdiff); only --want's priority gap is unknown (2026-11-25: 138 of 2,236 driver candidates)
+        self.snap = c2regs.export(fns[0]) if fns else {"passes": [], "pops": []}
         self.instrs = tsweep.listing_instrs(asm, func)
         self.shape = [_mask(x) for x in self.instrs]
         self.keys = [tsweep._key(x) for x in self.instrs]

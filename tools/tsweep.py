@@ -41,7 +41,7 @@ Example (Fallout 3 0x008e7d40):
   tsweep.py t.cpp --func FUN_00c7e9a0@SceneOwner \\
       --metric "hinge(prio('this',2), 79) + 10*(sat(0xa8)!='eax')" --show "prio('scene',2)" -- /TP /MT /GS /EHsc /Gy
 """
-import argparse, hashlib, difflib, itertools, math, os, re, shutil, sys
+import argparse, hashlib, difflib, itertools, math, os, re, shutil, sys, time
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image import ROOT
@@ -68,6 +68,13 @@ def out_name(path, func=None):
 
 
 ALT = re.compile(r"\{\{(.*?\}*)\}\}(?!\})", re.S)   # a code `}` just before the closing `}}` stays in the alternative
+
+
+def cl_errors(text, n=300):
+    """The compiler's error lines from a failed compile's output, warnings dropped (a C4288 flood buries the C2143);
+    the plain tail when no line says error."""
+    errs = [l.strip() for l in text.splitlines() if re.search(r"\b(fatal )?error\b", l) and not re.search(r"\bwarning C\d+", l)]
+    return "; ".join(errs)[:n] if errs else text[-n:]
 
 # x64 (a build table with "arch": "x64", cl 17.00 x86_amd64): the 64-bit registers, r8..r15 with their parts, the
 # low bytes sil/dil/bpl/spl; capstone decodes in 64-bit mode; frame slots are rsp-relative (docs/c2/port-1700.md)
@@ -267,7 +274,39 @@ def _split_ops(ops):
 CS_MNEMONIC = {"fcompi": "fcomip", "fucompi": "fucomip"}
 
 
+_OVERRUN_SAID = set()
+
+
 def orig_instrs(path):
+    """The original's listing (see _orig_instrs), with a warning when it runs past the function's end."""
+    out = _orig_instrs(path)
+    if path not in _OVERRUN_SAID:
+        k = listing_overrun(out)
+        if k is not None:
+            _OVERRUN_SAID.add(path)
+            sys.stderr.write("warning: %s runs past the function's end: a ret at instruction %d is followed by %s "
+                             "(%d of %d instructions are another function or padding; bdiff and alignment score "
+                             "against them). Regenerate the listing for this function's size.\n"
+                             % (path, k, out[k + 1][0] if out[k + 1][0] != "push" else "a new prologue",
+                                len(out) - k - 1, len(out)))
+    return out
+
+
+def listing_overrun(ins):
+    """Index of a `ret` followed by inter-function padding (int3) or a new `push ebp; mov ebp, esp` prologue: the
+    listing ran into the next function (M&B 0x4b9110: a 4000-byte cached listing of a 1464-byte function). Mid-
+    function alignment pads are nop/lea/npad and never follow with int3, so they don't trigger it."""
+    for k in range(len(ins) - 1):
+        if ins[k][0] != "ret":
+            continue
+        nx = ins[k + 1]
+        if nx[0] == "int3" or (nx[0] == "push" and nx[1] == "ebp" and k + 2 < len(ins) and
+                               ins[k + 2][0] == "mov" and ins[k + 2][1].replace(" ", "") == "ebp,esp"):
+            return k
+    return None
+
+
+def _orig_instrs(path):
     """Lines 'VA  mnemonic  operands' (capstone-style disassembly of the original function)."""
     out, va = [], []
     for ln in open(path):
@@ -744,7 +783,7 @@ class Ctx:
             _, _, rc, out, log = c2trace.run_trace(src, c2regs.HOOKS, cl, keep=os.path.join(work, "r"), quiet=True)
             fns = c2regs.parse(log, func)
             if not fns:
-                raise RuntimeError("function not register-allocated (compile error?): " + out[-300:])
+                raise RuntimeError("function not register-allocated (compile error?): " + cl_errors(out))
             self.regs = fns[0]
         if need_scratch or orig:
             _, _, rc, out, log = c2trace.run_trace(src, c2scratch.HOOKS, cl, keep=os.path.join(work, "s"), quiet=True)
@@ -854,6 +893,11 @@ def main():
     # a `{{..}}` without `<|>` is code, not a spot: a nested brace initialiser (`int f[2][2]={{0,1},{2,3}};`) in a
     # pack unit used to be taken as a one-way spot and lost its outer braces in every variant
     spots = [m.group(1).split("<|>") for m in ALT.finditer(text) if "<|>" in m.group(1)]
+    # a `{{a|b}}` (one bar) is a mistyped spot, not code: it would run as one variant with the braces reaching cl
+    for m in ALT.finditer(text):
+        if "<|>" not in m.group(1) and re.search(r"(?<![|<])\|(?![|>])", m.group(1)) and "{" not in m.group(1):
+            print("warning: line %d: {{%s}} has a `|` but no `<|>`: alternatives are separated by `<|>`; it stays code"
+                  % (text.count("\n", 0, m.start()) + 1, m.group(1)[:60]), file=sys.stderr, flush=True)
     combos = list(itertools.product(*[range(len(s)) for s in spots]))
     if len(combos) > a.max:
         sys.exit("%d combinations (> --max %d): split the grid" % (len(combos), a.max))
@@ -886,12 +930,21 @@ def main():
             vals = [eval(e, {"__builtins__": {}}, ctx.ns) for e in exprs]
             return job, vals, None
         except SystemExit as e:
-            return job, None, "trace failed: %s" % str(e)[-200:]
+            return job, None, "trace failed: %s" % cl_errors(str(e), 200)
         except Exception as e:
             return job, None, "%s: %s" % (type(e).__name__, e)
 
+    # one line per finished combination: n/N, elapsed, its metric, the best so far (a long sweep is not silent)
+    t0, res, best = time.time(), [], None
     with ThreadPoolExecutor(a.jobs) as ex:
-        res = list(ex.map(run, jobs))
+        for n, r in enumerate(ex.map(run, jobs), 1):
+            res.append(r)
+            v = r[1][0] if r[1] is not None else None
+            if v is not None and (best is None or v < best[0]):
+                best = (v, os.path.basename(r[0][0]))
+            print("  [%d/%d %4.0fs] %s: %s   best %s" % (n, len(jobs), time.time() - t0, os.path.basename(r[0][0]),
+                  v if v is not None else (r[2] or "?")[:60], "%s (%s)" % best if best else "-"), file=sys.stderr,
+                  flush=True)
     ok = sorted(((v[0], j) + (v,) for j, v, err in res if v is not None and v[0] is not None),
                 key=lambda t: t[0])
     bad = [(j, err) for j, v, err in res if v is None or v[0] is None]

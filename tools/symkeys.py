@@ -51,7 +51,7 @@ frame only) and are reused first.  The replay is exact for the traced stream; an
 change makes those allocations and no others (the construct table in symkeys.md section 4 says what each construct
 allocates).
 """
-import argparse, json, os, re, sys
+import argparse, collections, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c2trace
 
@@ -925,6 +925,44 @@ def print_imms(f):
             print("   %-34s web %4s%s" % (what, x["gr"], "  (reused)" if x.get("reused") else ""))
 
 
+def event_text(f, i):
+    """One event as `events` prints it (for `#N` anchors: what event N is)."""
+    e = f.events[i]
+    if e[0] == "alloc":
+        return "alloc %s key %d %s line %d" % (e[1].cls, e[1].key, label(e[1]), e[1].line)
+    if e[0] in ("inl+", "spl+"):
+        return "%s %s (call line %d)" % ("read inlinee" if e[0] == "inl+" else "splice", short("%s#%d" % (e[1], e[2])),
+                                        e[3])
+    if e[0] in ("inl-", "spl-"):
+        return "%s end" % ("read inlinee" if e[0] == "inl-" else "splice")
+    return " ".join(str(x) for x in e[:3])
+
+
+def print_tmps(f, a):
+    """The tmp-class symbols allocated in an event range, grouped by the construct they were made in (the inline
+    expansion, else the function itself) and the source line current then: a `sub:tmp@#N:k` lever needs k of
+    these gone, and this says where they come from."""
+    num = lambda t: int(str(t).lstrip("#")) if t is not None else None
+    hi, lo = num(a.before), num(a.after) or 0
+    hi = len(f.events) if hi is None else hi
+    print("#### %s: tmp allocations in events [%d, %d)" % (f.name, lo, hi))
+    if hi < len(f.events):
+        print("# event #%d = %s" % (hi, event_text(f, hi)))
+    groups = collections.OrderedDict()
+    for i in range(lo, min(hi, len(f.events))):
+        e = f.events[i]
+        if e[0] != "alloc" or e[1].cls != "tmp":
+            continue
+        s = e[1]
+        k = (short(s.inl) if s.inl else "(the function's own code)", s.line)
+        groups.setdefault(k, []).append((i, s))
+    total = sum(len(v) for v in groups.values())
+    print("# %d tmp allocations; by construct and line (line = offset from the function's first line):" % total)
+    for (con, line), v in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        print("  %4d  %-40s line %4d   events %s%s" % (len(v), con[:40], line, ", ".join("#%d" % i for i, _s in v[:6]),
+                                                       " ..." if len(v) > 6 else ""))
+
+
 def print_events(f):
     print("#### %s" % f.name)
     for i, e in enumerate(f.events):
@@ -988,12 +1026,20 @@ def opdesc(o):
     return "%-46s %s" % (what, t)
 
 
+def line_note(f):
+    """Site lines are offsets from the function's first source line (FUNC+0x44), as --line and --site take them."""
+    if f.line0:
+        return "# line = offset from the function's first line (source line %d): absolute = %d + line" % (f.line0, f.line0)
+    return "# line = offset from the function's first line (that line was not traced)"
+
+
 def print_sites(f, a):
     lo, hi = (0, 1 << 30)
     if a.line:
         p = a.line.split("-")
         lo, hi = int(p[0]), int(p[-1])
     print("#### %s: commutative operand sorts (OptLeftWeightTree), first operand = evaluated first / loaded" % f.name)
+    print(line_note(f))
     for e in f.events:
         if e[0] != "sort" or not lo <= e[3] <= hi or (a.pass_ and e[1] != a.pass_):
             continue
@@ -1601,6 +1647,7 @@ def levers_sites(f, a):
         evs.extend((st, e, ia, ib) for e, ia, ib in hits)
     base = {id(s): s.key for s in f.syms}
     print("#### %s: %d site constraints, %d sorts" % (f.name, len(sites), len(evs)))
+    print(line_note(f))
     for st, e, ia, ib in evs:
         print("  %-28s line %d %s: %s before %s now: %s" % (st["text"], e[3], e[2], opname(e[4][ia]), opname(e[4][ib]),
                                                           site_state(e, ia, ib, base)))
@@ -1995,7 +2042,10 @@ def main(argv=None):
         i = argv.index("--")
         argv, cl = argv[:i], argv[i + 1:]
     ap = argparse.ArgumentParser(usage=__doc__)
-    ap.add_argument("cmd", choices=("keys", "events", "whatif", "levers", "export", "sites", "compare"))
+    ap.add_argument("cmd", choices=("keys", "events", "whatif", "levers", "export", "sites", "compare", "tmps"))
+    ap.add_argument("--before", help="tmps: list the temporaries allocated before this event (#N as levers "
+                    "prints it in `sub:tmp@#N`, or a plain number), grouped by construct and line")
+    ap.add_argument("--after", help="tmps: and at or after this event (#N)")
     ap.add_argument("src", nargs="?")
     ap.add_argument("edits", nargs="*")
     ap.add_argument("--from", dest="from_")
@@ -2074,6 +2124,8 @@ def main(argv=None):
             print_sites(f, a)
         elif a.cmd == "events":
             print_events(f)
+        elif a.cmd == "tmps":
+            print_tmps(f, a)
         elif a.cmd == "whatif" and a.batch:
             whatif_batch(f, a)
         elif a.cmd == "whatif":
