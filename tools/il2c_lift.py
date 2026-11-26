@@ -30,6 +30,7 @@ class LiftEmitter(il2c.Emitter):
         self.calls = calls                   # callee va -> {"arities": set, "this": bool, "ret": bool}
         self.needs_string = False            # a memcpy: <string.h>
         self.needs_math = False              # sqrt: <math.h>
+        self.intrin = set()                  # compiler intrinsics used (declared and #pragma intrinsic)
         self.lang_c = False                  # a /TC unit: no extern "C", no member stand-ins
         self.argty = {}                      # OPARG temporary -> the type code of the value it carries
         self.copyof = {}                     # temporary -> the temporary it copies (`mov ecx, esi`)
@@ -78,8 +79,9 @@ class LiftEmitter(il2c.Emitter):
             if va is not None:
                 self.gl.add(va)
                 return "*(%s*)g_%08x" % (CTYPE.get(m.group(2), "int"), va)
-            if m.group(1) == "_this":
-                raise Unsupported("this assigned")
+            if m.group(1) == "_this":                   # `ecx = ecx->next`: this is a cursor (a plain int parameter)
+                self.self_assigned = True
+                return "self"
         return super().lvalue(tok)
 
     def rvalue(self, tok, line, want=None):
@@ -283,6 +285,15 @@ class LiftEmitter(il2c.Emitter):
             argv = [self.rvalue(a, L) for a in srcs[1:]]
             self.needs_string = True
             return "memcpy((void*)(%s), (const void*)(%s), (unsigned int)(%s));" % tuple(argv)
+        mi = re.match(r"^\?__lift_(xadd|xchg|rdtsc|inc|dec)@@YAXXZ$", tgt)
+        if mi:                                   # lift2il's lock xadd / xchg / rdtsc: the compiler intrinsics
+            argv = [self.rvalue(a, L) for a in srcs[1:]]
+            fn = {"xadd": "_InterlockedExchangeAdd", "xchg": "_InterlockedExchange", "rdtsc": "__rdtsc",
+                  "inc": "_InterlockedIncrement", "dec": "_InterlockedDecrement"}[mi.group(1)]
+            self.intrin.add(fn)
+            e = "%s(%s)" % (fn, "(long volatile*)(%s), (long)(%s)" % tuple(argv) if len(argv) == 2 else
+                            "(long volatile*)(%s)" % argv[0] if argv else "")
+            return ("%s = (%s)%s;" % (self.lvalue(d[0]), self.ctype_of(d[0]), e)) if d else e + ";"
         if tgt == "?__lift_memset@@YAXXZ":       # rep stos: the memset intrinsic
             argv = [self.rvalue(a, L) for a in srcs[1:]]
             self.needs_string = True
@@ -1274,7 +1285,7 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
                         lf.arg_types.get(int(p[1:]), "1004")[0] in "45e" else "int", p) for p in params]
     if this:
         conv = "__fastcall"
-        plist = ["char* self", "int edx_unused"] + typed
+        plist = ["%s self" % ("int" if getattr(em, "self_assigned", False) else "char*"), "int edx_unused"] + typed
     elif lf.ret_pop:
         conv, plist = "__stdcall", typed
     else:
@@ -1291,11 +1302,24 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
     return "\n".join(head) + ("\n\n" if head else "") + sig + body + "\n", lf
 
 
+INTRIN = {
+    "_InterlockedExchangeAdd": 'extern "C" long __cdecl _InterlockedExchangeAdd(long volatile*, long);\n'
+                               "#pragma intrinsic(_InterlockedExchangeAdd)",
+    "_InterlockedExchange": 'extern "C" long __cdecl _InterlockedExchange(long volatile*, long);\n'
+                            "#pragma intrinsic(_InterlockedExchange)",
+    "__rdtsc": 'extern "C" unsigned __int64 __rdtsc(void);\n#pragma intrinsic(__rdtsc)',
+    "_InterlockedIncrement": 'extern "C" long __cdecl _InterlockedIncrement(long volatile*);\n'
+                             "#pragma intrinsic(_InterlockedIncrement)",
+    "_InterlockedDecrement": 'extern "C" long __cdecl _InterlockedDecrement(long volatile*);\n'
+                             "#pragma intrinsic(_InterlockedDecrement)"}
+
+
 def heads(em, lang_c, cxx=False):
     """The declarations a unit needs: headers, il2c's prelude, the globals, the callees. cxx: callees get C++
     linkage (in an EH unit an extern "C" callee is assumed not to throw, and cl would drop the state stores)."""
     head = (["#include <string.h>"] if em.needs_string else []) + (["#include <math.h>"] if em.needs_math else []) + \
         ["".join(em.prelude)] * bool(em.prelude) + \
+        [INTRIN[f] for f in sorted(em.intrin)] + \
         ["extern __declspec(thread) int tls_%x;" % o for o in sorted(em.tls)] + \
         ['extern "C" unsigned char g_%08x[];' % g for g in sorted(em.gl)]
     ext = "" if lang_c or cxx else 'extern "C" '

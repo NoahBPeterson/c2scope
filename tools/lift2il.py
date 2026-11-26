@@ -46,8 +46,10 @@ F4, F8 = ("4004", "4008") if os.environ.get("C2_BUILD", "").startswith("13") els
 FOPS = {"fadd": "add", "fsub": "sub", "fmul": "OPMUL", "fdiv": "OPDIV", "fsubr": "subr", "fdivr": "divr"}
 # fcom* + fnstsw ax + test ah, MASK + jcc: (mask, jcc) -> the IL condition of `st0 cmp operand`
 # (C0 = st0 < x, C3 = st0 == x; C2 = unordered)
-FCC = {(0x41, "jne"): "le", (0x41, "je"): "g", (0x01, "jne"): "l", (0x01, "je"): "ge",
-       (0x40, "jne"): "e", (0x40, "je"): "ne", (0x05, "jnp"): "l", (0x05, "jp"): "ge",
+# a branch taken on unordered (NaN sets C0, C2 and C3) is the negation of an ordered compare, "!": cl writes
+# `if (x >= c)` as `test ah, 1; jne else` (checked by compiling every form, cl 13.10 and 15.00)
+FCC = {(0x41, "jne"): "!g", (0x41, "je"): "g", (0x01, "jne"): "!ge", (0x01, "je"): "ge",
+       (0x40, "jne"): "e", (0x40, "je"): "ne", (0x05, "jnp"): "l", (0x05, "jp"): "!l",
        (0x44, "jp"): "ne", (0x44, "jnp"): "e",
        # `test ah, 0x41; jp` (C0 and C3 alike: greater, or unordered) is !(st0 <= x): cl's `if (a >= b)` with the
        # operands loaded the other way; `jnp` is st0 <= x, false on NaN. "!" marks the NaN-inclusive negation
@@ -89,6 +91,7 @@ class Lifter:
         self.aggregates = set()            # (frame offset, bytes): one object (a block copy's source / destination)
         self.bvctor = {}                   # outgoing offset -> (copy constructor va, bytes): a by-value class
         self.load_src = {}                 # temp -> (base token, disp) of the load that defined it
+        self.bv_block = {}                 # outgoing offset -> bytes of a struct copied there by rep movsd
         self.byval = []                    # the last call's by-value structs: (first argument index, address, bytes)
         # catch funclets inside the function's bytes are not its code; a resume target only a handler reaches
         # starts the catch block's own code (`catch (...) { return false; }`)
@@ -134,6 +137,8 @@ class Lifter:
         if m == "xor" and len(i.operands) == 2 and i.operands[0].type == X.X86_OP_REG and \
                 i.operands[0].reg == i.operands[1].reg:
             rn.discard(full(self.md.reg_name(i.operands[0].reg)))        # xor r, r reads nothing
+        if m == "cdq":
+            wn.discard("eax")                          # capstone lists eax as written; cdq only sets edx
         if m == "ret":
             rn.add("eax")                              # the return value: returned when defined in the function
         if m == "call" or self.is_tailjmp(i):
@@ -725,6 +730,12 @@ class Lifter:
         pro = self.prologue()
         self.pro = pro
         self.find_tls()
+        self.divs = self.find_divs()
+        self.pair_end = set()
+        self.pair_pieces = set()                       # instructions folded into an __int64 add / sub
+        self.call64 = set()                            # calls whose edx:eax an __int64 add / sub reads
+        self.at = {}                                   # insn index -> (esp, ebp) before it
+        self.pairs = self.find_pairs()
         # (a prologue `push ecx` only reserves a slot: no read of this)
         self.this_used = any(r == "ecx" and ("entry", "ecx") in ds and self.ins[k].mnemonic != "call" and
                              not self.is_tailjmp(self.ins[k]) and k not in pro
@@ -765,17 +776,24 @@ class Lifter:
                 try:
                     i = self.ins[k]
                     m, ops = i.mnemonic, i.operands
+                    self.at[k] = (esp, ebp)
                     if k in pro:
                         esp, ebp = self.stack_effect(i, esp, ebp)
                         continue
+                    if k in self.pairs:
+                        op, dv, av, bv = self.pairs[k]
+                        self.emit(k, op, [self.pair_tok(dv)], [self.pair_tok(av), self.pair_tok(bv)])
+                        flags = self.carry = None
+                        if k in self.skip or i.mnemonic in ("adc", "sbb", "mov"):
+                            continue
                     if k in self.skip:
                         continue
-                    dv = self.magic_div(k)
-                    if dv:
-                        src, dvs, kend, dreg = dv
-                        self.emit(k, "OPDIV", ["%s:1004" % self.var_written(kend, dreg)],
-                                  ["%s:1004" % self.var_read(k + 1, src), "%d:1004" % dvs])
-                        self.skip.update(range(k + 1, kend + 1))
+                    if k in self.divs:
+                        xop, dvs, sg, kend, dreg = self.divs[k]
+                        ty = "1004" if sg else "2004"
+                        x = self.opnd(k, xop, esp, ebp).rsplit(":", 1)[0] + ":" + ty
+                        self.emit(k, "OPDIV", ["%s:%s" % (self.var_written(kend, dreg), ty)], [x, "%d:%s" % (dvs, ty)])
+                        flags = None
                         continue
                     if self.eh and m == "mov" and ops[0].type == X.X86_OP_MEM and ops[1].type == X.X86_OP_IMM:
                         mm = ops[0].mem
@@ -900,6 +918,8 @@ class Lifter:
                             continue
                         used = self.used_after((k, "eax"))
                         d = ["%s:1004" % self.var_written(k, "eax")] if used else []
+                        if k in self.call64:                # its edx:eax is one __int64 an add / sub reads
+                            d = ["%s:1008" % self.var_written(k, "eax")]
                         self.emit(k, "OPCALL", d, [callee] + toks, note)
                         esp = esp_after
                         flags = None
@@ -971,7 +991,7 @@ class Lifter:
                             t = self.temp("9000")
                             fa, fb = self.fcmp
                             if fa.endswith(":" + F8) or fb.endswith(":" + F8):   # fldz / fld1 against a double:
-                                fa, fb = (re.sub(r"^(-?[\d.]+):%s$" % F4, r"\1:%s" % F8, x) for x in (fa, fb))
+                                fa, fb = (re.sub(r"^(-?\d+):%s$" % F4, r"\1:%s" % F8, x) for x in (fa, fb))
                             self.emit(k, "OPCMP", [t], [fa, fb])
                             fneg = cc.startswith("!")
                             self.emit(k, "OPBRANCH", [], ["s0:0", t, "->"], "cc=%s s0=L%x%s" % (
@@ -1096,6 +1116,23 @@ class Lifter:
                         self.block_fill(k, i)
                     elif m in ("movsd", "movsb") and not ops:  # a single unrolled element of a copy
                         raise Unsupported("string move without rep")
+                    elif m in ("lock xadd", "xadd", "xchg", "lock xchg") and len(ops) == 2 and \
+                            X.X86_OP_MEM in (ops[0].type, ops[1].type):
+                        flags = self.interlocked(k, i, esp, ebp)
+                    elif m == "rdtsc":
+                        if not self.readers((k, "edx")):  # the low half only: (unsigned)__rdtsc()
+                            self.emit(k, "OPCALL", ["%s:2004" % self.var_written(k, "eax")],
+                                      ["?__lift_rdtsc@@YAXXZ:1004"], "s0=?__lift_rdtsc@@YAXXZ")
+                            continue
+                        t = self.temp("2008")
+                        self.emit(k, "OPCALL", [t], ["?__lift_rdtsc@@YAXXZ:1004"], "s0=?__lift_rdtsc@@YAXXZ")
+                        n = t.rsplit(":", 1)[0]
+                        self.emit(k, "OPASSIGN", ["%s:2004" % self.var_written(k, "eax")], ["%s:2004" % n])
+                        if True:
+                            h = self.temp("2008")
+                            self.emit(k, "shr", [h], [t, "32:1004"])
+                            self.emit(k, "OPASSIGN", ["%s:2004" % self.var_written(k, "edx")],
+                                      ["%s:2004" % h.rsplit(":", 1)[0]])
                     elif m in ("nop", "int3") or m.startswith("npad"):
                         pass
                     else:
@@ -1132,7 +1169,12 @@ class Lifter:
                 self.emit(k, "neg", [self.dst(k, ops[0], esp, ebp)], [self.opnd(k, ops[0], esp, ebp)])
             return flags
         if m in ("comiss", "ucomiss", "comisd", "ucomisd"):
-            return (self.opnd(k, ops[0], esp, ebp), self.opnd(k, ops[1], esp, ebp))
+            ab = (self.opnd(k, ops[0], esp, ebp), self.opnd(k, ops[1], esp, ebp))
+            if k + 1 < len(self.ins) and self.ins[k + 1].mnemonic == "lahf":
+                # `ucomiss; lahf; test ah, MASK; jcc`: ZF / PF / CF land where fnstsw puts C3 / C2 / C0, with the
+                # same meaning (unordered sets all three), so the x87 table (FCC) reads it
+                self.fcmp = ab
+            return ab
         if m in ("cvtsi2ss", "cvtsi2sd"):
             src = self.opnd(k, ops[1], esp, ebp)
             self.emit(k, "OPASSIGN", [self.dst(k, ops[0], esp, ebp)], [src])
@@ -1149,6 +1191,47 @@ class Lifter:
             self.emit(k, "OPASSIGN", [d], [src])
             return flags
         raise Unsupported("sse %s" % m)
+
+    def interlocked(self, k, i, esp, ebp):
+        """`lock xadd [m], r` is r = _InterlockedExchangeAdd(&m, r), `xchg [m], r` r = _InterlockedExchange(&m, r)
+        (the intrinsics compile to exactly these; a refcount's ++ / -- is xadd with 1 / -1)."""
+        ops = i.operands
+        mo, ro = (ops[0], ops[1]) if ops[0].type == X.X86_OP_MEM else (ops[1], ops[0])
+        if ro.type != X.X86_OP_REG or ro.size != 4:
+            raise Unsupported("interlocked operand")
+        mm = mo.mem
+        base = self.md.reg_name(mm.base) if mm.base else None
+        if not base or mm.index or base in ("esp", "ebp"):
+            raise Unsupported("interlocked address")
+        addr = "%s:1004" % self.var_read(k, full(base))
+        if mm.disp:
+            t = self.temp()
+            self.emit(k, "add", [t], [addr, "%d:1004" % mm.disp])
+            addr = t
+        r = full(self.md.reg_name(ro.reg))
+        fn = "?__lift_%s@@YAXXZ" % ("xadd" if "xadd" in i.mnemonic else "xchg")
+        v = self.consts.get(self.var_read(k, r))
+        d = self.one_def(k, r)
+        if v is None and d is not None and self.ins[d].mnemonic in ("mov", "or") and \
+                self.ins[d].operands[1].type == X.X86_OP_IMM and (self.ins[d].mnemonic == "mov" or
+                                                                  self.ins[d].operands[1].imm & 0xFFFFFFFF == 0xFFFFFFFF):
+            v = self.ins[d].operands[1].imm & 0xFFFFFFFF       # `or r, -1`: cl's short way to load -1
+        nx = self.ins[k + 1] if k + 1 < len(self.ins) else None
+        if "xadd" in i.mnemonic and v is not None and (v & 0xFFFFFFFF) in (1, 0xFFFFFFFF) and nx is not None and \
+                nx.mnemonic == ("inc" if v & 0xFFFFFFFF == 1 else "dec") and nx.op_str == r:
+            # `mov r, 1; lock xadd [m], r; inc r`: _InterlockedIncrement's new value (or -1 / dec: Decrement)
+            fn = "?__lift_%s@@YAXXZ" % ("inc" if v & 0xFFFFFFFF == 1 else "dec")
+            self.skip.add(k + 1)
+            a = [self.temp()]
+            self.emit(k, "OPARG", [a[0]], [addr])
+            res = "%s:1004" % self.var_written(k + 1, r)
+            self.emit(k, "OPCALL", [res], [fn + ":1004"] + a, "s0=" + fn)
+            return (res, "0:1004")                        # the inc / dec's flags: the new value against 0
+        a = [self.temp(), self.temp()]
+        self.emit(k, "OPARG", [a[0]], [addr])
+        self.emit(k, "OPARG", [a[1]], ["%s:1004" % self.var_read(k, r)])
+        self.emit(k, "OPCALL", ["%s:1004" % self.var_written(k, r)], [fn + ":1004"] + a, "s0=" + fn)
+        return None
 
     def block_fill(self, k, i):
         """`rep stosd` (edi, eax, ecx dwords): memset when eax is 0 or one byte repeated (cl's zeroing of a struct
@@ -1200,8 +1283,18 @@ class Lifter:
         a memcpy of the same size is what cl /O2 turns back into `mov ecx, N; rep movsd` (an intrinsic)."""
         unit = 4 if "movsd" in (i.mnemonic + " " + i.op_str) else 1
         n = "%s:1004" % self.var_read(k, "ecx")
-        self.note_aggregate(k, ("esi", "edi"), n, unit)
         c = self.consts.get(n.rsplit(":", 1)[0])
+        ds = self.reach_defs.get((k, "edi"), set())
+        d = next(iter(ds))[0] if len(ds) == 1 else None
+        if isinstance(d, int) and d in self.esp_alias and c and c > 0 and self.out_top is not None:
+            # `sub esp, 32; mov edi, esp; mov ecx, 8; lea esi, [x]; rep movsd`: a struct passed by value, copied
+            # into the argument area (M&B 00411920): one argument, the source's address, written *(S32*)addr
+            off = self.esp_alias[d]
+            self.note_aggregate(k, ("esi",), n, unit)
+            self.out_args[off] = ("%s:1004" % self.var_read(k, "esi"), c * unit)
+            self.bv_block[off] = c * unit
+            return
+        self.note_aggregate(k, ("esi", "edi"), n, unit)
         if c and c > 0:                                    # a constant count: the literal byte size, so cl
             n, unit = "%d:1004" % (c * unit), 1               # inlines the copy again (`mov ecx, 9; rep movsd`)
         if unit > 1:
@@ -1334,13 +1427,26 @@ class Lifter:
             raise Unsupported("x87 stack underflow (a value from the caller or a call)")
         return len(self.fpu) - 1 - j
 
+    def fild_type(self, k):
+        """The precision of a fild's value: the source converted the integer to float when the first float memory
+        operand the value meets is a dword (`(float)d * 1e-5f` is `fild; fmul dword`; as a double cl multiplies by
+        a qword constant), else to double."""
+        for x in self.ins[k + 1:k + 12]:
+            if x.mnemonic.startswith("j") or x.mnemonic in ("call", "ret", "fild", "fld", "fldz", "fld1"):
+                break
+            if x.mnemonic.startswith("f") and not x.mnemonic.startswith(("fi", "fnst", "fstsw", "fx")) and \
+                    any(o.type == X.X86_OP_MEM for o in x.operands):
+                op = next(o for o in x.operands if o.type == X.X86_OP_MEM)
+                return F4 if op.size == 4 else F8
+        return F8
+
     def x87(self, k, i, esp, ebp):
         m, ops = i.mnemonic, i.operands
         if m in ("fld", "fild"):
             if ops[0].type == X.X86_OP_REG:
                 self.fpu.append(self.fpu[self.st(ops[0])])
             elif m == "fild":
-                t = self.temp(F8)
+                t = self.temp(self.fild_type(k))
                 src = self.opnd(k, ops[0], esp, ebp).rsplit(":", 1)[0] + ":" + MTY.get(ops[0].size, "1004")
                 self.emit(k, "OPASSIGN", [t], [src])
                 self.fpu.append(t)
@@ -1526,47 +1632,299 @@ class Lifter:
             self.tls_base.add(j)
             self.skip.add(j)
 
-    def magic_div(self, k):
-        """cl's signed division by a constant: `mov eax, M; imul r; [sar edx, S;] mov t, edx; shr t, 31;
-        add d, t` (d, t = eax/edx in either order) is r / D. D is recovered from M and S and checked on
-        sample dividends. Returns (r, D, index of the add, d)."""
+    def find_divs(self):
+        """cl's division by a constant, found before the walk: `mov eax, M; imul x` (signed) or `mul x` (unsigned),
+        then the fix-ups on edx: [add / sub edx, x;] [sar / shr edx, S;] and for a signed quotient `mov t, edx;
+        shr t, 31; add t, edx` (or `add edx, t`). cl's scheduler may put unrelated instructions between them.
+        D is recovered from M, the fix-up and S and checked on sample dividends (D < 0 too: cl divides by -D and
+        negates in one step). -> {index of the mul: (operand x, D, signed, index of the last step, result reg)};
+        the mov and the fix-ups go in self.skip."""
+        out = {}
+        blk = {}
+        for n, b in enumerate(self.bl):
+            for k in b:
+                blk[k] = n
         ins = self.ins
-        if k + 4 >= len(ins):
+        for k, i in enumerate(ins):
+            if i.mnemonic not in ("imul", "mul") or len(i.operands) != 1:
+                continue
+            defs = self.reach_defs.get((k, "eax"), set())
+            if len(defs) != 1:
+                continue
+            (km, _), = defs
+            if not isinstance(km, int) or blk.get(km) != blk.get(k):
+                continue
+            mi = ins[km]
+            if not (mi.mnemonic == "mov" and mi.op_str.startswith("eax, ") and mi.operands[1].type == X.X86_OP_IMM):
+                continue
+            M = mi.operands[1].imm & 0xFFFFFFFF
+            xop = i.operands[0]
+            src = full(self.md.reg_name(xop.reg)) if xop.type == X.X86_OP_REG else None
+            if src == "eax":
+                continue
+            if src == "edx":
+                src = None                                # `imul edx`: x is gone after it (a fix-up reads a copy)
+            signed = i.mnemonic == "imul"
+            watch = {"edx"}                               # eax (the low half) and x may be reused by other code
+            steps = []                                    # the chain, in order, skipping unrelated instructions
+            j, t, fix, S, dreg = k + 1, None, 0, 0, "edx"
+            want = ["fix", "shift", "mov", "shr31", "add"] if signed else ["fix", "shift"]
+            while j < len(ins) and blk.get(j) == blk.get(k) and want:
+                x = ins[j]
+                o = x.op_str
+                rd, wr = self.acc[j]
+                if want[0] == "fix" and x.mnemonic in ("add", "sub") and o.startswith("edx, ") and \
+                        x.operands[1].type in (X.X86_OP_REG, X.X86_OP_MEM) and (o == "edx, " + src if src else
+                                                                                x.operands[1].type == X.X86_OP_MEM):
+                    fix, steps = (1 if x.mnemonic == "add" else -1), steps + [j]
+                    want = want[1:]
+                elif want[0] in ("fix", "shift") and x.mnemonic == ("sar" if signed else "shr") and \
+                        o.startswith("edx, ") and x.operands[1].type == X.X86_OP_IMM:
+                    S, steps, want = x.operands[1].imm, steps + [j], want[want.index("shift") + 1:]
+                elif signed and want[0] in ("fix", "shift", "mov") and x.mnemonic == "mov" and o.endswith(", edx") \
+                        and x.operands[0].type == X.X86_OP_REG:
+                    t = full(self.md.reg_name(x.operands[0].reg))
+                    watch.add(t)
+                    steps, want = steps + [j], want[want.index("mov") + 1:]
+                elif signed and want[0] == "shr31" and x.mnemonic == "shr" and o == t + ", 0x1f":
+                    steps, want = steps + [j], want[1:]
+                elif signed and want[0] == "add" and x.mnemonic == "add" and \
+                        sorted(o.replace(" ", "").split(",")) == sorted([t, "edx"]):
+                    dreg = o.split(",")[0]
+                    steps, want = steps + [j], []
+                elif x.mnemonic in ("call", "ret") or x.mnemonic.startswith("j") or (rd | wr) & watch:
+                    break                                 # something else touches the chain's registers
+                elif src in wr and want and want[0] == "fix":
+                    want = want[1:]                       # x overwritten: no fix-up from it
+                j += 1
+            if signed and want:
+                continue
+            if not signed and not steps:
+                pass                                      # `mul x` with edx used as is: S = 0
+            kend = steps[-1] if steps else k
+            # the chain's other registers must die: only dreg's value is read later
+            chain = {k} | set(steps)
+            others = ({"eax", "edx", t} - {dreg, None}) if signed else {"eax"}
+
+            def read_outside(d):
+                return any(kk not in chain and self.ins[kk].mnemonic != "ret" for kk in self.readers(d))
+            if any(read_outside((s2, r)) for s2 in chain for r in others & self.acc[s2][1]):
+                continue
+            if signed and dreg not in self.acc[kend][1]:
+                continue
+            if signed:
+                Meff = (M - (1 << 32) if M & 0x80000000 else M) + fix * (1 << 32)
+                if not Meff:
+                    continue
+                D = round((1 << (32 + S)) / Meff)
+
+                def q(x):
+                    hi = (x * (M - (1 << 32) if M & 0x80000000 else M)) >> 32
+                    hi = (hi + fix * x) >> S
+                    return hi + (1 if hi < 0 else 0)
+
+                def tdiv(x, d):
+                    r = abs(x) // abs(d)
+                    return r if (x < 0) == (d < 0) else -r
+                samples = (0, 1, abs(D) - 1, abs(D), abs(D) + 1, 12345, 7 * abs(D) + 3, (1 << 31) - 1, -1, -abs(D),
+                           -(1 << 31), 99991, -77777, 3 * abs(D) - 1, -(5 * abs(D)) - 1)
+                if abs(D) < 2 or any(q(x) != tdiv(x, D) for x in samples):
+                    continue
+            else:
+                if fix:
+                    continue
+                D = round((1 << (32 + S)) / M) if M else 0
+                samples = (0, 1, D - 1, D, D + 1, 12345, 7 * D + 3, (1 << 32) - 1, (1 << 31), 99991, 3 * D - 1)
+                if D < 2 or any(((x * M) >> 32 >> S) != x // D for x in samples):
+                    continue
+            out[k] = (xop, D, signed, kend, dreg)
+            self.skip.add(km)
+            self.skip.update(steps)
+        return out
+
+    # ---- __int64 arithmetic: register / memory pairs
+    def mem_pair(self, k1, o1, k2, o2):
+        """Are o1 (at k1) and o2 (at k2) the low and high dwords of one 8-byte memory operand?"""
+        if o1.type != X.X86_OP_MEM or o2.type != X.X86_OP_MEM or o1.size != 4 or o2.size != 4:
+            return False
+        m1, m2 = o1.mem, o2.mem
+        if (m1.base, m1.index, m1.scale, m1.segment) != (m2.base, m2.index, m2.scale, m2.segment) or \
+                m2.disp != m1.disp + 4:
+            return False
+        for r in (m1.base, m1.index):
+            if r and self.md.reg_name(r) not in ("esp", "ebp"):
+                n = full(self.md.reg_name(r))
+                if self.reach_defs.get((k1, n)) != self.reach_defs.get((k2, n)):
+                    return False
+        return True
+
+    def const_of(self, k, op):
+        """The 32-bit value of an immediate, or of a register whose one definition is `mov r, imm` / `xor r, r`."""
+        if op.type == X.X86_OP_IMM:
+            return op.imm & 0xFFFFFFFF
+        if op.type != X.X86_OP_REG:
             return None
-        i0, i1 = ins[k], ins[k + 1]
-        if not (i0.mnemonic == "mov" and i0.op_str.startswith("eax, ") and i0.operands[1].type == X.X86_OP_IMM and
-                i1.mnemonic == "imul" and len(i1.operands) == 1 and i1.operands[0].type == X.X86_OP_REG):
+        d = self.one_def(k, full(self.md.reg_name(op.reg)))
+        if d is None:
             return None
-        M = i0.operands[1].imm & 0xFFFFFFFF
-        j, S = k + 2, 0
-        src = self.md.reg_name(i1.operands[0].reg)
-        addback = ins[j].mnemonic == "add" and ins[j].op_str == "edx, " + src   # a magic >= 2^31: add x back
-        if addback:
-            j += 1
-        if ins[j].mnemonic == "sar" and ins[j].op_str.startswith("edx, "):
-            S, j = ins[j].operands[1].imm, j + 1
-        a, b, c = ins[j], ins[j + 1] if j + 1 < len(ins) else None, ins[j + 2] if j + 2 < len(ins) else None
-        if not (a.mnemonic == "mov" and a.op_str.endswith(", edx") and b is not None and b.mnemonic == "shr" and
-                b.op_str == a.op_str.split(",")[0] + ", 0x1f" and c is not None and c.mnemonic == "add"):
+        i = self.ins[d]
+        if i.mnemonic == "mov" and i.operands[1].type == X.X86_OP_IMM and i.operands[0].size == 4:
+            return i.operands[1].imm & 0xFFFFFFFF
+        if i.mnemonic == "xor" and i.operands[1].type == X.X86_OP_REG and i.operands[0].reg == i.operands[1].reg:
+            return 0
+        return None
+
+    def readers(self, d):
+        """Instructions that read the value defined at d = (index, reg); a partial write (`fnstsw ax`,
+        `mov al, 1`) keeps the rest of the register but does not read the value."""
+        r = d[1]
+        out = []
+        for (kk, rr), ds in self.reach_defs.items():
+            if rr == r and d in ds:
+                rd = {full(self.md.reg_name(x)) for x in self.ins[kk].regs_access()[0]}
+                # a call's ecx read only asks whether it is a __thiscall: a sub / sbb result in ecx is no `this`
+                if r in rd or self.ins[kk].mnemonic == "ret" or (r != "ecx" and (
+                        self.ins[kk].mnemonic == "call" or self.is_tailjmp(self.ins[kk]))):
+                    out.append(kk)
+        return out
+
+    def one_def(self, k, r):
+        ds = self.reach_defs.get((k, r), set())
+        if len(ds) != 1:
             return None
-        t = a.op_str.split(",")[0]
-        dreg = c.op_str.split(",")[0]
-        if sorted(c.op_str.replace(" ", "").split(",")) != sorted([t, "edx"]) or dreg not in ("eax", "edx", t):
-            return None
-        Ms = M - (1 << 32) if M & 0x80000000 else M
-        D = round((1 << (32 + S)) / M) if M else 0
-        if D < 2:
-            return None
-        def q(x):
-            hi = (x * Ms) >> 32
-            if addback:
-                hi += x
-            hi >>= S
-            return hi + (1 if hi < 0 else 0)
-        for x in (0, 1, D - 1, D, D + 1, 12345, 7 * D + 3, (1 << 31) - 1, -1, -D, -(1 << 31), 99991, -77777):
-            if q(x) != int(x / D):
+        (d, _), = ds
+        return d if isinstance(d, int) else None
+
+    def pair_value(self, kl, ol, kh, oh, used):
+        """The 64-bit value of the pair (ol at kl, oh at kh): ("mem", k, op) for an 8-byte memory operand (read at
+        k), ("imm", v), ("sx", k, op) / ("zx", k, op) for a 32-bit value sign- / zero-extended. Registers loaded
+        for it go in used (index, reg)."""
+        cl_, ch_ = self.const_of(kl, ol), self.const_of(kh, oh)
+        if cl_ is not None and ch_ is not None:          # constants, also kept in registers (`xor ebx, ebx`)
+            v = (ch_ << 32) | cl_
+            return ("imm", v - (1 << 64) if v >> 63 else v)
+        if ch_ == 0 and ol.type in (X.X86_OP_REG, X.X86_OP_MEM) and oh.type == X.X86_OP_REG:
+            return ("zx", kl, ol)
+        if self.mem_pair(kl, ol, kh, oh):
+            return ("mem", kl, ol)
+        if oh.type == X.X86_OP_IMM and oh.imm & 0xFFFFFFFF == 0 and ol.type in (X.X86_OP_REG, X.X86_OP_MEM):
+            return ("zx", kl, ol)
+        if (ol.type == X.X86_OP_REG) != (oh.type == X.X86_OP_REG) and X.X86_OP_IMM not in (ol.type, oh.type):
+            # one half loaded into a register first: `mov edx, [m]; ...; sub ecx, edx; sbb eax, [m+4]`
+            kr, orr = (kl, ol) if ol.type == X.X86_OP_REG else (kh, oh)
+            r = full(self.md.reg_name(orr.reg))
+            d = self.one_def(kr, r)
+            if d is None or self.ins[d].mnemonic != "mov" or self.ins[d].operands[1].type != X.X86_OP_MEM:
                 return None
-        return full(src), D, j + 2, full(dreg)
+            ml = (d, self.ins[d].operands[1]) if orr is ol else (kl, ol)
+            mh = (d, self.ins[d].operands[1]) if orr is oh else (kh, oh)
+            if not self.mem_pair(ml[0], ml[1], mh[0], mh[1]):
+                return None
+            used.append((d, r))
+            return ("mem", ml[0], ml[1])
+        if ol.type == X.X86_OP_REG and oh.type == X.X86_OP_REG:
+            rl, rh = full(self.md.reg_name(ol.reg)), full(self.md.reg_name(oh.reg))
+            dh = self.one_def(kh, rh)
+            if dh is not None and self.ins[dh].mnemonic == "cdq" and rl == "eax" and rh == "edx" and \
+                    self.reach_defs.get((dh, "eax")) == self.reach_defs.get((kl, "eax")):
+                return ("sx", kl, ol)
+            dl, dh = self.one_def(kl, rl), self.one_def(kh, rh)
+            if dl is None or dh is None:
+                return None
+            il, ih = self.ins[dl], self.ins[dh]
+            if il.mnemonic == ih.mnemonic == "mov" and self.mem_pair(dl, il.operands[1], dh, ih.operands[1]):
+                used += [(dl, rl), (dh, rh)]
+                return ("mem", dl, il.operands[1])
+            if dl == dh and il.mnemonic == "call" and rl == "eax" and rh == "edx":
+                return ("call", dl)                       # an __int64 returned in edx:eax (`_allmul`, a callee)
+            if ih.mnemonic == "cdq" and rl == "eax" and rh == "edx" and self.one_def(dh, "eax") == dl:
+                return ("sx", kl, ol)
+            if ih.mnemonic == "xor" and ih.operands[0].reg == ih.operands[1].reg:
+                return ("zx", kl, ol)
+        return None
+
+    def find_pairs(self):
+        """cl's __int64 add / sub: `add lo, x; adc hi, y` (`sub` / `sbb`) on a register pair loaded from memory or
+        on memory in place, the result stored to memory. -> {index of the last instruction: (op, dst, a, b)};
+        the pieces go in self.skip."""
+        out = {}
+        blk = {k: n for n, b in enumerate(self.bl) for k in b}
+        ins = self.ins
+        for kh, ih in enumerate(ins):
+            if ih.mnemonic not in ("adc", "sbb") or len(ih.operands) != 2:
+                continue
+            if ih.operands[0].type == X.X86_OP_REG and ih.operands[1].type == X.X86_OP_REG and \
+                    ih.operands[0].reg == ih.operands[1].reg:
+                continue                                  # `sbb r, r`: a carry mask (setcc)
+            kl = kh - 1
+            while kl >= 0 and blk.get(kl) == blk.get(kh) and (ins[kl].mnemonic in ("mov", "lea", "push", "pop") or (
+                    ins[kl].mnemonic.startswith("f") and not ins[kl].mnemonic.startswith(("fcomi", "fucomi")))):
+                kl -= 1                                   # nothing that writes EFLAGS (x87 code keeps them)
+            want = "add" if ih.mnemonic == "adc" else "sub"
+            if kl < 0 or blk.get(kl) != blk.get(kh) or ins[kl].mnemonic != want or len(ins[kl].operands) != 2:
+                continue
+            il = ins[kl]
+            Lo, Ho = il.operands[0], ih.operands[0]
+            used = []
+            b = self.pair_value(kl, il.operands[1], kh, ih.operands[1], used)
+            if b is None:
+                continue
+            pieces = [kl, kh]
+            if Lo.type == X.X86_OP_MEM:                   # in place: `sub [m], x; sbb [m+4], y`
+                if not self.mem_pair(kl, Lo, kh, Ho):
+                    continue
+                dst = a = ("mem", kl, Lo)
+                kend = kh
+            else:
+                if Ho.type != X.X86_OP_REG:
+                    continue
+                rl, rh = full(self.md.reg_name(Lo.reg)), full(self.md.reg_name(Ho.reg))
+                a = self.pair_value(kl, Lo, kh, Ho, used)
+                if a is None or a[0] != "mem":
+                    continue
+                # the result: read only by `mov [p], lo` and `mov [p+4], hi`
+                # (a ret's read of eax is the conservative "maybe returned": a store's register is not the result)
+                rdl = [x for x in self.readers((kl, rl)) if x != kh and ins[x].mnemonic != "ret"]
+                rdh = [x for x in self.readers((kh, rh)) if ins[x].mnemonic != "ret"]
+                if len(rdl) != 1 or len(rdh) != 1:
+                    continue
+                sl, sh = ins[rdl[0]], ins[rdh[0]]
+                if not (sl.mnemonic == sh.mnemonic == "mov" and sl.operands[1].type == sh.operands[1].type ==
+                        X.X86_OP_REG and full(self.md.reg_name(sl.operands[1].reg)) == rl and
+                        full(self.md.reg_name(sh.operands[1].reg)) == rh and
+                        self.mem_pair(rdl[0], sl.operands[0], rdh[0], sh.operands[0])):
+                    continue
+                if blk.get(rdl[0]) != blk.get(kh) or blk.get(rdh[0]) != blk.get(kh):
+                    continue
+                dst = ("mem", rdl[0], sl.operands[0])
+                kend = max(rdl[0], rdh[0], kh)
+                pieces += [rdl[0], rdh[0]]
+            # the loaded registers must serve only this operation
+            ok = True
+            for d, r in used:
+                if any(x not in (kl, kh) for x in self.readers((d, r))):
+                    ok = False
+            if not ok:
+                continue
+            out[kend] = (ARITH[want], dst, a, b)
+            self.call64.update(v[1] for v in (a, b) if v[0] == "call")
+            self.skip.update(set(pieces) - {kend} | {d for d, _ in used})
+            self.pair_pieces.update(pieces)
+            self.pair_end.add(kend)
+        return out
+
+    def pair_tok(self, v):
+        if v[0] == "imm":
+            return "%d:1008" % v[1]
+        if v[0] == "call":
+            return "%s:1008" % self.var_written(v[1], "eax")
+        k, op = v[1], v[2]
+        esp, ebp = self.at[k]
+        t = self.opnd(k, op, esp, ebp)
+        base, ty = t.rsplit(":", 1)
+        if v[0] == "mem":
+            return base + ":1008"
+        return base + (":1004" if v[0] == "sx" else ":2004")
 
     def frame_offsets(self):
         """Entry-relative offsets of the frame slots the lifted code names (`_lN` is -N)."""
@@ -1668,6 +2026,8 @@ class Lifter:
         # stored through the esp copy, each loaded from consecutive offsets of one base, is `*(S12*)(base + off)`
         self.byval = []
         for q, o in enumerate(offs):
+            if o in self.bv_block:
+                self.byval.append((q, None, 0, self.bv_block.pop(o)))   # copied in by rep movsd: args[q] is the source
             if o in self.bvctor:
                 cv, n = self.bvctor.pop(o)
                 self.byval.append((q, None, cv, -n))        # a class with a copy constructor (FUN_<cv>)
@@ -1683,7 +2043,7 @@ class Lifter:
                     self.byval.append((i, src[0][0], src[0][1], 4 * (j - i)))
             i = max(j, i + 1)
         if any(n > 0 for *_r, n in self.byval):
-            for i, b, disp, n in reversed([x for x in self.byval if x[3] > 0]):
+            for i, b, disp, n in reversed([x for x in self.byval if x[3] > 0 and x[1] is not None]):
                 t = self.temp()
                 self.lines.append("I 0 add 0 0 | %s <- %s:1004 %d:1004" % (t, b, disp))
                 args[i:i + n // 4] = [t]
@@ -1715,7 +2075,8 @@ class Lifter:
                 return any(u.mnemonic == "mov" and u.operands[0].type == X.X86_OP_MEM and
                            u.op_str.endswith(", " + reg) for u in self.ins[j + 1:j + 8])
             return any(x[0] not in ("entry", "undef") and self.ins[x[0]].mnemonic != "call" and not arg_only(x[0])
-                       and not zero_for_stores(x[0]) for x in defs)
+                       and not zero_for_stores(x[0]) and x[0] not in self.pair_pieces for x in defs)   # (folded
+            #                                                         into an __int64 store: not a return value)
         root = self.find(d)
         return any(self.find(v) == root for (kk, rr), v in self.reach.items() if rr == d[1])
 
@@ -1736,13 +2097,25 @@ class Lifter:
                         restored.add(self.ins[j].op_str)
                     j -= 1
         out |= self.eh_ins
-        lead = True
+        # `add esp, N` in an epilogue (before a ret, among the pops): a `sub esp, N` before the first call or branch
+        # is the frame, wherever cl scheduled it (`mov ecx, [ecx]; sub esp, 0x200`: M&B 0049ccc0)
+        frame_adds = set()
+        for k, i in enumerate(self.ins):
+            if i.mnemonic == "ret":
+                j = k - 1
+                while j >= 0 and self.ins[j].mnemonic in ("pop", "add", "mov", "leave"):
+                    if self.ins[j].mnemonic == "add" and self.ins[j].op_str.startswith("esp, "):
+                        frame_adds.add(self.ins[j].op_str[5:])
+                    j -= 1
+        lead, aligned = True, False
         saved, written = set(), set()
         for k, i in enumerate(self.ins[:first_flow]):
             m, o = i.mnemonic, i.op_str
             if k in self.eh_ins:
                 continue
-            if m == "push" and o in CALLEE_SAVED and o in restored and o not in saved and o not in written:
+            if m == "push" and o in CALLEE_SAVED and o in restored and (
+                    (o not in saved and o not in written) or (o == "ebp" and aligned)):   # an aligned frame saves
+                #                                                                         ebp again after `and esp`
                 saved.add(o)
                 out.add(k)                          # saved here (once, before any write), restored before the ret
                 continue
@@ -1755,10 +2128,11 @@ class Lifter:
             elif m == "mov" and o == "ebp, esp":
                 out.add(k)
             elif m == "sub" and o.startswith("esp, ") and (lead or any(
-                    self.ins[q].mnemonic == "push" for q in range(k + 1, first_flow))):
+                    self.ins[q].mnemonic == "push" for q in range(k + 1, first_flow)) or o[5:] in frame_adds):
                 out.add(k)                          # also a late one: pushes follow before the first call, so
                 #                                     the room is the frame (a local passed by address), not arguments
             elif m == "and" and o.startswith("esp, "):
+                aligned = True
                 out.add(k)                          # an aligned frame: offsets stay relative to the aligned esp
             else:
                 lead = False
