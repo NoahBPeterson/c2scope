@@ -42,8 +42,8 @@ def ours_bytes(obj, va):
                 starts = sorted(o for n2, (s_, o, sz2) in syms.items() if s_ == si and o > off and
                                 not (hint and n2.startswith("__catch$" + nm) and o < off + hint))
                 mine = sec["data"][off:starts[0] if starts else len(sec["data"])]
-                if starts:
-                    mine = mine.rstrip(b"\xcc")
+                mine = mine.rstrip(b"\xcc")       # padding, or the int3 cl puts after a noreturn call (a row's
+                #                                    size ends at the call: M&B 0x40f776, `throw;`)
                 if hint and len(mine) > hint and any(n2.startswith("__catch$" + nm) for n2 in syms):
                     mine = mine[:hint]             # the row counts the catch blocks (15.00: `__catch$` symbols)
             rel = sorted({v - off for v, _s, _t in sec["relocs"] if off <= v < off + len(mine)})

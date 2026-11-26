@@ -258,7 +258,8 @@ class LiftEmitter(il2c.Emitter):
             e = "(((il2c_gm%d*)(%s))->*(*(il2c_gp%d*)g_%08x))(%s)" % (n, argv[0], n, g, ", ".join(
                 "(%s)(%s)" % (t, a) for t, a in zip(tys, argv[1:])))
             return ("%s = (%s)%s;" % (self.lvalue(d[0]), rty, e)) if d else e + ";"
-        mf = re.match(r"^\?__lift_(sqrt|abs|sin|cos|atan2)@@YAXXZ$", tgt)
+        mf = re.match(r"^\?__lift_(sqrt|abs|sin|cos|tan|atan2|exp|log|log10|asin|acos|atan|sinh|cosh|tanh|pow|"
+                      r"fmod)@@YAXXZ$", tgt)
         if mf:                                   # x87 fsqrt / fabs / fsin / fcos / fpatan: intrinsics at /O2
             self.needs_math = True
             fn = {"abs": "fabs"}.get(mf.group(1), mf.group(1))
@@ -290,6 +291,10 @@ class LiftEmitter(il2c.Emitter):
         if not m:
             return super().call(L)
         va = int(m.group(1), 16)
+        if L["notes"].get("noreturn") == "1" and L["notes"].get("stdcall") == "1" and not d and not self.lang_c \
+                and len(srcs) == 3 and all(self.rvalue(a, L).strip("()").replace("int", "").strip("() ") == "0"
+                                           for a in srcs[1:]):
+            return "throw;"                      # `push 0; push 0; call _CxxThrowException`: a rethrow
         argv = [self.rvalue(a, L) for a in srcs[1:]]
         # parameter types from the argument tokens: a float stays a float (an `unsigned int` parameter would convert
         # it, a `...` one would promote it to double)
@@ -316,6 +321,8 @@ class LiftEmitter(il2c.Emitter):
                 tys[q] = st
                 argv[q] = "*(%s*)(%s)" % (st, argv[q])
         c = self.calls.setdefault(va, {"sigs": set(), "this_sigs": set(), "ret": False})
+        if L["notes"].get("noreturn") == "1":
+            c["noreturn"] = True
         if L["notes"].get("thiscall") == "1":
             if not argv:
                 raise Unsupported("thiscall without this")
@@ -383,6 +390,49 @@ def pure(rhs):
               "(char)", "(bool)", "(void*)", "(signed char)", "(__int64)", "(unsigned __int64)"):
         r = r.replace(c, "")
     return not PURE_CALL.search(r) and not re.search(r"\)\s*\(", r)
+
+
+def drop_unused_decls(body):
+    """A declared local nothing reads or writes (a call's dropped result): at /Od every declared local gets a
+    frame slot (`push ecx`, an `mov esp, ebp` epilogue: Spore 012538b0), so leave none behind."""
+    for m in list(re.finditer(r"(?m)^    [\w ]+?\*? ((?:t|v_l)\d+)(?:\[\d+\])?;\n", body)):
+        if len(re.findall(r"\b%s\b" % m.group(1), body)) == 1:
+            body = body.replace(m.group(0), "", 1)
+    return body
+
+
+def fold_aggregates(body, lf):
+    """lift2il's aggregates (a block copy's frame source / destination of a known size): the slots inside become
+    elements of one array declared at the lowest one (`int v_l36[9]`; `v_l32` -> `*(float*)&v_l36[1]`)."""
+    for off, n in sorted(getattr(lf, "aggregates", ())):
+        N = -off
+        if n % 4 or n > N:
+            continue
+        base = "v_l%d" % N
+        decl = dict((m.group(2), m.group(1)) for m in re.finditer(r"(?m)^    ([\w ]+?\*?) (v_l\d+);$", body))
+        if base not in decl:
+            continue
+        inner = [M for M in range(N, N - n, -4) if "v_l%d" % M in decl]
+        lines = body.split("\n")
+        out = []
+        for l in lines:
+            m = re.match(r"^    [\w ]+?\*? (v_l\d+);$", l)
+            if m and m.group(1) in ["v_l%d" % M for M in inner]:
+                if m.group(1) == base:
+                    out.append("    int %s[%d];" % (base, n // 4))
+                continue
+            for M in inner:
+                v, k, ty = "v_l%d" % M, (N - M) // 4, decl["v_l%d" % M]
+                el = "%s[%d]" % (base, k)
+                l = re.sub(r"\*\(([\w ]+\*?)\*\)&\(%s\)" % v, r"*(\1*)&%s" % el, l)
+                if M == N:
+                    l = re.sub(r"(?<![\w&])%s\b(?!\[)" % v, "(*(%s*)&%s)" % (ty, el), l)
+                else:
+                    l = re.sub(r"&%s\b" % v, "&%s" % el, l)
+                    l = re.sub(r"(?<![\w&])%s\b(?!\[)" % v, "(*(%s*)&%s)" % (ty, el), l)
+            out.append(l)
+        body = "\n".join(out)
+    return body
 
 
 def size_addressed_locals(body, lf):
@@ -1216,7 +1266,7 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
             body = body.replace("{", "{\n    /* lift2il: EH frame not reproduced: %s */" % lf.eh_unsupported.replace("*/", "* /"), 1)
     if os.environ.get("L2C_DROP_DEAD", "1") == "1":
         body = drop_dead(body)
-    body = size_addressed_locals(body, lf)
+    body = drop_unused_decls(size_addressed_locals(fold_aggregates(body, lf), lf))
     pty = lambda p: CTYPE.get(lf.arg_types.get(int(p[1:]), "1004"), "int")
     if pty("a4") is None:
         pass
@@ -1254,9 +1304,10 @@ def heads(em, lang_c, cxx=False):
             continue                             # a recursive call: the definition declares it
         r = c.get("fret") or ("int" if c["ret"] else "void")
         if c["this_sigs"]:
-            mem = " ".join("%s FUN_%08x(%s);" % (r, cva, ", ".join(sig)) for sig in sorted(c["this_sigs"]))
+            nr = "__declspec(noreturn) " if c.get("noreturn") else ""
+            mem = " ".join("%s%s FUN_%08x(%s);" % (nr, r, cva, ", ".join(sig)) for sig in sorted(c["this_sigs"]))
             head.append("struct C_%08x { %s };" % (cva, mem))
-        if c["sigs"] or not c["this_sigs"]:
+        if (c["sigs"] or not c["this_sigs"]) and cva != getattr(em, "self_va", None):
             sigs = sorted(c["sigs"])
             if len(sigs) > 1 and any(t != "unsigned int" for sg in sigs for t in sg):
                 if not getattr(em, "partial", False):
@@ -1271,7 +1322,8 @@ def heads(em, lang_c, cxx=False):
                 plist_c = ", ".join(sigs[0])         # fixed: a float argument must not be promoted
             else:
                 plist_c = "..." if not lang_c else ""
-            head.append('%s%s %s FUN_%08x(%s);' % (ext, r, cc, cva, plist_c))
+            head.append('%s%s%s %s FUN_%08x(%s);' % (ext, "__declspec(noreturn) " if c.get("noreturn") else "",
+                                                      r, cc, cva, plist_c))
     return [h.replace('extern "C" unsigned char', 'extern unsigned char') if lang_c else h for h in head]
 
 

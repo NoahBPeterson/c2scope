@@ -74,9 +74,9 @@ def obj_function(obj, sym):
         mine = sec["data"][off:off + msz]
     else:
         starts = sorted(o for s_, o, _z in syms.values() if s_ == si and o > off)
-        mine = sec["data"][off:starts[0] if starts else len(sec["data"])]
-        if starts:
-            mine = mine.rstrip(b"\xcc")
+        # trailing int3 dropped even when no symbol follows, as spore-decomp's fingerprint.py does (under /Gy a
+        # function is alone in its section; cl's int3 after a noreturn call: M&B 0x40f776, a bare `throw;`)
+        mine = sec["data"][off:starts[0] if starts else len(sec["data"])].rstrip(b"\xcc")
     # SECREL (11) and SECTION (10) give a section-relative constant (a thread-local variable's offset in .tls) that the
     # linker assigns: retail has no fixup there, and the value is not the compiler's. Returned apart, to be masked.
     rel = sorted({v - off for v, _s, t in sec["relocs"] if off <= v < off + len(mine) and t not in (10, 11)})
@@ -93,6 +93,7 @@ def score(obj, row, img, sym=None):
         mine, rels, secrel, span = obj_function(obj, sym) if sym else w8_diff.ours_bytes(obj, va) + ([], None)
     except RuntimeError:
         return dict(status="NO-SYMBOL")
+    mine = bytes(mine).rstrip(b"\xcc")         # fingerprint.py drops our trailing int3 whatever path found the bytes
     theirs = bytes(img.bytes_at(va, size))
     mask = corpusmod.unpack(row["mask"]) | {o + k for o in secrel for k in range(4)}
     n = min(len(mine), size)

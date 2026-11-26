@@ -111,11 +111,13 @@ Pass compiler flags literally after `--`; in zsh a `$FLAGS` variable holding sev
 | `tools/ccache.py` | content cache behind every traced compile (`stats`, `clear`; `CCACHE=0` bypasses it) | tracer.md |
 | `tools/slotwant.py` | frame-colouring inverse: a wanted slot layout (`with:A,B`, `frame=N`, ...) -> source edits (scope, share, array size), each verified by a traced compile | docs/c2/slotwant.md |
 | `tools/il2c_lift.py lift` | lift one function of a retail x86 binary to C++ that cl should compile back to its bytes (`--partial` drafts, `--outline` per block) | docs/c2/lift2il.md |
+| `tools/lift2il64.py` | the same for x64 (MSVC 2012 / cl 17.00): `il`, `unit`, `check` (compile with `C2_CL64` and compare), `bench`; `tidy64.py` / `tidycheck64.py` make the result readable | docs/c2/lift2il64.md |
+| `tools/x64check.py` | compile one C++ function with an x64 cl and compare it with the executable, byte by byte and relocation by relocation | docs/c2/lift2il64.md |
 
 Worked example: `docs/c2/frontend.md`, "Applied to 0x008e7d40", is the full story of a Fallout 3 function that
 went from 98 differing instructions to byte-exact, and `helpersweep` finds that match automatically in 11 compiles.
 
-## Lift a function from a binary (x86 only)
+## Lift a function from a binary
 
 `lift2il` reads a function's machine code from a 32-bit PE built by MSVC 7.1 / 8 / 9 (c2 13.10, 14.00, 15.00)
 and writes C++ for it; compile that at the binary's flags and it should give the same bytes back.
@@ -132,7 +134,18 @@ on three games' functions (lbench, a fixed sample of 300-400 functions per game)
 Fallout 3's, 22% of Mount & Blade's and 23% of Spore's recompile byte-identical (the largest so far: 5,237 bytes,
 1,778 instructions with 312 branches), most of them under 256 bytes; many
 more lift and compile but differ in register allocation, scheduling or frame layout, which the tools above explain.
-What it does and does not lift: docs/c2/lift2il.md. Not for x64.
+What it does and does not lift: docs/c2/lift2il.md.
+
+For x64, `lift2il64.py` does the same for code built by Visual Studio 2012 (cl 17.00). It writes the C++, then
+compiles it and checks it against the executable in one step:
+
+```
+export C2_CL64="wine /path/to/VC/bin/x86_amd64/cl.exe"
+uv run python tools/lift2il64.py check 1401234560 --binary game.exe --flags /O2,/GS-
+```
+
+On 1,000 functions of a retail x64 game, 51% recompile byte-identical: 82% of the ones up to 32 bytes and 14% of
+those between 129 and 256 bytes. docs/c2/lift2il64.md has the details.
 
 ## License
 

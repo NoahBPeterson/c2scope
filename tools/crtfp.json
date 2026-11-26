@@ -1,0 +1,263 @@
+{
+ "vs2005-libcmt": {
+  "sqrt": {
+   "stub": [
+    "sub esp, 0xc",
+    "fst qword ptr [esp]",
+    "call A",
+    "call A",
+    "add esp, 0xc",
+    "ret "
+   ],
+   "cores": [
+    [
+     "mov eax, dword ptr [esp + 8]",
+     "and eax, A",
+     "cmp eax, A",
+     "je A",
+     "ret ",
+     "mov eax, dword ptr [esp + 8]",
+     "ret ",
+     "cmp word ptr [esp], 0x27f",
+     "je A",
+     "fldcw word ptr [esp]",
+     "pop edx",
+     "ret ",
+     "mov ax, word ptr [esp]",
+     "cmp ax, 0x27f"
+    ],
+    [
+     "push edx",
+     "wait ",
+     "fnstcw word ptr [esp]",
+     "mov eax, dword ptr [esp + 0xc]",
+     "je A",
+     "cmp word ptr [esp], 0x27f",
+     "je A",
+     "call A",
+     "test eax, A",
+     "jne A",
+     "fsqrt ",
+     "cmp dword ptr [A], 0",
+     "jne A",
+     "mov edx, 5"
+    ]
+   ],
+   "args": 1
+  },
+  "exp": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "log": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "log10": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "sin": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "cos": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "tan": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "asin": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "acos": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "atan": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "sinh": {
+   "stub": [
+    "mov edx, A",
+    "jmp A",
+    "mov edx, A",
+    "jmp A",
+    "mov edx, A",
+    "jmp A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "cosh": {
+   "stub": [
+    "mov edx, A",
+    "jmp A",
+    "mov edx, A",
+    "jmp A",
+    "cmp dword ptr [A], 2",
+    "je A"
+   ],
+   "cores": [],
+   "args": 1
+  },
+  "tanh": {
+   "stub": [
+    "mov edx, A",
+    "jmp A",
+    "cmp dword ptr [A], 2",
+    "je A",
+    "call A",
+    "push dword ptr [esp + 4]"
+   ],
+   "cores": [
+    [
+     "push 3",
+     "call A",
+     "cmp eax, 1",
+     "pop ecx",
+     "je A",
+     "push 3",
+     "call A",
+     "test eax, eax",
+     "pop ecx",
+     "jne A",
+     "cmp dword ptr [A], 1",
+     "jne A",
+     "push 0xfc",
+     "call A"
+    ]
+   ],
+   "args": 1
+  },
+  "pow": {
+   "stub": [
+    "cmp dword ptr [A], 0",
+    "je A",
+    "sub esp, 8",
+    "stmxcsr dword ptr [esp + 4]",
+    "mov eax, dword ptr [esp + 4]",
+    "and eax, A"
+   ],
+   "cores": [],
+   "args": 2
+  },
+  "atan2": {
+   "stub": [
+    "mov edx, A",
+    "jmp A",
+    "cmp dword ptr [A], 2",
+    "je A",
+    "call A",
+    "push dword ptr [esp + 4]"
+   ],
+   "cores": [
+    [
+     "push 3",
+     "call A",
+     "cmp eax, 1",
+     "pop ecx",
+     "je A",
+     "push 3",
+     "call A",
+     "test eax, eax",
+     "pop ecx",
+     "jne A",
+     "cmp dword ptr [A], 1",
+     "jne A",
+     "push 0xfc",
+     "call A"
+    ]
+   ],
+   "args": 2
+  },
+  "fmod": {
+   "stub": [
+    "mov edx, A",
+    "jmp A",
+    "fxch st(1)",
+    "cmp dword ptr [A], 1",
+    "je A",
+    "fprem "
+   ],
+   "cores": [],
+   "args": 2
+  }
+ }
+}
