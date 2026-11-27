@@ -3870,7 +3870,7 @@ def inline_order_tests():
     a cycle's back edge (the callee is not compiled yet: body no), a virtual call (no edge: caller first), and
     /Od (source order). 13.10 only: the probes are 13.10's."""
     if not BUILD.startswith("13.10"):
-        skip("c2inline order/body (7 checks)", "13.10 builds only (C2_BUILD=13.10.3052 / 13.10.3077)")
+        skip("c2inline order/body (12 checks)", "13.10 builds only (C2_BUILD=13.10.3052 / 13.10.3077)")
         return
     src = os.path.join(HERE, "tests", "data", "inline_order.cpp")
 
@@ -3902,11 +3902,47 @@ def inline_order_tests():
     check("c2inline --func: a site nested in an inlinee (depth 2) shows for the outer function",
           bool(re.search(r"^in \?\?0W@@\S+\s+\?\?0B@@\S+\s+2\s", r.stdout, re.M)), True)
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2inline.py"), gen, "--order", "--",
+                        "/TP", "/MT", "/EHsc", "/GS"], capture_output=True, text=True, cwd=HERE)
+    order = re.findall(r"^\s+\d+\s+\?+(\w+)@", r.stdout, re.M)
+    check("c2inline --order /O2: a virtual vector-deleting-dtor call has no edge: vdel before ??_EDer, but a direct "
+          "??_ET before build", (order.index("vdel") < order.index("_EDer"), order.index("_ET") < order.index("build")),
+          (True, True))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2inline.py"), gen, "--order", "--",
                         "/TP", "/MT", "/EHsc", "/GS", "/Og-"], capture_output=True, text=True, cwd=HERE)
     order = re.findall(r"^\s+\d+\s+\?+(\w+)@", r.stdout, re.M)
     check("c2inline /Og-: no call graph: build before its generated ??_E; an expanded static callee is body never",
           (order.index("build") < order.index("_ET"), bool(re.search(r"\?sh@@\S+\s+1\s.*\snever\s+INLINE", r.stdout))),
           (True, True))
+
+    # /GL + link /LTCG (c2ltcg.py's build, traced inside link.exe): the compile order is still callee-first and a
+    # helper in the other module is inlined, but the image layout follows the IL order: caller first
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2inline.py"),
+                        os.path.join(HERE, "tests", "data", "inline_ltcg_a.cpp"), "--order", "--with",
+                        os.path.join(HERE, "tests", "data", "inline_ltcg_b.cpp"), "--", "/TP", "/MT", "/EHsc", "/GS", "/Gy"],
+                       capture_output=True, text=True, cwd=HERE)
+    comp, _, lay = r.stdout.partition("image layout")
+    comp = re.findall(r"^\s+\d+\s+\?+(\w+)@", comp, re.M)
+    lay = re.findall(r"^\s+\d+\s+\?+(\w+)@", lay.split("caller ")[0], re.M)
+    check("c2inline --with (LTCG): compile order callee-first (late_helper before a_late, _ET before a_vec)",
+          (comp.index("late_helper") < comp.index("a_late"), comp.index("_ET") < comp.index("a_vec")), (True, True))
+    check("c2inline --with (LTCG): image layout is the IL order: a_late before late_helper, _ET right after a_vec",
+          (lay.index("a_late") < lay.index("late_helper"), lay.index("_ET") == lay.index("a_vec") + 1), (True, True))
+    check("c2inline --with (LTCG): a helper in the other module is inlined (a_far / far_helper body yes INLINE)",
+          bool(re.search(r"\?a_far@@\S+\s+\?far_helper@@\S+\s+1\s.*\syes\s+INLINE", r.stdout)), True)
+
+    # one TU, no /GL: static functions (address not taken) take register arguments, everything else the stack
+    import tempfile
+    kd = tempfile.mkdtemp()
+    subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2inline.py"),
+                    os.path.join(HERE, "tests", "data", "inline_static_cc.cpp"), "--keep", kd, "--", "/TP", "/MT", "/EHsc",
+                    "/GS", "/Ob0"], capture_output=True, text=True, cwd=HERE)
+    lst = open(os.path.join(kd, "inline_static_cc.asm")).read().replace("\r", "")
+    regs = {m.group(1).split("@")[0].lstrip("?"): bool(m.group(2))
+            for m in re.finditer(r"^(\?\S+) PROC[^\n]*\n((?:; _\w+\$ = [a-z]+\n)*)", lst, re.M)}
+    check("static-function register arguments (13.10, one TU): static, stdcall static, recursive static yes; "
+          "address-taken, anonymous namespace, extern, static member no",
+          [regs.get(n) for n in ("f_static", "f_std", "f_rec", "f_addr", "f_anon", "f_extern", "sm")],
+          [True, True, True, False, False, False, False])
 
 
 inline_order_tests()

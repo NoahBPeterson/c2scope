@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """c2inline: why c2 inlined a call here (or not), per call site, from one traced compile.  Doc: docs/c2/inline.md
 
-usage: c2inline.py SRC [--func F] [--callee C] [--order] -- <cl args>       (C2_BUILD=13.10.3052 / 13.10.3077)
+usage: c2inline.py SRC [--func F] [--callee C] [--order] [--with OTHER.cpp,..] -- <cl args>       (C2_BUILD=13.10.3052 / 13.10.3077)
 
 For every call site the inliner weighs (InlCallGraphDecision, the /O2 cost model of inline.md rule 3) it prints the
 function being compiled, the callee, the inlining depth, and the model's numbers:
@@ -83,6 +83,10 @@ def main(argv):
     ap.add_argument("--func", help="only sites in functions whose decorated name contains this")
     ap.add_argument("--callee", help="only sites whose callee's name contains this")
     ap.add_argument("--order", action="store_true", help="print the compile order of the TU's functions first")
+    ap.add_argument("--with", dest="more", help="LTCG: compile SRC and these (comma list) with /GL, link /LTCG under the trace "
+                    "(c2ltcg.py's build) and report every function of the whole program; the order is then the linker's")
+    ap.add_argument("--export", default="", help="with --with: names exported from the linked DLL (comma list; the roots, "
+                    "/OPT:REF); default none: /OPT:NOREF, every function internal")
     ap.add_argument("--keep")
     a = ap.parse_args(argv)
     import c2build, c2trace
@@ -97,6 +101,25 @@ def main(argv):
              # has been compiled, its call-graph data is complete), the depth. hook 8: ConsiderCandidate's final verdict
              "@ShouldInlineCallTuple@28=g%s>0>0>4$,eax>4>0x28>0x18>4$,eax>4>0x28>0x18>0x69,s2,s1" % cf,
              "@ConsiderCandidate@36=ecx/xeax"]
+    if a.more:
+        import c2ltcg
+        os.environ["CCACHE"] = "0"
+        os.environ["C2TRACE_REMOTE"] = "0"                    # the /GL compiles and the link run here (c2ltcg.py)
+        if hasattr(c2trace, "run_remote"):
+            c2trace.run_remote = lambda *x, **k: None
+        more = [os.path.abspath(m) for m in a.more.split(",") if m]
+        plain = c2trace.run_tool
+
+        def ltcg_tool(args, trace=True, extra_env=None):
+            src = args[-1]
+            obj = next(x[3:] for x in args if x.startswith("/Fo"))
+            clx = [x for x in args[:-1] if not x.startswith(("/FA", "/Fa", "/Fo"))]
+            rc_, text, _dll = c2ltcg.build([src] + more, clx, os.path.dirname(obj), [e for e in a.export.split(",") if e], plain, trace, extra_env, None)
+            return rc_, text
+        c2trace.run_tool = ltcg_tool
+    if a.more and not a.keep:
+        import tempfile
+        a.keep = tempfile.mkdtemp(prefix="c2inline_ltcg_")       # the map file is read from here
     img, hk, rc, out, log = c2trace.run_trace(a.src, hooks, cl, keep=a.keep, func=False)
     if rc:
         sys.stdout.write(out)
@@ -157,6 +180,13 @@ def main(argv):
             later = [c for c in calls.get(n, []) if c in pos and pos[c] > i]
             print("  %2d  %-36s%s" % (i + 1, n, ("  calls later-compiled (body not visible): " + ", ".join(later)) if later else ""))
         print("  emission order %s the compile order" % ("=" if sorted(done, key=done.get) == order else "DIFFERS FROM"))
+        if a.more:
+            import c2ltcg
+            lay = [n for n, _va, _o in c2ltcg.read_map(os.path.join(c2trace.keep_path(a.keep), "ltcg.map"))
+                   if not n.startswith(("$L", "__ehhandler"))]
+            print("image layout (link map, address order; under /LTCG this is the IL order, not the compile order):")
+            for i, n in enumerate(lay):
+                print("  %2d  %s" % (i + 1, n))
         print()
     shown = 0
     print("%-34s %-34s %2s %5s %5s %5s %5s %5s %10s %4s %-6s %s" % ("caller", "callee", "dp", "size", "c", "d", "loop%",

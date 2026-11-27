@@ -337,6 +337,92 @@ a compiler-generated helper right after its first user: with `/Og-`, `build` the
   in code now: `CgIdentifyNodeRecursion` is called from the head of the node list (1070cc77), and `CgAddNode` pushes
   new nodes at the head. **[C code; the 0x400000 effect not traced]**
 
+**Is the 0x1000 bit per function (late instantiations, generated members, big TUs)? No.** Probed on every function
+(`g<_CurFunc>>0>0>0x69`, with the node pointer at +0x99, in the `@Inline@4` hook: work/scratch/inline/ord/nodes.sh):
+- t1.cpp (75 functions, `<vector>` and `<string>`: a class-template `operator+`/`operator*`/ctor used only late,
+  `??_E`, implicit NavCell ctor/dtor, vector iterator `operator+`), t2.cpp (dynamic initializers `_$E*`, thunk
+  targets, covariant return, `dllexport`, `naked`, `__fastcall`, `__stdcall`, `extern "C"`, a guarded static, a
+  function-try-block, a switch, explicit and implicit instantiation), t3.cpp (EH, `new`/`delete`, `throw`),
+  big1.cpp (1200 functions, one with 1200 calls): **every function has the bit and a node**, on 3077 and (t1) 3052.
+  Every order is callee-first. In t1, t2 and g1 no site has body "no" except in a cycle.
+- c1xx writes the bit as `(global byte 1058d0e8) << 12` while it composes the function's flag word (c1xx.dll
+  1046fffa-10470008). That byte is set once, at the end of option processing, if `-Og` was given (104246b7-104246c3)
+  and cleared otherwise (10401012), and nothing else writes it. The same byte gates c1xx's callee-list recording
+  (10415d0c). So the bit is a **TU-wide** property of `-Og`, not of the function. **[C code; c1xx.dll 13.10.3077]**
+- `/d1<opt>` passes `-<opt>` to c1xx (works through cl). `/d1Binl`, `/d1Og`: no change. `/d1BnoImplicitInline` clears
+  0x40 (the inline-candidate bit) of the implicit members, not 0x1000. `/d1Bdlp` and `/d1Goptil` gave no IL to read.
+- cl 13.10.6030 (work/toolchain/c2-13.10.6030, untraced `/FAsc` listing of o1.cpp) gives the same order as 3077.
+
+**But a caller-first order does occur at `/O2`, for a call that is not an edge.** `delete[] p` of a class with a
+virtual destructor calls the vector deleting destructor `??_E` through the vtable (`call DWORD PTR [edx]`), so there is
+no call-graph edge, and c1xx emits `??_E` after its first user: `vdel` is compiled before `??_EDer`
+(tests/data/inline_gen.cpp, t3.cpp `eh6`; both 13.10 builds). A direct `??_E`/`??_G` call (class without a virtual
+destructor: `build` / `??_ET`, t3 `eh3` / `??_GD`) is an edge and goes callee-first. The same holds for every other
+virtual or indirect call. Such a call is never an inline candidate, so it does not explain a site where ours
+inlines; it does explain "the original's helper sits right after its caller" when the original's call is virtual.
+**[C: listing and order; I: that it is the source of the M&B rows]**
+
+**/GL + link /LTCG (13.10.3077; 3052 same order and layout).** `c2inline.py SRC --with OTHER.cpp,.. [--export NAMES] --order
+-- <cl flags>` compiles every source with `/GL` (c2ltcg.py's `build`) and traces `link /LTCG` loading the patched c2.dll;
+`--order` then also prints the **image layout** from the link map. Sources: tests/data/inline_ltcg_a.cpp and
+_b.cpp (a caller with a same-module helper defined after it, a helper in the other module, a template `operator+`,
+`??_E` for `delete[]` of a class with a non-virtual dtor defined in the other module, the same with everything local);
+probes in work/scratch/inline/ord/ltcg/ (m, h, x: three modules, with and without exported roots).
+- **Compile order under /LTCG is still bottom-up and callee-first**, over the whole program: `late_helper` before
+  `a_late`, `??_ET` before `a_vec`, a leaf in another module before its callers. A cycle behaves as in a single TU.
+- **Cross-module inlining happens, and every site the model sees is decided as at `/O2`**: `a_far` inlines `far_helper`
+  from the other module (body yes), `a_tfar` inlines `far_tpl`, the template `operator+` / `operator*` / ctor are
+  inlined in all three modules, `??_ET` into `a_vec` (88 bytes, d -43), with `/OPT:NOREF` and with exported roots.
+  No site stayed a call and none had body "no" outside a cycle. **[C]**
+- **The image layout is different, and is caller-first.** Without /GL, `/Gy` COMDATs are laid out in compile order
+  (map of the same sources: `late_helper, a_far, a_tfar, ??_ET, ??_EL, It<int> members, ..., a_late, a_tpl, a_vec, ...`:
+  helpers first). With /LTCG the link map has the functions in **IL order, module by module, first-need helpers right
+  after their user**: `a_late, late_helper, a_far, a_tpl, a_tfar, a_vec, ??_ET, a_lvec, ??_EL, It members`, then the
+  other module's `T::T, T::~T, far_helper, far_tpl`. That is the shape seen in the M&B image (`build` then
+  `??_Etstring`; a caller followed by the helpers it needs). **[C: maps k1 (3077) and k3052, kb (no /GL)]**
+  So a helper sitting after its caller in the image is *not* evidence that it was compiled after the caller, and
+  the compile order, which is what decides inlining, is the bottom-up one either way.
+- Not explained by LTCG: a helper that is **not inlined** where `/O2` inlines it. In every LTCG build here the
+  tiny helpers (`operator+` 14 bytes, `??_E` 78-88, vector ctor) were inlined at "accepted at once" or `v < 74`.
+- No Rich header can be read from the M&B exe (`mount&blade.exe` / `mb_original.exe`: the stub area at 0x40-0x128 is
+  Steam-wrapped data, linker version 7.10, an extra `.bind` section), so the prodid check (a /GL compile has its own)
+  could not be done on it. **[C for "no Rich header"]**
+
+**Register conventions, link order and budgets (follow-up on the LTCG question; 13.10.3077, 3052 spot-checked).**
+- **One plain `/O2` TU already gives register arguments to statics.** A `static` function whose address is not taken
+  takes its parameters in registers (`; _a$ = edx`, `_b$ = edi`, `_c$ = esi` in the listing, the callers load them
+  instead of pushing), also `static __stdcall`, `static __fastcall` and a self-recursive static, even when it
+  is called once and not inlined (`/Ob0`). Extern functions, an address-taken static, functions in an anonymous
+  namespace (external linkage as far as c2 can tell), `inline` COMDAT functions and static members keep the stack
+  convention. tests/data/inline_static_cc.cpp, work/scratch/inline/ord/cc/s1.cpp, s2.cpp. No `/GL` is involved, so
+  T-region helpers with whole-TU register conventions need no LTCG. **[C: listing, both builds]**
+- **Under /GL + /LTCG almost everything gets them.** Same file linked with no exports: every function except the
+  address-taken one (`f_addr`) takes register arguments: extern, anonymous-namespace, static member, recursive,
+  stdcall (`ltcg.asm` of work/scratch/inline/ord/cc/kl). ltcg.md 2.1 has the rules (not exported, not referenced from a
+  non-/GL object, address not taken, not virtual, not varargs): the gate is the same "SSR+0x20 & 0x2400" test, and
+  bit 0x2000 is "referenced from outside" (set for exports and non-/GL references by the linker). So an LTCG
+  link that keeps the layout but not the conventions needs the functions to be reachable from outside the /GL set:
+  exported, or referenced from a non-/GL object. c2's option table has nothing that turns the change off (`-dlp` /
+  `-nodlp` is read by the profile-probe code, not by the gate). **[C for the listing; the switch search: the
+  table of 108664cc-10866a18 and the references of 108a91ac / 108a91b0]**
+- **The /Ob level is recorded in the /GL object and honoured at link:** `/GL /Ob0` inlines nothing at link,
+  `/Ob1` inlines the class-body / `inline` / template helpers (13 sites) but not the plain `far_helper` /
+  `late_helper` / `far_tpl`, `/Ob2` all (22). **[C: m.cpp + h.cpp]** (M&B's `/Ob1` observation fits "plain helpers
+  stay calls", not "helpers defined after the caller".)
+- **Mixed link order.** Objects `b1` (plain), `a` (/GL), `b2` (plain), `c` (/GL), linked `/LTCG` in the orders
+  b1 a b2 c, a b1 c b2, c b2 a b1 and b1 b2 a c (work/scratch/inline/ord/mix): **all /GL code comes first, in the
+  command-line order of the /GL objects, then the plain objects in command-line order**; the layout never
+  interleaves. So a binary whose T and B regions interleave was not linked with /LTCG. **[C: link maps]**
+- **The link-time budget is per caller, not per module or program.** The bloat term of the cost model
+  (rule 3) grows with the caller's own instruction count: a caller `big` with 4000 calls to a 37-byte helper has c =
+  24 at the first site, 43 at site 250, 65 at 1500, and from site 555 of 4000 (c = 74) the rest stay calls, while
+  another caller `other` in the same TU, compiled after it, still inlines the same helper at c = 24. The caller's
+  total size, including calls not yet expanded, sets the term. No counter that accumulates across the program (or
+  a module) was found in the paths read (`InlCallGraphDecision`, `ShouldInlineCallTuple`, `InlineeIsTooBig`: all per
+  caller). So a big program does not exhaust it; a very large *caller* does, and its remaining helper calls then
+  stay calls even for tiny helpers only if the caller is huge (thousands of calls). **[C: big300/1500/4000.cpp;
+  I: that nothing global exists]**
+
 So, for "caller first with a later-defined, non-cyclic helper": on this build it needs no call graph, i.e. c1xx run
 without `-Og`. With it on, only a cycle, an indirect/virtual call or a nodeless caller (none found) puts a caller
 first. Whether an `/Og-` + `optimize("g", on)` TU generates the same code as `/O2` for the other functions was not
