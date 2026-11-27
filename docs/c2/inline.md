@@ -259,7 +259,8 @@ Dump points: `@Inline@4` is c1xx's IL; `@WrnEmitWarnings@4` comes right after In
 
 `uv run tools/c2inline.py f.cpp --order -- <cl flags>` prints the order c2 compiles the TU's functions in, and every
 site has a `body` column: **yes** = the callee had been compiled when the site was weighed (the cost model of rule 3
-ran on its size), **no** = it had not (no size; c1xx's IL count decides, rule 7), **extern** = not in this TU.
+ran on its size), **no** = it had not (no size; c1xx's IL count decides, rule 7), **never** = not compiled as a
+function in this TU (extern, or an inline/static/`__forceinline` callee that is only expanded).
 `body` is a **read field**: bit 1 of the dword at callee FUNC+0x69, which `ShouldInlineCallTuple` 1078cf54 tests
 before it calls `InlCallGraphDecision` (clear: it takes the IL-size path instead). The order (the `@Inline@4`
 entry sequence; `@dop2_EncodeAndRelated@4` gives the same sequence, each function is compiled through to its
@@ -303,6 +304,43 @@ call is in a cycle with a callee that is **too big for the IL-size budget of rul
 "the original made a call where ours inlines": tests/data/inline_order.cpp `cyc_a` (call) against `cyc_b` (inlined,
 because `cyc_a` is already compiled). In a cycle the callee's body is never visible to the member that goes first.
 **[C for the cycle behaviour; I that this explains the M&B rows: not tested on them]**
+
+**What turns the order off, and what does not (13.10.3077; 3052 spot-checked).** The call graph has a node for a
+function only if bit 12 of the dword at FUNC+0x69 (SSR+0x50 0x1000 in il_pipeline.md) is set: the IL reader
+(10708c86, just before its `CgAddNode` call at 10708c90) tests it. c1xx writes it per function; a probe there saw it
+set on every function at `/O2` and clear on every function at `/Og-` and at `/Od`, and `/Od /Og` brings it back. With
+no nodes `CgBuildCallGraph` has nothing to order and the functions stay in c1xx's emission order, which puts
+a compiler-generated helper right after its first user: with `/Og-`, `build` then `??_E` of the class it deletes
+(`/O2`: `??_E` first). **[C: tests/data/inline_gen.cpp, work/scratch/inline/ord/g1.cpp, p1.cpp]**
+
+- **Per-function `#pragma optimize` never changes the order.** `("g", off)`, `("", off)`, `("t", off)` around the
+  caller, the callee, both or the whole file at `/O2` (o4, p2, q_g, q_all), and `("g", on)` for some or all functions
+  at `/Og-` (p1, p2): the order is callee-first in the first case and source order in the second, whatever the
+  pragmas say, and the 0x1000 bit is the same with and without the pragma. The pragma only decides whether a function
+  may inline and be inlined: at `/Og-` a pair with `g` on in both inlines by the IL path (rule 7), with the callee
+  `g` off it stays a call, with the caller `g` off the site is never weighed (p2). So the pragma can be scoped to the
+  few functions concerned for the *inlining*; the *order* is a TU-wide property of the command line (`-Og`).
+- **Command-line switches tried at `/O2`, none changes the order:** `/Ob0 /Ob1 /Ob2 /O1 /Os /Ox /Oa /Ow /Op /Zi /Z7
+  /Gz /GS- /arch:SSE2 /fp:fast`. Only `/Og-` and `/Od` turn it off. (`/GL` writes no IL to compare.)
+- **c2 has no `-d2` switch for it.** The option table in c2.dll (name, global, flags triples from 108664cc to
+  10866a18: `-Ob#`, `-inl*#`, `-vol#`, `-loopopt`, `-ltcg`, `-optref`, `-dlp`, `-dos`, `-datasort`, ...) has no
+  ordering option, and a `-d2` prefix is not in it; `CgBuildCallGraph` reads `-optref` (108819ec: unreachable-function
+  removal) and `-ltcg` (10881d14: the entry-point list), not the order. c1xx.dll's switch strings include `-Og`,
+  `-Binl`, `-Bdlp`, `-BnoImplicitInline`, `-Goptil`; the last three were not tried and the code that writes the
+  0x1000 bit in c1xx was not read. **[C for the c2 table; unconfirmed for c1xx]**
+- **Two more things the walk does** (14.00 text in il_pipeline.md 4.2; the 13.10 code has the same shape, read at
+  1070d00b-1070d0d6, 107c0463, 107c049f): a function **without a node goes first** (pass 0, in list order), and a
+  function with **FUNC+0x20 & 0x400000 (a dynamic initializer, il_pipeline.md) goes to a second list that is appended
+  last**. Neither was produced on 13.10: functions with `try`, `__try`, `setjmp`, varargs, `_alloca`, inline asm,
+  a destructor, a loop, an unknown callee, `noinline` all got nodes and were ordered like plain ones (n1.cpp); a
+  nodeless caller would have gone before an earlier-defined leaf. The DFS start (the last-defined function) is read
+  in code now: `CgIdentifyNodeRecursion` is called from the head of the node list (1070cc77), and `CgAddNode` pushes
+  new nodes at the head. **[C code; the 0x400000 effect not traced]**
+
+So, for "caller first with a later-defined, non-cyclic helper": on this build it needs no call graph, i.e. c1xx run
+without `-Og`. With it on, only a cycle, an indirect/virtual call or a nodeless caller (none found) puts a caller
+first. Whether an `/Og-` + `optimize("g", on)` TU generates the same code as `/O2` for the other functions was not
+checked (the cost model needs a node, so every site there is decided by the IL budget). **[I]**
 
 Not covered: whether 14.00/15.00 use the same walk (rule 1 was seen there; the cycle start and the `/Od` behaviour
 were not tried), `/GL` (the order is then the linker's), `#pragma inline_depth` / `inline_recursion` and `-vol`,

@@ -3870,7 +3870,7 @@ def inline_order_tests():
     a cycle's back edge (the callee is not compiled yet: body no), a virtual call (no edge: caller first), and
     /Od (source order). 13.10 only: the probes are 13.10's."""
     if not BUILD.startswith("13.10"):
-        skip("c2inline order/body (5 checks)", "13.10 builds only (C2_BUILD=13.10.3052 / 13.10.3077)")
+        skip("c2inline order/body (7 checks)", "13.10 builds only (C2_BUILD=13.10.3052 / 13.10.3077)")
         return
     src = os.path.join(HERE, "tests", "data", "inline_order.cpp")
 
@@ -3896,6 +3896,17 @@ def inline_order_tests():
     out, order, rows = run("/Od")
     check("c2inline --order /Od: no call-graph order, source order", order,
           ["caller_late", "late", "cyc_a", "cyc_b", "u", "vf"])
+    gen = os.path.join(HERE, "tests", "data", "inline_gen.cpp")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2inline.py"), gen, "--order", "--func", "copy", "--",
+                        "/TP", "/MT", "/EHsc", "/GS"], capture_output=True, text=True, cwd=HERE)
+    check("c2inline --func: a site nested in an inlinee (depth 2) shows for the outer function",
+          bool(re.search(r"^in \?\?0W@@\S+\s+\?\?0B@@\S+\s+2\s", r.stdout, re.M)), True)
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2inline.py"), gen, "--order", "--",
+                        "/TP", "/MT", "/EHsc", "/GS", "/Og-"], capture_output=True, text=True, cwd=HERE)
+    order = re.findall(r"^\s+\d+\s+\?+(\w+)@", r.stdout, re.M)
+    check("c2inline /Og-: no call graph: build before its generated ??_E; an expanded static callee is body never",
+          (order.index("build") < order.index("_ET"), bool(re.search(r"\?sh@@\S+\s+1\s.*\snever\s+INLINE", r.stdout))),
+          (True, True))
 
 
 inline_order_tests()

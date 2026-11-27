@@ -20,7 +20,8 @@ function being compiled, the callee, the inlining depth, and the model's numbers
          the dword at callee FUNC+0x69, the bit ShouldInlineCallTuple tests before it asks the cost model (set once
          the callee was compiled and its call-graph data collected). "yes": the cost model above ran on the callee's
          compiled size. "no": the callee comes later in the TU's compile order, there is no size, and c1xx's IL
-         size decides instead (inline.md rule 7). "extern": not defined in this TU. The compile order (@Inline@4
+         size decides instead (inline.md rule 7). "never": the callee is not compiled as a function in this TU at all
+         (extern, or an inline / static / __forceinline function that is only ever expanded: it has no code of its own). The compile order (@Inline@4
          entry order) is a cross-check: a row where it disagrees with the bit is marked NOTE.
   --order  also prints the TU's compile order, one line per function, with the in-TU callees compiled after it.
 
@@ -161,7 +162,7 @@ def main(argv):
     print("%-34s %-34s %2s %5s %5s %5s %5s %5s %10s %4s %-6s %s" % ("caller", "callee", "dp", "size", "c", "d", "loop%",
                                                                  "d'", "w", "v", "body", "verdict"))
     for r in rows:
-        if a.func and a.func not in (r["func"] or ""):
+        if a.func and a.func not in (r["func"] or "") and a.func not in (r["top"] or ""):   # a site nested in an inlinee shows for the function it is expanded into too
             continue
         if a.callee and a.callee not in r["callee"]:
             continue
@@ -181,10 +182,10 @@ def main(argv):
             pv = (r["dp"] * 100000000 // r["w"] + (D - 1) * r["dp"]) // D
             if pv != r["v"]:
                 why += "; model gives v=%d: another branch" % pv
-        body = "extern" if r["callee"] not in pos else "yes" if r["ready"] else "no"
+        body = "never" if r["callee"] not in pos else "yes" if r["ready"] else "no"
         # the same from the order: the callee came through its code emission before the top-level caller started
         inferred = "yes" if r["callee"] in done and pos[r["callee"]] < pos.get(r["top"], -1) else "no"
-        if body != "extern" and body != inferred and r["callee"] != r["top"]:
+        if body != "never" and body != inferred and r["callee"] != r["top"]:
             why += "; NOTE the order says body=%s" % inferred
         verdict = "INLINE" if r.get("final", r.get("yes")) else "call"
         if "yes" in r and r["yes"] != r.get("final", r["yes"]):
