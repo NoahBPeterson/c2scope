@@ -89,6 +89,24 @@ is decided here), regalloc.md §7 (which variables are candidates), il_pipeline.
 
    **[C: code of ICGD (disassembly 10b6a040-10b6a5c5) and InlBenefit; traces a1-a3, a5; blind test p1 below]**
 
+   **13.10 (3052 and 3077): the same model plus a loop term.** Between the early accept and the speed test, 13.10
+   adds `size * B / 255` to d, where B is a byte of the callee's call-graph node (+0x4e) that is 0 for a loop-free
+   callee and reads as its loop share in 255ths (21% for a 64-byte callee with one 4-instruction loop, 62% for a
+   52-byte callee whose body is the loop) **[C: code at 3052 1079452c (`imul size; x/255`, then `idiv` by a
+   runtime constant that is 1); traced B and bonus on p3: 0/0, 54/13, 159/32; the meaning of B is I]**. So:
+
+   ```
+   d'  = d + floor(size * B / 255)          (13.10; the early accept still tests d, before this)
+   v   = (d'*1e8/w + 6d') / 7  if w <= 1e8,  (d'*1e8/w + 2d') / 3  if w > 1e8;  inline iff v < 74
+   ```
+
+   A callee that is mostly loop pays up to its whole size again: `big` (34 bytes, c 31, loop 57%) gets v 50 and is
+   inlined, `huge` (63 bytes, c 60, loop 79%) gets v 80 even with its call in a loop (w 5e8). Straight-line code
+   then needs c + loop bytes < 74, not c < 74. Per site: `C2_BUILD=13.10.3077 uv run tools/c2inline.py f.cpp
+   [--func F] [--callee C] -- <cl flags>` prints caller, callee, size, c, d, loop%, d', w, v and the deciding step,
+   and checks v against this formula. Static-callee / call-count adjustments of 14.00's d' were not seen on 13.10
+   (not tested). **[C: traces p2/p3, both builds]**
+
 4. **`inline` makes no difference at /O2.** `i10` (`inline`) and `f10` (plain) got the same cost, and both
    were rejected (a2). The keyword flag (`+0x50 & 0x80`) is read only on the non-speed path (/O1: -7). Member
    functions defined in the class body carry the same flag. **[C: code, a2]**
@@ -253,6 +271,7 @@ Dump points: `@Inline@4` is c1xx's IL; `@WrnEmitWarnings@4` comes right after In
 | a7 | recursion back edge, IL count 8..14 | budget 12 | ≤12 inlined, ≥13 not **[C]** |
 | **p1 (blind)** | t1 (80 B, 2 args), t2 (60 B, branch), static t3 in a loop, `T::m` (84 B) in an if arm and in straight-line code, t4 (45 B, 4 calls) | inline, inline, inline (~60), reject (78), inline (69), inline (32) | **5 of 6 held**. t4 got c = 42, not 32: the no-branch bonus also needs no side-effecting call (corrected in rule 3 from `InlCollectBlockCmpInfo` 10b70de0) |
 | b1, c1-c8 | IL left by inlining (rules 10-14) | — | the tables above |
+| p2, p3 (13.10) | loop callees of 34/63/52 bytes, a 79-byte branchy one, sites straight / if arm / loop | the 14.00 model | v off by a loop term: d' = d + size·B/255 (rule 3, 13.10) **[C]** |
 
 ## Unknown / not covered
 

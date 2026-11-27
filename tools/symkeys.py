@@ -1593,9 +1593,17 @@ def site_events(f, site, pass_):
         if e[0] != "sort" or e[1] != pass_ or not site["lo"] <= e[3] <= site["hi"] or len(e[4]) < 2:
             continue
         nm = [opname(o) for o in e[4]]
-        ia = [i for i, x in enumerate(nm) if site["A"] in x]
-        ib = [i for i, x in enumerate(nm) if site["B"] in x and i not in ia[:1]]
+        # an exact operand name wins over a substring match: with substrings only, `A>B` and `B>A` could pick the
+        # same two operands (each name inside both) and print the same verdict for both directions (M&B feedback)
+        ia = [i for i, x in enumerate(nm) if x == site["A"]] or [i for i, x in enumerate(nm) if site["A"] in x]
+        ib = [i for i, x in enumerate(nm) if x == site["B"] and i not in ia[:1]] or \
+            [i for i, x in enumerate(nm) if site["B"] in x and i not in ia[:1]]
         if ia and ib:
+            amb = len({i for i, x in enumerate(nm) if site["A"] in x} & {i for i, x in enumerate(nm) if site["B"] in x}) > 0 \
+                and nm[ia[0]] != site["A"] and nm[ib[0]] != site["B"]
+            if amb:
+                sys.stderr.write("symkeys: --site %s is ambiguous at line %s: %r and %r both match %s; name the operands "
+                                 "exactly\n" % (site["text"], e[3], site["A"], site["B"], ", ".join(nm)))
             out.append((e, ia[0], ib[0]))
     return out
 

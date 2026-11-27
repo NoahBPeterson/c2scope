@@ -1217,7 +1217,8 @@ def body_of(text, func):
     m = re.match(r"\?(\w+?)@@Y", func)
     if m or not func.startswith("?"):
         name = m.group(1) if m else func
-        if not m and re.match(r"_[A-Za-z_]\w*(@\d+)?$", func):      # an extern "C" symbol: `_T2_FindSID`, `_f@8`
+        if not m and re.match(r"[_@][A-Za-z_]\w*(@\d+)?$", func):   # an extern "C" symbol: `_T2_FindSID`, `_f@8`,
+            #                                                         a __fastcall one `@f@16`
             names = {fn[0] for fn in helpersweep.functions(text)}
             c = re.sub(r"@\d+$", "", func)[1:]
             name = c if c in names or func not in names else func

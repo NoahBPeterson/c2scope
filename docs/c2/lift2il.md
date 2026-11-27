@@ -16,6 +16,13 @@ il2c_lift.py lift BINARY VA --size N --c2 BUILD [--partial] [--outline]
   EH frame) instead of C++: for functions too big to read as code.
 - With a corpus (`corpus.py`'s JSONL: an image, rows of VA / size / relocation mask), `il2c_lift.py check` lifts,
   compiles and scores a sample (`lbench.py`'s scorer).
+- `l2c_search.py CORPUS VA...` (or `--from CHECK.jsonl`, the DIFF rows of `il2c_lift.py check --json`) takes the
+  near misses further: it compiles every single rewrite of the lifted C++ that leaves what it computes alone
+  (adjacent independent statements swapped, a compare's or a commutative operator's operands exchanged, two
+  declarations swapped, a temporary's signedness, a reference alias that shifts the symbol keys behind register
+  ties: symkeys.md) and keeps the closest, for `--rounds N`. On 442 register / copy / schedule near misses it matched
+  47; on Spore's 124 large near misses, 4. A variant is never proved equivalent: a MATCH is the original's bytes, a
+  DIFF only the search produced is a lead.
 
 ## How it works
 
@@ -49,7 +56,8 @@ constants are addresses.
 | structs and classes passed by value | `*(S*)(base + off)` for a dword copy; a class with its copy constructor `FUN_<ctor>` |
 | integer arithmetic | signed division by constants (magic numbers), `rep movsd` as memcpy, `rep stos` as memset |
 | x87 | arithmetic incl. integer operands (`fimul` ..), `fsqrt` / `fabs` / `fsin` / `fcos` / `fpatan`, compares through `fnstsw` + `test ah` (incl. the parity forms, NaN-exact) and `fcomi` / `lahf`, float returns (typed double), `_ftol` as `(int)x`, values merging at joins |
-| SSE | scalar float / double |
+| `__int64` (register pairs) | `add/adc`, `sub/sbb`, constant `shld`/`shrd` shifts and `and`/`or`/`xor` on a pair, as one `__int64` operation; the pair's inputs are a call's edx:eax (through `mov` copies), a memory pair (also each half loaded separately), `cdq` / zero, constants, or another such value; its consumers a pair store, the compare chain `cmp hi; jl/jg; cmp lo; jb` as one compare, an `__int64` return in edx:eax, or the halves split back out (`lo = (int)t`, `hi = (int)(t >> 32)`) for other readers. A fold is kept only when every reader of what it drops is accounted for (`find_i64`). Not joined: two halves of unrelated origin (cl compiles `(hi << 32) \| lo` as real code) |
+| SSE | scalar float / double; on Spore, `cvtss2si`, the floor / ceil sequences and the `maxss` / `minss` clamps as the vetted helpers of spore-decomp `match/include/sse_helpers.h` (`SseRoundToInt` ..), and on cl 15.00 `fistp qword` as `X87RoundToInt64` |
 | TLS | `__declspec(thread)` globals |
 | C++ EH (`__CxxFrameHandler3`) | static initialisers, constructors / destructors (incl. polymorphic), RAII locals, `new` with a class `operator delete` (incl. placement), `try { } catch (...) { ..; throw; }` |
 
@@ -59,7 +67,9 @@ C++ EH needs C++ linkage (an `extern "C"` function is nothrow under /EHsc, so cl
 
 - more than one `try` block, typed catches, EH states changed inside a branch or set from a variable;
 - jump tables of other shapes (an index bias, computed jumps);
-- `mul` / `OPMUL` with a 64-bit result (`__int64` products), `lock xadd` and other atomics, `xchg`, `rdtsc`;
+- `mul` with a 64-bit result (`__int64` products, the `new T[n]` overflow check `mul; seto; neg; or`), `__int64`
+  values whose halves arrive from unrelated places (a 64-bit local split across registers), 8-byte arguments pushed
+  from a register pair, `rdtsc`;
 - x87 rounding-mode changes (`fnstcw` / `fldcw`), `lahf` on integer flags, packed SSE;
 - member functions called from a C unit, `this` reassigned.
 

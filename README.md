@@ -106,11 +106,13 @@ Pass compiler flags literally after `--`; in zsh a `$FLAGS` variable holding sev
 | `tools/callform.py` | call census by dispatch form, two listings: missing block vs allocator in one command | docs/c2/callform.md |
 | `tools/tsweep.py` | variant sweep scored by trace numbers and aligned register diff | tracer.md |
 | `tools/helpersweep.py` | finds inline-helper rewrites that fix a colouring order without code change | tracer.md, frontend.md |
+| `tools/c2inline.py` | why cl 13.10 inlined a call or not, per call site: the callee's size, the cost terms, its loop share, the block weight and the deciding test | docs/c2/inline.md rule 3 |
 | `tools/rwsweep.py` | general search over mechanical source rewrites (identity helpers, aliases, dead uses, swaps): which ones move registers without changing code | tracer.md |
 | `tools/c2sched.py` | the instruction scheduler's decisions and a model check | docs/c2/sched.md |
 | `tools/ccache.py` | content cache behind every traced compile (`stats`, `clear`; `CCACHE=0` bypasses it) | tracer.md |
 | `tools/slotwant.py` | frame-colouring inverse: a wanted slot layout (`with:A,B`, `frame=N`, ...) -> source edits (scope, share, array size), each verified by a traced compile | docs/c2/slotwant.md |
 | `tools/il2c_lift.py lift` | lift one function of a retail x86 binary to C++ that cl should compile back to its bytes (`--partial` drafts, `--outline` per block) | docs/c2/lift2il.md |
+| `tools/l2c_search.py` | a lifted function that compiles close but not exact: compiles every semantics-keeping rewrite (statement swaps, operand order, declarations, signedness, symbol-key aliases) and keeps the closest | docs/c2/lift2il.md |
 | `tools/lift2il64.py` | the same for x64 (MSVC 2012 / cl 17.00): `il`, `unit`, `check` (compile with `C2_CL64` and compare), `bench`; `tidy64.py` / `tidycheck64.py` make the result readable | docs/c2/lift2il64.md |
 | `tools/x64check.py` | compile one C++ function with an x64 cl and compare it with the executable, byte by byte and relocation by relocation | docs/c2/lift2il64.md |
 
@@ -134,7 +136,10 @@ on three games' functions (lbench, a fixed sample of 300-400 functions per game)
 Fallout 3's, 22% of Mount & Blade's and 23% of Spore's recompile byte-identical (the largest so far: 5,237 bytes,
 1,778 instructions with 312 branches), most of them under 256 bytes; many
 more lift and compile but differ in register allocation, scheduling or frame layout, which the tools above explain.
-What it does and does not lift: docs/c2/lift2il.md.
+What it does and does not lift: docs/c2/lift2il.md. For a lift that compiles close but not byte-identical,
+`l2c_search.py` tries the rewrites that steer cl without changing what the code does (statement order, operand
+order, declarations, reference aliases) and keeps the closest; it needs a corpus file describing the binary
+(`corpus.py`, format in its docstring).
 
 For x64, `lift2il64.py` does the same for code built by Visual Studio 2012 (cl 17.00). It writes the C++, then
 compiles it and checks it against the executable in one step:

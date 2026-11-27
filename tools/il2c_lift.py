@@ -68,6 +68,10 @@ class LiftEmitter(il2c.Emitter):
             return "(%s)(self)" % CTYPE.get(ty, "int")
         if n.startswith("_a") and ty in ("1004", "2004") and self.ptypes.get(nm) in ("float",):
             return "(%s)(*(%s*)&%s)" % (CTYPE[ty], CTYPE[ty], nm)     # a float argument's bits, copied as a dword
+        if n.startswith("_l") and ty in ("1008", "2008"):
+            # an __int64 read of a frame slot (`fild qword [esp+0x34]`, `params[i]`): its 8 bytes, not the
+            # declared dword widened (lift2il makes such a slot a 2-dword aggregate, so the halves stay adjacent)
+            return "(*(%s*)&%s)" % (CTYPE[ty], nm)
         return super().var(n, ty)
 
     def lvalue(self, tok):
@@ -284,6 +288,12 @@ class LiftEmitter(il2c.Emitter):
             rty = self.ctype_of(d[0]) if d else "void"
             e = "((%s (__cdecl*)(...))(*(int*)g_%08x))(%s)" % (rty, g, ", ".join(argv))
             return ("%s = (%s)%s;" % (self.lvalue(d[0]), rty, e)) if d else e + ";"
+        ms = re.match(r"^\?__lift_(Sse\w+|X87RoundToInt64)@@YAXXZ$", tgt)
+        if ms:                                   # Spore's vetted inline-asm helpers (sse_helpers.h)
+            self.sse_helpers = True
+            argv = ", ".join("(float)(%s)" % self.rvalue(a, L) for a in srcs[1:])
+            e = "%s(%s)" % (ms.group(1), argv)
+            return ("%s = (%s)%s;" % (self.lvalue(d[0]), self.ctype_of(d[0]), e)) if d else e + ";"
         if tgt == "?__lift_strlen@@YAXXZ":       # lift2il's inlined strlen loop: the strlen intrinsic
             self.needs_string = True
             return "%s = (int)strlen((const char*)(%s));" % (self.lvalue(d[0]), self.rvalue(srcs[1], L))
@@ -1093,19 +1103,48 @@ def eh_local_inline(lf, em, va, params, typed, head, stmts, decls, marks, off):
     that read what the constructor saved (after the -1 store if there is one, else the last statements before
     the return: cl drops the -1 store when nothing after can throw) are the destructor."""
     k0 = marks[0]
-    ctor = [l for l in stmts[:k0] if l.strip()]
-    if not ctor or any(not l.startswith("    ") or l.startswith("     ") for l in ctor):
-        raise Unsupported("EH: an inline local's construction is not straight-line")
     above = sorted(o for o in lf.frame_offsets() if o > off) + [lf.eh["node"]]
     size = min(o for o in above if o > off) - off
     fields = sorted({-int(n) for n in re.findall(r"\bv_l(\d+)\b", "\n".join(stmts)) if off <= -int(n) < off + size})
     if not fields or any((f - off) % 4 for f in fields):
         raise Unsupported("EH: an inline local's members")
+    # the code before state 0, as top-level statements with their nested blocks; the object's construction is the
+    # trailing ones that touch its members (or a temporary stored in one), the rest is the function's own code
+    units = []
+    for l in stmts[:k0]:
+        if not l.strip():
+            continue
+        if l.startswith("    ") and not l.startswith("     ") and not (units and l.strip().startswith("}")):
+            units.append([l])
+        elif units:
+            units[-1].append(l)
+        else:
+            raise Unsupported("EH: an inline local's construction is not straight-line")
     saved = {}                                # constructor temporary -> the member it was stored in
-    for l in ctor:
-        m = re.match(r"^    v_l(\d+) = \(int\)\((t\d+)\);$", l)
-        if m:
+    for u in units:
+        m = re.match(r"^    v_l(\d+) = \(int\)\((t\d+)\);$", u[0])
+        if m and len(u) == 1 and off <= -int(m.group(1)) < off + size:
             saved[m.group(2)] = -int(m.group(1))
+    touches = lambda u: any(re.search(r"\bv_l%d\b" % -f, l) for f in fields for l in u) or \
+        any(re.search(r"\b%s\b" % t, l) for t in saved for l in u)
+    j = len(units)
+    while j and touches(units[j - 1]):
+        j -= 1
+    pre = [l for u in units[:j] for l in u]
+    ctor = [l for u in units[j:] for l in u]
+    if not ctor:
+        raise Unsupported("EH: an inline local's construction is not straight-line")
+    if not pre and any(not l.startswith("    ") or l.startswith("     ") for l in ctor) and \
+            not re.match(r"^    (t\d+) = \(int\)\(", ctor[0]):
+        raise Unsupported("EH: an inline local's construction is not straight-line")
+    # `t = (int)(expr); v_lN = (int)(t); ...` with expr reading the function's values: the constructor's argument
+    # (`L obj(expr)`, a smart pointer taking ownership of a value: `intrusive_ptr<T> p(x)`)
+    carg = None
+    m = re.match(r"^    (t\d+) = \(int\)\((.*)\);$", ctor[0])
+    if m and m.group(1) in saved and re.search(r"\b(a\d+|self|t\d+)\b", m.group(2)) and \
+            len(re.findall(r"(?m)^\s+%s = " % m.group(1), "\n".join(stmts))) == 1:
+        carg = m.group(2)
+        ctor = ["    %s = (int)(p0);" % m.group(1)] + ctor[1:]
     rest = stmts[k0 + 1:]
     if len(marks) > 1:
         k1 = marks[1] - k0 - 1
@@ -1135,7 +1174,15 @@ def eh_local_inline(lf, em, va, params, typed, head, stmts, decls, marks, off):
         return re.sub(r"\bv_l(\d+)\b", lambda m: mem(-int(m.group(1))) if off <= -int(m.group(1)) < off + size
                       else m.group(0), l)
     ctemps = set(re.findall(r"\b(t\d+)\b", "\n".join(ctor)))
-    outside = "\n".join(body + ret)
+    outside = "\n".join(pre + body + ret)
+    obj = "v_l%d" % -off
+    for t in sorted(ctemps):
+        # a temporary the constructor stored in a member and nothing writes again: the function reads the member
+        if t in saved and re.search(r"\b%s\b" % t, outside) and \
+                len(re.findall(r"(?m)^\s+%s = " % t, "\n".join(stmts))) == 1:
+            body = [re.sub(r"\b%s\b" % t, "v_l%d" % -saved[t], l) for l in body]     # the member's slot: named
+            ret = [re.sub(r"\b%s\b" % t, "v_l%d" % -saved[t], l) for l in ret]       # obj.mN below
+            outside = "\n".join(pre + body + ret)
     if any(re.search(r"\b%s\b" % t, outside) for t in ctemps) or re.search(r"\b(a\d+|self)\b", "\n".join(ctor + dtor)):
         raise Unsupported("EH: an inline local's code reads the function's values")
     cdecls = ["        int %s;" % t for t in sorted(ctemps - set(saved))] if ctemps - set(saved) else []
@@ -1143,18 +1190,18 @@ def eh_local_inline(lf, em, va, params, typed, head, stmts, decls, marks, off):
     members = []
     for q in range(0, size, 4):
         members.append("int %s;" % mem(off + q))
-    sub = "struct %s {\n    %s\n    __forceinline %s() {\n%s\n    }\n    __forceinline ~%s() {\n%s\n    }\n};" % (
-        cls, " ".join(members), cls, "\n".join(cdecls + ["    " + to_member(l) for l in ctor if not
-                                                         re.match(r"^    v_l\d+ = \(int\)\(t\d+\);$", l) or True]),
+    cbody = [to_member(l) for l in ctor]
+    cbody = [l for l in cbody if not re.match(r"^\s*(m\d+) = \(int\)\(\1\);$", l)]
+    sub = "struct %s {\n    %s\n    __forceinline %s(%s) {\n%s\n    }\n    __forceinline ~%s() {\n%s\n    }\n};" % (
+        cls, " ".join(members), cls, "int p0" if carg else "", "\n".join(cdecls + ["    " + l for l in cbody]),
         cls, "\n".join(ddecls + ["    " + to_member(l) for l in dtor]))
-    obj = "v_l%d" % -off
     body = [re.sub(r"\bv_l(\d+)\b", lambda m: "%s.%s" % (obj, mem(-int(m.group(1)))) if off <= -int(m.group(1)) <
                    off + size else m.group(0), l) for l in body + ret]
-    used = set(re.findall(r"\b(t\d+)\b", "\n".join(body)))
+    used = set(re.findall(r"\b(t\d+)\b", "\n".join(pre + body + ([carg] if carg else []))))
     decls = [d for d in decls if (DECL.match(d).group(1) in used) or (DECL.match(d).group(1).startswith("v_l") and
              not off <= -int(DECL.match(d).group(1)[3:]) < off + size)]
     sig = _eh_sig(lf, va, typed)
-    return "\n".join(head(em) + [sub]) + "\n\n" + sig + "{\n" + "\n".join(decls + ["    %s %s;" % (cls, obj)] + body) + \
+    return "\n".join(head(em) + [sub]) + "\n\n" + sig + "{\n" + "\n".join(decls + pre + ["    %s %s%s;" % (cls, obj, "(%s)" % carg if carg else "")] + body) + \
         "\n}\n"
 
 
@@ -1234,8 +1281,8 @@ def _params_for_copies(stmts, decls):
 
 def _eh_sig(lf, va, typed):
     """A plain function's signature in an EH unit: C++ linkage (an extern "C" function is nothrow under /EHsc)."""
-    ret = "float" if lf.float_ret else "bool" if (lf.value_rets and lf.byte_rets == lf.value_rets) else \
-        "int" if lf.value_ret else "void"
+    ret = "float" if lf.float_ret else "__int64" if getattr(lf, "i64_ret", False) else \
+        "bool" if (lf.value_rets and lf.byte_rets == lf.value_rets) else "int" if lf.value_ret else "void"
     if any(re.search(r"\b_this:", l) for l in lf.lines):
         return "%s __fastcall FUN_%08x(%s)\n" % (ret, va, ", ".join(["char* self", "int edx_unused"] + typed))
     return "%s %s FUN_%08x(%s)\n" % (ret, "__stdcall" if lf.ret_pop else "__cdecl", va, ", ".join(typed) or "void")
@@ -1252,8 +1299,8 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
     this = any(re.search(r"\b_this:", l) for l in il)
     nargs = max([(o - 4) // 4 + 1 for o in lf.args_read] + [lf.ret_pop // 4])
     params = ["a%d" % (4 + 4 * k) for k in range(nargs)]
-    ret = "float" if lf.float_ret else "bool" if (lf.value_rets and lf.byte_rets == lf.value_rets) else \
-        "int" if lf.value_ret else "void"
+    ret = "float" if lf.float_ret else "__int64" if getattr(lf, "i64_ret", False) else \
+        "bool" if (lf.value_rets and lf.byte_rets == lf.value_rets) else "int" if lf.value_ret else "void"
     lang_c = bool(flags) and "/TC" in flags.split()
     this_alias = set()
     if lf.eh:
@@ -1375,12 +1422,23 @@ INTRIN = {
                              "#pragma intrinsic(_InterlockedDecrement)"}
 
 
+def sse_helpers_text():
+    """spore-decomp's reviewed sse_helpers.h (SseRoundToInt, SseClamp, ...), included as text so a lifted unit compiles
+    alone; a port into the project replaces it with `#include "sse_helpers.h"`. L2C_SSE_HELPERS names the file."""
+    p = os.environ.get("L2C_SSE_HELPERS") or os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "spore-decomp", "match", "include", "sse_helpers.h")
+    if not os.path.isfile(p):
+        raise Unsupported("an SSE helper (sse_helpers.h not found: L2C_SSE_HELPERS)")
+    return open(p).read()
+
+
 def heads(em, lang_c, cxx=False):
     """The declarations a unit needs: headers, il2c's prelude, the globals, the callees. cxx: callees get C++
     linkage (in an EH unit an extern "C" callee is assumed not to throw, and cl would drop the state stores)."""
     head = (["#include <string.h>"] if em.needs_string else []) + (["#include <math.h>"] if em.needs_math else []) + \
         ["".join(em.prelude)] * bool(em.prelude) + \
         [INTRIN[f] for f in sorted(em.intrin)] + \
+        ([sse_helpers_text()] if getattr(em, "sse_helpers", False) else []) + \
         ["extern __declspec(thread) int tls_%x;" % o for o in sorted(em.tls)] + \
         ['extern "C" unsigned char g_%08x[];' % g for g in sorted(em.gl)]
     ext = "" if lang_c or cxx else 'extern "C" '
@@ -1472,10 +1530,18 @@ def outline(img, va, size, mask=None):
     return "\n".join(out)
 
 
+_CHECK_BUILD = None
+
+
 def _check_one(args):
     """Lift, emit, compile at the corpus flags and score with lbench's CI scorer (read-only use of lbench)."""
     path, head, r, outdir = args
-    os.environ["C2_BUILD"] = head["c2"]
+    build = r.get("c2") or head["c2"]                # the row's compiler (Spore's /vc71 rows are 13.10 in a 15.00
+    global _CHECK_BUILD                              # corpus); msvc pins its toolchain when first imported, so one
+    if _CHECK_BUILD not in (None, build):            # process compiles for one build (check: a pool per build)
+        raise RuntimeError("_check_one: this process compiles for %s, row %s wants %s" % (_CHECK_BUILD, r["va"], build))
+    _CHECK_BUILD = build
+    os.environ["C2_BUILD"] = build
     import corpus as corpusmod, lbench, w8_score
     from w8_emit import Image
     res = dict(va=r["va"], size=r["size"])
@@ -1574,8 +1640,12 @@ def main(argv):
     pick = pool[::step][:a.sample]
     outdir = os.path.join(os.path.dirname(HERE), "work", "scratch", "l2c_%s" % head["corpus"])
     os.makedirs(outdir, exist_ok=True)
-    with ProcessPoolExecutor(a.jobs) as ex:
-        res = list(ex.map(_check_one, [(a.corpus, head, r, outdir) for r in pick]))
+    res = [None] * len(pick)
+    for build in sorted({r.get("c2") or head["c2"] for r in pick}):   # one pool per compiler build (_check_one)
+        idx = [n for n, r in enumerate(pick) if (r.get("c2") or head["c2"]) == build]
+        with ProcessPoolExecutor(a.jobs) as ex:
+            for n, x in zip(idx, ex.map(_check_one, [(a.corpus, head, pick[n], outdir) for n in idx])):
+                res[n] = x
     st = collections.Counter(r["status"] for r in res)
     print("%d functions: %s" % (len(res), dict(st)))
     why = collections.Counter(r.get("why", "")[:60] for r in res if r["status"] in ("UNSUPPORTED", "CL-ERROR", "ERROR"))
