@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""swdiff: the per-case convergence driver for big switch functions (T27).
+"""swdiff: the per-case convergence driver for big switch functions.
 
-Reads f4check's aligned full diff (--full-diff), the switch's case table (cases.txt), and
+Reads an aligned full diff of the function (original | ours rows), the switch's case table (cases.txt), and
 optionally the /FAsc listing of the candidate, and prints the work list: the common-code diffs
 (prologue, loop, epilogue), the per-case diffs classified (call-shape / register / shape / spill /
 vtable), the shared-tail map (which case bodies share which block, original vs ours), the
@@ -9,12 +9,13 @@ vtable-call debt grouped by slot, and per-0x100-region exact counts computed fro
 
 usage: swdiff.py --diff DIFF.txt --cases CASES.txt [--lst OURS.cod] [--case +0x...]
                  [--top N] [--out FILE]
-       DIFF comes from: f4check.py CAND.cpp --pack PK --full-diff DIFF.txt
-       CASES: the `=== case +0x...` table (f4_prepare's cases.txt)
+       DIFF: one row per aligned pair, '%s %-8s %-40s | %s' (mark, +0xOFF, original mnemonic and operands,
+             ours), from your project's compare tool
+       CASES: the `=== case +0x...` table (one line per case: its value and +0x offset)
        --lst: the /FAsc listing of the same compile (source-line join for our rows)
 
 The classification needs no c2 hooks: everything is listing machinery, so the loop
-(edit -> f4check --full-diff -> swdiff) is free and offline.
+(edit -> compare -> swdiff) is free and offline.
 """
 import argparse, re, sys
 from collections import defaultdict
@@ -191,7 +192,7 @@ def vtable_target(ops):
 
 def main(argv):
     ap = argparse.ArgumentParser(prog="swdiff.py", usage=__doc__)
-    ap.add_argument("--diff", required=True, help="f4check --full-diff FILE (the aligned pair listing)")
+    ap.add_argument("--diff", required=True, help="the aligned full diff FILE (one original | ours pair per row)")
     ap.add_argument("--cases", required=True, help="the `=== case +0x...` table")
     ap.add_argument("--lst", help="the /FAsc listing of the same compile (the source-line join)")
     ap.add_argument("--case", help="only this case (+0x...)")

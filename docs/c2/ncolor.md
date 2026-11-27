@@ -1469,7 +1469,7 @@ zlib: unchanged (ilfull replay 2669 / 2669, sim 2690 / 2690 with WALK_FULL); our
 function shorter / longer" diff raises but `c2ncol.py` and `ncolsim.py` do not put next to the original: **what
 NColor did per candidate, and what the two listings actually do to the frame.** Input is a `c2ncol.py --export`
 JSON (cl 17.00 x86_amd64) and any number of listings in `VA mnemonic operands` form (what `orig_va.s` /
-`my_va.s` are; f4check's `+0xN` diff format is accepted too). It is offline: no compile, no trace, so it runs on
+`my_va.s` are; an offset-keyed `+0xN` diff format is accepted too). It is offline: no compile, no trace, so it runs on
 an export made elsewhere.
 
 **Per candidate** the report counts the bucket each candidate landed in — one region (`whole`), two or more

@@ -16,7 +16,7 @@ next) is visible as a run of splits. The `main` region is the longest one; `stol
 got a must-save register.
 
 --asm FILE ...: one or more listings (`VA mnemonic operands` lines, the form orig_va.s / my_va.s have; the `+0xN`
-form of f4check's diff is accepted too). For each it reports the frame accesses as a proxy for that build's spills:
+form of an offset-keyed aligned diff is accepted too). For each it reports the frame accesses as a proxy for that build's spills:
 per [rbp/rsp+-0xN] slot the loads and stores, the slots reloaded or re-stored three or more times, and the top
 slots by access count. `lea` is an address, not an access, and is not counted; a read-modify-write counts once as a
 load and once as a store. Two listings also get a side-by-side summary: an original and a draft, or two drafts.

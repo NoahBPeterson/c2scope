@@ -1169,7 +1169,7 @@ def callform_tests():
         "0000000a call qword ptr [rax + 0x18]",
         "0000000f call qword ptr [rax + 0x20]",
         "00000014 call qword ptr [rip]",                 # unresolved thunk name
-        "00000019 call FUN_1414d7200",                   # unresolved direct name
+        "00000019 call FUN_1804d7200",                   # unresolved direct name
     ])
     out = run(orig, missing)
     check("callform: a missing teardown block is one slot-0 form delta, not scattered replacements",
@@ -1183,7 +1183,7 @@ def callform_tests():
         "0000000a call qword ptr [rax + 0x18]",
         "0000000f call qword ptr [rax + 0x20]",
         "00000014 call qword ptr [rip]",
-        "00000019 call FUN_1414d7200",
+        "00000019 call FUN_1804d7200",
     ])
     check("callform: register spelling (rax vs r8) is not a finding",
           "allocator spelling, not a finding" in run(orig, equal, "--targets"), True)
@@ -1197,16 +1197,16 @@ def callform_tests():
           ("devirtualised destructor(s): ??1Foo@@UEAA@XZ" in devout,
            "structural lead" in devout), (True, True))
     check("callform: unresolved FUN_ vs mangled names are paired as a listing artifact",
-          "pairs with FUN_1414d7200 by count: symbol-resolution artifact" in
+          "pairs with FUN_1804d7200 by count: symbol-resolution artifact" in
           run(orig, dev, "--targets"), True)
     reg = os.path.join(d, "reg.json")
-    json.dump({"symbols": {"?callee@@YAXXZ": "0x141507190"}}, open(reg, "w"))
-    sa = listing("sa.s", ["00000000 call FUN_141507190", "00000005 call FUN_141507190",
+    json.dump({"symbols": {"?callee@@YAXXZ": "0x180507190"}}, open(reg, "w"))
+    sa = listing("sa.s", ["00000000 call FUN_180507190", "00000005 call FUN_180507190",
                           "0000000a call ?z@@YAXXZ"])
-    sb = listing("sb.s", ["00000000 call FUN_141507190", "00000005 call ?z@@YAXXZ"])
+    sb = listing("sb.s", ["00000000 call FUN_180507190", "00000005 call ?z@@YAXXZ"])
     check("callform: --syms resolves a FUN_ placeholder on both sides to one callee",
           "(both sides resolve to ?callee@@YAXXZ)" in run(sa, sb, "--targets", "--syms", reg), True)
-    sc = listing("sc.s", ["00000000 call FUN_141507190", "00000005 call ?other@@YAXXZ"])
+    sc = listing("sc.s", ["00000000 call FUN_180507190", "00000005 call ?other@@YAXXZ"])
     se = listing("se.s", ["00000000 call ?callee@@YAXXZ", "00000005 call ?other@@YAXXZ",
                           "0000000a call ?other@@YAXXZ"])
     check("callform: --syms binds a cross-spelling pair as confirmed, not an artifact",
@@ -1221,11 +1221,11 @@ def callform_tests():
 
 
 def swdiff_tests():
-    """tools/swdiff.py (T27): the per-case convergence driver — the case attribution walk, the fix
+    """tools/swdiff.py: the per-case convergence driver — the case attribution walk, the fix
     classifiers (register / shape / spill / call-shape / vtable), the shared-tail map, the vtable
-    table and the region counts, on a synthetic f4check --full-diff fixture. No compile."""
+    table and the region counts, on a synthetic aligned full-diff fixture. No compile."""
     import io, contextlib, swdiff as S
-    # the fixture rendered with f4check's own row format ('%s %-8s %-40s | %s'), so the test also
+    # the fixture rendered with the diff's row format ('%s %-8s %-40s | %s'), so the test also
     # validates the real column widths; ours rows carry a dummy offset (the real ours column prints
     # mnem+ops only, '%s %s' % y[1:] of a (off, mnem, ops) row)
     rows = [
@@ -1234,7 +1234,7 @@ def swdiff_tests():
         ("!", ("+0x0007", "mov", "rax, qword ptr [rcx + 8]"), ("", "mov", "qword ptr [rbp - 8], rax")),
         ("!", ("+0x0020", "mov", "rbx, rax"), ("", "mov", "r12, rax")),
         ("!", ("+0x0023", "mov", "rdx, r8"), ("", "mov", "rdx, r9")),
-        (" ", ("+0x0026", "call", "FUN_1401549f0"), ("", "call", "FUN_1401549f0")),
+        (" ", ("+0x0026", "call", "FUN_1801549f0"), ("", "call", "FUN_1801549f0")),
         ("!", ("+0x002b", "je", "+0x60"), ("", "je", "+0x80")),
         ("!", ("+0x0030", "mov", "eax, dword ptr [rbx]"), ("", "mov", "eax, dword ptr [r12]")),
         (" ", ("+0x0034", "mov", "qword ptr [rsp + 0x20], rax"), ("", "mov", "qword ptr [rsp + 0x20], rax")),
@@ -1242,7 +1242,7 @@ def swdiff_tests():
         ("!", ("+0x0042", "jmp", "+0x90"), ("", "jmp", "+0x90")),
         (" ", ("+0x0050", "test", "rax, rax"), ("", "test", "rax, rax")),
         ("!", ("+0x0053", "je", "+0x60"), ("", "je", "+0x80")),
-        (" ", ("+0x0059", "call", "FUN_1401549f0"), ("", "call", "FUN_1401549f0")),
+        (" ", ("+0x0059", "call", "FUN_1801549f0"), ("", "call", "FUN_1801549f0")),
         ("!", ("+0x005e", "jmp", "+0x60"), ("", "jmp", "+0x80")),
         ("!", ("+0x0060", "mov", "rcx, qword ptr [rsp + 0x20]"), None),
         ("!", ("+0x0065", "call", "?Release@NiRefObject@@QEAAXXZ"), None),

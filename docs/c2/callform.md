@@ -1,7 +1,7 @@
 # The call-form census: missing block or allocator? (`tools/callform.py`)
 
 One-command triage for "why is my draft N bytes short / long". The aligned diff
-(`f4check --full-diff`, `icount.py --asm-vs`) shows a **missing whole basic block**
+(a full aligned diff, `icount.py --asm-vs`) shows a **missing whole basic block**
 as scattered replacement rows that are indistinguishable from register-allocation
 divergence — on `bhkCollisionQuery::Process` a 277-byte absent teardown block was
 read as "NColor cascade" for two passes. The census is the discriminator: a missing
@@ -14,7 +14,7 @@ uv run tools/callform.py orig.s my.s --targets  # also diff the callees per form
 uv run tools/callform.py orig.s                 # census of one listing
 ```
 
-Both listings are `VA mnemonic operands` lines (capstone style; f4check's `+0xN`
+Both listings are `VA mnemonic operands` lines (capstone style; an offset-keyed `+0xN`
 form is accepted). Offline: no compile, no trace, no symbol map — it reads only
 what the listing says, and normalises away the two things that otherwise bury the
 signal: **register names** (allocator spelling) and **callee resolution**
@@ -28,7 +28,7 @@ where the original spells `__imp_X`).
 | `call [reg] (slot N)` | memory-indirect, displacement / 8 = vtable entry | `call qword ptr [rax]` → slot 0 (the scalar-deleting dtor), `[r8 + 0x18]` → slot 3 |
 | `call [reg+d] (other)` | displacement that is not a vtable slot | base+index, not 8-aligned |
 | `call [rip] (thunk)` | rip-relative indirect: IAT thunks and function-pointer globals | `call [rip -> __imp_TlsGetValue]`, `[rip]` unresolved |
-| `direct` | a direct call, named or not | `call ?slowBlockFree@@QEAAXPEAXH@Z`, `call FUN_141507190` |
+| `direct` | a direct call, named or not | `call ?slowBlockFree@@QEAAXPEAXH@Z`, `call FUN_180507190` |
 | `call reg` | register-indirect | `call rax` |
 | `other` | far call, segment forms | |
 
@@ -81,7 +81,7 @@ with the 121-byte residue confirmed as the allocator wall (§9.2), not structure
   displacement is reported raw, without a slot claim.
 - **Equal census does not prove equal structure** — two different blocks can call
   the same set. It is a discriminator (structure changed or not), not a proof of
-  placement; follow a nonzero delta with `f4check`'s diff and the address search
+  placement; follow a nonzero delta with the aligned diff and the address search
   named in the verdict.
 - A devirtualised call in *both* listings stays a `direct`/`direct` pair and is
   invisible here; the tool sees what the listings show, and slots only move when

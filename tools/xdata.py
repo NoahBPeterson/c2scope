@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The image's unwind and ICF state: is a body's .pdata chained (a /GL+/LTCG link), and how many
-bodies are byte-identical twins?  Measured for bhkCollisionQuery::Process, 2026-11-23 (ticket §14).
+bodies are byte-identical twins?  (2026-11-23)
 
 usage: xdata.py --image EXE [--va VA] [--icf [N]] [--sample N] [--band VA]
 
@@ -15,11 +15,10 @@ usage: xdata.py --image EXE [--va VA] [--icf [N]] [--sample N] [--band VA]
 --sample N     the random sample size (default 17377).
 --band VA      only count .pdata entries whose body begins in the 1 MB band at VA (the same TU).
 
-Offline: pefile + struct only, no capstone, no trace. Measured on the plain 1.10.163 Fallout4.exe
-(2026-11-23): 291,114 entries (54,325 bodies < 0x20), 10 chained fragments for 0x141dbd030 (every
-one after the first UNW_FLAG_CHAININFO, back to the main fragment's unwind 0x143587c18), and 9.2%
-identical-prefix twins in a 17,377-body sample. The ticket records 291,080 / 54,291 / 9.3% — the
-drift is the entry filter and the hash length, not a finding.
+Offline: pefile + struct only, no capstone, no trace. Measured on a retail x64 game
+executable (2026-11-23): 291,114 entries (54,325 bodies < 0x20), 10 chained fragments for one function (every
+one after the first UNW_FLAG_CHAININFO, back to the main fragment's unwind), and 9.2% identical-prefix twins in a
+17,377-body sample (an earlier count with another entry filter and hash length: 291,080 / 54,291 / 9.3%).
 """
 import argparse, os, random, struct, sys
 

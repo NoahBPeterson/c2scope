@@ -6,7 +6,7 @@ usage: callform.py FIRST.s SECOND.s [--targets] [--syms FILE]
        callform.py ONE.s                        (census only, no diff)
 
 Both listings are one instruction per line, `VA mnemonic operands` (what orig.s / my_va.s are;
-f4check's `+0xN` form is accepted too). Every call is grouped by its dispatch form, the register
+an offset-keyed `+0xN` form is accepted too). Every call is grouped by its dispatch form, the register
 names and the callee spelling normalised away, because those are the two things the allocator and
 the symbol resolution change while the call's *kind* stays:
 
