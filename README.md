@@ -115,6 +115,8 @@ Pass compiler flags literally after `--`; in zsh a `$FLAGS` variable holding sev
 | `tools/l2c_search.py` | a lifted function that compiles close but not exact: compiles every semantics-keeping rewrite (statement swaps, operand order, declarations, signedness, symbol-key aliases) and keeps the closest | docs/c2/lift2il.md |
 | `tools/lift2il64.py` | the same for x64 (MSVC 2012 / cl 17.00): `il`, `unit`, `check` (compile with `C2_CL64` and compare), `bench`; `tidy64.py` / `tidycheck64.py` make the result readable | docs/c2/lift2il64.md |
 | `tools/x64check.py` | compile one C++ function with an x64 cl and compare it with the executable, byte by byte and relocation by relocation | docs/c2/lift2il64.md |
+| `tools/x360img.py` | Xbox 360 game files to PE images (STFS packages, disc images, XEX2) and which XDK / compiler build made a game | docs/c2/port-x360.md |
+| `tools/x360check.py` | compile one function with the Xbox 360 cl and compare it with a game image, word by word and relocation by relocation | docs/c2/port-x360.md |
 
 Worked example: `docs/c2/frontend.md`, "Applied to 0x008e7d40", is the full story of a Fallout 3 function that
 went from 98 differing instructions to byte-exact, and `helpersweep` finds that match automatically in 11 compiles.
@@ -151,6 +153,30 @@ uv run python tools/lift2il64.py check 1401234560 --binary game.exe --flags /O2,
 
 On 1,000 functions of a retail x64 game, 51% recompile byte-identical: 82% of the ones up to 32 bytes and 14% of
 those between 129 and 256 bytes. docs/c2/lift2il64.md has the details.
+
+## Xbox 360 (PowerPC): the XDK 9328 compiler
+
+The tracer also runs inside the Xbox 360 cross compiler of XDK 2.0.9328 (cl 15.00.8153, the VS2008 compiler with a
+PowerPC back end; build `xbox360`). Extract the XDK installer (`7z x XDKSetupXenon9328.exe`, nothing is run), then:
+
+```
+uv run python tools/x360img.py stage /path/to/XDK work/xdk-stage            # bin, include, lib of the XDK
+uv run python tools/c2build.py setup --c2 xbox360 --from work/xdk-stage
+C2_BUILD=xbox360 uv run python tools/c2trace.py regs f.cpp --func F -- /O2   # also: il, c2sched.py, rasim check
+```
+
+`il` (every pass, PowerPC opcode and register names), `regs` and `rasim check` (the allocator's priorities and
+colouring order, 0 mismatches on 14 zlib functions), `c2sched.py` (Xenon's dual-issue list scheduler) and
+`symkeys.py` (every symbol key replayed; the commutative operand sorts) work;
+docs/c2/port-x360.md has what was measured and what is not ported. For a game:
+
+```
+uv run python tools/x360img.py info default.xex          # which XDK and compiler build made it (Rich header)
+uv run python tools/x360img.py pe default.xex game.pe    # the PE image inside a decrypted XEX (also: stfs, iso)
+uv run python tools/x360check.py game.pe 82123450 16 f.cpp   # one function, word by word with relocations
+```
+
+A game matches this compiler only if `info` reports build 8153 (Left 4 Dead 2 does; Xbox Live Indie Games are .NET).
 
 ## License
 

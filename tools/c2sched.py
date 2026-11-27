@@ -38,11 +38,17 @@ HOOKS = [
     "@SchComputeStaticPriority@4+0x40=esi>0x1c,eax>0xc>0x1c,eax>0x14,eax>0x10,esi>0x3c",  # 5 one DAG edge
 ]
 HOOKS = c2trace.c2build.hooks("sched", HOOKS)    # another c2 build: its own table entry (port-1310.md)
+# A build table may give the node-ready event's fields by name (`sched_ready`: t prio ht lex ns np fl est cyc lat unit
+# op, one per spec of hook 2) when its DAGNODE packs them differently, and `sched_cyc_entry` when the issue cycle is
+# SchSelectInstrs' own argument (logged at its entry) instead of a global (the Xbox 360 back end).
+READY = c2trace.c2build.get("sched_ready")
+CYC_ENTRY = bool(c2trace.c2build.get("sched_cyc_entry"))
 
 
 def parse(log, funcpat):
     """-> [(funcname, pre IL lines, post IL lines, regions)] ; region = dict(nodes={tuple: info}, issue=[(cyc, [t..])])"""
     funcs, cur, il_target, region, pend_edges, pend_marks = [], None, None, None, None, None
+    sel_cyc = None
     for ln in log.splitlines():
         if ln.startswith("T "):
             if il_target is not None:
@@ -86,6 +92,15 @@ def parse(log, funcpat):
             region = dict(nodes={}, issue=[], ready=[], events=[], edges=edges)
             pend_edges = pend_marks = None
             cur[3].append(region)
+        elif hk == 2 and region is not None and READY:     # a build table's own field layout (sched_ready)
+            d = dict(zip(READY, [int(x, 16) if x != "?" else 0 for x in v]))
+            t = d.get("t", 0)
+            region["nodes"][t] = dict(prio=d.get("prio", 0), ht=d.get("ht", 0) & 0xffff, lex=d.get("lex", 0) & 0xffff,
+                                      ns=d.get("ns", 0) & 0xffff, np=d.get("np", 0) & 0xffff, fl=d.get("fl", 0) & 0xff,
+                                      est=d.get("est", 0), rdy=sel_cyc if sel_cyc is not None else d.get("cyc", 0),
+                                      lat=d.get("lat", 0) & 0xff, unit=d.get("unit", 0), op=d.get("op", 0))
+            region["ready"].append(t)
+            region["events"].append(("add", t))
         elif hk == 2 and region is not None:
             t, prio, hl, pn, fl, est, cyc, lu, op = [int(x, 16) if x != "?" else 0 for x in v[:9]]
             region["nodes"][t] = dict(prio=prio, ht=hl & 0xffff, lex=hl >> 16, ns=pn >> 16, np=pn & 0xffff,
@@ -96,11 +111,16 @@ def parse(log, funcpat):
             region["events"].append(("add", t))
         elif hk == 3 and ev == "E" and region is not None:
             region["events"].append(("sel", int(v[0], 16)))
+            if CYC_ENTRY:
+                sel_cyc = int(v[0], 16)
         elif hk == 3 and ev == "X" and region is not None:
             n = int(v[0], 16)
-            cyc = int(v[1], 16)
-            region["issue"].append((cyc, [int(x, 16) for x in v[2:2 + n]]))
-            region["events"].append(("iss", cyc, [int(x, 16) for x in v[2:2 + n]]))
+            if CYC_ENTRY:                            # the cycle is SchSelectInstrs' argument (Xbox 360), not a global
+                cyc, tl = sel_cyc or 0, v[1:1 + n]
+            else:
+                cyc, tl = int(v[1], 16), v[2:2 + n]
+            region["issue"].append((cyc, [int(x, 16) for x in tl]))
+            region["events"].append(("iss", cyc, [int(x, 16) for x in tl]))
     return funcs
 
 
@@ -426,8 +446,11 @@ def simulate_p6(funcs, verbose=False):
 
 
 def report(funcs, show_all=False):
+    seen = {}
     for name, pre, post, regions in funcs:
-        print("== %s: %d regions scheduled" % (name, len(regions)))
+        seen[name] = seen.get(name, 0) + 1          # Schedule can run more than once per function (Xbox 360: around
+        many = sum(1 for f in funcs if f[0] == name) > 1   # Globregs and Color, and in CodegenFinish)
+        print("== %s%s: %d regions scheduled" % (name, " (Schedule run %d)" % seen[name] if many else "", len(regions)))
         txt = instr_text(pre)
         for k, r in enumerate(regions):
             order = sorted((n for t, n in r["nodes"].items() if t), key=lambda n: n["lex"])

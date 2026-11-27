@@ -1,0 +1,658 @@
+{
+ "version": "15.00.8153",
+ "c2_sha256": "54c9b25b057948afb521e54c9e929409c75b864587d588ee1eb781594568aba7",
+ "image_base": "10b00000",
+ "arch": "ppc",
+ "patch": {
+  "cave_rva": "125440",
+  "text_vsize": "12443c",
+  "entry_rva": "11fd11",
+  "iat_loadlibrarya": "102c",
+  "loadlib": "exw",
+  "file_delta": "c00",
+  "nsec": 4
+ },
+ "dll_build": "15.00",
+ "setup": {
+  "from": "work/xdk/stage",
+  "sdk": "",
+  "sal": ""
+ },
+ "functions": {
+  "@dop2_Codegen@4": [
+   "75bec",
+   0,
+   "near",
+   "traced: once per function, ecx = FUNC"
+  ],
+  "@dop2_PreLowerGlobalOpts@4": [
+   "75a35",
+   0,
+   "near",
+   "c2port calls; called from the driver 75834's caller chain"
+  ],
+  "@dop2_CodegenUpdate@4": [
+   "74ef6",
+   0,
+   "near",
+   "driver 75834, 3rd pass"
+  ],
+  "@EncEmitFunc@4": [
+   "2e176",
+   0,
+   "near",
+   "last call of dop2_EncodeAndRelated"
+  ],
+  "@dop2_PostLowerPreRegAllocGlobalOpts@4": [
+   "74dc0",
+   0,
+   "near",
+   "driver 75834, 1st pass"
+  ],
+  "@dop2_GlobalRegAlloc@4": [
+   "74e1b",
+   0,
+   "near",
+   "driver 75834, 2nd pass: FgEarlyTailDup, a lowering step, Globregs, Color (x86's shape)"
+  ],
+  "@Globregs@4": [
+   "50b36",
+   0,
+   "near",
+   "called by dop2_GlobalRegAlloc; loose match 0.54"
+  ],
+  "@Color@4": [
+   "2bcc1",
+   0,
+   "near",
+   "dop2_GlobalRegAlloc's last call; callees SpillOrDefer, BetterToDefer, FoldTooCheapDefs, Sbv* as x86 Color"
+  ],
+  "@FgEarlyTailDup@4": [
+   "3205f",
+   0,
+   "near",
+   "dop2_GlobalRegAlloc's first call; loose 0.58"
+  ],
+  "@dop2_PostCodegenFlowOpts@4": [
+   "74fc9",
+   0,
+   "near",
+   "driver 75834, 4th pass"
+  ],
+  "@dop2_PreEncode@4": [
+   "75014",
+   0,
+   "near",
+   "driver 75834, 5th pass (x86 has PreEncode before EncodeAndRelated; inferred)"
+  ],
+  "@dop2_FinalFlowOpts@4": [
+   "7508f",
+   0,
+   "near",
+   "driver 75834, 6th pass; calls FgCodeMotion, FgCoalesceLabels"
+  ],
+  "@FgCodeMotion@4": [
+   "35957",
+   0,
+   "near",
+   "called by dop2_FinalFlowOpts; loose 0.63"
+  ],
+  "@FgCoalesceLabels@4": [
+   "318fb",
+   0,
+   "near",
+   "called by dop2_FinalFlowOpts; loose 0.82"
+  ],
+  "@dop2_CodegenFinish@4": [
+   "75111",
+   0,
+   "near",
+   "driver 75834, 7th pass"
+  ],
+  "@MscClean@4": [
+   "7d3ce",
+   0,
+   "near",
+   "called by dop2_CodegenFinish; loose 0.51"
+  ],
+  "@dop2_EncodeAndRelated@4": [
+   "751ec",
+   0,
+   "near",
+   "driver 75834, last pass; calls EncEmitFunc"
+  ],
+  "@OrderGlobregs@12": [
+   "2b6d8",
+   0,
+   "near",
+   "Color's class loop: after Spillcosts / SpillObvious, (func, class) like x86"
+  ],
+  "@ChoosePhysReg@12": [
+   "28860",
+   0,
+   "near",
+   "Color: after InsertSplitPoints, ecx = the popped gr, edx = class; reads the weights table 0x10c3b4d0"
+  ],
+  "@SpillOrDefer@12": [
+   "2b429",
+   0,
+   "near",
+   "Color: benefit <= 0 path (x86 shape), ecx = gr"
+  ],
+  "@HandleCurrUncolorable@8": [
+   "2b56b",
+   0,
+   "near",
+   "Color: gr+0x20 register set empty, ecx = gr"
+  ],
+  "@Spillcosts@12": [
+   "2768f",
+   0,
+   "near",
+   "Color's class loop, called again after splits; the P*w / blkcost / live-through prio updates"
+  ],
+  "@SpillObvious@16": [
+   "2b606",
+   0,
+   "near",
+   "Color's class loop after Spillcosts, 4 arguments"
+  ],
+  "@InitialSplitPoints@16": [
+   "26f0f",
+   0,
+   "near",
+   "Color's class loop, first call"
+  ],
+  "@InsertSplitPoints@28": [
+   "2a536",
+   0,
+   "near",
+   "Color: before ChoosePhysReg, 7 arguments"
+  ],
+  "@UpdateAffectedGlobregs@20": [
+   "2baf0",
+   0,
+   "near",
+   "Color: after ChoosePhysReg"
+  ],
+  "@BetterToDefer@4": [
+   "29477",
+   0,
+   "near",
+   "Color: deferral test, loose 0.66"
+  ],
+  "@InsertInList@8": [
+   "258a3",
+   0,
+   "near",
+   "Color: re-insert of a deferred gr, loose 0.89"
+  ],
+  "@RemoveSplitGlobregs@4": [
+   "259df",
+   0,
+   "near",
+   "same code as x86's (loose 0.89)"
+  ],
+  "@Schedule@8": [
+   "dba9c",
+   0,
+   "near",
+   "traced: once per function at /O2 (edx = 1), called from dop2_GlobalRegAlloc around Globregs / Color when 0x10c262d8 is set, and from dop2_CodegenFinish"
+  ],
+  "@SchSchedGraph@4": [
+   "db986",
+   0,
+   "near",
+   "traced: once per region"
+  ],
+  "@SchSelectInstrs@4": [
+   "db7da",
+   0,
+   "near",
+   "traced: once per cycle, ecx = cycle, returns the number issued (2 = Xenon's dual issue)"
+  ],
+  "@SchAddToReadyList@4": [
+   "db6d5",
+   0,
+   "near",
+   "x86's list insert, sorted by +0x3c then the lex word +0x44"
+  ],
+  "@SchComputeStaticPriority@4": [
+   "db52b",
+   0,
+   "near",
+   "prio +0x38 = sum of node terms shifted by the row at [0x10c69cac]"
+  ],
+  "@SchNeedSchedule@4": [
+   "db4e5",
+   0,
+   "near",
+   "loose 0.79, called by Schedule"
+  ],
+  "@SymInit@0": [
+   "c8b2c",
+   0,
+   "near",
+   "loose 0.56"
+  ],
+  "@SymAlloc@4": [
+   "c7b5b",
+   0,
+   "near",
+   "kind in cl; free lists of [0x10c67684] +0x2c..+0x38 (read)"
+  ],
+  "@SymFree@4": [
+   "c7da7",
+   0,
+   "near",
+   "loose 0.76 by similarity; the chain loop and free lists read"
+  ],
+  "@SymMakeUserVar@4": [
+   "c7fde",
+   0,
+   "near",
+   "loose 0.84; SSR in ecx"
+  ],
+  "@SymNewEquiv@16": [
+   "c81d5",
+   0,
+   "near",
+   "loose 0.62; sym ecx, size s1 (+0x20), offset s2 (+0x24) as x86's"
+  ],
+  "@RdrReadProc@4": [
+   "baf93",
+   0,
+   "near",
+   "loose 0.56"
+  ],
+  "@OptFuncExpr@8": [
+   "8cbdc",
+   0,
+   "near",
+   "loose 0.79"
+  ],
+  "@SymGarbageCollection@4": [
+   "c8fd9",
+   0,
+   "near",
+   "loose 0.86"
+  ],
+  "@SymAllocPool@0": [
+   "c7a0c",
+   0,
+   "near",
+   "loose 0.70; called by SymAlloc when a list's pool block is full"
+  ],
+  "@GetInlinee@28": [
+   "5a107",
+   0,
+   "near",
+   "loose 0.55; the call in ecx, its callee [+4]"
+  ],
+  "@HshBuildTable@4": [
+   "11ad5d",
+   0,
+   "near",
+   "loose 0.55"
+  ],
+  "@HshEnterAssign@8": [
+   "52d40",
+   0,
+   "near",
+   "loose 0.54"
+  ],
+  "@SymAllocTmp@4": [
+   "c7ea9",
+   0,
+   "near",
+   "25 callers; pops the tmp list +0x2c, else the tmp pool +0x24: SymAlloc's tmp path as its own function"
+  ],
+  "@MscMergeSort@8": [
+   "7cfb8",
+   0,
+   "near",
+   "loose 0.71; callers OptLeftWeightTree, the Fact*Sort family, MscAllocateSegments; list ecx, compare edx"
+  ],
+  "@OptLeftWeightTree@4": [
+   "898c1",
+   0,
+   "near",
+   "loose 0.77; node in ebp, the operand-list sort at 0x899fb (return 0x89a00), returns the node"
+  ]
+ },
+ "partial": true,
+ "hooks": {
+  "default": [
+   "@dop2_Codegen@4=ecx"
+  ],
+  "il_spec": "=g10c38108>0>0>4$,g10c38108>0>8>0>0x1c%",
+  "il_default": [
+   "@dop2_PreLowerGlobalOpts@4",
+   "@dop2_Codegen@4",
+   "@dop2_PostLowerPreRegAllocGlobalOpts@4",
+   "@FgEarlyTailDup@4",
+   "@Globregs@4",
+   "@Color@4",
+   "@dop2_CodegenUpdate@4",
+   "@dop2_PostCodegenFlowOpts@4",
+   "@dop2_PreEncode@4",
+   "@dop2_FinalFlowOpts@4",
+   "@FgCodeMotion@4",
+   "@FgCoalesceLabels@4",
+   "@dop2_CodegenFinish@4",
+   "@MscClean@4",
+   "@dop2_EncodeAndRelated@4",
+   "@EncEmitFunc@4"
+  ],
+  "regs": [
+   "@Color@4=g10c38108>0>0>4$,g10c38108>0>0x44,g10c38108>0>8>0>0x1c%",
+   "@OrderGlobregs@12=edx",
+   "10b2bec8=edi,edi>0xc,edi>0x40,edi>0x24,edi>0x44,edi>0x1c,edi>0>0x1c,edi>0>4,edi>0>0>4$",
+   "10b2bf7b=edi,edi>0x10>0x1c~10b12328$",
+   "10b28942=edx~10b12328$,edx~10c3b4d0",
+   "@SpillOrDefer@12=ecx",
+   "@HandleCurrUncolorable@8=ecx",
+   "@Spillcosts@12",
+   "10b27dc5=esi,edi",
+   "10b27dd0=eax,eax>0x18,esi,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "10b27dff=eax,eax>0x18,esi,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "10b27e0d=eax,esi,eax>0>0>4$,eax>0>0x1c,eax>0>4",
+   "10b259f1=esi"
+  ],
+  "sched": [
+   "@Schedule@8=g10c38108>0>0>4$,g10c38108>0>8>0>0x1c%",
+   "@SchSchedGraph@4",
+   "@SchAddToReadyList@4=ecx>0x1c,ecx>0x38,ecx>0x48,ecx>0x44,ecx>0x26,ecx>0x24,ecx>0x4e,ecx>0x40,ecx>0x1c>4",
+   "@SchSelectInstrs@4=ecx/xeax,g10c35058>0>0x1c,g10c3505c>0>0x1c,g10c35060>0>0x1c",
+   "@Globregs@4=g10c38108>0>0>4$,g10c38108>0>8>0>0x1c%"
+  ],
+  "symkeys": {
+   "init": "@SymInit@0",
+   "alloc": "@SymAlloc@4=ecx,g10c262c8>0,a0,a1,a2,a3,a4,a5,a6,a7,a8/xeax>0x1c,eax",
+   "free": "10bc7dbd=esi>0x1c,ebx",
+   "uservar": "@SymMakeUserVar@4=ecx>4$,ecx,ecx>0x28/xeax",
+   "equiv": "@SymNewEquiv@16=ecx,ecx>8,s2/xeax,eax>0x10,eax>0x20",
+   "read": "@RdrReadProc@4/xeax",
+   "opt": "@OptFuncExpr@8=g10c38108>0>0>4$",
+   "gc": "@SymGarbageCollection@4",
+   "pool": "@SymAllocPool@0/xeax>4>0x1c",
+   "getinl": "@GetInlinee@28=ecx>4>0x28>0x18>4$,ecx>4>0x14/xeax",
+   "hshwalk": "@HshBuildTable@4/xeax",
+   "hshasg": "@HshEnterAssign@8/xeax",
+   "alloc2": "@SymAllocTmp@4=ecx,g10c262c8>0,a0,a1,a2,a3,a4,a5,a6,a7,a8/xeax>0x1c,eax",
+   "sort": "@MscMergeSort@8=a0/xebp>4,ebp>0x14,eax>8,eax>0x10,eax>0x18>0x1c,eax>0x28>8,eax>0x28>0x18>0x1c,eax>0>8,eax>0>0x10,eax>0>0x18>0x1c,eax>0>0x28>8,eax>0>0x28>0x18>0x1c",
+   "sortx": "@OptLeftWeightTree@4/xeax>0x28>0x28>8,eax>0x28>0x28>0x18>0x1c,eax>0x28>0x28>0x2c>0x18>0x1c,eax>0x28>0x28>0x28,eax>0x28>0x28>0>8,eax>0x28>0x28>0>0x18>0x1c,eax>0x28>0>0x28>8,eax>0x28>0>0x28>0x18>0x1c,eax>0x28>0>0x28>0x2c>0x18>0x1c,eax>0x28>0>0x28>0x28,eax>0x28>0>0x28>0>8,eax>0x28>0>0x28>0>0x18>0x1c",
+   "sort3": "10b89a03=ebp>0x28>0>0>8,ebp>0x28>0>0>0x10,ebp>0x28>0>0>0x18>0x1c,ebp>0x28>0>0>0x28>8,ebp>0x28>0>0>0x28>0x18>0x1c,ebp>0x28>0>0>0x2c>0x18>0x1c,ebp>0x28>0>0>0x28,ebp>0x28>0>0>0>8,ebp>0x28>0>0>0>0x10,ebp>0x28>0>0>0>0x18>0x1c,ebp>0x28>0>0>0>0x2c>0x18>0x1c,ebp>0x28>0>0>0>0>8"
+  }
+ },
+ "globals": {
+  "_CurFunc": "10c38108",
+  "_RegName": "10b12328",
+  "weights": "10c3b4d0",
+  "_RegOrders": "10c304e4",
+  "priolist": "10c3ba64",
+  "_issueArray": "10c35058",
+  "_SchmdHWT_ptr": "10c69cac",
+  "ready_head": "10c35070",
+  "OpSchedInfo": "10b1c390",
+  "sched_latency_matrix": "10c340b8",
+  "_SymTab": "10c67684",
+  "_CurLine": "10c262c8",
+  "_Function": "10c262d0"
+ },
+ "dll": {
+  "opname": "0",
+  "opcount": "0",
+  "regname": "10b12328",
+  "curfunc": "10c38108"
+ },
+ "opnames": {
+  "1": "add",
+  "2": "add.",
+  "b": "addi",
+  "c": "addic",
+  "d": "addic.",
+  "e": "addis",
+  "15": "addze",
+  "19": "and",
+  "1a": "and.",
+  "1b": "andc",
+  "1f": "b",
+  "21": "bc",
+  "27": "bclr",
+  "29": "bctr",
+  "2a": "bctrl",
+  "2b": "bl",
+  "2d": "cmpw",
+  "2e": "cmpwi",
+  "2f": "cmplw",
+  "30": "cmplwi",
+  "32": "cntlzw",
+  "4b": "divw",
+  "4f": "divwu",
+  "59": "eqv",
+  "5b": "extsb",
+  "5d": "extsh",
+  "5f": "extsw",
+  "65": "fadds",
+  "67": "fcfid",
+  "71": "fctiwz",
+  "75": "fdivs",
+  "79": "fmadds",
+  "83": "fmuls",
+  "93": "frsp",
+  "9f": "fsubs",
+  "a3": "lbz",
+  "a4": "lbzu",
+  "a6": "lbzx",
+  "a7": "ld",
+  "ad": "lfd",
+  "b1": "lfs",
+  "b5": "lha",
+  "ba": "lhz",
+  "bb": "lhzu",
+  "bd": "lhzx",
+  "d6": "lwz",
+  "d7": "lwzu",
+  "d9": "lwzx",
+  "e6": "mflr",
+  "f8": "mtspr",
+  "108": "mulhwu",
+  "110": "mulli",
+  "111": "mullw",
+  "117": "neg",
+  "11d": "or",
+  "121": "ori",
+  "131": "rlwimi",
+  "133": "rlwinm",
+  "134": "rlwinm.",
+  "13f": "slw",
+  "145": "sraw",
+  "147": "srawi",
+  "14b": "srw",
+  "14d": "stb",
+  "14e": "stbu",
+  "150": "stbx",
+  "151": "std",
+  "157": "stdx",
+  "159": "stfd",
+  "15e": "stfs",
+  "162": "sth",
+  "164": "sthu",
+  "166": "sthx",
+  "17a": "stw",
+  "17e": "stwu",
+  "180": "stwx",
+  "181": "subf",
+  "182": "subf.",
+  "183": "subfc",
+  "187": "subfe",
+  "18b": "subfic",
+  "192": "subfze",
+  "19d": "tw",
+  "26a": "xor",
+  "26c": "xori",
+  "26d": "xoris",
+  "270": "li",
+  "271": "lis",
+  "272": "mr",
+  "273": "mr.",
+  "274": "not",
+  "276": "op276?",
+  "281": "addi_281",
+  "282": "addi_282",
+  "284": "blr",
+  "286": "lis_286",
+  "287": "addi_287",
+  "288": "bdnz",
+  "289": "bdz",
+  "28c": "subfe_28c",
+  "292": "DCD",
+  "298": "OPILLEGAL?",
+  "299": "OPICONST?",
+  "29a": "OPSCONST?",
+  "29b": "OPFCONST?",
+  "29c": "OPTEXT?",
+  "29d": "OPREG?",
+  "29e": "OPLOCAL?",
+  "29f": "OPGLOBAL?",
+  "2a0": "OPBASED?",
+  "2a1": "OPINDEXED?",
+  "2a2": "OPLOCALSCALED?",
+  "2a3": "OPSCALED?",
+  "2a4": "OPSYMOFF?",
+  "2a5": "OPSYMSEG?",
+  "2a6": "OPSEGOFF?",
+  "2a7": "OPEXTERNAL?",
+  "2a8": "OPINTERNAL?",
+  "2a9": "OPLABOFF?",
+  "2aa": "OPPCREL?",
+  "2ab": "OPFRAMESIZE?",
+  "2ac": "OPREGSET?",
+  "2ad": "OPSYMSET?",
+  "2ae": "OPARG",
+  "2af": "OPASSIGN",
+  "2b0": "OPVOLATILEASSIGN",
+  "2b1": "OPLOAD",
+  "2b2": "OPSTORE",
+  "2b3": "OPCONVERT",
+  "2b4": "OPNOT",
+  "2b5": "OPNEG",
+  "2b6": "op2b6?",
+  "2b7": "op2b7?",
+  "2b8": "op2b8?",
+  "2b9": "op2b9?",
+  "2ba": "op2ba?",
+  "2bb": "op2bb?",
+  "2bc": "op2bc?",
+  "2bd": "op2bd?",
+  "2be": "op2be?",
+  "2bf": "op2bf?",
+  "2c0": "OPRET",
+  "2c1": "op2c1?",
+  "2c2": "op2c2?",
+  "2c3": "op2c3?",
+  "2c4": "op2c4?",
+  "2c5": "OPADD",
+  "2c6": "OPSUB",
+  "2c7": "OPMUL",
+  "2c8": "OPMULHI",
+  "2c9": "OPSHL",
+  "2ca": "OPAND",
+  "2cb": "OPOR",
+  "2cc": "OPXOR",
+  "2cd": "OPDIV",
+  "2ce": "OPREM",
+  "2cf": "OPSHR",
+  "2d0": "op2d0?",
+  "2d1": "op2d1?",
+  "2d2": "op2d2?",
+  "2d3": "op2d3?",
+  "2d4": "OPCMP",
+  "2d5": "OPEQ",
+  "2d6": "OPNE",
+  "2d7": "OPLT",
+  "2d8": "OPGT",
+  "2d9": "OPLE",
+  "2da": "OPGE",
+  "2db": "OPSPADJUST",
+  "2dc": "OPCALL",
+  "2dd": "OPBRANCH",
+  "2de": "OPGOTO",
+  "2df": "OPCATCHRET",
+  "2e0": "OPFINALLYCALL",
+  "2e1": "OPFINALLYRET",
+  "2e2": "OPSCOPEGOTO",
+  "2e3": "OPSCOPEEXITGOTO",
+  "2e4": "OPONERROR",
+  "2e5": "OPEXITGOTO",
+  "2e6": "OPLEAVE",
+  "2e7": "OPLOOPBRANCH?",
+  "2e8": "OPSWITCH",
+  "2e9": "OPSCOPEEXIT?",
+  "2ea": "OPQUESTION"
+ },
+ "sched_ready": [
+  "t",
+  "prio",
+  "ht",
+  "lex",
+  "ns",
+  "np",
+  "fl",
+  "est",
+  "op"
+ ],
+ "sched_cyc_entry": true,
+ "sched_hwt": [
+  -1,
+  13,
+  8,
+  -1,
+  -2,
+  10,
+  0
+ ],
+ "opsched": [
+  "10b1c390",
+  "295"
+ ],
+ "symkeys_free_by": "kindmap",
+ "symkeys_free_map": {
+  "3": "tmp",
+  "0": "frame",
+  "1": "frame",
+  "2": "frame",
+  "4": "frame",
+  "5": "frame",
+  "6": "glob",
+  "7": "glob",
+  "8": "glob"
+ },
+ "symkeys_free_default": "other",
+ "symkeys_kind_class": {
+  "3": "tmp",
+  "6": "tmp",
+  "4": "frame",
+  "5": "frame",
+  "13": "frame",
+  "7": "glob",
+  "8": "glob",
+  "9": "other",
+  "10": "other",
+  "11": "other",
+  "0": "hash",
+  "1": "hash",
+  "2": "hash",
+  "12": "hash",
+  "15": "hash",
+  "14": "hash"
+ },
+ "symkeys_nofree": [
+  "hash"
+ ],
+ "symkeys_init_used": {
+  "frame": 1
+ },
+ "symkeys_sort_ret": "10b89a00"
+}

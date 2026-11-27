@@ -72,6 +72,7 @@ ENTRY_RVA = 0x1D706D         # __DllMainCRTStartup@12
 IAT_LOADLIBRARYA = 0x1D8028  # KERNEL32!LoadLibraryA IAT slot (RVA)
 FILE_DELTA, NSEC = 0, 5     # .text RVA - file offset; number of sections (build tables may override: patch)
 LOADLIB_W = False
+LOADLIB_EXW = False
 DEFAULT_HOOKS = ["@Color@4=s1,s2", "@Spillcosts@12=s1,s2,s3"]
 if c2build.table():           # another c2 build: its own toolchain copies and cave addresses (tools/c2builds/*.json)
     TRACE = c2build.toolchain(True)
@@ -82,6 +83,7 @@ if c2build.table():           # another c2 build: its own toolchain copies and c
     # optional: .text RVA minus file offset (0 when the file is section-aligned like 14.00), section count
     FILE_DELTA, NSEC = int(c2build.get("patch").get("file_delta", "0"), 16), int(c2build.get("patch").get("nsec", 5))
     LOADLIB_W = c2build.get("patch").get("loadlib") == "w"   # the IAT slot is LoadLibraryW (cl 17.00)
+    LOADLIB_EXW = c2build.get("patch").get("loadlib") == "exw"   # LoadLibraryExW (the Xbox 360 cross c2)
     DEFAULT_HOOKS = c2build.hooks("default", DEFAULT_HOOKS)
 
 DLL_SRC = r'''/* c2trace.dll: in-process function-entry/exit tracer for c2.dll (VS2005 SP1).
@@ -159,7 +161,8 @@ static DWORD OPCOUNT = 0xffffffff;   /* entries in the opcode-name table (13.10:
 /* tuple layout, `set blk|len|mem`: BLOCK tuple's BB*, an instruction's encoded-length byte, a memory operand's
  * {sym, disp, base leaf, index leaf} (13.10: 0x18, 0x16, 0x2c) */
 static int LBLK = 0x20, LLEN = 0x1c, LMEM = 0x24;
-static char opx[256][20];      /* `op <hex> <name>`: names of opcodes >= OPCOUNT */
+static char opx[1024][20];     /* `op <hex> <name>`: names of opcodes >= OPCOUNT (`set opcount 0`: of every opcode,
+                                * for a build whose c2.dll has no name table: the Xbox 360 cross c2) */
 typedef struct {
     int id; DWORD rva; int steal; int exitp; int ne, nx;
     int ni; int ilen[8], kind[8], cc[8]; DWORD tgt[8];   /* displaced instrs: kind 0 copy, 1 jcc, 2 jmp, 3 call */
@@ -373,7 +376,7 @@ static void dumpil(DWORD t, int max) {
         if (k == 26) out("T B %x\n", rd(t + LBLK));
         else if (k == 27) out("T L %x\n", t);
         else if (f & 1) {
-            if (op >= OPCOUNT && op - OPCOUNT < 256 && opx[op - OPCOUNT][0]) strcpy(c, opx[op - OPCOUNT]);
+            if (op >= OPCOUNT && op - OPCOUNT < 1024 && opx[op - OPCOUNT][0]) strcpy(c, opx[op - OPCOUNT]);
             else if (op >= OPCOUNT || !rstr(rd(OPNAME + delta + 4 * op), c, sizeof c)) sprintf(c, "op%x", op);
             out("T I %x %s %d %d |", t, c, rd(t + LLINE) & 0xffff, rb(t + LLEN));
             oplist(rd(t + LDST)); out(" <-"); oplist(rd(t + LSRC));
@@ -406,7 +409,7 @@ static DWORD OPEH = 0x2db, OPULAB = 0x300;   /* opcode numbers: OPPUSHSTATE (.. 
 static int xdepth;
 static const char *ccname[17] = { "0", "e", "ne", "l", "g", "le", "ge", "b", "a", "be", "ae", "s", "ns", "p", "np", "o", "no" };
 static void xopname(DWORD op, char *c, int max) {
-    if (op >= OPCOUNT && op - OPCOUNT < 256 && opx[op - OPCOUNT][0]) strcpy(c, opx[op - OPCOUNT]);
+    if (op >= OPCOUNT && op - OPCOUNT < 1024 && opx[op - OPCOUNT][0]) strcpy(c, opx[op - OPCOUNT]);
     else if (op >= OPCOUNT || !rstr(rd(OPNAME + delta + 4 * op), c, max)) sprintf(c, "op%x", op);
 }
 static int ssrname(DWORD s, const char *pre) {   /* front-end symbol (CODEADDR leaves, labels): name pointer at +4 */
@@ -899,7 +902,7 @@ static void install(BYTE *base) {
             if (sscanf(line, "kind %lx %lx", &a1, &a2) == 2 && a1 < 256) kmap[a1] = (BYTE)a2;
         } else if (!strcmp(a, "op")) {
             char nm[20]; unsigned long v;
-            if (sscanf(line, "op %lx %19s", &v, nm) == 2 && v >= OPCOUNT && v - OPCOUNT < 256) strcpy(opx[v - OPCOUNT], nm);
+            if (sscanf(line, "op %lx %19s", &v, nm) == 2 && v >= OPCOUNT && v - OPCOUNT < 1024) strcpy(opx[v - OPCOUNT], nm);
         } else if (!strcmp(a, "func") && nffilt < MAXFF) {
             if (sscanf(line, "func %255s", ffilt[nffilt]) == 1) nffilt++;
         } else if (!strcmp(a, "flush")) eachflush = 1;
@@ -974,15 +977,21 @@ BOOL WINAPI DllMain(HINSTANCE hi, DWORD reason, LPVOID res) {
 
 def cave():
     c = CAVE_RVA
-    code = bytes.fromhex("837c240801" "7515" "60" "e800000000" "5b")
-    code += b"\x8d\x83" + struct.pack("<i", (c + 0x21) - (c + 0xd))          # lea eax,[ebx+str]
+    ex = LOADLIB_EXW                       # LoadLibraryExW(name, 0, 0): two more pushes (the Xbox 360 c2 imports no
+    n = 0x21 + (4 if ex else 0)            # other loader); n = the cave's code length, the string follows it
+    code = bytes.fromhex("837c240801") + b"\x75" + bytes([n - 0xc]) + bytes.fromhex("60" "e800000000" "5b")
+    if ex:
+        code += bytes.fromhex("6a00" "6a00")                                # push 0 (dwFlags); push 0 (hFile)
+    code += b"\x8d\x83" + struct.pack("<i", (c + n) - (c + 0xd))            # lea eax,[ebx+str]
     code += b"\x50"                                                         # push eax
     code += b"\xff\x93" + struct.pack("<i", IAT_LOADLIBRARYA - (c + 0xd))   # call [ebx+IAT]
     code += b"\x61"                                                         # popad
-    code += b"\xe9" + struct.pack("<i", ENTRY_RVA - (c + 0x21))              # jmp original entry
-    assert len(code) == 0x21
-    if LOADLIB_W:
-        return code + "c2trace.dll\0".encode("utf-16-le")     # 57 bytes: still inside the 0x40 the patch checks
+    code += b"\xe9" + struct.pack("<i", ENTRY_RVA - (c + n))                # jmp original entry
+    assert len(code) == n
+    if LOADLIB_W or ex:
+        out = code + "c2trace.dll\0".encode("utf-16-le")   # 0x21 + 24 / 0x25 + 24: inside the 0x40 the patch checks
+        assert len(out) <= 0x40
+        return out
     return code + b"c2trace.dll\0"
 
 

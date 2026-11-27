@@ -16,9 +16,12 @@ import c2build as _c2b
 # what a build cannot run (table key `lacks`: feature -> reason; 13.00.9044, the VC6 front end: docs/c2/port-1300.md);
 # a test that needs one prints a skip line instead (not counted)
 LACKS = dict((_c2b.get("lacks") or {}) if _c2b.table() is not None else {})
-X64 = _c2b.table() is not None and _c2b.get("arch") == "x64"
+ARCH = _c2b.get("arch") if _c2b.table() is not None else None
+X64 = ARCH == "x64"
 X64_TESTS = re.compile(r"17|x64|ncol|alias_il")    # test functions that run on an x64 build (cl 17.00)
-if X64 and __name__ == "__main__":   # _X64_FILTER: the top-level checks below are x86 (Color, RegAssign, x87, 32-bit)
+if ARCH == "ppc":                                   # the Xbox 360 cross c2 (port-x360.md): its own test group only
+    X64_TESTS = re.compile(r"x360")
+if ARCH in ("x64", "ppc") and __name__ == "__main__":   # _X64_FILTER: the top-level checks below are x86 (Color, RegAssign, x87, 32-bit)
     import ast
     _src = open(__file__).read()
     _body, _started = [], False
@@ -29,8 +32,8 @@ if X64 and __name__ == "__main__":   # _X64_FILTER: the top-level checks below a
         if not _started:
             if _txt.startswith('print("regression tests'):
                 _started = True
-                _body.append(ast.parse('print("regression tests, x64 build: the x64 and build-independent test '
-                                       'functions (the x86 top-level checks are skipped)")').body[0])
+                _body.append(ast.parse('print("regression tests, %s build: its own and the build-independent test '
+                                       'functions (the x86 top-level checks are skipped)")' % ARCH).body[0])
             else:
                 _body.append(_n)
             continue
@@ -41,7 +44,7 @@ if X64 and __name__ == "__main__":   # _X64_FILTER: the top-level checks below a
             _body.append(_n)
         elif isinstance(_n, ast.Assign) and all(isinstance(t, ast.Name) and t.id.isupper() for t in _n.targets):
             _body.append(_n)                     # module constants (paths, BUILD, expected values): no compile
-        elif isinstance(_n, ast.If) and 'get("arch") == "x64"' in _txt:
+        elif isinstance(_n, ast.If) and 'get("arch") == "x64"' in _txt and X64:
             _body.append(_n)                     # an arch dispatch (loadcse17 / ltcgstub17)
         elif _txt.startswith('print("%d of %d passed"') or _txt.startswith("sys.exit(0 if all(results)"):
             _body.append(_n)
@@ -3799,6 +3802,66 @@ def x64_compile_tests():
 
 
 x64_compile_tests()
+
+
+def x360_tests():
+    """The Xbox 360 cross c2 (15.00.8153, PowerPC; docs/c2/port-x360.md): IL names, the regs report against the
+    listing, rasim check, the scheduler's rules, x360check's word compare. tests/data/x360_ops.cpp; no game image."""
+    if ARCH != "ppc":
+        skip("Xbox 360 c2 15.00.8153 (6 checks)", "the Xbox 360 build only (C2_BUILD=xbox360)")
+        return
+    src = os.path.join(HERE, "tests", "data", "x360_ops.cpp")
+    out = tool("il", src, "--func", "o_loop", "--at", "@dop2_Codegen@4,@EncEmitFunc@4", "--", "/O2")
+    check("x360 il: shared opcodes named at dop2_Codegen, machine opcodes and registers at EncEmitFunc",
+          ("OPADD" in out, "OPCMP" in out, bool(re.search(r"lwzu? .*r\d", out)), "bdnz" in out), (True, True, True, True))
+    d = tempfile.mkdtemp()
+    snap = os.path.join(d, "loop.json")
+    out = tool("regs", src, "--func", "o_loop", "--export", snap, "--", "/O2")
+    got = dict(re.findall(r"^\s+\d+\s+(\S+)\s+\S+\s+-?\d+\s+-?\d+\s+\d+\s+\d+\s+(r\d+)\s", out, re.M))
+    check("x360 regs: o_loop's registers are the listing's (p r3, n r4, s r5, i r6, the pointer t213 r11)",
+          {k: got.get(k) for k in ("p", "n", "s", "i", "t213")}, dict(p="r3", n="r4", s="r5", i="r6", t213="r11"))
+    rasim = os.path.join(HERE, "tools", "rasim", "target", "release", "rasim")
+    r = subprocess.run([rasim, "check", snap], capture_output=True, text=True).stdout if os.path.exists(snap) else ""
+    m = re.search(r"(\d+) pop totals checked; (\d+) mismatches; colouring order: (\d+) of (\d+)", r)
+    check("x360 rasim check: x86's priority formula, 0 mismatches, every pop predicted",
+          (m.group(2), m.group(3) == m.group(4)) if m else None, ("0", True))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2sched.py"), src, "--func", "o_", "--verify",
+                        "--", "/O2"], capture_output=True, text=True, cwd=HERE)
+    m6 = re.search(r"rule 6 \(static priority\): (\d+) of (\d+)", r.stdout)
+    m7 = re.search(r"rule 7, simplified .*: (\d+) of (\d+)", r.stdout)
+    check("x360 sched: static priority with this build's row on every node; simple selection on >= 95% of picks",
+          (m6 and m6.group(1) == m6.group(2), m7 and int(m7.group(1)) >= 0.95 * int(m7.group(2))), (True, True))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "symkeys.py"), "keys", src, "--func", "o_loop",
+                        "--", "/O2"], capture_output=True, text=True, cwd=HERE)
+    m = re.search(r"replay: (\d+)/(\d+) keys reproduced", r.stdout)
+    check("x360 symkeys: the allocator model (two allocators, five pools, SymInit's frame key) replays every key",
+          m and m.group(1) == m.group(2) and int(m.group(2)) > 100, True)
+    sys.path.insert(0, os.path.join(HERE, "tools"))
+    import x360check, msvc
+    f = os.path.join(d, "f.cpp")
+    open(f, "w").write('extern "C" char g_82001234[];\nstruct S { char pad[0x17f]; bool b; };\n'
+                       'extern "C" char* FUN_82000000(S* s) { s->b = false; return g_82001234; }\n')
+    obj = os.path.join(d, "f.obj")
+    rc, _o = msvc.run("cl", ["/nologo", "/c", "/O2", "/Fo" + obj, f], capture=True)
+    nm, code, rel = x360check.Obj(obj).function(0x82000000)
+    import struct
+    orig = bytearray(code)                   # the "original": our own words, with the relocated fields resolved
+    for o, (t, sym, _ro) in rel.items():
+        w = struct.unpack_from(">I", orig, o)[0]
+        if t == x360check.REFHI:
+            w = (w & 0xFFFF0000) | (((0x82001234 + 0x8000) >> 16) & 0xffff)
+        elif t == x360check.REFLO:
+            w = (w & 0xFFFF0000) | 0x1234
+        struct.pack_into(">I", orig, o, w)
+    same = x360check.compare(code, rel, bytes(orig), 0x82000000)
+    bad = bytearray(orig)
+    struct.pack_into(">I", bad, 4, struct.unpack_from(">I", bad, 4)[0] ^ 1)
+    kinds = [k for _o2, k, _a, _b in x360check.compare(code, rel, bytes(bad), 0x82000000)]
+    check("x360check: our own words with g_82001234's halves match; one changed field is reported",
+          (rc, same, len(kinds) == 1), (0, [], True))
+
+
+x360_tests()
 
 
 def probe_modules():

@@ -59,6 +59,8 @@ CLASSES = ("tmp", "frame", "glob", "other", "hash")
 # SymAlloc kind -> pool class (SymAlloc 0x10bef1d0, index table 0x10bef395)
 KIND_CLASS = {0: "tmp", 1: "tmp", 2: "tmp", 3: "tmp", 6: "tmp", 4: "frame", 5: "frame", 13: "frame",
               7: "glob", 8: "glob", 9: "other", 10: "other", 11: "other", 15: "hash"}
+# a build whose SymAlloc picks its free lists by other kind ranges (the Xbox 360 c2): {kind: class}
+KIND_CLASS = {int(k): v for k, v in (c2trace.c2build.get("symkeys_kind_class") or {}).items()} or KIND_CLASS
 # SymFree: the free list is picked from (head kind - 3) through the table at 0x10bef44c; kind 6: no list
 FREE_CLASS = {0: "tmp", 1: "frame", 2: "frame", 3: None, 4: "glob", 5: "glob", 6: "other", 7: "other", 8: "other"}
 
@@ -126,6 +128,8 @@ KIND_SHIFT = c2trace.c2build.get("symkeys_kind_shift")
 MEM_SRC = c2trace.c2build.get("symkeys_mem_src", bool(KIND_SHIFT))
 # the sort exit logs the two operands' displacements after the 12 x86 values (17.00 x64)
 SORT_DISP = c2trace.c2build.get("symkeys_sort_disp", False)
+# keys SymInit itself takes from a class's first block, unseen by the alloc hooks (Xbox 360: frame key 0)
+INIT_USED = dict(c2trace.c2build.get("symkeys_init_used") or {})
 # the equiv entry's offset is absolute; a 4th value is the root's offset, subtracted (17.00 x64)
 EQUIV_REL = c2trace.c2build.get("symkeys_equiv_rel", False)
 
@@ -257,9 +261,10 @@ def _parse(lines, img):
         if f is None:
             continue
         ev = f.events
-        if hk == "alloc":
+        if hk in ("alloc", "alloc2"):    # alloc2: a second allocator (the Xbox 360 c2's temporaries)
             if ent:
-                stack.append(dict(kind=int(v[0], 16) & 0xff, cr=creator(v[2:]), line=int(v[1], 16) & 0xffff if v[1] != "?" else 0))
+                stack.append(dict(kind=(int(v[0], 16) & 0xff) if hk == "alloc" else 3, cr=creator(v[2:]),
+                                  line=int(v[1], 16) & 0xffff if v[1] != "?" else 0))   # alloc2: always a temporary
             elif stack:
                 fr = stack.pop()
                 s = Sym(idx=len(ev), cls=KIND_CLASS.get(fr["kind"], "tmp"), kind=fr["kind"], key=int(v[0], 16),
@@ -635,7 +640,7 @@ def replay(ops):
     nxt = 0
     cur = {}
     for c in ("frame", "glob", "tmp", "other"):     # SymInit: four blocks in this order
-        cur[c] = [nxt, nxt + 32]
+        cur[c] = [nxt + INIT_USED.get(c, 0), nxt + 32]
         nxt += 32
     cur["hash"] = None
     free = {c: [] for c in CLASSES}
@@ -685,7 +690,7 @@ class FastKeys:
     def _init():
         nxt, cur = 0, {}
         for c in ("frame", "glob", "tmp", "other"):
-            cur[c] = [nxt, nxt + 32]
+            cur[c] = [nxt + INIT_USED.get(c, 0), nxt + 32]
             nxt += 32
         cur["hash"] = None
         return dict(nxt=nxt, cur=cur, free={c: [] for c in CLASSES}, owner={})

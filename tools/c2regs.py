@@ -671,6 +671,8 @@ def parse(log, funcpat):
             ch = grs.get(v[0])
             if ch is not None:
                 ch["choice"] = dict(nbrs=[], prefs=[], partners=[], avail=None)
+                if len(v) > 1 and isinstance(v[1], str) and v[1].startswith('"'):
+                    ch["out"] = v[1].strip('"')      # a probe after the call (Xbox 360: the colour, read there)
         elif ev == "E" and hk == 13 and ch is not None and "choice" in ch:
             ch["choice"]["nbrs"].append(dict(gr=v[0], num=v[1], avail=_bits(*v[2:5]), ben=s32(v[5]),
                                              coloured=bool(v[6]) if isinstance(v[6], int) else None,
