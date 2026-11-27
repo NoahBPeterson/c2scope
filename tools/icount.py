@@ -1542,7 +1542,8 @@ def fp_hints(an, cl):
         return []
     return ["ours `%s` ... `%s` rounds the value through its home; the original has %s such round trip%s and keeps "
             "the value on the x87 stack (a copy stored with `fst`, or none). /fp:precise rounds every float assignment "
-            "that way and /fp:fast does not: try /fp:fast (Spore 00d38780; docs/c2/x87.md section 2)"
+            "that way and /fp:fast does not: try /fp:fast (Spore 00d38780; docs/c2/x87.md section 2); "
+            "tools/x87round.py pairs every rounding point with the original's by dataflow and names why cl made ours"
             % (ours[0] + ("fewer" if len(ours) > 1 else "no", "s" if len(ours) > 1 else ""))]
 
 

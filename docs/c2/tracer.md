@@ -1670,7 +1670,7 @@ while a chosen function is being compiled:
   hashes, which depend on the compile's path). With `func` left out, the filter is the environment variable
   `C2TRACE_FUNC` if it is set, else the tool's own `--func` (read from its command line when c2trace is imported).
   So every tool that takes `--func` logs only that function's compile: regs, scratch, slots, merges, il, regmap,
-  loadcse, c2sched, schedwant, c2x87, icount, and the sweeps (tsweep, rwsweep, helpersweep, realize, effectmine),
+  loadcse, c2sched, schedwant, c2x87, x87round, icount, and the sweeps (tsweep, rwsweep, helpersweep, realize, effectmine),
   with the same results (the suite on all four builds, and filtered/unfiltered runs compared). Mount & Blade
   `agent_logic.cpp` (463 KB, 13.10, `regs --func ?move_dir@Agent@@...`, local wine): 193 MB of log and 76 s
   unfiltered, 4 KB and 11 s filtered, the same report. `C2TRACE_FUNC=`
