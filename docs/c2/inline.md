@@ -24,10 +24,9 @@ is decided here), regalloc.md §7 (which variables are candidates), il_pipeline.
 
 ### Which calls are inlined
 
-1. **c2 compiles functions callee-first.** When a function calls a function defined later in the file, it is
-   compiled after that callee: in a2.cpp `c_plain` calls `late`, which is defined after it, and the order was
-   `... c_ehcallee, late, c_plain`. Otherwise the source order is kept. A cycle (mutual recursion) is broken in
-   source order. The `/FAsc` listing and the object come out in this compile order.
+1. **c2 compiles functions callee-first** (bottom-up call-graph passes; exact rule in "Compile order" below).
+   When a function calls a function defined later in the file, it is compiled after that callee: in a2.cpp `c_plain` calls `late`, which is defined after it, and the order was
+   `... c_ehcallee, late, c_plain`. Otherwise the source order is kept. A cycle (mutual recursion) is broken at a back edge: the function defined first is compiled first. The `/FAsc` listing and the object come out in this compile order.
    **[C: @Inline@4 order in traces a2, a3, a4]**
    So when a caller is compiled, its callees usually have already been compiled out of line, and their final
    code size is known. That size drives rule 3.
@@ -255,6 +254,59 @@ Dump points: `@Inline@4` is c1xx's IL; `@WrnEmitWarnings@4` comes right after In
 15. **Static and `inline` callees are still compiled out of line first** (rule 1), and they stay in the
     listing as COMDATs even when every call was inlined (`s10b` in a2). `/Gy` plus the linker's `/OPT:REF`
     decide whether they ship. **[C: a2 listing; I: the link-time removal]**
+
+### Compile order, and when a caller is compiled before its callee (13.10)
+
+`uv run tools/c2inline.py f.cpp --order -- <cl flags>` prints the order c2 compiles the TU's functions in, and every
+site has a `body` column: **yes** = the callee had been compiled when the site was weighed (the cost model of rule 3
+ran on its size), **no** = it had not (no size; c1xx's IL count decides, rule 7), **extern** = not in this TU.
+`body` is a **read field**: bit 1 of the dword at callee FUNC+0x69, which `ShouldInlineCallTuple` 1078cf54 tests
+before it calls `InlCallGraphDecision` (clear: it takes the IL-size path instead). The order (the `@Inline@4`
+entry sequence; `@dop2_EncodeAndRelated@4` gives the same sequence, each function is compiled through to its
+emission before the next starts) is a cross-check, and the tool marks a row where the two disagree (none seen).
+**[C: traces on both 13.10 builds; tests/data/inline_order.cpp, work/scratch/inline/ord/o1-o4.cpp, m1.cpp]**
+
+What decides the order **[C: code of `CgBottomUpOrder` 1070cfdf, read in disassembly; `CgIdentifyNodeRecursion`
+1070ce78; matched against five traced files (o1-o4, a2)]**:
+
+- `CgBuildCallGraph` makes one node per function and an edge per direct call. `CgIdentifyNodeRecursion` walks the
+  graph depth-first and marks the edge that closes a cycle as a back edge (edge flag +0xc & 1).
+- `CgBottomUpOrder` then makes **passes over the node list in source order**. In a pass, a function is emitted when
+  every non-back-edge callee in the TU has already been emitted; it is removed from the list and the pass goes on
+  with the next node (so a callee emitted earlier in the same pass releases its caller in that pass). A function
+  with a callee defined after it therefore waits for the next pass, and goes after everything the first pass emitted.
+  Examples (o1): `plain_c, inl_c, ... , two_c` (all leaves, source order), then `plain_a, inl_a, ... chain_b, two_a, two_b`,
+  then `chain_a` (it precedes `chain_b` in source, so it misses pass 2). a2: `... c_ehcallee, late, c_plain`.
+- Not an edge, so no ordering: an **indirect call** (function pointer, a virtual call through `this` or a pointer),
+  and anything c2 never sees as a call. `V::u` calls `vf` virtually: `u` is compiled before `vf` (defined after it). **[C: o2, inline_order.cpp]**
+- Which member of a cycle goes first: the one whose only callees are back edges. The depth-first walk starts at the
+  **last-defined** function and goes towards the first, so in a two-function cycle the **first-defined** is compiled
+  first (it sees the other uncompiled, body no); in a three-function cycle a, b, c called by an outside function
+  defined before them the order is b, a, c, and with the outside caller defined after them c, b, a. Self recursion
+  is no cycle problem. **[C: traces m1, o1 mut, o2 cy_*, o3 x_*, y_*; I: that the start is the last-defined node
+  (the list that `CgAddNode` builds is pushed at the head; the code that walks it was not read)]**
+
+Source arrangements, with what each did (13.10.3052 and 3077 agree):
+
+| arrangement, caller defined first | caller compiled before callee? |
+|---|---|
+| callee defined later, plain, `inline`, `static`, `__forceinline`, `__declspec(noinline)`, a template, a class-body member, `operator+`, the address also taken | **no**: callee first (o1, o2) |
+| `/Ob0`, `/Ob1`, `/O1`, `#pragma optimize("", off)` / `("g", off)` / `("t", off)` on the caller or callee | **no**: same order; the order does not depend on /Ob or on pragmas (o1, o4) |
+| mutual recursion (a calls b, b calls a, a defined first) | **yes**: `a` first, a's call to `b` has body no (m1, o1) |
+| a virtual call through `this` or a pointer; a call through a function pointer | **yes**, but these are not inline candidates anyway (o1, o2) |
+| a known-type virtual call (`V o; o.vf()`) | no: it is a direct call with an edge (o2) |
+| `/Od` or `/Og-` on the command line | **yes, always**: plain source order, no call-graph ordering (o1, o4) |
+
+So in a plain `/O2` compile the only way to get "caller compiled before callee" for a direct call is a cycle in the
+call graph (directly or through other functions) with the caller in the position that goes first. A caller whose
+call is in a cycle with a callee that is **too big for the IL-size budget of rule 7** is the case that reproduces
+"the original made a call where ours inlines": tests/data/inline_order.cpp `cyc_a` (call) against `cyc_b` (inlined,
+because `cyc_a` is already compiled). In a cycle the callee's body is never visible to the member that goes first.
+**[C for the cycle behaviour; I that this explains the M&B rows: not tested on them]**
+
+Not covered: whether 14.00/15.00 use the same walk (rule 1 was seen there; the cycle start and the `/Od` behaviour
+were not tried), `/GL` (the order is then the linker's), `#pragma inline_depth` / `inline_recursion` and `-vol`,
+and what the `FUNC+0x20 & 0x400000` skip in `CgBottomUpOrder` is.
 
 ---
 

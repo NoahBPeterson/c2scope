@@ -19,7 +19,7 @@ whose trace fails is listed with the reason. The total line is the share of deci
 import os, re, shlex, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RASIM = os.path.join(ROOT, "tools", "rasim", "target", "release", "rasim")
+RASIM = os.path.join(ROOT, "tools", "rasim", "target", "release", "rasim") + (".exe" if os.name == "nt" else "")
 
 
 def run(cmd, env):

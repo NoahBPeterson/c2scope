@@ -134,6 +134,9 @@ INIT_USED = dict(c2trace.c2build.get("symkeys_init_used") or {})
 EQUIV_REL = c2trace.c2build.get("symkeys_equiv_rel", False)
 
 
+# the worker pools inherit the loaded snapshot by fork; Windows has no fork, so it runs the edits in one process
+_CAN_FORK = __import__("multiprocessing").get_all_start_methods().count("fork") > 0
+
 def tkind(k):
     """A logged tuple kind in 14.00's numbering (leaves 1-12, an instruction 13)."""
     if KIND_SHIFT and k is not None and k >= KIND_SHIFT[0]:
@@ -1718,9 +1721,9 @@ def levers_sites(f, a):
             nc - sum(1 for c in cand if not c[0].startswith("swap:")), sum(1 for c in cand if c[0].startswith("swap:"))))
     global _SW
     _SW = score
-    njobs = a.jobs or min(8, os.cpu_count() or 1)
+    njobs = a.jobs or min(8, os.cpu_count() or 1) if _CAN_FORK else 1
     print("# %d single edits to try, %d worker processes" % (len(cand), njobs), flush=True)
-    if njobs > 1 and len(cand) > 50:
+    if njobs > 1 and len(cand) > 50 and _CAN_FORK:
         import multiprocessing
         with multiprocessing.get_context("fork").Pool(njobs) as pool:
             got = pool.map(_site_one, [c[0] for c in cand], chunksize=max(1, len(cand) // (njobs * 8)))
@@ -1835,9 +1838,9 @@ def levers_match(f, a, pts, ops, tgt, ns):
                     jobs.append(("%s:hash%s:%d" % (sign, anchor, n), n, where, "hash", sign))
     global _MW
     _MW = (f, FastKeys(f, sort_syms(f)), sb)
-    njobs = a.jobs or min(8, os.cpu_count() or 1)
+    njobs = a.jobs or min(8, os.cpu_count() or 1) if _CAN_FORK else 1
     print("# %d edits to try, %d worker processes" % (len(jobs), njobs), flush=True)
-    if njobs > 1 and len(jobs) > 50:
+    if njobs > 1 and len(jobs) > 50 and _CAN_FORK:
         import multiprocessing
         with multiprocessing.get_context("fork").Pool(njobs) as pool:
             got = pool.map(_match_one, [j[0] for j in jobs], chunksize=max(1, len(jobs) // (njobs * 8)))

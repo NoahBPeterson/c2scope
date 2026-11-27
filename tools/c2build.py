@@ -86,7 +86,7 @@ def table():
     if n not in _cache:
         p = os.path.join(ROOT, "tools", "c2builds", n + ".json")
         if not os.path.exists(p):
-            sys.exit("C2_BUILD=%s: no build table %s" % (n, os.path.relpath(p, ROOT)))
+            sys.exit("C2_BUILD=%s: no build table %s" % (n, relpath(p, ROOT)))
         _cache[n] = json.load(open(p))
     return _cache[n]
 
@@ -125,6 +125,34 @@ def hooks(key, default):
             return Unported(key)
         sys.exit("c2 %s: no '%s' hooks in the build table (not ported; see docs/c2/port-1310.md)" % (name(), key))
     return h[key]
+
+
+WINDOWS = os.name == "nt"     # a Windows host runs the compilers directly; macOS / Linux run them under wine
+
+
+def exe(path):
+    """A program built here (rasim): `path.exe` on Windows."""
+    return path + ".exe" if WINDOWS else path
+
+
+def link_dir(src, dst):
+    """dst -> src for a directory: a symlink, or on Windows without the symlink right (no Developer Mode, not
+    elevated) a junction, which needs no right and which every Windows program follows the same way."""
+    try:
+        os.symlink(src, dst, target_is_directory=True)
+    except OSError:
+        if not WINDOWS:
+            raise
+        import _winapi
+        _winapi.CreateJunction(os.path.abspath(src), dst)
+
+
+def relpath(p, start=None):
+    """os.path.relpath for messages: on Windows a path on another drive has no relative form, so it stays absolute."""
+    try:
+        return os.path.relpath(p, start) if start is not None else os.path.relpath(p)
+    except ValueError:
+        return os.path.abspath(p)
 
 
 def tcpath(base, *parts):
@@ -215,17 +243,17 @@ def setup(argv):
         for sub in ("Include", "Lib"):
             src = os.path.realpath(tcpath(a.sdk, sub))
             if os.path.isdir(src):
-                os.symlink(src, os.path.join(tc, "SDK", sub))
+                link_dir(src, os.path.join(tc, "SDK", sub))
             else:
                 os.makedirs(os.path.join(tc, "SDK", sub))
                 print("note: no %s; <windows.h> will not be found" % src)
-        print("toolchain %s (c2.dll %s)" % (os.path.relpath(tc, ROOT), t["version"]))
+        print("toolchain %s (c2.dll %s)" % (relpath(tc, ROOT), t["version"]))
     tr = toolchain(True)
     if not os.path.isdir(tr):
         os.makedirs(os.path.join(tr, "VC"))
         shutil.copytree(os.path.join(tc, "VC", "Bin"), os.path.join(tr, "VC", "Bin"))
         for rel in ("VC/INCLUDE", "VC/LIB", "SDK"):
-            os.symlink(os.path.join(tc, rel), os.path.join(tr, rel))
+            link_dir(os.path.join(tc, rel), os.path.join(tr, rel))
     import c2trace
     c2trace.install()
 
@@ -236,4 +264,4 @@ if __name__ == "__main__":
     else:
         t = table()
         print("c2 build: %s%s" % (name(), "" if t is None else "  (table tools/c2builds/%s.json, toolchain %s)" % (
-            name(), os.path.relpath(toolchain(), ROOT))))
+            name(), relpath(toolchain(), ROOT))))

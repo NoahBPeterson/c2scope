@@ -1505,11 +1505,13 @@ def pipe_safe(fn, *args):
             return fn(*args)
         finally:                             # also on sys.exit (argparse --help): the buffer is written here
             sys.stdout.flush()
-    except BrokenPipeError:
+    except OSError as ex:                    # Windows: a closed pipe is EINVAL on flush, not EPIPE
+        if not isinstance(ex, BrokenPipeError) and not (os.name == "nt" and ex.errno == 22):
+            raise
         try:
             sys.stdout.flush()
             ours = _stdout_closed()
-        except BrokenPipeError:
+        except OSError:
             ours = True
         if not ours:
             raise
@@ -1528,7 +1530,7 @@ def _stdout_closed():
         p.register(sys.stdout.fileno(), select.POLLOUT)
         return any(ev & (select.POLLERR | select.POLLHUP) for _, ev in p.poll(0))
     except (OSError, AttributeError, ValueError):
-        return True
+        return os.name != "nt"               # Windows has no poll: stdout just flushed fine, so it is not closed
 
 
 def main():

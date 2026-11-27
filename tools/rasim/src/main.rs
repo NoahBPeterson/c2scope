@@ -1291,8 +1291,20 @@ fn default_sigpipe() {
         signal(SIGPIPE, SIG_DFL);
     }
 }
+// Windows has no SIGPIPE: a closed pipe is a write error (os error 232), which println! turns into that panic.
+// The panic hook ends the process quietly with 141 for it, as on Unix; any other panic is reported as usual.
 #[cfg(not(unix))]
-fn default_sigpipe() {}
+fn default_sigpipe() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.payload().downcast_ref::<String>().map(|s| s.as_str())
+            .or_else(|| info.payload().downcast_ref::<&str>().copied()).unwrap_or("");
+        if msg.starts_with("failed printing to stdout") {
+            std::process::exit(141);
+        }
+        prev(info);
+    }));
+}
 
 fn main() {
     default_sigpipe();

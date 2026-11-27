@@ -941,7 +941,7 @@ def phase(a, picks, pos, asm, snap, body, final=None):
         return 0
     tgt = os.path.splitext(snap)[0] + "_target.json"
     json.dump(dict(want=want, group=[(p["n"], gof[p["n"]]) for p in picks], groups=names), open(tgt, "w"))
-    rasim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rasim", "target", "release", "rasim")
+    rasim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rasim", "target", "release", "rasim") + (".exe" if os.name == "nt" else "")
     import subprocess
     r = subprocess.run([rasim, "scratch", snap, "--run", str(body + 1), "--target", tgt, "--top", str(a.top)],
                        capture_output=True, text=True)

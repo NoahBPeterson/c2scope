@@ -20,7 +20,7 @@ import os, re, shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INC = re.compile(r'^[ \t]*#[ \t]*(?:include|import)[ \t]*([<"])([^>"\r\n]+)[>"]', re.M)
-ABSINC = re.compile(r'^([ \t]*#[ \t]*(?:include|import)[ \t]*")(/[^"\r\n]+)(")', re.M)
+ABSINC = re.compile(r'^([ \t]*#[ \t]*(?:include|import)[ \t]*")(/[^"\r\n]+|[A-Za-z]:[\\/][^"\r\n]+)(")', re.M)   # /abs or C:\abs
 TOOLDIRS = (os.path.join(ROOT, "work", "toolchain") + os.sep,)
 SYSDIRS = [os.path.join(ROOT, "src", "include")]
 
@@ -81,8 +81,11 @@ class Snapshot:
         files = [f for f in files if f != tu]
         used_sys = [d for d in SYSDIRS if any(f.startswith(d + os.sep) for f in files)]
         keep = [d for d in idirs if not _tool(d)] + used_sys
-        self.root = os.path.commonpath([os.path.dirname(tu)] + [os.path.dirname(f) for f in files] + keep) \
-            if files or keep else os.path.dirname(tu)
+        try:
+            self.root = os.path.commonpath([os.path.dirname(tu)] + [os.path.dirname(f) for f in files] + keep) \
+                if files or keep else os.path.dirname(tu)
+        except ValueError:          # Windows: the paths are on different drives (no common root); path() mirrors per drive
+            self.root = None
         self.dest = os.path.abspath(dest)
         self.map = {}
         for f in files:
@@ -107,7 +110,13 @@ class Snapshot:
     def path(self, p):
         """The snapshot's copy of a live path under the snapshot's root (the path itself outside it)."""
         p = os.path.normpath(os.path.abspath(p))
-        if os.path.commonpath([p, self.root]) != self.root:      # (root may be "/": sources under /tmp, headers under /Users)
+        if self.root is None:                                     # one tree per drive: dest/C/..., dest/D/...
+            drive, rest = os.path.splitdrive(p)
+            return os.path.join(self.dest, drive.strip(":\\/").replace("\\", "_") or "_", rest.lstrip("\\/"))
+        try:
+            if os.path.commonpath([p, self.root]) != self.root:  # (root may be "/": sources under /tmp, headers under /Users)
+                return p
+        except ValueError:                                        # another drive than the root's
             return p
         return os.path.join(self.dest, os.path.relpath(p, self.root))
 

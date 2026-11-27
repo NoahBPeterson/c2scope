@@ -40,9 +40,11 @@ modified.
 
 ## Setup (once)
 
-Requirements: macOS or Linux with [wine](https://www.winehq.org/) (32-bit support), [uv](https://docs.astral.sh/uv/),
-[Rust](https://rustup.rs) (cargo) and `llvm-pdbutil` (part of LLVM: `brew install llvm`, or your distribution's
-llvm package). Then, in this directory:
+Requirements: Windows, or macOS / Linux with [wine](https://www.winehq.org/) (32-bit support);
+[uv](https://docs.astral.sh/uv/), [Rust](https://rustup.rs) (cargo) and `llvm-pdbutil` (part of LLVM: `brew install
+llvm`, your distribution's llvm package, or an LLVM release for Windows). On Windows the compilers run directly, with
+no wine; rustup's default Windows toolchain needs the Visual Studio C++ build tools (or use
+`rustup default stable-x86_64-pc-windows-gnu`). Then, in this directory:
 
 ```sh
 uv sync
@@ -51,7 +53,7 @@ uv run python setup.py --vs2005 /path/to/vs2005
 
 `/path/to/vs2005` is the directory that contains `VC/` and `SDK/` (for f3decomp: the toolchain its setup unpacks).
 Setup checks every requirement, verifies that `c2.dll` is the exact build, fetches c2's public symbols from the
-Microsoft symbol server (or pass `--pdb c2.pdb`), builds the function index, creates a wine prefix, builds the
+Microsoft symbol server (or pass `--pdb c2.pdb`), builds the function index, creates a wine prefix (not on Windows), builds the
 traced toolchain and rasim, and finishes with a regression test (9 checks). If a step fails it says why and how
 to fix it; run the same command again and it continues where it stopped.
 
@@ -93,7 +95,7 @@ Pass compiler flags literally after `--`; in zsh a `$FLAGS` variable holding sev
 
 | tool | what it does | doc |
 |---|---|---|
-| `tools/msvc.py` | runs cl/link/lib/dumpbin under this directory's own wine prefix | |
+| `tools/msvc.py` | runs cl/link/lib/dumpbin (on Windows directly; elsewhere under this directory's own wine prefix) | |
 | `tools/c2trace.py` | patched-c2 tracer: hook any c2 function by PDB name or address, log registers/stack/IL | docs/c2/tracer.md |
 | `c2trace.py regs` | register allocation report: candidates, priorities with per-block terms, colouring order, registers | docs/c2/regalloc.md |
 | `c2trace.py scratch` | scratch-register picks with the rotation cursor, mapped to listing offsets | docs/c2/regalloc.md §6 |
@@ -147,7 +149,7 @@ For x64, `lift2il64.py` does the same for code built by Visual Studio 2012 (cl 1
 compiles it and checks it against the executable in one step:
 
 ```
-export C2_CL64="wine /path/to/VC/bin/x86_amd64/cl.exe"
+export C2_CL64="wine /path/to/VC/bin/x86_amd64/cl.exe"      # Windows: C2_CL64=C:/path/to/VC/bin/x86_amd64/cl.exe
 uv run python tools/lift2il64.py check 1401234560 --binary game.exe --flags /O2,/GS-
 ```
 

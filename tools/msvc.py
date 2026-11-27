@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run the VS2005 SP1 tools (cl 14.00.50727.762) under this project's own Wine prefix.
+"""Run the VS2005 SP1 tools (cl 14.00.50727.762): directly on Windows, elsewhere under this project's own Wine prefix.
 
 usage: msvc.py [--tool cl|link|lib|dumpbin|undname|ml] <MSVC arguments>     (or: msvc.py cl|link|... <arguments>)
-Absolute Unix paths (bare, or after /I /Fo /Fa /Fe /OUT: /LIBPATH: /PDB: /MAP: /DEF: /IMPLIB:) become Z:\\ paths.
+Under wine, absolute Unix paths (bare, or after /I /Fo /Fa /Fe /OUT: /LIBPATH: /PDB: /MAP: /DEF: /IMPLIB:) become
+Z:\\ paths; on Windows (c2build.WINDOWS) the arguments go to the tool as given and there is no prefix.
 
 Toolchain: work/toolchain/vs2005 (VC/{Bin,INCLUDE,LIB} + SDK/{Include,Lib}); currently a symlink to fn3-test's
 copy, unpacked from Microsoft's Vista SDK Feb 2007 ISO by f3check's get_vs2005.py. Its VC/Bin is byte-identical to
@@ -29,11 +30,18 @@ def tc(rel):
     return Path(c2build.tcpath(TC, rel))
 
 
+NATIVE = c2build.WINDOWS
+
+
 def winpath(p):
+    if NATIVE:
+        return str(Path(p).resolve())
     return "Z:" + str(Path(p).resolve()).replace("/", "\\")
 
 
 def convert(args):
+    if NATIVE:
+        return list(args)
     out = []
     for a in args:
         for o in OPTS:
@@ -47,8 +55,11 @@ def convert(args):
 
 def env():
     e = os.environ.copy()
-    e.update(WINEPREFIX=str(PREFIX), WINEDEBUG="-all", WINEPATH=winpath(tc("VC/Bin")),
-             INCLUDE=";".join(winpath(p) for p in [ROOT / "src" / "include", tc("VC/INCLUDE"), tc("SDK/Include")]),
+    if NATIVE:                   # cl finds its DLLs (c1xx, c2, mspdb80) beside itself; PATH for the ones it spawns
+        e["PATH"] = winpath(tc("VC/Bin")) + os.pathsep + e.get("PATH", "")
+    else:
+        e.update(WINEPREFIX=str(PREFIX), WINEDEBUG="-all", WINEPATH=winpath(tc("VC/Bin")))
+    e.update(INCLUDE=";".join(winpath(p) for p in [ROOT / "src" / "include", tc("VC/INCLUDE"), tc("SDK/Include")]),
              LIB=";".join(winpath(p) for p in [tc("VC/LIB"), tc("SDK/Lib")]))
     return e
 
@@ -107,7 +118,9 @@ def ensure_wine(e):
     Without this, parallel runs from a cold start each made wine start its own server, and one of them could exit
     rc 0 with no output at all (9 parallel compiles from cold: about one in three rounds; this was the "parallel
     traces come back empty" bug). A bare `wineserver` cannot start on this install ("failed to load l_intl.nls"),
-    so the server is started through wine itself. With the server up, `start_keeper` keeps it up."""
+    so the server is started through wine itself. With the server up, `start_keeper` keeps it up. Windows: nothing."""
+    if NATIVE:
+        return
     import fcntl
     quiet = dict(env=e, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     PREFIX.parent.mkdir(parents=True, exist_ok=True)
@@ -131,7 +144,7 @@ def run(tool, args, capture=False, timeout=None):
     ensure_wine(e)
     with tempfile.TemporaryFile() as out:
         try:
-            rc = subprocess.run(["wine", str(tc("VC/Bin/" + tool + ".exe"))] + convert(args), env=e,
+            rc = subprocess.run(([] if NATIVE else ["wine"]) + [str(tc("VC/Bin/" + tool + ".exe"))] + convert(args), env=e,
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                 timeout=timeout).returncode
         except subprocess.TimeoutExpired:

@@ -961,7 +961,7 @@ def main(argv=None):
     h = hashlib.sha1((open(src_path, "rb").read() + repr((a.func, cl, os.environ.get("C2_BUILD"))).encode())).hexdigest()[:10]
     wd = a.keep or os.path.join(HERE, "work", "slotwant", "%s-%s" % (os.path.splitext(os.path.basename(src_path))[0], h))
     os.makedirs(wd, exist_ok=True)
-    print("# slotwant %s --func %s  (work dir %s)" % (os.path.relpath(src_path), a.func, os.path.relpath(wd, HERE)))
+    print("# slotwant %s --func %s  (work dir %s)" % (c2trace.c2build.relpath(src_path), a.func, c2trace.c2build.relpath(wd, HERE)))
 
     base, err = trace_one(src_path, a.func, cl, os.path.join(wd, "base"))
     if base is None:

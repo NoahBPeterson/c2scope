@@ -70,7 +70,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image import ROOT
 import c2trace, c2regs, tsweep
 
-RASIM = os.path.join(ROOT, "tools", "rasim", "target", "release", "rasim")
+RASIM = os.path.join(ROOT, "tools", "rasim", "target", "release", "rasim") + (".exe" if os.name == "nt" else "")
 REG = re.compile(r"\b(e?[abcd]x|[abcd][lh]|e?si|e?di|e?bp|[sd]il?|st\(\d\)|xmm\d)\b")
 
 
@@ -2445,7 +2445,7 @@ def show(c, r, n=None):
         print("        slots: %s; offsets %s" % (" ".join(r["sd"].strings()) or "-", r["sd"].where()[:160]))
     if r.get("note"):
         print("        %s" % r["note"])
-    print("        %s" % os.path.relpath(r["path"], ROOT))
+    print("        %s" % c2trace.c2build.relpath(r["path"], ROOT))
 
 
 def hit(c, r):
@@ -2494,9 +2494,9 @@ def cmd_edit(c, a):
             if r is not None:
                 show(c, r)
                 if c.orig is not None and hit(c, r):
-                    print("FOUND: %s" % os.path.relpath(r["path"], ROOT))
+                    print("FOUND: %s" % c2trace.c2build.relpath(r["path"], ROOT))
                     break
-    print("variants: %s" % os.path.relpath(c.out, ROOT))
+    print("variants: %s" % c2trace.c2build.relpath(c.out, ROOT))
 
 
 def parse_answers(text):
@@ -2909,17 +2909,17 @@ def cmd_pipeline(c, a):
                                       if unreal else ""))
         found = realise_answer(c, a, alts, "a%d_" % tried, st)
         if found:
-            print("FOUND after %d answers, %d compiles: %s (%s)" % (tried, st["ncomp"], os.path.relpath(found["path"], ROOT), found["desc"]))
+            print("FOUND after %d answers, %d compiles: %s (%s)" % (tried, st["ncomp"], c2trace.c2build.relpath(found["path"], ROOT), found["desc"]))
             return 0
     found = pair_search(c, a, st)
     if found:
         print("FOUND by a pair of realisations after %d answers, %d compiles: %s (%s)" % (
-            tried, st["ncomp"], os.path.relpath(found["path"], ROOT), found["desc"]))
+            tried, st["ncomp"], c2trace.c2build.relpath(found["path"], ROOT), found["desc"]))
         return 0
     ncomp, closest, done = st["ncomp"], st["closest"], st["done"]
     if a.from_model:
         print("NOT FOUND in %d answers, %d compiles%s" % (tried, ncomp, "" if closest is None else
-                                                        "; closest: %s (%s)" % (os.path.relpath(closest[1], ROOT), closest[2])))
+                                                        "; closest: %s (%s)" % (c2trace.c2build.relpath(closest[1], ROOT), closest[2])))
         return 1
     if nocon:
         print("## %d answers have no code-neutral construct in this source (docs/c2/realize.md): %s%s" % (
@@ -2993,7 +2993,7 @@ def cmd_pipeline(c, a):
             show(c, r)
         for r in good:
             if hit(c, r):
-                print("FOUND by a structural rewrite after %d answers, %d compiles: %s (%s)" % (tried, ncomp, os.path.relpath(r["path"], ROOT), r["desc"]))
+                print("FOUND by a structural rewrite after %d answers, %d compiles: %s (%s)" % (tried, ncomp, c2trace.c2build.relpath(r["path"], ROOT), r["desc"]))
                 return 0
         neutral = [r for r in good if r["d"].bag == 0 and not r["d"].empty()]
         fams = {}
@@ -3040,7 +3040,7 @@ def cmd_pipeline(c, a):
                      d=Delta(c.base, fn), f=fn, path=path, regs=c.regs_ok(fn), rd=c.regdiff(fn), bd=c.bdiff(fn), v="-", side=[])
             show(c, r)
             if hit(c, r):
-                print("FOUND by %d %s rewrites together after %d answers, %d compiles: %s" % (len(pick), f, tried, ncomp, os.path.relpath(path, ROOT)))
+                print("FOUND by %d %s rewrites together after %d answers, %d compiles: %s" % (len(pick), f, tried, ncomp, c2trace.c2build.relpath(path, ROOT)))
                 return 0
             sc = (r["rd"] if r["rd"] is not None else (0 if r["regs"] else 1) * 100 + r["d"].bag, r["path"], r["desc"])
             if closest is None or sc < closest:
@@ -3058,13 +3058,13 @@ def cmd_pipeline(c, a):
             show(c, r)
         for r in good:
             if hit(c, r):
-                print("FOUND by a callee body after %d answers, %d compiles: %s (%s)" % (tried, ncomp, os.path.relpath(r["path"], ROOT), r["desc"]))
+                print("FOUND by a callee body after %d answers, %d compiles: %s (%s)" % (tried, ncomp, c2trace.c2build.relpath(r["path"], ROOT), r["desc"]))
                 return 0
             sc = (r["rd"] if r["rd"] is not None else (0 if r["regs"] else 1) * 100 + r["d"].bag, r["path"], r["desc"])
             if closest is None or sc < closest:
                 closest = sc
     print("NOT FOUND in %d answers, %d compiles%s" % (tried, ncomp, "" if closest is None else
-                                                    "; closest: %s (%s)" % (os.path.relpath(closest[1], ROOT), closest[2])))
+                                                    "; closest: %s (%s)" % (c2trace.c2build.relpath(closest[1], ROOT), closest[2])))
     return 1
 
 

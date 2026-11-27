@@ -7,15 +7,17 @@ usage: uv run python setup.py --vs2005 /path/to/vs2005 [--pdb /path/to/c2.pdb] [
 SDK/Include, SDK/Lib (the layout f3decomp's get_vs2005.py unpacks). The tools never modify it.
 
 Every step is idempotent: run it again after fixing whatever it complained about and it carries on.
-  1. checks the host tools: wine, cargo (Rust), llvm-pdbutil
+Windows runs the compilers directly; macOS and Linux run them under wine.
+  1. checks the host tools: wine (not on Windows), cargo (Rust), llvm-pdbutil
   2. checks the toolchain and that its c2.dll is exactly the build the tools were written against
   3. links it as work/toolchain/vs2005 and copies c2.dll to Bin/c2.dll (the tools read symbols and code from there)
   4. gets c2.pdb: --pdb, or work/pdb/c2.pdb, or a download from the Microsoft public symbol server
      (https://msdl.microsoft.com/download/symbols/...; skipped with --no-download)
   5. builds work/index/c2.dll.csv (function names and addresses) from the PDB
-  6. creates this checkout's own wine prefix (work/toolchain/wineprefix)
+  6. creates this checkout's own wine prefix (work/toolchain/wineprefix) and runs cl in it (Windows: runs cl)
   7. builds the traced toolchain work/toolchain/vs2005-trace: a copy of VC/Bin whose c2.dll gets a small entry-point
-     patch that loads c2trace.dll (built here with the toolchain's own cl); everything else is symlinked
+     patch that loads c2trace.dll (built here with the toolchain's own cl); everything else is linked (a symlink;
+     on Windows without the symlink right, a directory junction)
   8. builds rasim (cargo build --release)
   9. runs the regression tests (tests/run_tests.py)
 """
@@ -26,6 +28,12 @@ sys.path.insert(0, os.path.join(HERE, "tools"))
 C2_SHA256 = "497d1ffe57f75db8b458167bdea475f3962829e139b355a2672a4ef51c716413"   # c2.dll 14.00.50727.762
 WORK = os.path.join(HERE, "work")
 TC = os.path.join(WORK, "toolchain")
+WINDOWS = os.name == "nt"
+RASIM = os.path.join(HERE, "tools", "rasim", "target", "release", "rasim" + (".exe" if WINDOWS else ""))
+
+
+def is_link(p):
+    return os.path.islink(p) or getattr(os.path, "isjunction", lambda q: False)(p)
 
 
 def step(n, text):
@@ -54,16 +62,30 @@ def sha256(path):
 
 def check_host():
     step(1, "host tools")
-    if not shutil.which("wine"):
+    if WINDOWS:
+        ok("Windows: the compilers run directly (no wine)")
+    elif not shutil.which("wine"):
         fail("wine not found on PATH", "macOS: brew install --cask wine-stable (or brew install wine); "
              "Linux: your distribution's wine package (32-bit support needed)")
-    ok("wine: " + subprocess.run(["wine", "--version"], capture_output=True, text=True).stdout.strip())
-    if not shutil.which("cargo"):
-        fail("cargo not found (rasim is written in Rust)", "install Rust from https://rustup.rs and open a new shell")
-    ok("cargo: " + subprocess.run(["cargo", "--version"], capture_output=True, text=True).stdout.strip())
+    else:
+        ok("wine: " + subprocess.run(["wine", "--version"], capture_output=True, text=True).stdout.strip())
+    if shutil.which("cargo"):
+        ok("cargo: " + subprocess.run(["cargo", "--version"], capture_output=True, text=True).stdout.strip())
+    elif os.path.isfile(RASIM):
+        ok("no cargo; using the rasim already built at " + os.path.relpath(RASIM, HERE))
+    else:
+        fail("cargo not found (rasim is written in Rust)", "install Rust from https://rustup.rs and open a new shell"
+             + ("; on Windows rustup's default toolchain needs the Visual Studio C++ build tools, or use "
+                "`rustup default stable-x86_64-pc-windows-gnu`" if WINDOWS else ""))
     import pdbindex
+    have_index = os.path.getsize(os.path.join(WORK, "index", "c2.dll.csv")) > 100000 \
+        if os.path.isfile(os.path.join(WORK, "index", "c2.dll.csv")) else False
     if not os.path.exists(pdbindex.PDBUTIL) and not shutil.which(pdbindex.PDBUTIL):
+        if have_index:
+            ok("no llvm-pdbutil; work/index/c2.dll.csv is already built")
+            return
         fail("llvm-pdbutil not found", "macOS: brew install llvm; Linux: install llvm (llvm-pdbutil ships with it); "
+             "Windows: an LLVM release for Windows (winget install LLVM.LLVM) with llvm-pdbutil.exe on PATH; "
              "or set LLVM_PDBUTIL=/path/to/llvm-pdbutil")
     ok("llvm-pdbutil: " + pdbindex.PDBUTIL)
 
@@ -91,10 +113,11 @@ def link_toolchain(vs):
     step(3, "link the toolchain into work/")
     os.makedirs(TC, exist_ok=True)
     link = os.path.join(TC, "vs2005")
-    if os.path.islink(link) and os.path.realpath(link) != os.path.realpath(vs):
-        os.remove(link)
+    if is_link(link) and os.path.realpath(link) != os.path.realpath(vs):
+        os.rmdir(link) if WINDOWS else os.remove(link)       # a link only: the toolchain itself is never touched
     if not os.path.exists(link):
-        os.symlink(vs, link)
+        from c2build import link_dir
+        link_dir(vs, link)
     os.makedirs(os.path.join(HERE, "Bin"), exist_ok=True)
     dst = os.path.join(HERE, "Bin", "c2.dll")
     if not os.path.exists(dst) or sha256(dst) != C2_SHA256:
@@ -146,13 +169,13 @@ def build_index():
 
 
 def wine_prefix():
-    step(6, "wine prefix work/toolchain/wineprefix (the first time takes a minute)")
+    step(6, "cl.exe runs" if WINDOWS else "wine prefix work/toolchain/wineprefix (the first time takes a minute)")
     import msvc
     msvc.ensure_wine(msvc.env())
     rc, out = msvc.run("cl", [], capture=True)
     if "Version 14.00.50727.762" not in out:
-        fail("cl.exe did not run under wine:\n" + out[-800:],
-             "run `uv run tools/msvc.py` by hand to see wine's error (32-bit wine support is required)")
+        fail("cl.exe did not run%s:\n" % ("" if WINDOWS else " under wine") + out[-800:],
+             "run `uv run tools/msvc.py` by hand to see the error" + ("" if WINDOWS else " (32-bit wine support is required)"))
     ok("cl 14.00.50727.762 runs")
 
 
@@ -167,7 +190,8 @@ def traced_toolchain(vs):
         p = os.path.join(tr, sub)
         if not os.path.exists(p):
             os.makedirs(os.path.dirname(p), exist_ok=True)
-            os.symlink(tcpath(vs, sub), p)
+            from c2build import link_dir
+            link_dir(tcpath(vs, sub), p)
     import c2trace
     patched = os.path.exists(os.path.join(bindst, "c2trace.dll")) and sha256(os.path.join(bindst, "c2.dll")) != C2_SHA256
     if not patched:
@@ -177,11 +201,14 @@ def traced_toolchain(vs):
 
 def build_rasim():
     step(8, "rasim (Rust)")
+    if not shutil.which("cargo"):
+        ok("no cargo; keeping " + os.path.relpath(RASIM, HERE))
+        return
     r = subprocess.run(["cargo", "build", "--release", "--quiet", "--manifest-path",
                         os.path.join(HERE, "tools", "rasim", "Cargo.toml")], capture_output=True, text=True)
     if r.returncode:
         fail("cargo build failed:\n" + r.stderr[-1500:])
-    ok("tools/rasim/target/release/rasim")
+    ok(os.path.relpath(RASIM, HERE))
 
 
 def tests():
@@ -198,7 +225,7 @@ def main():
     ap.add_argument("--no-download", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
     a = ap.parse_args()
-    if not a.vs2005 and os.path.islink(os.path.join(TC, "vs2005")):
+    if not a.vs2005 and is_link(os.path.join(TC, "vs2005")):
         a.vs2005 = os.path.realpath(os.path.join(TC, "vs2005"))      # re-run without repeating the path
     check_host()
     vs = check_toolchain(a.vs2005)

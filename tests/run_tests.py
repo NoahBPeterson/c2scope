@@ -98,7 +98,7 @@ check("scratch: eB picks (the binding is pick-neutral)", seq, "ecx edx ecx edx e
 
 snap = os.path.join(tempfile.mkdtemp(), "eA.json")
 tool("regs", DATA, "--func", "?eA@@", "--export", snap, *FLAGS)
-rasim = os.path.join(HERE, "tools", "rasim", "target", "release", "rasim")
+rasim = os.path.join(HERE, "tools", "rasim", "target", "release", "rasim") + (".exe" if os.name == "nt" else "")
 r = subprocess.run([rasim, "check", snap], capture_output=True, text=True).stdout
 m = re.search(r"(\d+) mismatches; colouring order: (\d+) of (\d+)", r)
 check("rasim check: 0 mismatches", int(m.group(1)) if m else None, 0)
@@ -2272,7 +2272,7 @@ relocmask_tests()
 def fold_tests():
     """A reload folds into the named variable only when its stretch holds one reference (regalloc.md 3.6.10)."""
     src = os.path.join(HERE, "tests", "data", "fold.cpp")
-    rasim_ = os.path.join(HERE, "tools", "rasim", "target", "release", "rasim")
+    rasim_ = os.path.join(HERE, "tools", "rasim", "target", "release", "rasim") + (".exe" if os.name == "nt" else "")
     d = tempfile.mkdtemp()
     got = {}
     for fn_ in ("fa", "fb"):
@@ -2637,11 +2637,12 @@ def toolgap_tests():
     cwd = os.getcwd()
     try:
         os.chdir(HERE)
-        got = (c2trace.keep_path("b/k_x"), c2trace.keep_path("work/scratch/k"), c2trace.keep_path("/tmp/k"))
+        absk = os.path.join(os.path.abspath(os.sep), "tmp", "k")      # /tmp/k; on Windows D:\\tmp\\k
+        got = (c2trace.keep_path("b/k_x"), c2trace.keep_path("work/scratch/k"), c2trace.keep_path(absk))
     finally:
         os.chdir(cwd)
     check("c2trace keep_path: root-relative b/k_x -> work/keep/b/k_x; work/.. and absolute unchanged", got,
-          (os.path.join(HERE, "work", "keep", "b", "k_x"), os.path.join(HERE, "work", "scratch", "k"), "/tmp/k"))
+          (os.path.join(HERE, "work", "keep", "b", "k_x"), os.path.join(HERE, "work", "scratch", "k"), absk))
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2trace.py"), "no_such_file.cpp", "--keep",
                         os.path.join(dd, "k")], capture_output=True, text=True, cwd=dd)
     check("c2trace: a missing source stops before the keep directory is made",
@@ -2825,7 +2826,7 @@ def incsnap_tests():
     sn = incsnap.Snapshot(tu, cl, os.path.join(d, "snap"), text=text)
     st = sn.text(text)
     check("incsnap: the closure (quoted, ../ relative, <> from /I), the /I dir and the unit's include point at copies",
-          (sorted(os.path.relpath(f, live) for f in sn.files), sn.cl[:2], sn.cl[2] == "/I" + sn.path(sysd),
+          (sorted(os.path.relpath(f, live).replace(os.sep, "/") for f in sn.files), sn.cl[:2], sn.cl[2] == "/I" + sn.path(sysd),
            os.path.join(d, "snap") in st and live + os.sep + "inc" not in st),
           (["inc/a.h", "inc/b.h", "sys/c.h"], ["/TP", "/O2"], True, True))
     breakit()
@@ -3555,7 +3556,7 @@ def tool_portability_tests():
         return True
     os.path.exists = cs_exists
     try:
-        got = [os.path.relpath(c2build.tcpath(d, *a), d) for a in (("VC/Bin/c2.dll",), ("VC", "INCLUDE"),
+        got = [os.path.relpath(c2build.tcpath(d, *a), d).replace(os.sep, "/") for a in (("VC/Bin/c2.dll",), ("VC", "INCLUDE"),
                                                                      ("SDK/Lib",), ("SDK/Include",))]
     finally:
         os.path.exists = real_exists
@@ -3820,7 +3821,7 @@ def x360_tests():
     got = dict(re.findall(r"^\s+\d+\s+(\S+)\s+\S+\s+-?\d+\s+-?\d+\s+\d+\s+\d+\s+(r\d+)\s", out, re.M))
     check("x360 regs: o_loop's registers are the listing's (p r3, n r4, s r5, i r6, the pointer t213 r11)",
           {k: got.get(k) for k in ("p", "n", "s", "i", "t213")}, dict(p="r3", n="r4", s="r5", i="r6", t213="r11"))
-    rasim = os.path.join(HERE, "tools", "rasim", "target", "release", "rasim")
+    rasim = os.path.join(HERE, "tools", "rasim", "target", "release", "rasim") + (".exe" if os.name == "nt" else "")
     r = subprocess.run([rasim, "check", snap], capture_output=True, text=True).stdout if os.path.exists(snap) else ""
     m = re.search(r"(\d+) pop totals checked; (\d+) mismatches; colouring order: (\d+) of (\d+)", r)
     check("x360 rasim check: x86's priority formula, 0 mismatches, every pop predicted",
@@ -3862,6 +3863,42 @@ def x360_tests():
 
 
 x360_tests()
+
+
+def inline_order_tests():
+    """c2inline --order and the body column (docs/c2/inline.md "Compile order"): the callee-first bottom-up order,
+    a cycle's back edge (the callee is not compiled yet: body no), a virtual call (no edge: caller first), and
+    /Od (source order). 13.10 only: the probes are 13.10's."""
+    if not BUILD.startswith("13.10"):
+        skip("c2inline order/body (5 checks)", "13.10 builds only (C2_BUILD=13.10.3052 / 13.10.3077)")
+        return
+    src = os.path.join(HERE, "tests", "data", "inline_order.cpp")
+
+    def run(*cl):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2inline.py"), src, "--order", "--"] +
+                           ["/TP", "/MT", "/GS", "/EHsc", "/Gy"] + list(cl), capture_output=True, text=True, cwd=HERE)
+        out = r.stdout + r.stderr
+        order = [m.group(1) for m in re.finditer(r"^\s+\d+\s+\?+(\w+)@", out, re.M)]
+        rows = {}
+        for m in re.finditer(r"^\?(\w+)@@\S+\s+\?(\w+)@@\S+\s+1\s.*?\s(yes|no|extern)\s+(INLINE|call)\b", out, re.M):
+            rows[(m.group(1), m.group(2))] = (m.group(3), m.group(4))
+        return out, order, rows
+
+    out, order, rows = run()
+    check("c2inline --order: callee-first bottom-up (late before its caller), a cycle in source order, "
+          "virtual caller first", order, ["late", "cyc_a", "cyc_b", "u", "vf", "caller_late"])
+    check("c2inline body: a callee defined later but compiled first: body yes, inlined",
+          rows.get(("caller_late", "late")), ("yes", "INLINE"))
+    check("c2inline body: the cycle's first-compiled member sees the other uncompiled: body no, a call",
+          rows.get(("cyc_a", "cyc_b")), ("no", "call"))
+    check("c2inline body: the second member sees the first compiled: body yes, inlined",
+          rows.get(("cyc_b", "cyc_a")), ("yes", "INLINE"))
+    out, order, rows = run("/Od")
+    check("c2inline --order /Od: no call-graph order, source order", order,
+          ["caller_late", "late", "cyc_a", "cyc_b", "u", "vf"])
+
+
+inline_order_tests()
 
 
 def probe_modules():

@@ -2139,7 +2139,7 @@ def run_mine(a, cl):
         recs += pairs
     prune(M, recs, wants)
     left = [p for p in os.popen("ps -o pid=,command= -U %d" % os.getuid()).read().splitlines()
-            if re.search(r"\bcl\.exe\b", p) and "wine" in p.lower() and "python" not in p]
+            if re.search(r"\bcl\.exe\b", p) and "wine" in p.lower() and "python" not in p] if os.name != "nt" else []
     if left:
         print("note: cl.exe under wine is running on this machine (not this run's: every compile here went to the "
               "server):", len(left))
