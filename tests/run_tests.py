@@ -493,6 +493,73 @@ def symkeys_more_tests():
               [(1, 1), (1, 1), (2, 0), (3, 0), (3, 0), (2, 0), (2, 0), (3, 0), (1, 0), (1, 0)])
 
 
+def symkeys_levers_tests():
+    """Papercuts of the M&B wave S1 (13.10): levers says up front what keys cannot do, key selectors for repeated
+    names, a label for unnamed subtrees, where an optimiser temp comes from, inline-level edits, and the SU
+    catalogue of sulever (symkeys.md sections 3 and 5)."""
+    skd = tempfile.mkdtemp()
+    NA = os.path.join(HERE, "tests", "data", "symkeys_nary.cpp")
+    LV = os.path.join(HERE, "tests", "data", "symkeys_lev.cpp")
+    ja, jl = os.path.join(skd, "a.json"), os.path.join(skd, "l.json")
+    symkeys("export", NA, "--func", "k", "--out", ja, *FLAGS)
+    symkeys("export", LV, "--func", "k", "--out", jl, *FLAGS)
+    out = symkeys("sites", "--from", ja, "--func", "kcse", "--pass", "2")
+    check("symkeys sites: an unnamed subtree prints as `(?hXXXX ..)`, its subtree hash",
+          bool(re.search(r"1st \(\?h([0-9a-f]{4}) \.\.\)\s+SU1 n3 h\1\b", out)), True)
+    check("symkeys sites: an optimiser temporary says which c2 step made it and for which line",
+          bool(re.search(r"^\s+\^ \$o\d+: made by \w+ at line \d+", out + symkeys("sites", "--from", jl, "--func", "kv", "--pass", "2"), re.M)), True)
+    out = symkeys("levers", "--from", ja, "--func", "kcse", "--site", "*:_a>(?h", "--top", "3")
+    check("symkeys levers --site: an order decided by SU is said up front (no keys can give it), no key search",
+          ("cannot be given by symbol keys" in out and "decided by SU" in out and "no key search" in out
+           and "0 edit sets" not in out), True)
+    # key selectors: two field views of dir share the name `_dir+4`
+    out = symkeys("keys", "--from", jl, "--func", "kv")
+    ks = [int(m.group(1)) for m in re.finditer(r"^\s+(\d+) frame\s+\d+\s+_dir\+4\s", out, re.M)]
+    if not BUILD.startswith("13.10"):
+        ks = []          # 14.00 / 15.00 name the two views `_dir+4.b0` / `_dir+4.f4`: no shared name
+    check("symkeys keys: a struct local has two field views with one name (_dir+4; 13.10)", len(ks) >= 2 or not BUILD.startswith("13.10"), True)
+    if len(ks) >= 2:
+        out = symkeys("whatif", "--from", jl, "--func", "kv", "add:frame@_dir+4@%d:1" % ks[1])
+        rows = re.findall(r"^\s+_dir\+4\s+(\d+) ->\s+(\d+)", out, re.M)
+        check("symkeys whatif: NAME@KEY edits the second field view (the first keeps its key)",
+              (str(ks[0]) not in [a for a, _ in rows], (str(ks[1]), str(ks[1] + 1)) in rows), (True, True))
+        out = symkeys("sites", "--from", jl, "--func", "kv", "--pass", "2")
+        sel = re.search(r"\(?_d2\+\d+ \(?key (\d+)", out)
+        out = symkeys("levers", "--from", jl, "--func", "kv", "--site", "*:#%s>#%d" % (sel.group(1) if sel else "0", ks[1]), "--depth", "1")
+        check("symkeys levers --site: #KEY selects an operand by the key of its symbol",
+              bool(sel) and bool(re.search(r"line \d+ OP\w+: \S+ \(key %s\) before \S+ \(key %d\)" % (sel.group(1), ks[1]), out)), True)
+    # an edit in an inline helper's body is made in every expansion
+    out = symkeys("keys", "--from", jl, "--func", "kh")
+    k2 = re.search(r"^\s+(\d+) frame\s+\d+\s+_s\s+sq2#2\b", out, re.M)
+    out = symkeys("levers", "--from", jl, "--func", "kh", "--var", "_s@sq2#2", "--above", k2.group(1) if k2 else "0", "--classes", "frame", "--top", "40")
+    hits = re.findall(r"^(add:frame@\S+)$", out, re.M)
+    check("symkeys levers: an edit inside the helper's body is one edit at all three expansions (level: inline x3)",
+          (any(h.count("|") == 2 for h in hits), "level: inline x3" in out, not any("|" not in h and "@_s@sq2" in h for h in hits)), (True, True, True))
+    out = symkeys("levers", "--from", jl, "--func", "kh", "--var", "_s@sq2#2", "--above", k2.group(1) if k2 else "0", "--classes", "frame", "--top", "40", "--per-expansion")
+    check("symkeys levers --per-expansion keeps the one-expansion edits (no source construct gives them)",
+          any("|" not in h and "@_s@sq2#2" in h for h in re.findall(r"^(add:frame@\S+)$", out, re.M)), True)
+    # sulever catalogue: weights of the spellings of one operand
+    fam = os.path.join(skd, "fam.json")
+    symkeys("export", os.path.join(HERE, "tests", "data", "sulever_fam.cpp"), "--out", fam, "--", "/TP", "/O2")
+    out = symkeys("sites", "--from", fam, "--pass", "2")
+    w = {}
+    for blk in out.split("#### ")[1:]:
+        m = re.match(r"\?(\w+)@@", blk)
+        if m:
+            w[m.group(1)] = [re.sub(r"\s+", " ", re.sub(r"key \d+|\$o\d+", "K", ln)).strip() for ln in blk.splitlines()[2:] if ln.strip() and "^" not in ln]
+    bad = [k for k in ("n02", "n03", "n06", "n07", "n08", "n09", "n10", "n13", "n16", "n19") if w.get(k) != w.get("n00")]
+    bad += [k for k in w if k[0] == "p" and w[k] != w.get("p00")]
+    bad += [k for k in ("q01", "q02", "q03", "q04") if w.get(k) != w.get("q00")] + [k for k in ("q06", "q07") if w.get(k) != w.get("q05")]
+    bad += [k for k in ("m01", "m02", "m03") if w.get(k) != w.get("m00")] + [k for k in ("m05",) if w.get(k) != w.get("m04")]
+    check("sulever catalogue: identity / local-copy / access spellings leave every sort weight alone (%d functions)" % len(w),
+          (len(w) >= 36, bad), (True, []))
+    def su(k):          # the 1st operand of the function's OPADD (the narrow variable's side)
+        m = re.search(r"OPADD 1st .*?SU(\d) n\d", " ".join(w.get(k, [])))
+        return m.group(1) if m else None
+    check("sulever catalogue: the view-mask and the wide mask make the narrow variable's sort SU1; spelled plainly SU0",
+          (su("n04"), su("n05"), su("n00")), ("1", "1", "0"))
+
+
 def fpcolor_tests():
     """13.10: FPColor (x87 values outside Color's class loop), docs/c2/port-1310.md section 12."""
     out = tool("regs", FP, "--func", "_h", "--all-classes", "--why", "*", "--", "/arch:SSE2")
@@ -655,6 +722,8 @@ else:
 if c2build.table() is None or "symkeys" in (c2build.get("hooks") or {}):
     symkeys_tests()
     symkeys_more_tests()
+    if BUILD.startswith(("13.10", "14.00", "15.00")):
+        symkeys_levers_tests()
     symkeys_hash_tests()
 else:
     print("  symkeys: no symkeys hooks in this build table (not ported): skipped")
@@ -3751,7 +3820,7 @@ def symkeys17_levers_tests():
           (bool(re.search(r"^add:frame@r:28\n    -> r key 128 ", out, re.M)), " r:128 " in traced), (True, True))
     out = sk("levers", "--from", base, "--func", "kdead", "--var", "r", "--below", "4", "--max", "3")
     check("symkeys17 levers: a sub edit names the local it removes (kdead: the dead `float d = 0;`)",
-          bool(re.search(r"^sub:frame@r:1\n.*\n.*\n    removes: d ", out, re.M)), True)
+          bool(re.search(r"^sub:frame@r:1\n(?:.*\n){2,3}    removes: d ", out, re.M)), True)
     out = sk("levers", "--from", base, "--func", "kx87", "--site", "1:s>[p", "--max", "4", "--top", "3")
     check("symkeys17 levers --site: no edit set removes a symbol the code reads (kx87: s, p, q are operands)",
           (bool(re.search(r"^# \d+ sub edits dropped", out, re.M)), bool(re.search(r"^1/1 sites", out, re.M)),

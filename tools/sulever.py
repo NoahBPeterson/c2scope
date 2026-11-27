@@ -18,8 +18,9 @@ This tool says which component decides and by how much, and what would satisfy t
      (A, C) would have as one subtree (SU by OptNodeComplexity: the first operand's SU, then +1 for each later one
      with an equal SU, its SU + 1 for a larger one; count 1 + both counts), and whether the outer sort then puts it
      before B. The pair becomes one operand only under another opcode (the chain flattens through equal opcodes);
-  3. the catalogue of source constructs that change an operand's SU or count, with what they do to the code
-     (CATALOGUE below; [C] = seen in a compile);
+  3. the catalogue of source constructs that change an operand's SU or count, with what they do to the code and on
+     which builds (CATALOGUE below; [C] = seen in a compile, tests/data/sulever_fam.cpp has the measured families;
+     on 13.10 no code-neutral rewrite that raises or lowers SU / count was found);
   4. --spell TEXT: TEXT is the source text of operand A (or B), e.g. `(uint32)lo`, on --src-line N (default: the one
      line of <src> that holds it). Every catalogue spelling that applies is written into a tsweep template
      (`work/sulever/<stem>-<hash>/sweep.cpp`); each is traced again to read the site's new order, and with --asm-vs
@@ -66,26 +67,44 @@ def node_su(sus):
 # does to the code.
 CATALOGUE = [
     dict(id="view-mask", effect="SU0 -> SU1 (count 2): AND(32-bit view of X, MASK)", applies="narrow",
-         neutral="yes when X lives in memory (a parameter, an address-taken local): instruction selection folds "
-                 "`and m32, 0xff` / `0xffff` into `movzx r32, byte/word ptr` [C: Spore 0x0068c6d0, bdiff 2 -> 0]",
+         neutral="14.00 / 15.00: yes when X lives in memory (a parameter, an address-taken local): instruction selection "
+                 "folds `and m32, 0xff` back into `movzx r32, byte ptr` [C: Spore 0x0068c6d0 (15.00), bdiff 2 -> 0; "
+                 "tests/data/sulever_fam.cpp n04 on 14.00 and 15.00: same code]. 13.10.3077 / 3052: NO, the dword load "
+                 "and `and eax, 255` stay (6 instructions against 4) [C: sulever_fam.cpp n04]",
          spell=lambda x, m: ["(*(unsigned int*)&%s & %s)" % (x, m)]),
     dict(id="wide-mask", effect="SU0 -> SU1: AND(zero-extension of X, a mask wider than X's type)", applies="narrow",
-         neutral="no: the `and` stays (0xffff on a byte: +1 instruction) [C: 0x0068c6d0, bdiff 2]",
+         neutral="no: the `and` stays (0xffff on a byte: +1 instruction) [C: 0x0068c6d0, bdiff 2; sulever_fam.cpp n05, "
+                 "all four builds]",
          spell=lambda x, m: ["((unsigned int)%s & %s)" % (x, "0xffff" if m == "0xff" else "0xffffff")]),
     dict(id="same-width-mask", effect="none: `(T)X & 0xff` on a byte X is folded before pass 1", applies="narrow",
-         neutral="(listed so that it is not tried again) [C: 0x0068c6d0 r2_t1]", spell=None),
+         neutral="(listed so that it is not tried again) [C: 0x0068c6d0 r2_t1; sulever_fam.cpp n10 on all four builds]",
+         spell=None),
+    dict(id="identity", effect="none: `x + 0`, `x | 0`, `x ^ 0`, `x * 1`, `x << 0`, `x & -1`, `~~x`, `-(-x)`, `(x, x)`, "
+         "`(0 ? 1 : x)`, `+x`, redundant parentheses, `(unsigned)x` / `(int)(unsigned char)x` of a value that already "
+         "has that type, `p[0]` / `*(p + 0)` / `*(int*)p` for `*p`, `(&q->a)[1]` / `*(int*)((char*)q + 4)` / "
+         "`q[0].b` for `q->b`: the same tree before pass 1 (all weights equal)", applies="any",
+         neutral="(listed so that they are not tried again) [C: sulever_fam.cpp n02..n19 and the p / q groups; "
+                 "13.10.3077, 13.10.3052, 14.00, 15.00]", spell=None),
     dict(id="regroup-op", effect="the pair (A, C) becomes one operand (SU/count as `regrouping` prints)",
          applies="nary",
          neutral="no: the inner operator is another opcode (`+` or `^` for disjoint bits: `add` against `or`) "
                  "[C: 0x0068c6d0 r2, bdiff 8 -> 2]", spell=None),
     dict(id="local-copy", effect="none: a single-use local (`uint32 v = ..; x = v | ..`, also `v |= ..` chains, "
-         "`g = m & k; g |= ..`) is substituted before the sort", applies="any",
-         neutral="(listed so that it is not tried again) [C: 0x0068c6d0 r3_t1, 8 spellings]", spell=None),
+         "`g = m & k; g |= ..`), a pointer local (`int* r = &q->b; *r`) or a reference local (`int& r = q->b`) is "
+         "substituted before the sort; used twice it weighs as the expression written twice (and costs the same "
+         "code as that)", applies="any",
+         neutral="(listed so that it is not tried again) [C: 0x0068c6d0 r3_t1, 8 spellings; sulever_fam.cpp group m, "
+                 "all four builds]", spell=None),
     dict(id="member-offset", effect="a member at offset 0 is a memory leaf (SU0 n1); at offset d != 0 it is reached "
-         "through an address temporary and weighs as OPADD(p, d) (SU1 n2)", applies="mem",
-         neutral="only through the layout (which member is at 0), x87.md rule 2 [C]", spell=None),
+         "through an address temporary and weighs as OPADD(p, d) (SU1 n2); a byte / short member is a conversion of "
+         "it (SU1 n3)", applies="mem",
+         neutral="only through the layout (which member is at 0), x87.md rule 2; no rewrite of the access changes it "
+                 "[C: sulever_fam.cpp q groups: every spelling of the same access has the same weights]", spell=None),
     dict(id="call", effect="a call adds 7 to SU", applies="any", neutral="no", spell=None),
 ]
+# Not in the catalogue because nothing was found: a code-neutral rewrite that raises or lowers SU / count by itself on
+# 13.10 (only the view-mask does, on 14.00 and 15.00).  A wanted order decided this way on 13.10 is a different
+# expression shape (different code: tell sulever the original's assembly with --asm-vs), not a spelling.
 
 
 def applies(o, what):
@@ -121,17 +140,14 @@ def diagnose(f, site, pass_):
         print("  B %-28s %s" % (symkeys.opname(B), wstr(B["w"])))
         print("  A>B is %s; decided by %s" % (state, comp))
         if ia > ib:
-            if comp == "hash":
+            if comp == "hash" and symkeys.decide(ops, ia, ib)[2]:
                 print("  -> a key edit can do it: symkeys.py levers --site '%s'" % site["text"])
+            elif comp == "hash":
+                print("  -> decided by the hash, but neither operand's hash follows a symbol key (a constant, an unnamed "
+                      "subtree, a temporary that hashes by its definition): no key edit, and no catalogue rewrite changes "
+                      "it; the operand's own leaves would have to change")
             else:
-                need = []
-                if comp == "SU":
-                    need.append("raise A to SU%d (count/hash then decide: B is n%d h%04x)" % (sb, nb, hb))
-                    need.append("raise A to SU%d (wins outright)" % (sb + 1))
-                    need.append("lower B to SU%d" % sa + (" (then count: A n%d vs B n%d at the same SU)" % (na, nb)))
-                else:
-                    need.append("raise A's count to %d or more (or the same count and a larger hash)" % nb)
-                    need.append("lower B's count below %d" % na)
+                need = symkeys.need_lines(A, B, comp)
                 print("  -> no key edit can do it (symkeys levers searches keys, i.e. hash); needed, one of:")
                 for x in need:
                     print("       %s" % x)

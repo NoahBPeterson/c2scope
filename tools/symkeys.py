@@ -2,13 +2,13 @@
 """Symbol keys (SYM.key: the number c2 hashes and sorts symbols by): traced, replayed, what-if.  Doc: docs/c2/symkeys.md
 
 usage: symkeys.py keys    <src> --func F [--all] [--brief] [--grep RE] [--phase reader|inline|opt] [-- <cl args>]
-       symkeys.py sites   <src> --func F [--line LO-HI] [--pass 1|2] [-- <cl args>]
+       symkeys.py sites   <src> --func F [--line LO-HI] [--pass 1|2] [--source FILE] [-- <cl args>]
        symkeys.py events  <src> --func F [-- <cl args>]
        symkeys.py whatif  <src> --func F EDIT [EDIT..] [--show RE] [--batch FILE|- [--compact]] [-- <cl args>]
        symkeys.py levers  <src> --func F --var NAME (--to LO-HI | --above K | --below K | --mod8 R | --hash-above H
                           | --hash-below H) [--line LO-HI] [--match REF.json] [--n 1,2,16 | --max N] [--no-inline]
        symkeys.py levers  <src> --func F --site LINE:A>B [--site ..] [--sites-file F] [--classes frame,tmp,glob]
-                          [--n ..|--max N] [--depth 1|2|3] [--pool K]       (several wanted orders at once)
+                          [--n ..|--max N] [--depth 1|2|3] [--pool K] [--per-expansion]   (several wanted orders at once)
        symkeys.py compare <src> --func F [EDIT..] --vs VARIANT.json      (prediction vs a traced variant)
        symkeys.py export  <src> --func F --out FILE.json
    Every command takes --from FILE.json (an export) instead of <src>: no compile.  --c2 13.10 / 15.00 / 17.00 (x64) as usual.
@@ -35,14 +35,20 @@ whatif   replay the stream with edits; prints the keys that change and the pass-
            add:CLASS@#E[:n]  at event index E (as `events` prints it)
            del:V             V is never allocated (its frees vanish)
            swap:V,W          V's first allocation moves to just before W's (V first referenced later / earlier)
-         V is a symbol as `keys` prints it (`_x`, `_v+4.f4`, `_t@Helper#2`, `$T5944+0.f4@Cls::Fn#2`).
+         V is a symbol as `keys` prints it (`_x`, `_v+4.f4`, `_t@Helper#2`, `$T5944+0.f4@Cls::Fn#2`); when several share
+         the name, `NAME@KEY` picks one by its key (`_dir+0@169`).  `e1|e2` is one edit made at several places.
 levers   every single add/sub edit at every first reference of a named symbol (and every inline expansion start) before
          --var, n from --n / 1..--max; prints those that put --var's key where asked, ranked by the other operand orders
          they flip, with the source construct each one stands for.  --match REF.json ranks instead by how many pass-2
          operand orders still differ from REF (a draft whose code already matches, or any reference trace).
          --site LINE:A>B (repeatable; A, B substrings of two operands as `sites` prints them, LINE an offset, LO-HI or
          *): edit sets (singles, then pairs / triples of the best) that give every such sort the wanted order at once,
-         ranked by how many are satisfied (partial solutions included), then other orders flipped.
+         ranked by how many are satisfied (partial solutions included), then other orders flipped.  An operand is also
+         `#KEY` or `NAME@KEY` (by symbol key), or the `?hXXXX` label of an unnamed subtree.  A wanted order the keys
+         cannot give (SU / node count / an unfollowable hash decides it) is reported first, with what would change it
+         (tools/sulever.py has the source rewrites), and left out of the search.  Each edit prints its `level:`
+         (reader / inline xN / optimiser): an edit in an inline helper's body is made in every expansion (--per-expansion
+         keeps the single-expansion edits).
 compare  predicts VARIANT from <src> + EDITs: share of keys and of pass-2 operand orders predicted exactly.
 
 What is modelled (docs/c2/symkeys.md section 1): keys come in blocks of 32 per pool class (frame, global, temp,
@@ -739,7 +745,7 @@ class FastKeys:
     def keys(self, edits):
         """{id(sym): key} for the deps (unmoved deps are left out: callers default to sym.key)."""
         ops = self.ops
-        m = re.match(r"^add:(frame|tmp|glob|other|hash)@([^#].*?)(?::(\d+))?$", edits[0]) if len(edits) == 1 else None
+        m = re.match(r"^add:(frame|tmp|glob|other|hash)@([^#|].*?)(?::(\d+))?$", edits[0]) if len(edits) == 1 and "|" not in edits[0] else None
         if m and self._pos(m.group(2)) is not None:
             # one insertion: the edited stream is the base with n new allocations at the anchor (no O(n) rebuild)
             p = self._pos(m.group(2))
@@ -1020,7 +1026,7 @@ def opdesc(o):
                                      "t%d" % m[0], _disp(m[1]))
         else:
             what = "(%s ..)" % ("%s key %d" % (label(d), d.key) if d is not None and (d.cls != "tmp" or d.phase == "opt") else
-                                "t%d" % o["dkey"] if o["dkey"] is not None else "?")
+                                "t%d" % o["dkey"] if o["dkey"] is not None else "?h%04x" % (w & 0xffff))
         m2 = o.get("mem2")
         if m2 and m2[2] is not None and m2[2].cls != "tmp":
             what = what[:-4] + " [%s key %d+..] ..)" % (label(m2[2]), m2[2].key)
@@ -1041,11 +1047,68 @@ def line_note(f):
     return "# line = offset from the function's first line (that line was not traced)"
 
 
+CREATOR_HINT = {"HshInsertEntry": "value-numbering temp: a value the line computes (a repeated one is numbered once)",
+                "TupMakeTmpBinary": "result temp of a binary operation of that line",
+                "TupMakeTmpUnary": "result temp of a unary operation / conversion of that line",
+                "OptRebuildTuples": "temp made rebuilding the tuples of that line (a subtree evaluated first)"}
+
+
+def opt_syms(o):
+    """The optimiser-made (`$o<n>`) symbols an operand reads: leaf, first / second source, memory bases."""
+    out = []
+    for k in ("sym", "dsym", "dsym2"):
+        if o.get(k) is not None:
+            out.append(o[k])
+    for k in ("mem", "mem2"):
+        if o.get(k) and o[k][2] is not None:
+            out.append(o[k][2])
+    seen = []
+    for x in out:
+        if x.phase == "opt" and x not in seen:
+            seen.append(x)
+    return seen
+
+
+def first_line(f, src):
+    """The source line of the function's first line: traced (FUNC+0x44), else the first line of `src` that declares
+    its undecorated name (the offsets `sites` prints count from there)."""
+    if f.line0:
+        return f.line0
+    m = re.match(r"\??(?:\?\?\w)?([^@?]+)@", f.name or "")
+    if m and src:
+        rx = re.compile(r"(?<![\w:])(?:\w+::)?%s\s*\(" % re.escape(m.group(1)))
+        for i, ln in enumerate(src):
+            if rx.search(ln):
+                return i + 1
+    return 0
+
+
+def prov(f, o, src=None):
+    """Where an optimiser temporary of this operand comes from: the c2 step that made it and the source line it
+    was made for (the line offset is the one `--line` takes; `src` = the source file's lines, when known)."""
+    out = []
+    for x in opt_syms(o):
+        mk = re.sub(r"^@|@\d+$", "", re.sub(r"/\w+$", "", x.creator or ""))
+        t = "%s: made by %s at line %d" % (label(x), mk, x.line)
+        l0 = first_line(f, src)
+        if l0 and src and 0 < l0 + x.line <= len(src):
+            t += " (source %d: %s)" % (l0 + x.line, src[l0 + x.line - 1].strip()[:90])
+        if mk in CREATOR_HINT:
+            t += ", " + CREATOR_HINT[mk]
+        out.append(t)
+    return out
+
+
 def print_sites(f, a):
     lo, hi = (0, 1 << 30)
     if a.line:
         p = a.line.split("-")
         lo, hi = int(p[0]), int(p[-1])
+    srcf = getattr(a, "source", None) or (a.src if a.src and os.path.isfile(a.src) else None)
+    try:
+        src = open(srcf, errors="replace").read().split("\n") if srcf else None
+    except OSError:
+        src = None
     print("#### %s: commutative operand sorts (OptLeftWeightTree), first operand = evaluated first / loaded" % f.name)
     print(line_note(f))
     for e in f.events:
@@ -1060,16 +1123,100 @@ def print_sites(f, a):
             print("%31s %s %s%s" % ("", ("2nd", "3rd", "4th", "5th")[min(k, 3)], opdesc(o) if o["w"] is not None else
                                     "%s (5th or later: not logged)" % LEAFKIND.get(o["kind"], "kind%d" % o["kind"]),
                                     "   (tie: source order)" if tie and k == 0 else ""))
+        shown = set()
+        for o in ops:
+            for t in prov(f, o, src):
+                if t not in shown:
+                    shown.add(t)
+                    print("%31s ^ %s" % ("", t))
     print_orders(f, a, lo, hi)
 
 
 # ---------------------------------------------------------------- what-if
 
+def _label_count(f):
+    if getattr(f, "_lc", None) is None:
+        f._lc = {}
+        for s in f.syms:
+            f._lc[label(s)] = f._lc.get(label(s), 0) + 1
+    return f._lc
+
+
+def anchor_of(f, s):
+    """The name an edit uses for symbol s: its label, plus `@KEY` when another symbol has the same label (two field
+    views of one variable, `_dir+0` keys 16 and 169)."""
+    return label(s) if _label_count(f)[label(s)] == 1 else "%s@%d" % (label(s), s.key)
+
+
+_NOTED = set()
+
+
 def find(f, name):
-    hits = [s for s in f.syms if label(s) == name or s.name == name]
+    """A symbol by label or name.  `NAME@KEY` (or `#KEY`) picks the one with that key when several share the label
+    (`_dir+0@169`); a bare name takes the first and says so."""
+    hits = [s for s in f.syms if label(s) == name] or [s for s in f.syms if s.name == name]
     if not hits:
-        raise SystemExit("no symbol %s (names are as `keys` prints them)" % name)
+        m = re.fullmatch(r"(.*?)@(\d+)", name) or re.fullmatch(r"()#(\d+)", name)
+        if m:
+            hits = [s for s in f.syms if s.key == int(m.group(2)) and (not m.group(1) or label(s) == m.group(1) or s.name == m.group(1))]
+    if not hits:
+        raise SystemExit("no symbol %s (names are as `keys` prints them; NAME@KEY or #KEY selects by key)" % name)
+    if len(hits) > 1 and (id(f), name) not in _NOTED and len({s.key for s in hits}) > 1 and label(hits[0]) == name:
+        _NOTED.add((id(f), name))
+        sys.stderr.write("symkeys: %s names %d symbols (keys %s); using key %d, select one with %s@KEY\n" % (
+            name, len(hits), ", ".join(str(s.key) for s in hits), hits[0].key, name))
     return hits[0]
+
+
+def split_edits(edits):
+    """An edit may be several joined by `|` (one source change made at every expansion of an inline helper)."""
+    return [x for e in edits for x in e.split("|")]
+
+
+def expand_inline(f, e):
+    """An add/sub edit anchored at a symbol inside an inline expansion's body, as the one source change it stands for:
+    the same edit in every expansion of that helper (its body is one piece of source; no construct gives one
+    expansion a different offset).  Other edits are returned as they are."""
+    m = re.match(r"^(add|sub):(\w+)@([^#|].*?):(\d+)$", e)
+    if not m:
+        return e
+    try:
+        s = find(f, m.group(3))
+    except SystemExit:
+        return e
+    if not s.inl:
+        return e
+    base = s.inl.rsplit("#", 1)[0]
+    peers = {}
+    for x in f.syms:
+        if x.inl and x.inl.rsplit("#", 1)[0] == base and x.name == s.name and x.inl not in peers:
+            peers[x.inl] = x
+    if len(peers) < 2:
+        return e
+    return "|".join("%s:%s@%s:%s" % (m.group(1), m.group(2), anchor_of(f, x), m.group(4))
+                    for x in sorted(peers.values(), key=lambda x: x.idx))
+
+
+def edit_level(f, e):
+    """Where in the source an edit lives: `reader` (a statement of the function itself, or the call statement of an
+    inline helper), `inline xN` (in a helper's body, so in all N expansions), `inline x1` (a helper expanded once),
+    `optimiser` (value-numbering temps: code-neutral constructs, symkeys.md 8.2)."""
+    parts = split_edits([e])
+    if len(parts) > 1:
+        return "inline x%d (the helper's body: every expansion gets it)" % len(parts)
+    m = re.match(r"^(?:add|sub):(\w+)@(#?)(.+?)(?::\d+)?$", e)
+    if not m:
+        return "reader (first references reordered)"
+    if m.group(1) == "hash":
+        return "optimiser"
+    if m.group(2):
+        return "reader (a statement before the inline call)"
+    try:
+        if find(f, m.group(3)).inl:
+            return "inline x1 (a helper expanded once)"
+    except SystemExit:
+        pass
+    return "reader"
 
 
 def _sub_drop(ops, at, cls, n):
@@ -1090,7 +1237,7 @@ def sub_drops(f, edits):
     ops = stream(f)
     pos = {id(op[2]): i for i, op in enumerate(ops) if op[0] == "a" and op[2] is not None}
     out = []
-    for e in edits:
+    for e in split_edits(edits):
         m = re.match(r"sub:(frame|tmp|glob|other|hash)@(#?)(.+?)(?::(\d+))?$", e)
         if not m:
             continue
@@ -1147,7 +1294,7 @@ def apply_edits(f, edits):
             pos[id(op[2])] = i
     ins = []         # (op index, [ops])
     drop = set()
-    for e in edits:
+    for e in split_edits(edits):
         e = re.sub(r"^add:", "+", re.sub(r"^sub:", "-", re.sub(r"^del:", "-", e)))
         m = re.match(r"([+-])(frame|tmp|glob|other|hash)@(#?)(.+?)(?::(\d+))?$", e)
         if m:
@@ -1416,23 +1563,42 @@ def resolve_ref(f, v):
     return v
 
 
-def candidate_points(f, target, inline_too=True, opt_too=False):
+def same_statement_start(f, i):
+    """Is event i (an inline expansion's start) in the same statement as an earlier top-level expansion, or inside
+    another expansion's body?  Then no source statement of the caller falls between the two, and an edit there has
+    no reader-level construct (a local declared in the caller lands before the whole statement, so before the first
+    of them); it exists only as an edit of the helper's body, in every expansion."""
+    depth, prev = 0, None
+    for e in f.events[:i]:
+        if e[0] == "inl+":
+            if depth == 0:
+                prev = e
+            depth += 1
+        elif e[0] == "inl-":
+            depth -= 1
+    return depth > 0 or (prev is not None and prev[3] == f.events[i][3])
+
+
+def candidate_points(f, target, inline_too=True, opt_too=False, per_exp=False):
     """Insertion points before the target's allocation, as (edit anchor, description, op index):
     the first allocation of each named symbol of the function itself (reader order), the start of each inline
     expansion (reading the callee), and, inside expansions, the first named local of each one."""
     pts, seen, opi = [], set(), 0
+    f._skipped_inl = 0
     for i, e in enumerate(f.events):
         if e[0] == "alloc" and e[1] is target:
             break
         if e[0] == "alloc":
             s = e[1]
             if s.user and s.cls in ("frame", "glob") and (s.inl is None or inline_too) and not s.name.startswith("$"):
-                k = ("v", label(s))
+                k = ("v", label(s), s.key if _label_count(f)[label(s)] > 1 else 0)
                 if k not in seen:
                     seen.add(k)
-                    pts.append(("@" + label(s), ("before parameter %s (parameters take keys last to first: a frame "
+                    pts.append(("@" + anchor_of(f, s), ("before parameter %s (parameters take keys last to first: a frame "
                                                  "symbol here is one more parameter after it)" % label(s))
                                 if s.kind == 5 and s.inl is None else "before the first reference of %s" % label(s), opi))
+        elif e[0] == "inl+" and inline_too and not per_exp and same_statement_start(f, i):
+            f._skipped_inl += 1
         elif e[0] == "inl+" and inline_too:
             pts.append(("@#%d" % i, "at the start of inline %s" % short("%s#%d" % (e[1], e[2])), opi))
         if e[0] == "alloc" and opt_too and e[1].phase == "opt" and e[1].cls == "hash":
@@ -1518,15 +1684,29 @@ def levers(f, a):
     if lines and len(lines) == 1:
         lines = (lines[0], lines[0])
     opt = tgt.phase == "opt" or "hash" in (a.classes or "")
-    pts = candidate_points(f, tgt, not a.no_inline, opt) + [("@" + label(tgt), "just before %s itself" % label(tgt), tidx)]
+    pts = candidate_points(f, tgt, not a.no_inline, opt, a.per_expansion) + [("@" + anchor_of(f, tgt), "just before %s itself" % label(tgt), tidx)]
     ns = [int(x) for x in a.n.split(",")] if a.n else list(range(1, a.max + 1))
+    if f._skipped_inl:
+        print("# %d inline-expansion start points left out: no statement of the caller falls between them and the "
+              "previous expansion (--per-expansion keeps them)" % f._skipped_inl)
     hits = []
+    fk = None
     lclasses = (a.classes or ("frame,tmp,other,glob,hash" if opt else "frame,tmp,other,glob")).split(",")
     for anchor, where, at in pts:
         for cls in lclasses:
             for sign in ("+", "-"):
                 for n in ns:
-                    k1 = _prefix_key(ops, at, cls, n, sign, tidx)
+                    ex = "%s:%s%s:%d" % ("add" if sign == "+" else "sub", cls, anchor, n)
+                    ex = ex if a.per_expansion else expand_inline(f, ex)
+                    if "|" in ex:
+                        # a helper's body: the edit lands in every expansion
+                        try:
+                            fk = fk or FastKeys(f, {id(tgt)})
+                            k1 = fk.keys([ex]).get(id(tgt), tgt.key)
+                        except (SystemExit, KeyError, IndexError, ValueError, StopIteration):
+                            k1 = None
+                    else:
+                        k1 = _prefix_key(ops, at, cls, n, sign, tidx)
                     if k1 is not None and target_ok(a, k1):
                         if sign == "-" and not realizable(f, ["sub:%s%s:%d" % (cls, anchor, n)], [tgt]):
                             break       # it removes a symbol the code reads: no source change does that
@@ -1544,13 +1724,23 @@ def levers(f, a):
                 except (SystemExit, KeyError):
                     continue
                 if k1 is not None and target_ok(a, k1):
-                    hits.append((label(w), "%s first referenced just before %s" % (label(tgt), label(w)), "frame",
+                    hits.append((anchor_of(f, w), "%s first referenced just before %s" % (label(tgt), label(w)), "frame",
                                  "swap", 1, k1))
     res = []
+    done = set()
     for anchor, where, cls, sign, n, k1 in hits:
-        e = ("swap:%s,%s" % (label(tgt), anchor) if sign == "swap" else
+        e = ("swap:%s,%s" % (anchor_of(f, tgt), anchor) if sign == "swap" else
              "%s:%s%s:%d" % ("add" if sign == "+" else "sub", cls, anchor, n))
+        if not a.per_expansion:
+            e = expand_inline(f, e)
+        if e in done:
+            continue            # the same helper edit reached from another expansion
+        done.add(e)
         newkey = keys_after(f, apply_edits(f, [e]))
+        if "|" in e:
+            k1 = newkey.get(id(tgt), k1)       # the helper edit at every expansion moves the target differently
+            if not target_ok(a, k1):
+                continue
         moved = [(s, s.key, newkey[id(s)]) for s in f.syms if s is not tgt and interesting(f, s) and id(s) in newkey
                  and newkey[id(s)] != s.key]
         fl = flips(f, newkey, a.pass_ or 2)
@@ -1567,6 +1757,7 @@ def levers(f, a):
     for no, nb, nm, n, e, where, cls, sign, k1, moved, fixed, other in res[:a.top]:
         print("%s\n    -> %s key %d (hash %04x); %d target sorts change, %d other sorts flip, %d other keys move%s" % (
             e, label(tgt), k1, h16(k1), len(fixed), no, nm, (", %d of --keep" % nb) if keep else ""))
+        print("    level: %s" % edit_level(f, e))
         print("    %s: %s" % (where, SWAP_CONSTRUCT if sign == "swap" else (CONSTRUCT if sign == "+" else UNCONSTRUCT)[cls])
               + (" (x%d)" % n if n > 1 else ""))
         if sign == "-" and named_drops(f, [e]):
@@ -1595,6 +1786,16 @@ def parse_site(t):
     return dict(text=t, lo=lo, hi=hi, A=A, B=B)
 
 
+def op_match(nm, text):
+    """Does operand text `nm` (as `sites` prints it) match the --site operand `text`?  A substring, or a key selector:
+    `#169` (any operand with a symbol of key 169) / `_dir+0@169` (that name and key); an unnamed subtree as `?h00c8`
+    is its printed label, a plain substring."""
+    m = re.fullmatch(r"(.*?)@(\d+)", text) or re.fullmatch(r"()#(\d+)", text)
+    if m:
+        return m.group(1) in nm and re.search(r"\bkey %s\b" % m.group(2), nm) is not None
+    return text in nm
+
+
 def site_events(f, site, pass_):
     out = []
     for e in f.events:
@@ -1603,11 +1804,11 @@ def site_events(f, site, pass_):
         nm = [opname(o) for o in e[4]]
         # an exact operand name wins over a substring match: with substrings only, `A>B` and `B>A` could pick the
         # same two operands (each name inside both) and print the same verdict for both directions (M&B feedback)
-        ia = [i for i, x in enumerate(nm) if x == site["A"]] or [i for i, x in enumerate(nm) if site["A"] in x]
+        ia = [i for i, x in enumerate(nm) if x == site["A"]] or [i for i, x in enumerate(nm) if op_match(x, site["A"])]
         ib = [i for i, x in enumerate(nm) if x == site["B"] and i not in ia[:1]] or \
-            [i for i, x in enumerate(nm) if site["B"] in x and i not in ia[:1]]
+            [i for i, x in enumerate(nm) if op_match(x, site["B"]) and i not in ia[:1]]
         if ia and ib:
-            amb = len({i for i, x in enumerate(nm) if site["A"] in x} & {i for i, x in enumerate(nm) if site["B"] in x}) > 0 \
+            amb = len({i for i, x in enumerate(nm) if op_match(x, site["A"])} & {i for i, x in enumerate(nm) if op_match(x, site["B"])}) > 0 \
                 and nm[ia[0]] != site["A"] and nm[ib[0]] != site["B"]
             if amb:
                 sys.stderr.write("symkeys: --site %s is ambiguous at line %s: %r and %r both match %s; name the operands "
@@ -1644,6 +1845,59 @@ def _site_one(e):
     return _SW([e])
 
 
+def wstr(w):
+    return "SU%d n%d h%04x" % wparts(w) if w is not None else "?"
+
+
+def wparts(w):
+    return (w >> 24, (w >> 16) & 0xff, w & 0xffff)
+
+
+def key_dependent(o):
+    """Does the operand's weight move with a symbol key, as the model follows it (op_weight: a named leaf, a field
+    view, a memory base, a temporary that hashes by its own key, a subtree's first sources)?  Not a constant, an
+    unnamed subtree (`?h00c8`: its leaves are not logged), or a temporary that hashes by its definition."""
+    if o["w"] is None:
+        return True
+    syms = [x for k in ("sym", "dsym", "dsym2") for x in (o.get(k),) if x is not None]
+    syms += [o[k][2] for k in ("mem", "mem2") if o.get(k) and o[k][2] is not None]
+    for d in (1, 5, 33, 64, 2049):
+        if op_weight(o, {id(x): x.key + d for x in syms}) != o["w"]:
+            return True
+    return False
+
+
+def decide(ops, ia, ib):
+    """Which component of the weight (SU << 24 | count << 16 | hash) puts operand ia relative to ib:
+    -> (component, satisfied, reachable): `SU` / `count` / `hash` / `equal`; satisfied = ia sorts before ib now;
+    reachable = a symbol-key edit can still give A before B (the hash decides and some operand's hash moves with a key)."""
+    A, B = ops[ia], ops[ib]
+    if A["w"] is None or B["w"] is None:
+        return "?", ia < ib, True
+    sa, na, ha = wparts(A["w"])
+    sb, nb, hb = wparts(B["w"])
+    comp = "SU" if sa != sb else "count" if na != nb else "hash" if ha != hb else "equal"
+    sat = ia < ib
+    if comp in ("SU", "count"):
+        return comp, sat, False
+    return comp, sat, key_dependent(A) or key_dependent(B)
+
+
+def need_lines(A, B, comp):
+    """What would have to change for A to sort before B when SU / count (not the hash) decides."""
+    sa, na, ha = wparts(A["w"])
+    sb, nb, hb = wparts(B["w"])
+    need = []
+    if comp == "SU":
+        need.append("raise A to SU%d (count / hash then decide: B is n%d h%04x)" % (sb, nb, hb))
+        need.append("raise A to SU%d (wins outright)" % (sb + 1))
+        need.append("lower B to SU%d" % sa + " (then count: A n%d vs B n%d at the same SU)" % (na, nb))
+    else:
+        need.append("raise A's count to %d or more (or the same count and a larger hash)" % nb)
+        need.append("lower B's count below %d" % na)
+    return need
+
+
 def levers_sites(f, a):
     """Edit sets that satisfy several wanted operand orders at once (--site LINE:A>B, repeatable, or --sites-file):
     every single add/sub edit before the last symbol the sites depend on, then pairs (--depth 2) and triples
@@ -1667,6 +1921,35 @@ def levers_sites(f, a):
     for st, e, ia, ib in evs:
         print("  %-28s line %d %s: %s before %s now: %s" % (st["text"], e[3], e[2], opname(e[4][ia]), opname(e[4][ib]),
                                                           site_state(e, ia, ib, base)))
+    blocked = []
+    for st, e, ia, ib in evs:
+        comp, sat, reach = decide(e[4], ia, ib)
+        if not sat and not reach:
+            blocked.append((st, e, ia, ib, comp))
+    if blocked:
+        print("# %d of %d wanted orders cannot be given by symbol keys (the weight is SU << 24 | count << 16 | hash; "
+              "keys move only the hash):" % (len(blocked), len(evs)))
+        for st, e, ia, ib, comp in blocked:
+            A, B = e[4][ia], e[4][ib]
+            if comp in ("SU", "count"):
+                gap = (wparts(B["w"])[0] - wparts(A["w"])[0], "SU") if comp == "SU" else \
+                    (wparts(B["w"])[1] - wparts(A["w"])[1], "node(s)")
+                print("#   %s line %d %s: %s (%s) vs %s (%s): decided by %s, A is %d %s behind" % (
+                    st["text"], e[3], e[2], opname(A), wstr(A["w"]), opname(B), wstr(B["w"]), comp, gap[0], gap[1]))
+                for x in need_lines(A, B, comp):
+                    print("#       to change it: %s" % x)
+            else:
+                print("#   %s line %d %s: %s (%s) vs %s (%s): decided by the %s, which no symbol key moves "
+                      "(neither operand's hash follows a key: an unnamed subtree, a constant, or a temporary that hashes "
+                      "by its definition)" % (
+                          st["text"], e[3], e[2], opname(A), wstr(A["w"]), opname(B), wstr(B["w"]), comp))
+        print("#   source rewrites that change the deciding property: tools/sulever.py <SRC | --from EXPORT.json> "
+              "--func <F> --site '%s' [--spell '<operand text>']" % blocked[0][0]["text"])
+        evs = [x for x in evs if not any(x[1] is b[1] and x[2] == b[2] and x[3] == b[3] for b in blocked)]
+        if not evs:
+            print("# nothing left for keys to do: no key search")
+            return []
+        print("# searching keys for the remaining %d sorts" % len(evs))
     deps = set()
     for _, e, ia, ib in evs:
         for o in (e[4][ia], e[4][ib]):
@@ -1680,8 +1963,11 @@ def levers_sites(f, a):
     if last is None:
         raise SystemExit("the sites' operands have no symbol whose key an edit can move")
     classes = (a.classes or "frame,tmp,glob").split(",")
-    pts = candidate_points(f, last, not a.no_inline, "hash" in classes) + [("@" + label(last), "just before %s itself" % label(last), None)]
+    pts = candidate_points(f, last, not a.no_inline, "hash" in classes, a.per_expansion) + [("@" + anchor_of(f, last), "just before %s itself" % label(last), None)]
     ns = [int(x) for x in a.n.split(",")] if a.n else list(range(1, a.max + 1))
+    if f._skipped_inl:
+        print("# %d inline-expansion start points left out: no statement of the caller falls between them and the "
+              "previous expansion (--per-expansion keeps them)" % f._skipped_inl)
     site_ids = {id(e) for _, e, _, _ in evs}
 
     fk = FastKeys(f, deps)
@@ -1702,6 +1988,15 @@ def levers_sites(f, a):
     for cls in classes:
         kp, _ = prune_points(f, pts, cls)
         cand += [("%s:%s%s:%d" % (sign, cls, anchor, n), n) for anchor, where, _ in kp for sign in ("add", "sub") for n in ns]
+    if not a.per_expansion:
+        # an edit inside an inline helper's body is made in every expansion of it (one piece of source)
+        seen_c, c2 = set(), []
+        for e_, n_ in cand:
+            e_ = expand_inline(f, e_)
+            if e_ not in seen_c:
+                seen_c.add(e_)
+                c2.append((e_, n_))
+        cand = c2
     # a sub that removes a symbol the code still reads is no source change (the sites' own operands included)
     keep = [s_ for s_ in f.syms if id(s_) in deps]
     nc = len(cand)
@@ -1787,6 +2082,9 @@ def levers_sites(f, a):
             continue
         seen.add(key)
         print("%d/%d sites  %3d other flips  %s" % (sat, len(evs), len(other), " ".join(edits)))
+        lv = sorted({edit_level(f, x) for x in edits})
+        if lv != ["reader"]:
+            print("    level: %s" % "; ".join(lv))
         gone = [label(x) for x in named_drops(f, edits)]
         if gone:
             print("    removes: %s (each must be an unread local in the source)" % ", ".join(gone))
@@ -2091,6 +2389,10 @@ def main(argv=None):
     ap.add_argument("--vs", help="compare: the traced variant (export JSON) to predict")
     ap.add_argument("--match", help="levers: rank edits by operand orders that differ from this export")
     ap.add_argument("--no-inline", action="store_true")
+    ap.add_argument("--per-expansion", action="store_true", help="levers: keep an edit inside an inline expansion to that "
+                    "one expansion (no source construct does that: a helper's body is one piece of source)")
+    ap.add_argument("--source", help="sites: the source file, to print the source line a `$o` temporary was made for "
+                    "(default: <src> when it is a file)")
     ap.add_argument("--site", action="append", help="levers: a wanted order LINE:A>B (repeatable)")
     ap.add_argument("--sites-file", help="levers: wanted orders, one LINE:A>B per line")
     ap.add_argument("--classes", help="levers: allocation classes to edit (frame,tmp,glob,other,hash; defaults: --site "

@@ -106,16 +106,35 @@ tests/data/symkeys_nary.cpp: `kn4` sorts `_a _b _c _d` (keys 4..1); in `kcall3` 
 four builds). In Mount & Blade's Operation::execute the `scene(vs)->visitors[p0]` adds are four-operand sorts
 (`[$o58791 key 24043+0]`, `(?g_visitor_scene key 4135 ..)`, `$o53502`, a constant; lines 1260-1269). **[C]**
 
-**When SU or count decides** (`tools/sulever.py --site LINE:A>B`): no key edit moves the order, and the operand
-has to change shape without changing code. Known constructs **[C]**:
+**When SU or count decides** (`levers --site` says so up front; `tools/sulever.py --site LINE:A>B` has the detail): no
+key edit moves the order, and the operand has to change shape without changing code. Of the three components of the
+weight only the hash moves with a key; on 13.10 most operand-order rows left over after the key search are decided by
+SU, node count or the hash of an unnamed subtree (`(?h00c8 ..)`, whose leaves are not logged). `levers --site` checks
+every wanted order first: A before B is *blocked* when SU or count differs (it prints both weights, how far A is
+behind, and what would have to change) or when neither operand's hash follows a key (constants, unnamed subtrees,
+temporaries that hash by their definition); blocked sites are left out of the search, and with none left there is no
+search (the output ends `nothing left for keys to do`). Known constructs **[C]**:
 - a zero-extended narrow variable in memory (a byte or short parameter) is SU0; `(*(unsigned*)&x & 0xff)` (a 32-bit
-  view of it, masked) is SU1 and instruction selection turns `and m32, 0xff` back into `movzx r32, byte ptr [m]`:
-  Spore 0x0068c6d0, `(hi << 8) | lo | (g & 0xffff0000)` with lo before the mask term, byte match.
-  `(unsigned)x & 0xff` is folded before pass 1; a wider mask (`& 0xffff`) gives SU1 but keeps the `and`.
-- a single-use local or a `v |= ..` chain is substituted before the sort (no effect); an inner pair under another
-  opcode (`+`, `^`) is one operand of the outer sort but changes the instruction.
+  view of it, masked) is SU1. On 14.00 and 15.00 instruction selection turns `and m32, 0xff` back into
+  `movzx r32, byte ptr [m]` (code the same: Spore 0x0068c6d0, `(hi << 8) | lo | (g & 0xffff0000)` with lo before the
+  mask term, byte match; tests/data/sulever_fam.cpp n04). **On 13.10.3077 and 3052 it does not**: the dword load and
+  `and eax, 255` stay (6 instructions against 4), so the view-mask is not a spelling there. `(unsigned)x & 0xff` is
+  folded before pass 1; a wider mask (`& 0xffff`) gives SU1 but keeps the `and` on every build.
+- a single-use local, a pointer local (`int* r = &q->b; *r`), a reference local (`int& r = q->b`) or a `v |= ..`
+  chain is substituted before the sort (no effect); used twice it weighs as the expression written twice. An inner
+  pair under another opcode (`+`, `^`) is one operand of the outer sort but changes the instruction.
+- identity rewrites change nothing: `x + 0`, `x | 0`, `x ^ 0`, `x * 1`, `x << 0`, `x & -1`, `~~x`, `-(-x)`, `(x, x)`,
+  `(0 ? 1 : x)`, `+x`, redundant parentheses, same-type casts, `p[0]` / `*(p + 0)` / `*(int*)p` for `*p`,
+  `(&q->a)[1]` / `*(int*)((char*)q + 4)` / `q[0].b` for `q->b`: all weights equal, on 13.10.3077, 3052, 14.00 and
+  15.00 (39 functions, tests/data/sulever_fam.cpp, checked by the suite). **[M]** A byte or short member is a
+  conversion of its load (SU1 n3 at d != 0).
 - an offset-0 member is SU0 n1 (or n2 through a float conversion); there is no known code-neutral way to raise it
-  (Fallout 3 0x00a72450: 12 spellings, `rot.Column(n).x` CSEs into a hash temp, still SU0).
+  (Fallout 3 0x00a72450: 12 spellings, `rot.Column(n).x` CSEs into a hash temp, still SU0), and a member at d != 0
+  is SU1 n2 whatever the spelling of the access: only the layout decides.
+- so on 13.10 a wanted order decided by SU / count is, as far as measured, a different expression shape (and
+  different code), not a spelling; the 14.00 / 15.00 view-mask is the only code-neutral SU lever found. Not found
+  does not mean absent: `sulever.py --spell` tries the catalogue spellings of one operand with real traced compiles
+  (and bdiff against the original with `--asm-vs`), and prints per spelling whether the site order came out as wanted.
 
 ## 4. Constructs: what takes a key (probes `c1.cpp` .. `c4.cpp`, 14.00, the same on 15.00)
 
@@ -164,6 +183,27 @@ an edit before it does not change while `$t<key>` would; `keys` shows those an o
 opt --all` all of them, with the c2 function that made them: `HshInsertEntry` value-numbering temps, `GdfInstrSdsu`,
 `OptRebuildTuples`, `TupMakeTmpBinary`), whatif and compare follow them, and `levers --var '$o34'` targets one.
 Their keys are replayed exactly; what is assumed is that the optimiser makes the same symbols after the edit.
+
+**Addressing symbols and operands (13.10 feedback, wave S1).** Several symbols can share one name (the second field
+view of a struct local: `_dir+0` keys 16 and 169; `keys` lists both). Anywhere a symbol is named (`whatif`, `levers
+--var`, `swap:`, anchors) `NAME@KEY` picks the one with that key (`add:frame@_dir+0@169:1`, `--var '_dir+0@169'`); a bare
+name still takes the first and now says so on stderr. In `--site` an operand is a substring of its printed text, or
+`#KEY` (any operand with a symbol of that key), or `NAME@KEY`: `--site '*:_dir+0@169>_dir+0@16'`. `levers` writes
+the anchor of a repeated name in that form itself, and no longer skips the second one. An unnamed subtree prints as
+`(?h00c8 ..)`, its subtree hash (the weight's low 16 bits, stable for one export), and `--site '*:?h00c8>_a'` addresses
+it. `sites` follows each optimiser temporary of an operand (`$o34`) with a `^` line: the c2 step that made it and the
+line offset it was made for, with the source line's text when `--source FILE` (or the traced `<src>`) is given (the function's first line is the
+traced one, else the first source line that declares its name) (`^ $o34: made by HshInsertEntry at line 5 (source 1263: ...), value-numbering temp`).
+The step names are those of `keys --phase opt`; only the line is exact, not which sub-expression of it.
+
+**Reader level and inline level.** `levers` tags every edit with where in the source it lives (`level:` line):
+*reader* (a statement of the function itself, or the call statement of an inline helper), *inline xN* (inside a
+helper's body: the edit is made in all N expansions at once, written `add:frame@_s@sq2#1:2|add:frame@_s@sq2#2:2|...`,
+because a helper's body is one piece of source and no construct gives one expansion a different offset), *optimiser*
+(value-numbering temps, section 8). An edit at the start of an expansion that has no caller statement before it (it
+shares its call line with the previous expansion, or sits in another helper) has no reader-level construct and is
+left out, with a count; `--per-expansion` brings back the old one-expansion-at-a-time edits (an offset between two
+expansions of one helper in one statement exists only as such an edit: the M&B 0x49e9c0 dead end). `|` joins edits in `whatif` / `compare` too.
 
 **The hash pool class (value-numbering temporaries).** `HshInsertEntry` makes the optimiser's value-numbering
 temps from the hash pool (blocks of 32, no free list of their own; after the optimiser they are freed onto the
