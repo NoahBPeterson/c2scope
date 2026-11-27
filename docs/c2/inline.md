@@ -38,7 +38,8 @@ is decided here), regalloc.md §7 (which variables are candidates), il_pipeline.
      - A virtual call on an object of known type (`V o; o.v()`) is direct, so it is a candidate and is inlined.
        **[C: a4]**
    - callees that contain `try`/`catch` (callee flag `+0x50 & 0x200`) or `__try` (`+0x20 & 0x1000`).
-     - A callee whose only EH is a local with a destructor **is** inlined (e2/ie2 in a2). **[C: a5, a2]**
+     - A callee whose only EH is a local with a destructor **is** inlined (e2/ie2 in a2) on 14.00; **on 13.10 only into a
+     caller that has EH state itself**, see "Why one caller calls a helper its sibling inlines". **[C: a5, a2]**
    - varargs functions and `__declspec(noinline)` (both lack the entry flag `+0x50 & 0x40`). **[C: a5]**
 
    What else blocks inlining:
@@ -136,7 +137,7 @@ is decided here), regalloc.md §7 (which variables are candidates), il_pipeline.
 8. **At most one inlining is attempted per call site.** Candidates are tried in IL order (`GetInlineCandidates`
    10b6d2f0 collects them in stream order). **[C: code, traces]**
 
-8a. **Two vetoes after the cost model accepts: `InlBadCandidate` 10b6a690** (84 bytes; called at the end of ICGD,
+8a. **(14.00; not on 13.10, see the section below) Two vetoes after the cost model accepts: `InlBadCandidate` 10b6a690** (84 bytes; called at the end of ICGD,
    10b6a46d, so `__forceinline` never reaches it). It returns 1 = do not inline in exactly two cases; there are no
    thresholds. Inputs: the call tuple (eax), the callee's call-graph node (esi; flag byte at node+0xb3), and bit 2
    of the candidate's `+0x1c` (stack argument: 1 when the call site is inside a loop of the caller, 0 otherwise
@@ -427,6 +428,108 @@ So, for "caller first with a later-defined, non-cyclic helper": on this build it
 without `-Og`. With it on, only a cycle, an indirect/virtual call or a nodeless caller (none found) puts a caller
 first. Whether an `/Og-` + `optimize("g", on)` TU generates the same code as `/O2` for the other functions was not
 checked (the cost model needs a node, so every site there is decided by the IL budget). **[I]**
+
+### Why one caller calls a helper its sibling inlines (13.10.3077 and 3052, `/O2 /EHsc /GS`)
+
+`c2inline.py` now says where a site that passed the cost model was kept: `kept by GetInlinee` etc. (the exits of
+`GetCandidateInsertionPoint`, `GetInlinee`, `ShouldInlineInlinee`, `InlineInlinee`, `InlBadCandidate`), and a site that
+`InlCallTupleIsCandidate` filtered out has **no row at all** (look for the call in the listing). Evidence: tests/data/inline_site.cpp
+(5 checks in `inline_order_tests`), work/scratch/inline/ord/pair/*.cpp (p1, p2, ctx, eh, ret, w, w2-w5, depth, big_it).
+
+**What is not a reason** (minimal pairs, a tiny helper inlined in every one of them): the caller having a `try`,
+an object with a destructor live across the call, `__try`, `__asm`, `setjmp`, `_alloca`, a volatile or address-taken
+local, a 64-byte buffer, a `__fastcall` or varargs caller, the call in a loop, an if arm, a switch case, a nested call
+argument, a condition, a ctor initializer, a destructor body, an unused result (p1, ctx). The site's position in the
+function never matters for a helper with d < 14 (the early accept comes before everything below), except `__try`.
+
+**Reasons, in the order the code meets them (13.10):**
+
+1. **Candidate filter** (`InlCallTupleIsCandidate` 1077a3a2 / `InlMightInlineEntry` 10774830; no row when it says no).
+   The callee is skipped when its SSR flags say: address taken (+0x20 & 0x400), `__try` (+0x20 & 0x1000),
+   `setjmp` (+0x20 & 0x100), +0x20 & 0x40 (varargs), a C++ `try` (+0x69 & 0x200), +0x69 & 0x80000 (not seen set), or the inline bit
+   +0x69 & 0x40 is missing (varargs, `noinline`, **a function that returns a class with a destructor by value**:
+   `r_dd`, `r_xd`, `k_rethdl`: +0x69 = 0x152a). Also: the call's argument count differs from the callee's
+   parameter count. Self-recursive callees (`k_rec`) are skipped too.
+   - **A callee with unwind state** (+0x69 & 0x100: a local or temporary with a destructor, e.g. a constructor of a
+     class with members that need unwinding, `k_dtor`) is a candidate **only when the caller has EH state too**
+     (caller flag +0x8c & 0x60000: any object with a destructor in the caller, or a `try`). A caller without any
+     (`e_none`) calls it; the same call in a caller with `Dt d;` (also one constructed after the call, or a temporary
+     in the statement) inlines it. A `__try` caller (+0x8c 0x4000) does not count. Without `/EHsc` the callee has no
+     unwind state and the rule disappears; under `/EHa` the costs change (k_dtor: call, v >= 74). **[C: eh.cpp,
+     inline_site.cpp, flags read at the filter]**. This is the one caller-wide property found that makes a helper
+     inlined in one function and called in another, with the same call and no size effect.
+   - **What carries the unwind bit (+0x69 & 0x100), probed on 13.10.3077 under `/EHsc`, `/EHs`, `/GX` and `/EHa`**
+     (work/scratch/inline/ord/eh/v1.cpp, v2.cpp, probe.py: `uv run work/scratch/inline/ord/eh/probe.py SRC -- /TP /MT /GS /EHsc`
+     prints callee +0x69/+0x20, caller +0x8c, the filter's answer and whether the helper's own listing has an EH frame):
+     - **It comes from the class layout, not from emitted EH code.** The implicit or user constructor and the destructor
+       of a class with a **member or base that has a destructor** have it (`??0MemDt`, `??1MemDt`, `??0BaseDt`,
+       `??0UserMem1`, `??0NavLike`, `??1NavLike`, and the same with an inline member dtor): +0x69 = 0x1dea, and their
+       listings have **no EH frame** (only the two-member classes `Mem2` / `UserMem` do). A function with a local that has a
+       destructor has it too (k_dtor 0x156a).
+     - **It is not on `??_E`, `??_G` or `??_H`** (the vector/scalar deleting destructors and the vector constructor iterator:
+       0x18ea for every class, also those with dtor-bearing members and bases), on a ctor of a class without a dtor-bearing
+       member (`??0Tr`, `??0NavPod`, `??0NavVirt` 0x18ea), nor on functions that only hold a pointer. So `??_Etstring` and
+       `??_H` themselves are candidates for every caller.
+     - **But what they call is.** The generated `??_G` / `??_E` call `~NavLike` / `~tstring` per element, and that
+       destructor has the bit while the generated caller has no EH state (flag 1): **no site, a call**
+       (`d_nav` in inline_site.cpp; `??1NavLike` from `??_GNavLike`, `??1MemDt` from `??_EMemDt`). That is the shape of the
+       original's `??_Etstring` (a plain element loop with `call ~tstring`). A caller with a local, a temporary, or a
+       placement/ordinary `new` of a class with a ctor (flag 0x20001, also when the caller emits no EH frame) inlines them.
+     - **EH flags.** `/EHsc`, `/EHs`, `/GX` and `/EHa` all set the bit (0x1dea); with no EH switch the callee reads 0x1cea
+       (0x400, no 0x100) and every caller inlines it. Caller flags: plain function 1 under `/EHsc` / `/EHs` / `/GX`, 0 under
+       `/EHa`; with an object, a temporary or `new`: 0x20001 / 0x20000; `try`: 0x60001; `__try` 0x4001.
+     So a member-wise ctor or dtor of a class like NavCell (a `std::vector` or string member) and the destructor of `tstring`
+     are the helpers this rule covers; `??_E` and `??_H` are not. **[C: v1.cpp, v2.cpp, both flag sets;
+     I: that c1xx sets it per function that constructs or destroys a dtor-bearing subobject, not from the IL's state changes]**
+2. **`ShouldInlineCallTuple` before the cost model:** the inline depth (`#pragma inline_depth(n)`, default 254) counts the
+   nesting level of the site; deeper sites stay calls ("decided before the cost model"; with `inline_depth(2)` a
+   chain d3 -> d2 -> d1 -> d0 keeps the level-3 call). The pragma applies to the function being compiled. In a
+   function with `__try`, only a callee of size <= 10 bytes is inlined, whatever its cost (sx1 inlined, sx2..6 calls).
+3. **Cost model (rule 3).** Early accept d < 14, independent of the site's weight. Otherwise v = (d'*1e8/w + 6d')/7
+   (w <= 1e8) or (d'*1e8/w + 2d')/3: with a callee of c = 42, if-arm nesting 0, 1, 2 gives v = 42, 48, 60 (inlined), 3
+   gives 84 (call), 4 and 5 give 132 and 228. The largest d' still inlined: straight 73, 1 arm 64, 2 arms 51, 3 arms
+   36, 4 arms 23, 5 arms none (< 14 is the early accept). A switch case weighs 1e8 / (2 * cases + ...): one case +
+   default 5e7, 4 cases + default 1e7 (v 96, call). **A site after a loop weighs 5e8** (the loop's weight), in a loop
+   5e8, in a loop nest 2.5e9, in `if` in a loop 2.5e8; loops favour inlining (v 28-33 for c = 42). **[C: w.cpp, w2.cpp]**
+4. **A site in a catch handler** (or in code only the handler reaches: `try { return ext(x); } catch (int) {..}
+   return h(x);`) with d >= 14 is rejected right after the d test, before the speed test ("rejected after d (a flag
+   test)"): `catch (...) { return h(x); }` calls `h` (c 42) and inlines a tiny `t`. The same for `__except`
+   and `__finally` handlers and filter expressions. A site in a try *body*, before the try, after a handler that
+   returns, or after a try whose body can fall through inlines normally. **[C: w3.cpp, w4.cpp; the exact flag
+   not read]**
+5. **Bloat** (`InlCallGraphDecision` 1078d1ef): for a callee with size > SizeLimit (9 bytes), when the caller's
+   instruction count so far + the callee's instruction count > 9000, `c += (size/2) * (callerInstrs + calleeInstrs)
+   / 9000` (a multiply by 0xe90452d5 and a shift: 2^45/9000). The caller's count starts as its whole instruction
+   count (counter 10882b58, set by `InlCollectInfo`) and grows by about one callee per expansion. So the term is
+   about size/2 times (instructions / 9000): a **6-instruction helper of 14 bytes** adds 7 at 9000 instructions and
+   needs about 30000 (d >= 14 at c = -9) to stop being accepted at once, about 110000 to fail v < 74. The flip points for other sizes are computed from the formula, not measured (a 40-byte helper adds 20 at 9000
+   instructions, an 85-byte `??_E` with c 35 about 42). Measured: a caller with
+   4000 calls to a 37-byte helper (c 24): first call stays at site 555 (c 74), a second caller in the same TU still
+   inlines it at c 24 (big4000.cpp). What to measure on the original: the caller's instruction count **before
+   inlining** (the listing's count minus what inlining added); under about 9000 the term is 0. **[C code and
+   traces; I: that M&B's callers are below it: a function of 9000 instructions is 30-40 KB of code]**
+6. **`c > 450` reject** (c = size - benefits + bloat): any helper over about 450 bytes. **`GetInlinee` / `ShouldInlineInlinee` /
+   `InlineInlinee`** reject what the earlier tests could not see: a callee with `_alloca` (`k_alloca`: kept by
+   GetInlinee), frame limits (rule 2). **A callee not compiled yet** (a back edge of a cycle, or a call with no
+   call-graph edge: virtual calls, indirect calls are not candidates anyway) takes the IL-size budget of rule 7.
+7. **13.10 has no "loop-invariant call to a branchy callee stays a call" veto** (rule 8a was read on 14.00):
+   `InlBadCandidate` returned 0 for every site of inlbad2.cpp except `U_lp_pure` (an unused result of a side-effect-free callee
+   that contains a loop: kept by InlBadCandidate, then deleted as dead), and the hoisted-call table of rule 8a does not
+   happen. **[C: inlbad2.cpp on 13.10.3077, InlBadCandidate exits, listings]**
+
+**Decision list for a parked site** (a direct call to an inline/template helper that ours inlines):
+- **Is the helper's own code size <= 10 bytes (a few instructions)?** Then only the candidate filter, the inline depth, `__try`
+  and the bloat (needs ~30000 instructions) can keep it. Check, in this order: (a) is the call inside a `__try` or
+  `catch`-handler region of the original (the surrounding code, funclets, a frame with a handler)? For tiny helpers
+  a handler does not matter, `__try` does not either when size <= 10; (b) did the helper have unwind state in the
+  original (`??_E` / `??_H` / member-wise ctors: the callee that constructs members or elements, each needing
+  cleanup)? **Then check whether the calling function has any EH state** (a local with a destructor, a `try`,
+  `/EHsc` frame, an `__ehhandler`/`$L` unwind table in the caller): the callers that call it have none, the ones that inline
+  it have. (c) is the helper's address taken anywhere in the TU (vtable slot, pointer, `&`): +0x20 & 0x400 stops
+  every site. (d) `#pragma inline_depth`: is the call nested under an inlined helper in the original (depth)?
+- **Larger helper (c >= 14)?** Additionally: (e) the site's if-arm nesting / switch width (weights above: c = 40
+  stops at 3 arms), (f) the caller is a catch handler (calls stay), (g) the caller's size (about 9000+ instructions).
+- Everything else of the earlier sections (order, LTCG, /Ob) was refuted for these rows.
 
 Not covered: whether 14.00/15.00 use the same walk (rule 1 was seen there; the cycle start and the `/Od` behaviour
 were not tried), `/GL` (the order is then the linker's), `#pragma inline_depth` / `inline_recursion` and `-vol`,

@@ -3870,7 +3870,7 @@ def inline_order_tests():
     a cycle's back edge (the callee is not compiled yet: body no), a virtual call (no edge: caller first), and
     /Od (source order). 13.10 only: the probes are 13.10's."""
     if not BUILD.startswith("13.10"):
-        skip("c2inline order/body (12 checks)", "13.10 builds only (C2_BUILD=13.10.3052 / 13.10.3077)")
+        skip("c2inline order/body (18 checks)", "13.10 builds only (C2_BUILD=13.10.3052 / 13.10.3077)")
         return
     src = os.path.join(HERE, "tests", "data", "inline_order.cpp")
 
@@ -3943,6 +3943,30 @@ def inline_order_tests():
           "address-taken, anonymous namespace, extern, static member no",
           [regs.get(n) for n in ("f_static", "f_std", "f_rec", "f_addr", "f_anon", "f_extern", "sm")],
           [True, True, True, False, False, False, False])
+
+    # per-caller / per-site reasons (inline.md "Why one caller calls a helper its sibling inlines")
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "c2inline.py"),
+                        os.path.join(HERE, "tests", "data", "inline_site.cpp"), "--", "/TP", "/MT", "/EHsc", "/GS"],
+                       capture_output=True, text=True, cwd=HERE)
+    site = {}
+    for m in re.finditer(r"^(?:in )?\?(\w+)@@\S+\s+\?(\w+)@@\S+\s+(\d+)\s.*?\s(INLINE|call)\b", r.stdout, re.M):
+        site.setdefault((m.group(1), m.group(2)), []).append((int(m.group(3)), m.group(4)))
+    v = lambda a, b: [x[1] for x in site.get((a, b), []) if x[0] == 1]
+    check("site: a callee with unwind state is a candidate only for a caller with EH state (e_none no site, e_local inlined)",
+          (v("e_none", "k_dtor"), v("e_local", "k_dtor")), ([], ["INLINE"]))
+    check("site: weight: h (c 42) inlined at 0 and 2 if-arms, a call at 3 (v 84)",
+          (v("w0", "h"), v("w2", "h"), v("w3", "h")), (["INLINE"], ["INLINE"], ["call"]))
+    check("site: in a catch handler h stays a call, the tiny t is inlined (early accept); in the try body h is inlined",
+          (v("c_hand", "h"), v("c_hand_t", "t"), v("c_body", "h")), (["call"], ["INLINE"], ["INLINE"]))
+    check("site: in a __try body only a callee of size <= 10 is inlined", (v("s_try_h", "h"), v("s_try_s", "s1")),
+          (["call"], ["INLINE"]))
+    check("site: #pragma inline_depth(2): a site at depth 3 stays a call, the top-level one is inlined",
+          (v("d_top", "d3"), any(x[1] == "call" for k, vv in site.items() if k[0] in ("d1", "d2", "d3", "d_top")
+                                  for x in vv if x[0] == 3)), (["INLINE"], True))
+    check("site: ~NavLike (member with a dtor: unwind state) is inlined into l_nav (a local) but not into the generated "
+          "??_G (no EH state: no site row)",
+          (bool(re.search(r"^\?l_nav@@\S+\s+\?\?1NavLike@@\S+\s+1\s.*\sINLINE", r.stdout, re.M)),
+           bool(re.search(r"^\?\?_GNavLike@@", r.stdout, re.M))), (True, False))
 
 
 inline_order_tests()

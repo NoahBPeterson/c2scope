@@ -26,7 +26,9 @@ function being compiled, the callee, the inlining depth, and the model's numbers
   --order  also prints the TU's compile order, one line per function, with the in-TU callees compiled after it.
 
 and the verdict with the step that decided it. A site the model never reached (a __forceinline callee, a callee
-that is not compiled yet, a veto) shows only the verdict; the verdict is ConsiderCandidate's final answer. InlCallGraphDecision's "yes" is the cost model's; the
+that is not compiled yet, a veto) shows only the verdict; a call the cost model accepted shows `kept by <stage>`
+(GetCandidateInsertionPoint, GetInlinee, ShouldInlineInlinee, InlineInlinee, InlBadCandidate); a callee that
+InlCallTupleIsCandidate filtered out (an EH callee into a caller without EH state, ...) has no row; the verdict is ConsiderCandidate's final answer. InlCallGraphDecision's "yes" is the cost model's; the
 vetoes after it (InlBadCandidate, inline.md 8a) can still keep the call.
 
 The probes are found by byte signature in the build's c2.dll (taken from 13.10.3052, where the function is split
@@ -99,8 +101,11 @@ def main(argv):
             ["@dop2_EncodeAndRelated@4=g%s>0>0>4$" % cf,        # hook 6: the function's code is emitted (it is done)
              # hook 7: one per call site weighed; the caller, the callee, the dword at callee FUNC+0x69 (bit 1: the callee
              # has been compiled, its call-graph data is complete), the depth. hook 8: ConsiderCandidate's final verdict
-             "@ShouldInlineCallTuple@28=g%s>0>0>4$,eax>4>0x28>0x18>4$,eax>4>0x28>0x18>0x69,s2,s1" % cf,
-             "@ConsiderCandidate@36=ecx/xeax"]
+             "@ShouldInlineCallTuple@28=g%s>0>0>4$,eax>4>0x28>0x18>4$,eax>4>0x28>0x18>0x69,s2,s1/xeax" % cf,
+             "@ConsiderCandidate@36=ecx/xeax",
+             # hooks 9-13, the stages after the cost model: their exits say where a site that ICGD accepted was kept
+             "@GetCandidateInsertionPoint@12=ecx/xeax", "@GetInlinee@28=ecx/xeax", "@ShouldInlineInlinee@20=ecx/xeax",
+             "@InlineInlinee@20=ecx/xeax", "@InlBadCandidate@12=ecx/xeax"]
     if a.more:
         import c2ltcg
         os.environ["CCACHE"] = "0"
@@ -131,6 +136,7 @@ def main(argv):
     REG = ("eax", "ecx", "edx", "ebx", "ebp", "esi", "edi", "esp")
     s32 = lambda x: (int(x, 16) ^ 0x80000000) - 0x80000000
     names, rows, cur = {}, [], None
+    stack = []
     order, done = [], {}           # order: names in @Inline@4 entry order; done: name -> position in the emission order
     for line in log.splitlines():
         if not line[:2] in ("E ", "X ") or "|" not in line:
@@ -153,12 +159,19 @@ def main(argv):
                        top=prow["top"] if prow else top,                         # the function being compiled
                        ready=bool(int(v[2], 16) & 2), size=0)                   # callee FUNC+0x69 bit 1
             rows.append(cur)
+            stack.append(cur)
+        elif kind == "X" and hook == 7 and stack:
+            stack[-1]["sict"] = int(f[4], 16) != 0
+        elif kind == "X" and hook in (9, 10, 11, 12, 13) and stack:
+            stack[-1].setdefault("stages", []).append((hook, int(f[4], 16)))
         elif kind == "E" and hook == 1 and cur is not None:
             cur["size"] = int(v[1], 16) if len(v) > 1 and v[1] != "?" else 0
         elif kind == "X" and hook == 1 and cur is not None:
             cur["yes"] = int(f[4], 16) != 0
-        elif kind == "X" and hook == 8 and cur is not None:
-            cur["final"] = int(f[4], 16) != 0
+        elif kind == "X" and hook == 8 and stack:
+            site = stack.pop()
+            site["final"] = int(f[4], 16) != 0
+            cur = stack[-1] if stack else site
         elif cur is not None and hook == 2:
             cur["c"] = s32(v[0])
         elif cur is not None and hook == 3:
@@ -218,6 +231,12 @@ def main(argv):
         if body != "never" and body != inferred and r["callee"] != r["top"]:
             why += "; NOTE the order says body=%s" % inferred
         verdict = "INLINE" if r.get("final", r.get("yes")) else "call"
+        if verdict == "call" and "final" in r:
+            STG = {9: "GetCandidateInsertionPoint", 10: "GetInlinee", 11: "ShouldInlineInlinee", 12: "InlineInlinee",
+                   13: "InlBadCandidate"}
+            bad = [STG[h] for h, v in r.get("stages", []) if (v != 0 if h == 13 else v == 0)]
+            if bad:
+                why += "; kept by " + bad[0]
         if "yes" in r and r["yes"] != r.get("final", r["yes"]):
             why += "; the cost model said %s, then vetoed" % ("yes" if r["yes"] else "no")
         print("%-34s %-34s %2d %5d %5s %5s %5s %5s %10s %4s %-6s %s (%s)" % (
