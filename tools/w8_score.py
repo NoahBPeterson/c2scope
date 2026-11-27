@@ -75,7 +75,7 @@ def compile_one(args):
 
 def undecorate(nm):
     """_cdecl, __stdcall and __fastcall decorate a C symbol: `_FUN_x`, `_FUN_x@8`, `@FUN_x@8`."""
-    m = re.match(r"^\?(?:\?[01])?(FUN_[0-9a-f]{8})@@", nm)   # C++: FUN_<va>(), or class FUN_<va>'s ctor / dtor
+    m = re.match(r"^\?(?:\?[01])?(FUN_[0-9a-f]{8})@(?:D_[0-9a-f]{8}@)?@", nm)   # C++: FUN_<va>(), or class FUN_<va>'s ctor / dtor
     if m:
         return m.group(1)
     if nm.startswith("@"):

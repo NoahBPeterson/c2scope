@@ -198,6 +198,9 @@ spelled `V`), hoist a common head statement. A reference that the original's ins
 
 ### 2.4 Order, interference, preference, copy partners
 
+`canreg:` / `noreg:` / `interf:` answers about a parameter that lives across a `mul` / `div` / call have no construct here:
+`tools/regroles.py` (docs/c2/regroles.md) realises them by statement moves and an explicit induction pointer defined before the clobber (Spore 0x009e0b90).
+
 `before:A:B` / `after:A:B` are priority edits: ask `rasim need SNAP 'A>B'` for the `ref:` / `unref:` form and take
 it to 2.1 or 2.3. A tie (equal priorities, decided by defOrd) is also an order of statements:
 

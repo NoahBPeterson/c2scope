@@ -129,6 +129,8 @@ class Lifter:
         self.byte_rets = self.value_rets = 0     # rets whose eax came from byte writes (al): a bool function
         self.ret_pop = 0                   # `ret N`
         self.value_ret = False             # some OPRET returns eax
+        self.od_ret = False                # /Od mode: a return value is computed right before the epilogue (od_tail);
+        #                                    ecx written by a bit test and a jcc is no `this`
         self.i64_ret = False               # some OPRET returns edx:eax as one __int64 (find_i64)
 
     # ---- registers read / written (full 32-bit names)
@@ -470,6 +472,9 @@ class Lifter:
                 return False
             elif self.ecx_is_data(d[0], k, esp, top):
                 return False
+            elif self.od_ret and self.ins[d[0]].mnemonic in ("and", "or", "xor", "sub", "shr", "shl", "sar") and \
+                    d[0] + 2 < k and self.ins[d[0] + 1].mnemonic.startswith("j"):
+                return False                 # `and ecx, 1; je L` (a bit test at /Od): ecx is the test's value, no `this`
         return True
 
     def ecx_is_data(self, d, k, esp=None, top=None):
@@ -1025,6 +1030,9 @@ class Lifter:
                                 self.cleans_before_next_call(k):
                             thiscall = False                   # ecx is only the caller's this left over, and the
                             #                                    caller pops the arguments: a cdecl call
+                        if thiscall and self.od_ret and args and caller_pops:
+                            thiscall = False                   # /Od: no merged cleanups, so a callee whose arguments the
+                            #                                    caller pops right away is cdecl (a thiscall callee pops them)
                         if thiscall:                           # `mov ecx, X; call`: X is the callee's `this`, first
                             args = ["%s:1004" % self.var_read(k, "ecx")] + args
                         pushes, ecx_set = [], False
@@ -1186,8 +1194,12 @@ class Lifter:
                         a, b2 = flags or ("0:1004", "0:1004")
                         if flags is None:
                             raise Unsupported("set%s without a compare" % m[3:])
-                        self.emit(k, "OPSETCC", ["%s:2001" % self.var_written(k, full(self.md.reg_name(ops[0].reg)))],
-                                  [a, b2], "cc=%s" % CCOF["j" + m[3:]])
+                        rr = full(self.md.reg_name(ops[0].reg))
+                        pre0 = self.od_ret and k >= 2 and self.ins[k - 1].mnemonic in ("cmp", "test") and \
+                            self.ins[k - 2].mnemonic == "xor" and \
+                            self.ins[k - 2].op_str == "%s, %s" % (rr, rr)
+                        self.emit(k, "OPSETCC", ["%s:2001" % self.var_written(k, rr)],
+                                  [a, b2], "cc=%s%s" % (CCOF["j" + m[3:]], " pre0=1" if pre0 else ""))
                     elif m.startswith("set") and ("j" + m[3:]) in CCOF and ops and ops[0].type == X.X86_OP_MEM:
                         # setcc byte [m]: the comparison's value stored (a bool local: M&B Operation::execute)
                         if flags is None:
@@ -2806,6 +2818,21 @@ class Lifter:
             out |= self.acc[j][1]
         return out
 
+    def od_tail(self, d, k):
+        """/Od: `return e;` evaluates e into eax and leaves; so a definition of eax at d is a return value only when
+        nothing but jumps and the epilogue lie between it and the ret at k. Anything else is a leftover (Spore 00537d90:
+        `mov eax, [this]; ..; mov [eax+0x44], 0; ret` returns nothing)."""
+        for q in range(d + 1, k):
+            i = self.ins[q]
+            if i.mnemonic in ("jmp", "leave", "pop", "nop") or q in getattr(self, "pro", ()):
+                continue
+            if i.mnemonic == "mov" and i.op_str == "esp, ebp":
+                continue
+            if i.mnemonic.startswith("j") and not i.mnemonic == "jmp":
+                return False
+            return False
+        return True
+
     def used_after(self, d, k=None, reg=None):
         """Is the value defined at d (insn index, reg) read anywhere? With k/reg: is reg's value at k defined
         inside the function (not the caller's leftover eax)?"""
@@ -2824,7 +2851,7 @@ class Lifter:
                            u.op_str.endswith(", " + reg) for u in self.ins[j + 1:j + 8])
             # `fnstsw ax` / `lahf`: a float compare's status word, never a return value (M&B 0048e5d0)
             return any(x[0] not in ("entry", "undef") and self.ins[x[0]].mnemonic not in ("call", "fnstsw", "lahf")
-                       and not arg_only(x[0])
+                       and not arg_only(x[0]) and not (self.od_ret and reg == "eax" and not self.od_tail(x[0], k))
                        and not zero_for_stores(x[0]) and x[0] not in self.pair_pieces for x in defs)   # (folded
             #                                                         into an __int64 store: not a return value)
         root = self.find(d)
@@ -2914,9 +2941,13 @@ class Lifter:
             if i.mnemonic != "ret":
                 continue
             j = k - 1
+            movesp = False
             while j >= 0 and (j in self.eh_ins or (self.ins[j].mnemonic == "pop" and self.ins[j].op_str in CALLEE_SAVED) or
                               self.ins[j].op_str in ("esp, ebp",) or self.ins[j].mnemonic == "leave" or
                               (self.ins[j].mnemonic == "add" and self.ins[j].op_str.startswith("esp, "))):
+                if self.od_ret and self.ins[j].mnemonic == "add" and movesp:
+                    break                           # /Od: `add esp, N; mov esp, ebp` is a call's cleanup, then the epilogue
+                movesp = movesp or self.ins[j].op_str == "esp, ebp"
                 out.add(j)
                 j -= 1
         return out

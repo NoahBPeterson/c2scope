@@ -36,6 +36,26 @@ class LiftEmitter(il2c.Emitter):
         self.copyof = {}                     # temporary -> the temporary it copies (`mov ecx, esi`)
         self.tls = set()                     # __declspec(thread) offsets read or written
         self.ptypes = {}                     # parameter name -> its C type (unit() fills it)
+        self.cc_helpers = set()              # /Od: (cc, unsigned) compare helpers used (inlined bool functions)
+        self.inl = True                      # the flags let c2 inline (/Ob1, /Ob2): helpers that rely on it are usable
+        self.od = False                      # /Od: the object of a virtual call is evaluated twice (canon)
+        self.defsrc = {}                     # temporary -> the frame slot / argument it copies
+
+    def canon(self, t, depth=0):
+        """The expression a temporary stands for, through register copies and loads (two temporaries loaded the
+        same way from the same slot are one value: /Od's `p->f()` evaluates p for the vtable and again for `this`)."""
+        if depth > 12:
+            return t
+        def one(m):
+            x = m.group(0)
+            if x in self.copyof:
+                return self.canon(self.copyof[x], depth + 1)
+            if x in self.defsrc:
+                return self.defsrc[x]
+            if x in self.loads:
+                return "(" + self.canon(strip_reg(self.loads[x]), depth + 1) + ")"
+            return x
+        return re.sub(r"\bt\d+\b", one, t)
 
     def name_of(self, n):
         if n == "_this":
@@ -119,6 +139,8 @@ class LiftEmitter(il2c.Emitter):
             dn, sn = strip_reg(L["dsts"][0]).rsplit(":", 1)[0], strip_reg(L["srcs"][0]).rsplit(":", 1)[0]
             if re.match(r"^(t\d+|_this)$", sn) and re.match(r"^t\d+$", dn):
                 self.copyof[dn] = sn
+            elif self.od and re.match(r"^_[al]\d+$", sn) and re.match(r"^t\d+$", dn):
+                self.defsrc[dn] = sn
         if L["op"] == "OPEHSTATE":
             return ("stmt", "__EH(%s);" % L["srcs"][0].split(":")[0])
         if L["op"] == "OPEHRESUME":
@@ -130,6 +152,10 @@ class LiftEmitter(il2c.Emitter):
             a, b = (self.rvalue(x, L) for x in L["srcs"][:2])
             op = {"e": "==", "ne": "!=", "l": "<", "le": "<=", "g": ">", "ge": ">=", "b": "<", "be": "<=", "a": ">",
                   "ae": ">="}[cc]
+            if L["notes"].get("pre0") == "1" and self.od and self.inl:      # `xor r, r; cmp; setcc r8`: an inlined bool-returning compare
+                self.cc_helpers.add((cc, uns))
+                return ("stmt", "%s = (unsigned char)(il2c_cc_%s%s((%s)(%s), (%s)(%s)));" % (
+                    self.lvalue(L["dsts"][0]), cc, "u" if uns else "", ty, a, ty, b))
             if L["notes"].get("neg") == "1":     # sbb r, r: 0 or -1
                 return ("stmt", "%s = (int)(-(int)((%s)(%s) %s (%s)(%s)));" % (self.lvalue(L["dsts"][0]), ty, a, op,
                                                                              ty, b))
@@ -223,7 +249,7 @@ class LiftEmitter(il2c.Emitter):
                 while x in self.copyof and x not in seen and x != base:
                     seen.add(x)
                     x = self.copyof[x]
-                if x == base:
+                if x == base or (self.od and self.canon(x) == self.canon(base)):
                     self.argsrc[a0] = base
             r = super().indirect(L, d, ["[%s:1004+%s]:1004" % (vp, mmem.group(2) or "0")] + srcs[1:])
             if "il2c_vc" in r:
@@ -246,7 +272,7 @@ class LiftEmitter(il2c.Emitter):
                     while x in self.copyof and x not in seen and x != base:
                         seen.add(x)
                         x = self.copyof[x]
-                    if x == base:
+                    if x == base or (self.od and self.canon(x) == self.canon(base)):
                         self.argsrc[a0] = base
                 r = super().indirect(L, d, ["[%s:1004+%s]:1004" % (vp, disp)] + srcs[1:])
                 if "il2c_vc" in r:
@@ -422,7 +448,7 @@ def pure(rhs):
 def drop_unused_decls(body):
     """A declared local nothing reads or writes (a call's dropped result): at /Od every declared local gets a
     frame slot (`push ecx`, an `mov esp, ebp` epilogue: Spore 012538b0), so leave none behind."""
-    for m in list(re.finditer(r"(?m)^    [\w ]+?\*? ((?:t|v_l)\d+)(?:\[\d+\])?;\n", body)):
+    for m in list(re.finditer(r"(?m)^    (?!return\b)[\w ]+?\*? ((?:t|v_l)\d+)(?:\[\d+\])?;\n", body)):
         if len(re.findall(r"\b%s\b" % m.group(1), body)) == 1:
             body = body.replace(m.group(0), "", 1)
     return body
@@ -1288,13 +1314,17 @@ def _eh_sig(lf, va, typed):
     return "%s %s FUN_%08x(%s)\n" % (ret, "__stdcall" if lf.ret_pop else "__cdecl", va, ", ".join(typed) or "void")
 
 
-def unit(img, va, size, mask=None, flags=None, partial=None):
+def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
     """(C++ text, lifter) for one function: lift2il, then il2c's emitter with the names and signature above.
     mask: the byte offsets retail relocates inside the function (a corpus row's `mask`), to tell addresses from
     numbers; None reads the image's relocation table."""
     if partial is None:
         partial = os.environ.get("L2C_PARTIAL") == "1"
     lf = lift2il.Lifter(img, va, size, mask, partial=partial)
+    if od is None:
+        od = (bool(flags) and "/Od" in flags.split()) or os.environ.get("L2C_OD") == "1"
+    lf.od_ret = bool(od)
+    inl = (not flags) or any(f in ("/Ob1", "/Ob2") for f in flags.split())   # c2 inlines `inline` / forced helpers
     il = lf.run()
     this = any(re.search(r"\b_this:", l) for l in il)
     nargs = max([(o - 4) // 4 + 1 for o in lf.args_read] + [lf.ret_pop // 4])
@@ -1309,6 +1339,8 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
         il, this_alias = alias_this(il)
     em = LiftEmitter(il, params, ret, set(), {})
     em.lang_c = lang_c
+    em.od = bool(od)
+    em.inl = inl
     em.this_alias = this_alias
     em.partial = partial
     em.self_va = va
@@ -1332,6 +1364,27 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
     if os.environ.get("L2C_DROP_DEAD", "1") == "1":
         body = drop_dead(body)
     body = drop_unused_decls(size_addressed_locals(fold_aggregates(body, lf), lf))
+    fr_text = None
+    if od:
+        import il2c_od
+        deep = []
+        mh = re.search(r"(?m)^    (v_l(\d+)) = \(int\)\(\(int\)\(self\)\);$", body)
+        if mh and this and not getattr(em, "self_assigned", False):
+            hn = int(mh.group(2))                           # slots below `this`'s home are compiler temporaries
+            for mv in re.finditer(r"(?m)^    int (v_l(\d+));$", body):
+                if int(mv.group(2)) > hn:
+                    deep.append("t%d" % (5000 + int(mv.group(2))))
+                    body = re.sub(r"\b%s\b" % mv.group(1), deep[-1], body)
+        body = drop_unused_decls(il2c_od.od_loops(il2c_od.od_goto_else(il2c_od.od_short_circuit(il2c_od.od_return_merge((il2c_od.od_inline_calls if inl else (lambda b: b))(il2c_od.od_clean(il2c_od.od_struct_copies(il2c_od.od_fold(body, deep)))))))))
+        body = il2c_od.od_parens(body)
+        home = None
+        if this and not getattr(em, "self_assigned", False):
+            body, home = il2c_od.this_home(body)
+        fr_text = None
+        lf.caller_cleans(0)                              # sets lf.frame_alloc: the prologue's reservation
+        named = (home - 8) if home else lf.frame_alloc    # `this`'s home is the first temporary below the named block
+        if named > 0:
+            fr_text, body = il2c_od.od_frame(body, named, va)
     pty = lambda p: CTYPE.get(lf.arg_types.get(int(p[1:]), "1004"), "int")
     if pty("a4") is None:
         pass
@@ -1345,12 +1398,34 @@ def unit(img, va, size, mask=None, flags=None, partial=None):
     else:
         conv, plist = "__cdecl", typed
     head = heads(em, lang_c)
+    if od and fr_text:
+        head.append(fr_text)
+    if od:
+        import il2c_od
+        for sig_ in sorted(il2c_od.SDECLS):
+            head.append("struct %s { %s };" % (il2c_od._sname(sig_), " ".join(
+                "%s m%d;" % ("float" if c_ == "f" else "int", q_) for q_, c_ in enumerate(sig_))))
+        il2c_od.SDECLS.clear()
+        for cc_, u_ in sorted(em.cc_helpers):
+            op_ = {"e": "==", "ne": "!=", "l": "<", "le": "<=", "g": ">", "ge": ">=", "b": "<", "be": "<=", "a": ">",
+                   "ae": ">="}[cc_]
+            t_ = "unsigned int" if u_ else "int"
+            head.append("__forceinline bool il2c_cc_%s%s(%s a, %s b) { return a %s b; }" % (cc_, "u" if u_ else "", t_, t_, op_))
+        for f_ in sorted(il2c_od.DELS):
+            head.append("__forceinline void il2c_d_%s(int p, int fl) { if (fl & 1) %s((unsigned int)(p)); }" % (f_, f_))
+        il2c_od.DELS.clear()
     ext = "" if lang_c else 'extern "C" '
     # 2. a path that returns nothing in a function that returns a value (a void tail call next to value rets)
     if ret != "void":
         body = re.sub(r"\breturn;", "return 0;", body)
     sig = '%s%s %s FUN_%08x(%s)\n' % (ext, ret if not (lang_c and ret == "bool") else "unsigned char", conv, va,
                                      ", ".join(plist) or "void")
+    if od and this and not lang_c and not getattr(em, "self_assigned", False):
+        # at /Od a __fastcall's unused edx is stored to a slot: a member function (thiscall) takes ecx alone
+        sig = 'struct D_%08x { %s FUN_%08x(%s); };\n%s D_%08x::FUN_%08x(%s)\n' % (
+            va, ret, va, ", ".join(typed) or "", ret, va, va, ", ".join(typed) or "")
+        body = re.sub(r"\bself\b", "this", body)
+        head.append("")
     body = inline_x87(body)
     if lang_c:
         body = body.replace("(bool)", "(unsigned char)")
@@ -1615,6 +1690,8 @@ def main(argv):
     ap.add_argument("--json")
     ap.add_argument("--partial", action="store_true", help="unit: emit what lifts, with a comment at each "
                     "unsupported construct (a structural draft of a big function); never scored as a match")
+    ap.add_argument("--od", action="store_true", help="unit: the /Od shape (il2c_od.py: temporaries folded into "
+                    "expressions, one frame struct); the default when the corpus row's flags contain /Od")
     a = ap.parse_args(argv)
     from w8_emit import Image
     import corpus as corpusmod
@@ -1630,8 +1707,10 @@ def main(argv):
     if a.cmd == "unit":
         va = a.va.lower().replace("0x", "").zfill(8)
         r = next(x for x in rows if x["va"] == va)
+        fl = r.get("flags") or head.get("flags") or ""
         text, _ = unit(Image(head["image"]), int(r["va"], 16), r["size"], corpusmod.unpack(r["mask"]),
-                       partial=a.partial or None)
+                       flags=fl if "/Od" in fl.split() else None, partial=a.partial or None,
+                       od=True if a.od else None)
         sys.stdout.write(text)
         return 0
     from concurrent.futures import ProcessPoolExecutor

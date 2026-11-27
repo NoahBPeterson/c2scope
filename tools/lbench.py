@@ -327,6 +327,14 @@ def cmd_run(a):
         vas = [json.loads(l)["va"] for l in open(os.path.join(a.same_as, "results.jsonl"))]
         byva = {r["va"]: r for r in corp.rows}
         rows = [byva[v] for v in vas if v in byva]
+    elif a.vas:                                   # an explicit VA list (one hex VA per line), optionally narrowed
+        want = set(w.lower().replace("0x", "").zfill(8) for w in open(a.vas).read().split())
+        rows = [r for r in corp.rows if r["va"] in want and (not a.status or r["status"] in a.status.split(","))
+                and (not a.max_size or r["size"] <= a.max_size) and (not a.min_size or r["size"] >= a.min_size)
+                and (not a.flag or a.flag in r["flags"].split())]
+        if a.sample and len(rows) > a.sample:
+            rows = random.Random(a.seed).sample(rows, a.sample)
+        rows.sort(key=lambda r: r["va"])
     else:
         rows = pick(corp, a.status.split(",") if a.status else None, a.sample, a.seed, a.max_size, a.min_size, a.bands)
     tag = a.tag or time.strftime("%m%d-%H%M")
@@ -499,6 +507,9 @@ def main():
     r.add_argument("--tag")
     r.add_argument("--out")
     r.add_argument("--same-as", help="a run directory: lift exactly its functions")
+    r.add_argument("--vas", help="a file of VAs (whitespace separated): run exactly those rows (--status / --max-size "
+                   "/ --flag narrow them, --sample N takes a random N of them, 0 = all)")
+    r.add_argument("--flag", help="with --vas: keep rows whose flags contain this word (e.g. /Od)")
     r.add_argument("--same-as-list", help=argparse.SUPPRESS)
     r.add_argument("--c2", help=argparse.SUPPRESS)
     s = sub.add_parser("show")

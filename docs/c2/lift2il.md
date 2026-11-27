@@ -73,6 +73,42 @@ C++ EH needs C++ linkage (an `extern "C"` function is nothrow under /EHsc, so cl
 - x87 rounding-mode changes (`fnstcw` / `fldcw`), `lahf` on integer flags, packed SSE;
 - member functions called from a C unit, `this` reassigned.
 
+## /Od mode (`tools/il2c_od.py`)
+
+Selected when a corpus row's flags contain `/Od` (`lbench.py`), or `il2c_lift.py unit CORPUS VA --od`. At /Od cl gives
+every declared local a frame slot and reloads it for each statement, so the /O2 shape (a temporary per register value) adds
+a store and a reload per temporary. The /Od emitter writes what a source file would have:
+
+- **Folding.** A temporary with one definition and one read goes into that read when nothing between them writes a slot
+  it names (any store / call when it reads memory) and no control flow lies between; a plain reload (`a4`, `this`, a
+  constant, `&slot`) is repeated at every read (reaching definitions split one eax into its webs first); a result nobody
+  reads loses its assignment (a call keeps the call). Consecutive stores of one constant are a chain (`c = b = a = 0`).
+- **Parentheses.** cl evaluates `x = (e)` and `x = e` in different orders (the right side first with the parentheses), so
+  the text carries only the parentheses precedence needs (`minparens`); `(int)` / `(float)` casts of values already of
+  that type go too (a float load under `(float)` becomes an SSE convert).
+- **Frame.** Named locals are allocated by a name hash, so the lifter's `v_lN` (slot at ebp-(N-4)) go into one packed
+  struct local laid out at the original's offsets, the dead room (inlined callees' slots) as `int dead[]`; a block of 64
+  bytes or more is 8-aligned, so a block whose size is 4 mod 8 is two structs, named `fb` (allocated first) and `fa`. Slots
+  that overlap (a structure seen in pieces) are reached by byte offset from the struct. `this` is the member function's own
+  home slot (the lifted unit is `D_<va>::FUN_<va>`, a thiscall method: a `__fastcall` free function would store edx),
+  and slots deeper than it are compiler temporaries: an if / else assigning one becomes a `?:`.
+- **Control flow.** `goto L; I: inc; L: if (c) { body; goto I; }` is `for (; c; inc)` and `L: if (c) { ..; goto L; }` is
+  `while (c)` (a goto followed by its label costs an extra jmp); `if (A) { if (B) goto L; } body L:` is
+  `if (!A || !B) { body }`; an arm that leaves by `goto` is an else; both arms ending in `t = e` before `return t` are a
+  `return` each, and the last one is not wrapped in an else (cl emits a jmp for it).
+- **Shapes.** Dword copies from one pointer to another, from a pointer to a local structure, and `memcpy` of a multiple of
+  4 bytes are one structure assignment (`*(S3*)d = *(S3*)s`, `rep movsd` from 16 bytes); a virtual call evaluates its
+  object twice (once for the vtable, once for `this`); under `/Ob1` an inlined `if (flags & 1) f(p)` with a constant flag
+  and `xor eax, eax; cmp; setcc al` (an inlined bool compare) are `__forceinline` helpers.
+- **Return value.** A value is returned only when eax is written right before the epilogue (`return e;`); a leftover eax
+  is a void function. A callee whose pushed arguments the caller pops at once is cdecl, not thiscall (`and ecx, 1; je`
+  leaves a dead ecx).
+
+What it does not do yet: functions with an EH frame (`eh_unit` does not take the /Od path), by-value structure arguments
+built in place (`sub esp, N; mov [ebp-x], esp`: 86 of 1147 Spore rows), x87 stack underflow, `sbb` masks, inlined bodies
+other than the two helpers (their dead slots are filled, their code is lifted as if written out), `xor eax, eax` store
+sequences for a float zero, compiler temporaries that are not `?:` results.
+
 ## What a match is, and what it is not
 
 A MATCH is byte-identical code, relocations aside, from source with placeholder names and types. Many more functions
