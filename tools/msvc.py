@@ -103,8 +103,8 @@ def start_keeper(e):
     2.37 s with a cold server on every call and 0.74 s with the server resident, and a traced `scratch` compile
     went from 2.49 s to 0.74 s. `wineserver -p` does not help: it cannot start directly on this install
     ("failed to load l_intl.nls"), and started through wine it still exits with the last client. A resident
-    A resident `cmd /c ping` has no visible window and is enough for the server to stay up. `regedit /dev/null`
-    was used before, but on some Wine builds (Wine Stable 11.0 on macOS) it shows a modal "file not found" dialog.
+    `cmd /c ping` has no visible window and is enough for the server to stay up. `regedit /dev/null` was used
+    before, but on some Wine builds (Wine Stable 11.0 on macOS) it shows a modal "file not found" dialog.
 
     The keeper is detached and writes its pid file; it dies on its own when the prefix is reset (`wineserver -k`).
     WINE_KEEP=0 disables it."""
