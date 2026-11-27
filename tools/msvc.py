@@ -103,12 +103,13 @@ def start_keeper(e):
     2.37 s with a cold server on every call and 0.74 s with the server resident, and a traced `scratch` compile
     went from 2.49 s to 0.74 s. `wineserver -p` does not help: it cannot start directly on this install
     ("failed to load l_intl.nls"), and started through wine it still exits with the last client. A resident
-    `regedit` has no visible window and is enough for the server to stay up.
+    A resident `cmd /c ping` has no visible window and is enough for the server to stay up. `regedit /dev/null`
+    was used before, but on some Wine builds (Wine Stable 11.0 on macOS) it shows a modal "file not found" dialog.
 
     The keeper is detached and writes its pid file; it dies on its own when the prefix is reset (`wineserver -k`).
     WINE_KEEP=0 disables it."""
     quiet = dict(env=e, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    p = subprocess.Popen(["wine", "regedit", "/dev/null"], start_new_session=True, **quiet)
+    p = subprocess.Popen(["wine", "cmd", "/c", "ping", "-n", "2147483647", "127.0.0.1"], start_new_session=True, **quiet)
     KEEPER.write_text(str(p.pid))
 
 
