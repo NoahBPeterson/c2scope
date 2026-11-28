@@ -1684,6 +1684,46 @@ class Lifter:
             # not after a branch or goto the def's instruction ended with (a call's result, then its jmp)
             self.lines.insert(at, l)
 
+    def byte_webs(self):
+        """Web names (t10xx) whose every def writes a byte (mov r8, .. / xor r8, r8 / movzx r, byte / setcc) and
+        whose every read is an 8-bit register read: the source's unsigned char / bool. Typed wider, cl allocates the
+        web as a dword (a zero def becomes `mov ecx, edi` instead of `xor cl, cl`; docs/c2/immcand.md 7)."""
+        B8 = {"al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl"} | {"r%db" % n for n in range(8, 16)}
+        def byte_def(k, r):
+            i = self.ins[k]
+            o = i.operands
+            if not o or o[0].type != X.X86_OP_REG or canon(self.md.reg_name(o[0].reg)) != r:
+                return False
+            if o[0].size == 1:
+                return True
+            return i.mnemonic == "movzx" and len(o) == 2 and o[1].size == 1
+        defs, ok = {}, {}
+        for key in list(self.names):
+            if not isinstance(key[0], int):
+                continue
+            root = self.find(key)
+            nm = self.names.get(root)
+            if not nm or not nm.startswith("t1"):
+                continue
+            defs.setdefault(nm, []).append(key)
+            ok[nm] = ok.get(nm, True) and byte_def(*key)
+        for (k, r), ds in self.reach_defs.items():
+            if not isinstance(k, int) or not ds:
+                continue
+            nms = {self.names.get(self.find(d)) for d in ds}
+            for nm in nms:
+                if nm not in ok or not ok[nm]:
+                    continue
+                i = self.ins[k]
+                rd = [x for x in i.operands if x.type == X.X86_OP_REG and canon(self.md.reg_name(x.reg)) == r]
+                mem = [x for x in i.operands if x.type == X.X86_OP_MEM and
+                       r in (canon(self.md.reg_name(x.mem.base)) if x.mem.base else None,
+                             canon(self.md.reg_name(x.mem.index)) if x.mem.index else None)]
+                if mem or not rd or any(self.md.reg_name(x.reg) not in B8 for x in rd):
+                    if r in self.acc[k][0] or rd or mem:
+                        ok[nm] = False
+        return sorted(n for n, v in ok.items() if v)
+
     def zero_reg(self, k, r):
         """Register r at k holds 0: its one reaching def is `xor r, r` (any width)."""
         ds = self.reach_defs.get((k, r), set())
@@ -2612,7 +2652,8 @@ def make_emitter(il, params, ret):
                 nm = mi.group(1)
                 w = re.search(r"(64|16|8)$", nm)
                 pt = {"64": "__int64", "16": "short", "8": "char"}.get(w.group(1) if w else "", "long")
-                e = "_%s((%s volatile*)(%s)%s)" % (nm, pt, argv[0], "".join(", (%s)(%s)" % (pt, x) for x in argv[1:]))
+                # (T*) not (T volatile*): the same code, and a volatile in a function body is refused at submit (Q1)
+                e = "_%s((%s*)(%s)%s)" % (nm, pt, argv[0], "".join(", (%s)(%s)" % (pt, x) for x in argv[1:]))
                 if d:
                     return "%s = (%s)%s;" % (self.lvalue(d[0]), rty, e)
                 return e + ";"
@@ -2785,6 +2826,40 @@ def outparam_sizes(text, img):
     return "\n".join(lines)
 
 
+ZSTORE = re.compile(r"^(\s*)\*\(__int64\*\)\(\(char\*\)(.+?)( \+ (\d+))?\) = \(__int64\)\(\(__int64\)0\);$")
+
+
+def drop_unused_decls(text, va):
+    """Locals declared and never referenced (cl /W3 warns C4101, refused at submit as Q11)."""
+    m = re.search(r"^\S[^\n]* FUN_%x\([^\n]*\)\n\{\n" % va, text, re.M)
+    if not m:
+        return text
+    body = text[m.end():]
+    out = []
+    for ln in body.split("\n"):
+        d = re.match(r"^    [\w ]+ (\w+);$", ln)
+        if d and len(re.findall(r"\b%s\b" % re.escape(d.group(1)), body)) == 1:
+            continue
+        out.append(ln)
+    return text[:m.end()] + "\n".join(out)
+
+
+def zero_pairs(text):
+    """A literal 8-byte zero store (the original's `mov qword ptr [m], 0`) as two 4-byte zero stores. cl 17.00 keeps
+    a known-zero register for zero stores (`mov [m], rbp`) and writes `mov qword ptr [m], 0` only when it combines two
+    adjacent int stores of 0 reached by two zero defs (docs/c2/immcand.md 7)."""
+    out = []
+    for ln in text.split("\n"):
+        m = ZSTORE.match(ln)
+        if not m:
+            out.append(ln)
+            continue
+        ind, base, off = m.group(1), m.group(2), int(m.group(4) or 0)
+        for o in (off, off + 4):
+            out.append("%s*(int*)((char*)%s%s) = (int)0;" % (ind, base, " + %d" % o if o else ""))
+    return "\n".join(out)
+
+
 def retslots(text, img, va):
     """A call that fills a local through the callee's hidden return pointer (the callee returns that same pointer:
     frameinfo64.returns_arg) as a class returned by value, initialised in place:
@@ -2886,6 +2961,13 @@ def variants(img, va, size):
         alts.append({"sqrt": "f"})
     if any(i.mnemonic == "sbb" for i in lf.ins):
         alts.append({"sbb": "neg"})
+    try:
+        if lf.byte_webs():
+            alts = alts + [dict(a, bytewebs=1) for a in [{}] + alts]   # byte-wide webs as unsigned char
+    except Exception:
+        pass
+    if any(ZSTORE.match(x) for x in text.split("\n")):
+        alts = alts + [dict(a, zeropair=1) for a in [{}] + alts]   # a literal qword 0 store as two int stores
     if re.search(r"^\s*v\d+ = \(__int64\)\(\(__int64\)\(a\d+\)\);$", text, re.M):
         alts.append({"pcopy": 1})                # a parameter copied at entry: passed itself (14 better / 16 worse)
 
@@ -3026,6 +3108,13 @@ def unit(img, va, size, opts=None):
         text = outparam_sizes(text, img)
     if lf.opts.get("retslot"):
         text = retslots(text, img, va)
+    if lf.opts.get("zeropair"):
+        text = zero_pairs(text)
+    text = drop_unused_decls(text, va)
+    if lf.opts.get("bytewebs"):
+        for n in lf.byte_webs():
+            text = re.sub(r"^    (?:unsigned int|int|unsigned short) v%s;$" % n[1:], "    unsigned char v%s;" % n[1:],
+                          text, flags=re.M)
     return text, lf
 
 

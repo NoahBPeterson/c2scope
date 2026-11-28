@@ -168,6 +168,17 @@ off). That's cl's own expansion of the intrinsic. With the xadd's result as a va
 from the hoisted -1 and takes another register (port-1700.md 13). 0x1406e7170 matched with it, plus the pcopy and
 `ret void` variants and its two out locals as int.
 
+## Zero pairs, byte webs, submit-clean output
+
+- opts `zeropair` (a variant when the lift has a literal 8-byte zero store): `*(__int64*)(p+N) = 0` as two int zero
+  stores. While a register holds a known 0, cl stores 0 through it (`mov [m], rbp`); `mov qword ptr [m], 0` is two
+  adjacent int zero stores combined late (immcand.md 7). 0x140cc1870 matched with it.
+- opts `bytewebs` (a variant when a web qualifies; Lifter.byte_webs): a web whose every def writes a byte (8-bit
+  destination, movzx from a byte) and whose every read is an 8-bit register read is declared unsigned char. Wider,
+  its zero def becomes `mov ecx, edi` instead of `xor cl, cl`. 0x141c40fd0 matched with it.
+- Intrinsic casts are `(long*)`, not `(long volatile*)` (same code; volatile in a function body is refused at
+  submit), and locals that are declared but never referenced are dropped (C4101 at /W3 is refused as Q11).
+
 ## Not yet handled
 - Re-rolling loops. cl rotated and duplicated the loop tests, so the goto-shaped lift gets re-optimised
   differently. This is the main cause of misses above 128 bytes.
