@@ -375,7 +375,8 @@ as omitting one here.
 - Whether a global's summary is per symbol or per field for struct globals.
 - How often the pre-optimisation/post-optimisation gap (section 5, first limit) occurs in real code.
 - The interaction with stack packing of param homes (frame.md rule 9 mentions the callee's mask): not probed.
-- cl 13.10 and 15.00: nothing here was run on them.
+- cl 13.10 and 15.00: the store-before-call rule was run on 13.10.3077, 13.10.3052 and 15.00 and behaves as on 14.00 (ipa.md); the other tables here were not repeated.
+- The dead-store consequence on all four builds, `noinline`, and the icount hint: ipa.md.
 
 ---
 

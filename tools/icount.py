@@ -1089,8 +1089,11 @@ class Analysis:
                 if i["op"] in ASSERT_OPS or i["op"] in NOCODE_OPS:
                     continue
                 ik = "load" if how == "changed" else il_kind(i)
-                if (k, i["tup"], how) in used or ik not in COMPAT.get(kind, {kind}):
+                if (k, i["tup"], how) in used:
                     continue
+                if ik not in COMPAT.get(kind, {kind}) and not (
+                        kind == "store" and how == "removed" and ik in ("const", "copy") and self.ipa_cause(k, i)):
+                    continue                  # (a store to a local the call's summary says is unread: IL `s2 <- 0`)
                 score = (ik == kind, how == "removed", -d[0], -d[1])
                 if best is None or score > best[0]:
                     best = (score, k, i, how, new)
@@ -1113,6 +1116,15 @@ class Analysis:
                     r["now"] = new
                 self._why = None
                 cls = self.refine_removed(cls, i, k, kind, how)
+                if kind == "store" and how == "removed" and cls == "removed-by:GlobalOptimize/DeadStores":
+                    ic = self.ipa_cause(k, i)
+                    if ic:
+                        self._why = ("removed because the callee's body is visible in this unit (interprocedural "
+                                     "mod/ref): %s has a summary (c2 compiled it first) that says it does not read "
+                                     "the object the pointer argument points to, so the call does not use this store; the "
+                                     "original probably had the callee in another unit (declaration only), or its "
+                                     "body reads the object (docs/c2/ipa.md)" % ic)
+                        cls = "removed-by:DeadStores:callee-summary"
                 if self._why:
                     r["why"] = self._why
                 for c, o, t in self.hist.changes(i["tup"], k):
@@ -1139,6 +1151,33 @@ class Analysis:
             res.append(r)
         self._last_copy = last_copy
         return res, cands
+
+    def ipa_cause(self, k, i):
+        """The callee's name when tuple i (an assignment to a local, last present in snapshot k) was deleted by
+        GdfRemoveDeadStores because the next call takes the address of a local and carries c2's callee summary with
+        a read side without a set it writes (docs/c2/ipa.md): in the dump such a call lists points-at sets (pas)
+        among its destinations that are not among its sources (the callee's summary: written, not read), where a
+        call without a summary (declaration only, function pointer, virtual) has the same set on both sides and a
+        callee that reads through the pointer has it on both. Else None."""
+        if self.interval(k)[0] != "removed-by:GlobalOptimize/DeadStores" or not i["dsts"]:
+            return None
+        if i["dsts"][0].startswith("[") or re.match(r"t\d", i["dsts"][0]):
+            return None
+        s = self.snaps[k]
+        amp = False
+        for x in s.ins:
+            if x["pos"] <= i["pos"]:
+                continue
+            if x["op"] == "OPARG" and "s0=&" in x["notes"]:
+                amp = True
+            if x["op"] == "OPCALL":
+                pas_d = {d for d in x["dsts"] if re.match(r"pas\d+:", d)}
+                pas_s = {d for d in x["srcs"] if re.match(r"pas\d+:", d)}
+                if amp and pas_d - pas_s:
+                    m = re.match(r"[?@_]?([^@:]+)", x["srcs"][0]) if x["srcs"] else None
+                    return "`%s`" % (m.group(1) if m else "the callee")
+                return None
+        return None
 
     def _off_of_tup(self, t):
         for off, x in self.tup_at.items():
@@ -1312,6 +1351,10 @@ LEVERS = {
                                         "(a variable with two definitions, an address-taken local, opt.md §3)",
     "removed-by:GlobalOptimize/DeadStores": "the original keeps the store: it is read (a call, a load through "
                                             "another pointer) before it is overwritten, or its object escapes",
+    "removed-by:DeadStores:callee-summary": "the original keeps the store, so the call may read it: the callee is "
+                                            "declared only (another unit; no summary), or its body reads the object "
+                                            "or hands the pointer to other code. Declare it (do not define it) here, "
+                                            "or give a body that reads (docs/c2/ipa.md)",
     "removed-by:GlobalOptimize/SingleUseCopyProp": "the original keeps the variable: give it a second use or a "
                                                    "call-argument use (opt.md summary 2)",
     "merged:FgDoLateFlowOpts": "`c2trace.py merges --off OFF` names the pair and the first difference; "

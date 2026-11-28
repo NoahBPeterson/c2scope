@@ -76,6 +76,7 @@ under wine. The compile takes 1 to 5 s on the server, plus about 1 s of analysis
 | `removed-by:GlobalOptimize/CSE` | sweep 2 (GoptOptimizeBlock with CSE) deleted our reload; the original reloads | read through a reference or pointer used twice (loadcse R3), or a store or call between (loadcse.md §4); realize `alias2:CHAIN` |
 | `removed-by:GlobalOptimize/LocalCopyProp`, `/SingleUseCopyProp`, `/ReverseCopyProp`, `/sweep1`, `/Canonicalize` | copy and constant propagation removed a copy or a value the original keeps | the original's variable has a second definition, a call-argument use or its address taken (opt.md §3) |
 | `removed-by:GlobalOptimize/DeadStores` | GdfRemoveDeadStores deleted a store the original makes | in the original something reads it before the overwrite (opt.md §6) |
+| `removed-by:DeadStores:callee-summary` | the same, and the next call takes the address of a local and carries c2's callee summary (a written points-at set it does not read): the callee's body is in this unit and never reads the object. The report says "removed because the callee's body is visible in this unit (interprocedural mod/ref)" | the original probably had the callee in another unit (declaration only), or its body reads the object, or passes the pointer to unsummarised code (docs/c2/ipa.md; M&B 0x4b9aa0: with `http_fetch` declared only, 24 = 24) |
 | `folded:range-check` | sweep 1 decided a compare from a dominating test of the same value | the original's first test reads another value (the field through the pointer instead of the local copy); 13.10 only, 14.00 and 15.00 fold both (probe `range`) |
 | `folded:nonnull` | sweep 1 decided a null test from the `p != 0` assertion c2 inserts after `*p` | only a memory operand `[p+K]` asserts `p != 0` (opt.md 7.7): a copy into p written as `memset` or as an inline helper that passes the size to `memcpy` as a parameter (`MemCopy(p, src, sizeof(T))`) is still an intrinsic at that point and keeps the test; `*p = *src` and `memcpy` with a constant size at the site do not (f3decomp R1050, all four builds). Otherwise the original's test comes before the dereference, or the dereference is of another value. F3 0x00422420: byte match |
 | `folded:compare` | another compare folded (constant, assertion on a branch arm) | |
@@ -128,6 +129,7 @@ the count difference and the class.
 | tail | equal arm tails | -8 merged:FgDoLateFlowOpts (twins from FgTryTailMerge) | -8 | -8 |
 | stmt | a statement the original has | -1 structure | -1 | -1 |
 | fp | `f` rounded through its home (/fp:precise), against precise semantics off | +6, `flags:` /fp:fast | +6, `flags:` /fp:fast | 0, no hint |
+| ipa (`tests/data/icount_ipa.cpp`, `tests/probes/icount_ipa.py`) | a local struct zeroed before a call, callee in the unit (noinline, never reads it) against declared only | -5 callee-summary | -5 | -5 |
 
 Rule probes (tests/data/rules, rules_misc_tests; opt.md §8.1 items 5 and 6):
 
