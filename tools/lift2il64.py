@@ -1993,7 +1993,8 @@ class Lifter:
                 if m in ("lock inc", "lock dec", "lock xadd", "lock cmpxchg", "xchg", "lock add", "lock or",
                          "lock and", "lock xchg"):
                     self.atomic(k, i, m, ops)
-                    flags = self.atomic_flags if m in ("lock cmpxchg", "lock inc", "lock dec") else None
+                    flags = self.atomic_flags if m in ("lock cmpxchg", "lock inc", "lock dec") or \
+                        getattr(self, "xadd_fused", False) else None
                     continue
                 if m in ("cdq", "cqo"):
                     continue
@@ -2050,6 +2051,28 @@ class Lifter:
                     continue
                 raise Unsupported("instruction %s" % m)
 
+    def const_of(self, k, r, depth=0):
+        """The constant register r holds at k: every reaching def is `mov r, imm` / `or r, -1` of one value, or a
+        register copy of such a value (cl hoists a -1 into a callee-saved register and copies it in a loop)."""
+        ds = self.reach_defs.get((k, r), set())
+        vals = set()
+        for d in ds:
+            if d[0] in ("entry", "undef"):
+                return None
+            i = self.ins[d[0]]
+            o = i.operands
+            if i.mnemonic == "or" and len(o) == 2 and o[1].type == X.X86_OP_IMM and \
+                    (o[1].imm & ((1 << (8 * o[0].size)) - 1)) == (1 << (8 * o[0].size)) - 1:
+                vals.add(-1)
+            elif i.mnemonic == "mov" and len(o) == 2 and o[1].type == X.X86_OP_IMM:
+                v = o[1].imm & ((1 << (8 * o[0].size)) - 1)
+                vals.add(v - (1 << (8 * o[0].size)) if v >> (8 * o[0].size - 1) else v)
+            elif i.mnemonic == "mov" and len(o) == 2 and o[1].type == X.X86_OP_REG and depth < 2:
+                vals.add(self.const_of(d[0], canon(self.md.reg_name(o[1].reg)), depth + 1))
+            else:
+                return None
+        return vals.pop() if len(vals) == 1 else None
+
     def atomic(self, k, i, m, ops):
         """lock-prefixed read-modify-writes: the _Interlocked* intrinsics."""
         if ops[0].type != X.X86_OP_MEM:
@@ -2080,6 +2103,31 @@ class Lifter:
             self.emit(k, "OPARG", [a2], [self.opnd(k, ops[1]).rsplit(":", 1)[0] + ":" + ty])
             self.emit(k, "OPCALL", [], [fn + ":1008", a1, a2], "s0=" + fn)
             return
+        self.xadd_fused = False
+        if m == "lock xadd" and ops[1].type == X.X86_OP_REG:
+            r = canon(self.md.reg_name(ops[1].reg))
+            c = self.const_of(k, r)
+            nx = self.ins[k + 1] if k + 1 < len(self.ins) else None
+            step = None
+            if nx is not None and nx.operands and nx.operands[0].type == X.X86_OP_REG and \
+                    canon(self.md.reg_name(nx.operands[0].reg)) == r and nx.operands[0].size == w:
+                if nx.mnemonic in ("dec", "inc") and len(nx.operands) == 1:
+                    step = -1 if nx.mnemonic == "dec" else 1
+                elif nx.mnemonic in ("add", "sub") and len(nx.operands) == 2 and nx.operands[1].type == X.X86_OP_IMM:
+                    v = nx.operands[1].imm
+                    v = v - (1 << 64) if v >> 63 else v
+                    step = v if nx.mnemonic == "add" else -v
+            if c in (-1, 1) and step == c and not self.opts.get("noxaddfuse"):
+                # cl's _InterlockedDecrement / _InterlockedIncrement: t = -1; lock xadd [m], t; t = t - 1. With the
+                # xadd's result as a variable of its own, the chain splits from a hoisted -1 and takes another
+                # register (docs/c2/port-1700.md 13)
+                fn = "?__lift_Interlocked%s%s@@YAXXZ" % ("Decrement" if c < 0 else "Increment", sfx)
+                res = "%s:%s" % (self.var_written(k + 1, r), ty)
+                self.emit(k, "OPCALL", [res], [fn + ":1008", a1], "s0=" + fn)
+                self.div_skip.add(k + 1)
+                self.atomic_flags = (res, "0:%s" % ty, "i")
+                self.xadd_fused = True
+                return
         if m in ("lock xadd", "xchg", "lock xchg"):
             fn = "?__lift_Interlocked%s%s@@YAXXZ" % ("ExchangeAdd" if m == "lock xadd" else "Exchange", sfx)
             r = canon(self.md.reg_name(ops[1].reg))
