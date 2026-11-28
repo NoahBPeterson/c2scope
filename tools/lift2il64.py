@@ -468,6 +468,9 @@ class Lifter:
         self.names = names
 
     def var_read(self, k, r):
+        if self.opts.get("zeroconst") and isinstance(k, int) and self.zero_reg(k, r):
+            return "0"                          # a register holding 0 (xor r, r): the source's literal 0 (opt-in:
+                                                # on five near-misses of a retail x64 game it changed nothing)
         ds = self.reach_defs.get((k, r))
         if not ds:
             return "_u_" + r
@@ -1680,6 +1683,18 @@ class Lifter:
             at = n + 1
             # not after a branch or goto the def's instruction ended with (a call's result, then its jmp)
             self.lines.insert(at, l)
+
+    def zero_reg(self, k, r):
+        """Register r at k holds 0: its one reaching def is `xor r, r` (any width)."""
+        ds = self.reach_defs.get((k, r), set())
+        if len(ds) != 1:
+            return False
+        d = next(iter(ds))[0]
+        if d in ("entry", "undef") or not isinstance(d, int):
+            return False
+        z = self.ins[d]
+        return z.mnemonic == "xor" and len(z.operands) == 2 and z.operands[0].type == X.X86_OP_REG and \
+            z.operands[1].type == X.X86_OP_REG and z.operands[0].reg == z.operands[1].reg
 
     def is_zero(self, k, op):
         """op (a register operand at k) holds 0: `xor z, z` is its one reaching def."""

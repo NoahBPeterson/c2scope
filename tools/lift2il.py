@@ -657,8 +657,12 @@ class Lifter:
                     find(ds[0])
                     # a call's (or tail jmp's) ecx read only asks "is this a __thiscall"; when several defs reach it
                     # (entry this, a scratch value, an earlier call's clobber) it must not join their webs
-                    if not (r == "ecx" and len(ds) > 1 and (self.ins[k].mnemonic == "call" or
-                                                            self.is_tailjmp(self.ins[k]))):
+                    # (unless every one is an explicit write that is no call's clobber: `je L; lea ecx, [eax-4];
+                    # jmp M; L: xor ecx, ecx; M: call`, a member `this` or 0, Spore 00804f80)
+                    explicit = all(isinstance(d[0], int) and self.ins[d[0]].mnemonic in ("lea", "xor", "mov", "add",
+                                                                                         "sub") for d in ds)
+                    if not (r == "ecx" and len(ds) > 1 and not explicit and (self.ins[k].mnemonic == "call" or
+                                                                             self.is_tailjmp(self.ins[k]))):
                         for d in ds[1:]:
                             union(ds[0], d)
                     self.reach[(k, r)] = ds[0]
@@ -679,7 +683,8 @@ class Lifter:
                     names[root] = "_aedx"
                 else:
                     names[root] = "t%d" % (1000 + len(names))
-                    if any(e[1] in ("eax", "ebx", "esi", "edi") for e in ent):
+                    if any(e[1] in ("eax", "ebx", "esi", "edi", "ebp") for e in ent):   # (ebp: an EH funclet
+                        #                                    reading its parent's frame, Spore 01211470)
                         self.entry_webs.add(names[root])   # a value in a register no standard convention passes
         self.names = names
 
@@ -1142,6 +1147,9 @@ class Lifter:
                                                            (nxt.mnemonic == "pop" and nxt.op_str in ("ecx", "edx")))
                         if not caller_pops and top is not None and not self.od_ret and self.cleans_before_next_call(k):
                             caller_pops = True                 # the cleanup scheduled a few instructions later
+                        if not caller_pops and args and not self.od_ret and self.all_caller_popped(k, 4 * len(args)):
+                            caller_pops = True                 # merged with the next calls' (`push; call edx; push;
+                            #                                    call ecx; add esp, 0x18`)
                         if top is not None and not caller_pops:
                             esp_after = top                    # __stdcall / __thiscall: the callee popped them
                         else:
@@ -1161,6 +1169,14 @@ class Lifter:
                         if thiscall and args and not self.od_ret and self.all_caller_popped(k, 4 * len(args)):
                             thiscall = False                   # the cleanup after it pops its arguments with the next
                             #                                    calls': a thiscall callee pops its own (cdecl)
+                        if thiscall and ops[0].type == X.X86_OP_REG and self.md.reg_name(ops[0].reg) == "ecx":
+                            thiscall = False                   # `mov ecx, [ebx]; call ecx`: ecx is the callee
+                        if thiscall and args and not self.od_ret and top is not None and \
+                                self.own_cleanup(k, 4 * len(args) + (self.pending_below(k, top) or 0)):
+                            thiscall = False                   # the caller pops exactly its arguments and no earlier
+                            #                                    call's are pending (a merged cleanup): cdecl, and ecx
+                            #                                    is a leftover (`sub ecx, eax; and ecx, -2; cmp ecx, 2`:
+                            #                                    Spore 0065d9f0)
                         if thiscall and self.od_ret and args and caller_pops:
                             thiscall = False                   # /Od: no merged cleanups, so a callee whose arguments the
                             #                                    caller pops right away is cdecl (a thiscall callee pops them)
@@ -1211,8 +1227,10 @@ class Lifter:
                         esp = esp_after
                         flags = None
                     elif m == "ret":
-                        if ops:
+                        if ops and not getattr(self, "ret_seen", False):
                             self.ret_pop = ops[0].imm
+                        self.ret_seen = True                # the first ret's: a row whose size runs into the next
+                        #                                     function (Spore 0094d360: `ret 4`, then its `ret 8`)
                         if k in self.ret64:                 # edx:eax: an __int64 (find_i64)
                             self.value_ret = self.i64_ret = True
                             self.value_rets += 1
@@ -2932,6 +2950,41 @@ class Lifter:
                 return False
         return False
 
+    def own_cleanup(self, k, own):
+        """The first stack cleanup after the call at k, before the next call, branch or ret, pops exactly `own` bytes
+        (`add esp, own`, or `pop ecx` for 4) and is not the epilogue's frame teardown."""
+        pro = getattr(self, "pro", set())
+        self.caller_cleans(k)
+        for q in range(k + 1, len(self.ins)):
+            i = self.ins[q]
+            if i.mnemonic in ("call", "ret") or i.mnemonic.startswith("j"):
+                return False
+            if q in self.eh_ins:
+                continue
+            if i.mnemonic == "add" and i.op_str.startswith("esp, ") and i.operands[1].type == X.X86_OP_IMM:
+                if q in pro and i.operands[1].imm <= self.frame_alloc:
+                    continue
+                return i.operands[1].imm == own
+            if i.mnemonic == "pop" and i.op_str in ("ecx", "edx") and q not in pro:
+                return own == 4
+            if i.mnemonic == "push" or (i.mnemonic == "sub" and i.op_str.startswith("esp, ")):
+                return False
+        return False
+
+    def pending_below(self, k, top):
+        """Bytes of earlier calls' arguments still on the stack below the call at k's (a deferred cdecl cleanup):
+        the esp where k's block starts (after the prologue's pushes in it) minus the top of k's outgoing area."""
+        b = self.bl[next(n for n, b_ in enumerate(self.bl) if b_[0] <= k <= b_[-1])]
+        if b[0] not in self.at:
+            return None
+        base = self.at[b[0]][0]
+        for q in b:
+            if q >= k:
+                break
+            if q in self.pro and q in self.at:
+                base = self.stack_effect(self.ins[q], *self.at[q])[0]
+        return base - top
+
     def cleans_before_next_call(self, k):
         """An `add esp, N` / `pop ecx` cleanup after the call at k and before the next call, branch or ret (cl may
         schedule a `mov esi, eax` in between), not the epilogue's: this call's own arguments popped by the caller.
@@ -3220,17 +3273,30 @@ class Lifter:
                         not self.consumed(k, later[0]):
                     out.add(k)
                     out.add(later[0])
+        # the `push ecx` slots the entry reserved come back as `pop ecx` in an esp frame's epilogue (not a cleanup)
+        nslots = sum(1 for q in out if q < first_flow and self.ins[q].mnemonic == "push" and
+                     self.ins[q].op_str in ("ecx", "eax", "edx"))
+        ebpf = any(self.ins[q].op_str == "ebp, esp" for q in out)
         for k, i in enumerate(self.ins):
             if i.mnemonic != "ret":
                 continue
             j = k - 1
-            movesp = False
+            movesp = added = False
+            slots = nslots
+            while j >= 0 and slots and self.ins[j].mnemonic == "pop" and self.ins[j].op_str in ("ecx", "eax", "edx") \
+                    and not ebpf:
+                out.add(j)                          # `pop edi; pop esi; pop ecx; ret`: the slot (Spore 00c8f470)
+                slots -= 1
+                j -= 1
             while j >= 0 and (j in self.eh_ins or (self.ins[j].mnemonic == "pop" and self.ins[j].op_str in CALLEE_SAVED) or
                               self.ins[j].op_str in ("esp, ebp",) or self.ins[j].mnemonic == "leave" or
                               (self.ins[j].mnemonic == "add" and self.ins[j].op_str.startswith("esp, "))):
-                if self.od_ret and self.ins[j].mnemonic == "add" and movesp:
-                    break                           # /Od: `add esp, N; mov esp, ebp` is a call's cleanup, then the epilogue
-                movesp = movesp or self.ins[j].op_str == "esp, ebp"
+                if self.ins[j].mnemonic == "add" and j not in self.eh_ins and (movesp or added):
+                    break                           # `add esp, N; mov esp, ebp` (/Od) and `add esp, N; pop edi; ..;
+                    #                                 add esp, M; ret`: the frame has one teardown, the earlier add
+                    #                                 is a call's cleanup (Spore 00656b80)
+                movesp = movesp or self.ins[j].op_str == "esp, ebp" or self.ins[j].mnemonic == "leave"
+                added = added or (self.ins[j].mnemonic == "add" and j not in self.eh_ins)
                 out.add(j)
                 j -= 1
         return out

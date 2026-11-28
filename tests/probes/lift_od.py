@@ -23,5 +23,8 @@ for _nm, _what in (("?od_sum@@", "for loop with an induction variable and a load
                    ("?od_bfset@@", "an inline bitfield setter called with constants"),
                    ("?nestcopy@NT@@", "a by-value copy built in place whose member has its own copy constructor"),
                    ("?pinc@PIO@@", "an inlined `return x++ + k` whose result is dropped: a temporary below this's home"),
-                   ("?big@BFR@@", "a frame over a page: the stack probe after the ebp setup keeps ecx (`this`)")):
+                   ("?big@BFR@@", "a frame over a page: the stack probe after the ebp setup keeps ecx (`this`)"),
+                   ("?od_bload@@", "a bool function returning a bool member: mov al, [eax+N], no cmp / setne"),
+                   ("?od_bloc@@", "a bool function returning a bool local: mov al, [ebp-x]"),
+                   ("?od_bnot@@", "`return !f();` of a bool callee in an int function (neg / sbb / add 1)")):
     check("lift /Od: %s" % _what, next((v for k, v in _got.items() if k.startswith(_nm)), _r.stderr[-300:]), "MATCH")

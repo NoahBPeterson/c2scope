@@ -1322,8 +1322,8 @@ def od_return_merge(body):
     one register both arms leave, not a variable)."""
     lines = body.split("\n")
     for r in range(len(lines) - 1, 0, -1):
-        m = re.match(r"^\s+return \(*(t\d+)\)*;$", lines[r])
-        if not m or lines[r - 1].strip() != "}":
+        m = re.match(r"^\s+return (?:\((?:bool|unsigned char|int)\))*\(*(t\d+)\)*;$", lines[r])
+        if not m or lines[r - 1].strip() != "}":     # (through the casts to the return type: Spore 007fd390)
             continue
         T = m.group(1)
         sub = _push_ret(lines, r - 1, T)

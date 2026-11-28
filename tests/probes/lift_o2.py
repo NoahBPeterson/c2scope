@@ -20,3 +20,9 @@ _g = os.path.join(HERE, "work", "scratch", "il2c_od", "gen_%s.cpp" % _hl.md5(b"?
 check("lift /O2: fucomip / fcomip pop the x87 stack (an int function, no float left for the ret)",
       bool(os.path.exists(_g) and 'int __cdecl FUN_' in open(_g).read() and "return (float)" not in open(_g).read()),
       True)
+for _nm, _what in (("?o2_vmem@@", "a virtual call on a member object, the vtable read through the owner's base"),
+                   ("?o2_cfp@@", "merged cdecl cleanups and an esp frame's own teardown; `call ecx` passes no this"),
+                   ("?o2_bret@@", "a bool variable returned as is (mov al, bl)"),
+                   ("?o2_bret2@@", "a bool callee's result kept in a bool variable"),
+                   ("?o2_subsw@@", "a chain of subs tested against 0 is a switch (sub eax, K; je; sub eax, 8; je)")):
+    check("lift /O2: %s" % _what, next((v for k, v in _got.items() if k.startswith(_nm)), "?"), "MATCH")

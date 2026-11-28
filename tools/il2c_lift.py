@@ -41,6 +41,8 @@ class LiftEmitter(il2c.Emitter):
         self.inl = True                      # the flags let c2 inline (/Ob1, /Ob2): helpers that rely on it are usable
         self.od = False                      # /Od: the object of a virtual call is evaluated twice (canon)
         self.defsrc = {}                     # temporary -> the frame slot / argument it copies
+        self.addk = {}                       # temporary -> (base, N) of `t = base + N` (a member's address)
+        self.vc_this = {}                    # OPARG temporary -> (t, `base + N`): a virtual call's object (vcall_member)
 
     def canon(self, t, depth=0):
         """The expression a temporary stands for, through register copies and loads (two temporaries loaded the
@@ -95,6 +97,10 @@ class LiftEmitter(il2c.Emitter):
             return "(%s)(self)" % CTYPE.get(ty, "int")
         if n.startswith("_a") and ty in ("1004", "2004") and self.ptypes.get(nm) in ("float",):
             return "(%s)(*(%s*)&%s)" % (CTYPE[ty], CTYPE[ty], nm)     # a float argument's bits, copied as a dword
+        if n.startswith("_a") and CTYPE.get(ty) in ("float", "double") and nm in self.ptypes and \
+                self.ptypes.get(nm) not in ("float", "double"):
+            return "(*(%s*)&%s)" % (CTYPE[ty], nm)   # a float stored over an int argument's slot, read back: its
+            #                                         bits (`fld [esp+0x14]`), not a conversion (fild: Spore 00f1aa10)
         if n.startswith("_l") and ty in ("1008", "2008"):
             # an __int64 read of a frame slot (`fild qword [esp+0x34]`, `params[i]`): its 8 bytes, not the
             # declared dword widened (lift2il makes such a slot a 2-dword aggregate, so the halves stay adjacent)
@@ -149,6 +155,16 @@ class LiftEmitter(il2c.Emitter):
                 self.copyof[dn] = sn
             elif self.od and re.match(r"^_[al]\d+$", sn) and re.match(r"^t\d+$", dn):
                 self.defsrc[dn] = sn
+        for w in L["dsts"]:                       # a write to a member address's base (or to it) ends its entry
+            w = strip_reg(w).rsplit(":", 1)[0]
+            if not w.startswith("[") and self.addk:
+                for t_ in [t_ for t_, (b_, _n) in self.addk.items() if t_ == w or b_ == w]:
+                    del self.addk[t_]
+        if L["op"] in ("add", "OPADD") and L["dsts"] and len(L["srcs"]) == 2:
+            dn, sn = strip_reg(L["dsts"][0]).rsplit(":", 1)[0], strip_reg(L["srcs"][0]).rsplit(":", 1)[0]
+            mk = re.match(r"^(-?\d+):1004$", strip_reg(L["srcs"][1]))
+            if mk and re.match(r"^(t\d+|_this)$", sn) and re.match(r"^t\d+$", dn):
+                self.addk[dn] = (sn, mk.group(1))     # `lea / add r, N`: a member's address (vcall_member)
         if L["op"] == "OPEHSTATE":
             return ("stmt", "__EH(%s);" % L["srcs"][0].split(":")[0])
         if L["op"] == "OPEHRESUME":
@@ -300,6 +316,35 @@ class LiftEmitter(il2c.Emitter):
                 tys[q:q + k_] = [st]
         return argv, tys
 
+    def vcall_member(self, vp, a0):
+        """`mov eax, [ecx+N]; mov edx, [eax+D]; add ecx, N; call edx`: the vtable read through the object's base
+        before its `this` (base + N) is formed, `p->m.f()` for a member m at N (Spore 00c24430). The vtable load
+        then reads `[this+0]`."""
+        mb = re.match(r"^\[(t\d+|_this):1004\+(-?\d+)\]:1004$", self.loads[vp])
+        if not mb or mb.group(2) == "0":
+            return
+        x, seen = self.argsrc.get(a0, a0), set()
+        while x not in self.addk and x in self.copyof and x not in seen:
+            seen.add(x)
+            x = self.copyof[x]
+        if self.addk.get(x) == (mb.group(1), mb.group(2)):
+            self.loads[vp] = "[%s:1004+0]:1004" % x
+            self.argsrc[a0] = x
+            # the object as the expression `base + N` at the call (cl reads the vtable through the base before it
+            # forms `this`; a named `this` computed before an intervening store would be a lea first, read through)
+            b_ = "(int)(self)" if mb.group(1) == "_this" else mb.group(1)
+            self.vc_this[a0] = (x, "(%s + (int)(%s))" % (b_, mb.group(2)))
+
+    def vc_inline(self, r, srcs):
+        """The virtual call r with its object written as vcall_member's expression."""
+        if len(srcs) > 1:
+            a0 = strip_reg(srcs[1]).rsplit(":", 1)[0]
+            if a0 in self.vc_this:
+                x, e = self.vc_this.pop(a0)
+                r = re.sub(r"(\(il2c_vc\d+\*\)\()(\(int\)\(%s\)|%s)\)" % (x, x), lambda m: m.group(1) + e + ")", r,
+                           count=1)
+        return r
+
     def call(self, L):
         d = [t for t in L["dsts"] if not re.match(r"^pas\d+", t)]
         srcs = [t for t in L["srcs"] if not re.match(r"^pas\d+", t)]
@@ -311,6 +356,8 @@ class LiftEmitter(il2c.Emitter):
             mv = re.match(r"^\[([^+\]]+):1004\]:1004$", self.loads[vp])
             if mv:
                 self.loads[vp] = "[%s:1004+0]:1004" % mv.group(1)
+            if len(srcs) > 1:
+                self.vcall_member(vp, strip_reg(srcs[1]).rsplit(":", 1)[0])
             base = re.match(r"^\[([^+\]]+):", self.loads[vp]).group(1)
             if len(srcs) > 1:
                 a0 = strip_reg(srcs[1]).rsplit(":", 1)[0]
@@ -322,7 +369,7 @@ class LiftEmitter(il2c.Emitter):
                     self.argsrc[a0] = base
             r = super().indirect(L, d, ["[%s:1004+%s]:1004" % (vp, mmem.group(2) or "0")] + srcs[1:])
             if "il2c_vc" in r:
-                return r
+                return self.vc_inline(r, srcs)
         if re.match(r"^t\d+$", tgt) and L["notes"].get("thiscall") == "1" and tgt in self.loads and \
                 not self.lang_c:
             # `mov eax, [ecx]; mov edx, [eax+D]; call edx` with ecx = this: a virtual call. il2c writes one from
@@ -333,6 +380,8 @@ class LiftEmitter(il2c.Emitter):
                 mv = re.match(r"^\[([^+\]]+):1004\]:1004$", self.loads[vp])
                 if mv:
                     self.loads[vp] = "[%s:1004+0]:1004" % mv.group(1)
+                if len(srcs) > 1:
+                    self.vcall_member(vp, strip_reg(srcs[1]).rsplit(":", 1)[0])
                 base = re.match(r"^\[([^+\]]+):", self.loads[vp]).group(1)
                 if len(srcs) > 1:                     # `this` passed through a register copy of the object
                     a0 = strip_reg(srcs[1]).rsplit(":", 1)[0]
@@ -345,7 +394,7 @@ class LiftEmitter(il2c.Emitter):
                         self.argsrc[a0] = base
                 r = super().indirect(L, d, ["[%s:1004+%s]:1004" % (vp, disp)] + srcs[1:])
                 if "il2c_vc" in r:
-                    return r
+                    return self.vc_inline(r, srcs)
         g = self._gva(tgt)
         if g is not None and L["notes"].get("thiscall") == "1":
             # `mov ecx, X; call [g]`: a __thiscall through a global pointer. C++ has no __thiscall function pointer;
@@ -499,6 +548,177 @@ def alias_this(il):
             continue
         out.append(re.sub(r"\b(t\d+):", lambda mm: "_this:" if mm.group(1) in al else mm.group(0), l))
     return out, al
+
+
+def sub_switch(il, lf):
+    """`sub eax, K1; je L1; sub eax, K2; je L2; ...` (each difference read only by its test and the next sub) is cl's
+    lowering of a switch with a few sparse cases [M: probe, 15.00: `switch (x) { case K: .. case K + 8: .. }` gives
+    `sub eax, K; je; sub eax, 8; je`, the if-chain `x == K .. x == K + 8` gives `cmp eax, K; jne` and the differences
+    spelled out give `sub eax, K; jne; add eax, -8`] (Spore 00ea2670, 00a52840, 008aec30): a switch on the first
+    sub's operand, case K1, K1+K2, ...; a last `jne D` makes D the default and the fall-through that case."""
+    out = list(il)
+    occ = collections.Counter()                     # reads (a register web's other definitions do not count:
+    for l in out:                                   # Spore 00a52840's eax web, defined again by a later call)
+        if l.startswith("I ") and "|" in l:
+            occ.update(re.findall(r"\b(t\d+):", l.split("|", 1)[1].split("<-", 1)[-1]))
+    refs = collections.Counter(re.findall(r"s0=(L[0-9a-f]+)", "\n".join(out)))
+    n = 0
+    while n < len(out):
+        m = re.match(r"^I ([0-9a-f]+) sub \S+ \S+ \| (t\d+):1004 <- (t\d+|_[a-z]\w*|_this):1004 (-?\d+):1004\s*$", out[n])
+        if not m:
+            n += 1
+            continue
+        x, cur, cum = m.group(3), m.group(2), int(m.group(4))
+        chain, keep, q, end, uses = [], [], n, None, collections.Counter()
+        cases = []
+        while True:
+            j = q + 1
+            mid = []
+            while j < len(out) and out[j].startswith("I ") and not re.search(r"\b%s:" % cur, out[j]) and \
+                    " OPBRANCH " not in out[j] and " OPCALL " not in out[j]:
+                mid.append(j)
+                j += 1
+            if j + 1 >= len(out):
+                break
+            mc = re.match(r"^I \S+ OPCMP \S+ \S+ \| (t\d+):9000 <- %s:1004 0:1004\s*$" % cur, out[j])
+            mb = re.match(r"^I \S+ OPBRANCH \S+ \S+ \|\s+<- s0:0 (t\d+):9000 -> ; cc=(e|ne) s0=(L[0-9a-f]+)\s*$",
+                          out[j + 1])
+            if not mc or not mb or mb.group(1) != mc.group(1):
+                break
+            uses[cur] += 1
+            keep += mid
+            chain += [q, j, j + 1]
+            lab = out[j + 2] if j + 2 < len(out) and out[j + 2].startswith("L ") else None
+            if mb.group(2) == "ne":
+                if lab is None:
+                    break
+                cases.append(((cum + 2 ** 31) % 2 ** 32 - 2 ** 31, "L" + lab.split()[1]))
+                end = (j + 2, mb.group(3))
+                break
+            cases.append(((cum + 2 ** 31) % 2 ** 32 - 2 ** 31, mb.group(3)))
+            if lab is None:
+                break
+            nx = re.match(r"^I \S+ sub \S+ \S+ \| (t\d+):1004 <- %s:1004 (-?\d+):1004\s*$" % cur, out[j + 3]) \
+                if j + 3 < len(out) else None
+            if not nx or refs["L" + lab.split()[1]]:
+                end = (j + 2, "L" + lab.split()[1])
+                break
+            chain.append(j + 2)
+            uses[cur] += 1                              # read by the next sub
+            cur, cum, q = nx.group(1), cum + int(nx.group(2)), j + 3
+        if end is None or len(cases) < 2 or x in uses or not _sub_chain_dead(lf, [out[k] for k in chain]):
+            n += 1
+            continue
+        a0 = m.group(1)
+        sw = "I %s OPSWITCH 0 0 | <- %s:1004 ; sw=%s def=%s" % (
+            a0, x, ",".join("%d:%s" % (v, t) for v, t in cases), end[1])
+        new = [out[k] for k in keep] + [sw]
+        lo, hi = n, end[0]
+        out[lo:hi] = new
+        n = lo + len(new)
+    return out
+
+
+def _sub_chain_dead(lf, lines):
+    """Each sub of the chain is read by the next sub alone (its test reads the flags): the lifter's reaching
+    definitions, since a register web's name also covers later, unrelated definitions."""
+    idx = {i.address: k for k, i in enumerate(lf.ins)}
+    subs = [idx.get(int(l.split()[1], 16)) for l in lines if " sub " in l]
+    if None in subs:
+        return False
+    for n, ks in enumerate(subs):
+        i = lf.ins[ks]
+        if i.mnemonic not in ("sub", "dec") or not i.operands or i.operands[0].type != 1:
+            return False
+        r = lift2il.full(lf.md.reg_name(i.operands[0].reg))
+        uses = {ku for (ku, rr), ds in lf.reach_defs.items() if rr == r and any(d[0] == ks for d in ds) and
+                not (lf.ins[ku].mnemonic == "ret" and (not lf.fn_value or (
+                    lf.value_rets and lf.byte_rets == lf.value_rets)))}   # (a void function's ret reads no eax, a
+        #                                                                       bool function's only the al it wrote)
+        def partial(ku):                            # `xor al, al` / `mov al, 1` / `setcc al`: a byte write, not a read
+            j = lf.ins[ku]
+            o = j.op_str.split(", ")
+            return j.operands and j.operands[0].type == 1 and j.operands[0].size < 4 and \
+                lift2il.full(o[0]) == r and (j.mnemonic.startswith("set") or (j.mnemonic == "mov" and r not in
+                                             lift2il.full(o[-1])) or (j.mnemonic in ("xor", "sub") and o[0] == o[-1]))
+        uses = {ku for ku in uses if not partial(ku)}
+        if not uses <= ({subs[n + 1]} if n + 1 < len(subs) else set()):
+            return False
+    return True
+
+
+def param_args(body):
+    """A parameter copied to a temporary that is only ever passed as a stack argument (`t = a4; f(t, &x); g(t)`)
+    passes the parameter itself: c2's stack packing gives a dead cdecl parameter's home to a local only when the
+    parameter is read by something other than a call argument (frame.md rule 9, MdmFlagUnsafeForStackPackParams),
+    and the copy is such a read, so cl put an address-taken local in the home where retail has its own slot
+    (Spore 00f39130: `sub esp, 0xc` for retail's 0x10)."""
+    if not re.search(r"&v_l\w", body):
+        return body                                  # (no address-taken local: the home decides nothing, and a
+        #                                              copy loaded early is what retail has: Spore 00804f80)
+    for m in re.finditer(r"(?m)^    (t\d+) = \(int\)\(\(int\)\((a\d+)\)\);$", body):
+        t, a = m.groups()
+        if re.search(r"(?m)^\s*%s = |&%s\b|\b%s\b\s*(\+\+|--|[-+*/&|^]?=[^=])" % (a, a, a), body) or \
+                len(re.findall(r"(?m)^\s*%s = " % t, body)) != 1 or not re.search(r"(?m)^    int %s;$" % t, body):
+            continue
+        uses = [l for l in body.split("\n") if re.search(r"\b%s\b" % t, l) and not re.match(r"^\s*(int )?%s( = |;)" % t, l)]
+        if not uses or not all(re.search(r"(FUN_[0-9a-f]{8}|->s\d+)\(", l) and
+                               len(re.findall(r"\b%s\b" % t, l)) ==
+                               len(re.findall(r"[(,] ?\((?:unsigned )?int\)\(%s\)" % t, l)) and
+                               not re.search(r"\(\((?:C_[0-9a-f]{8}|il2c_vc\d+)\*\)\(%s\)\)" % t, l) for l in uses):
+            continue
+        body = body.replace(m.group(0) + "\n", "", 1)
+        body = re.sub(r"\b%s\b" % t, a, body)
+        body = re.sub(r"(?m)^    int %s;\n" % a, "", body)
+    return body
+
+
+def member_base(il, lf):
+    """`mov ebx, [esi+0x18]; mov edi, [esi+0x1c]; add esi, 0x18` (Spore 006a2b20): retail forms a member's address
+    in place, in the base's own register, after loads at that member's offsets. The source read the member
+    through its address (`v = &this->m; v->a; v->b`): cl folded the address back into the loads and gave the
+    pointer the base's register. Written as loads through the base (`this->m.a`) and a later `&this->m`, cl keeps
+    both and forms the pointer with a lea into another register. So: when the add rewrites its own register
+    (`add r, N`, not a lea) and the base's web ends there, the loads of [base + N + k] (k >= 0) before it in the same
+    block, past every other read of the base, read through the pointer, which is formed before the first of them."""
+    out = list(il)
+    byaddr = {i.address: i for i in lf.ins}
+    for n, l in enumerate(out):
+        m = re.match(r"^I ([0-9a-f]+) add \S+ \S+ \| (t\d+):1004 <- (t\d+|_this):1004 (\d+):1004\s*$", l)
+        if not m:
+            continue
+        i = byaddr.get(int(m.group(1), 16))
+        if i is None or i.mnemonic != "add" or i.operands[0].type != 1:
+            continue                                   # (X86_OP_REG = 1: `add r, N`; a lea keeps its base)
+        tn, tb, N = m.group(2), m.group(3), int(m.group(4))
+        if any(re.search(r"\b%s:" % tb, x) for x in out[n + 1:] if x.startswith("I ")):
+            continue                                   # the base is read later: not the web's end
+        loads, first = [], None
+        for q in range(n - 1, -1, -1):
+            x = out[q]
+            if not x.startswith("I ") or re.search(r" (OPBRANCH|OPSWITCH|OPCALL|OPARG|OPRET) ", x):
+                break                                  # the block's straight-line run since the last call
+            dst = x.split("|", 1)[1].split("<-")[0].strip() if "|" in x else ""
+            if re.match(r"^(%s|%s):" % (tb, tn), dst):
+                break                                  # the base (or the pointer) written here
+            if re.search(r"\b%s:" % tn, x):
+                break
+            src = x.split("<-", 1)[1] if "<-" in x else ""
+            ks = [int(k_) for k_ in re.findall(r"\[%s:1004\+(\d+)\]" % tb, src)]
+            if ks and all(N <= k_ < N + 64 for k_ in ks) and len(re.findall(r"\b%s:" % tb, x)) == len(ks) and \
+                    not re.search(r"\b%s:" % tb, dst):
+                loads.append((q, None, ks))            # a load (or an operation's memory operand: `sub edi,
+                first = q                              # [esi+0x18]`) at the member's offsets
+                continue
+            if re.search(r"\b%s:" % tb, x):
+                break                                  # another read of the base: the loads stop here
+        if not loads:
+            continue
+        for q, _d, ks in loads:
+            out[q] = re.sub(r"\[%s:1004\+(\d+)\]" % tb, lambda m_: "[%s:1004+%d]" % (tn, int(m_.group(1)) - N), out[q])
+        mv = out.pop(n)
+        out.insert(first, mv)
+    return out
 
 
 PURE_CALL = re.compile(r"[A-Za-z_]\w*\(|->")
@@ -1669,7 +1889,7 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
             # convention passes (LTCG's custom conventions). (A register a call leaves beside its modelled result,
             # edx of an edx:eax return or eax beside st0, also reads as never written; those stay DIFF rows.)
             raise Unsupported("a register argument outside the standard conventions (%s read at the entry: an "
-                              "LTCG custom convention)" % ", ".join(undef[:3]))
+                              "LTCG custom convention, or ebp: an EH funclet in its parent's frame)" % ", ".join(undef[:3]))
     if re.search(r"\bv_[la]-\d", text) and not partial:
         # the bytes above the topmost dword local of a frame without ebp (`mov word ptr [esp+0x1a]` with the slots
         # named from entry-4): a valid slot, only its name needs no minus sign
@@ -1726,6 +1946,10 @@ def _unit(img, va, size, mask=None, flags=None, partial=None, od=None):
     inl_helpers = []
     if not od and not lf.eh and INLINE_DB:
         il, inl_helpers = inline_sites(lf, il, img, flags)
+    if not od and os.environ.get("L2C_SUBSWITCH", "1") != "0":
+        il = sub_switch(il, lf)
+    if not od and os.environ.get("L2C_MEMBASE", "1") != "0":
+        il = member_base(il, lf)
     this = any(re.search(r"\b_this:", l) for l in il)
     nargs = max([(o - 4) // 4 + 1 for o in lf.args_read] + [lf.ret_pop // 4])
     params = ["a%d" % (4 + 4 * k) for k in range(nargs)]
@@ -1769,6 +1993,8 @@ def _unit(img, va, size, mask=None, flags=None, partial=None, od=None):
         body = drop_dead(body)
     if not od and os.environ.get("L2C_ESCAPED", "1") == "1":
         body = escaped_objects(body, lf)
+    if not od and os.environ.get("L2C_PARAMARGS", "1") != "0":
+        body = param_args(body)
     body = drop_unused_decls(size_addressed_locals(fold_aggregates(body, lf), lf))
     if not od and os.environ.get("C2_BUILD", "").startswith(("13.10", "3052")) and os.environ.get("INVERT_OFF") != "1" \
             and os.environ.get("INVERT_X87") != "0":     # invert: x87names (13.10 rounds a float field, not a local)
@@ -1888,7 +2114,12 @@ def _unit(img, va, size, mask=None, flags=None, partial=None, od=None):
     elif ret == "bool":
         body = bool_flags(body)
     head += inl_helpers                                  # inlined callees, defined ahead of the caller
-    return "\n".join(head) + ("\n\n" if head else "") + sig + body + "\n", lf
+    if od and not lang_c:
+        body = od_bool_returns(body, ret)
+    text = "\n".join(head) + ("\n\n" if head else "") + sig + body + "\n"
+    if ret == "bool" and not lang_c and not od and os.environ.get("L2C_BOOLVARS", "1") != "0":
+        text = bool_vars(text)
+    return text, lf
 
 
 def inline_x87(body):
@@ -1947,6 +2178,111 @@ def bool_flags(body):
             body = re.sub(r"\b%s = \(unsigned char\)\(\(int\)([01])\);" % x,
                           lambda m: "%s = %s;" % (x, "true" if m.group(1) == "1" else "false"), body)
     return body
+
+
+def od_bool_returns(body, ret):
+    """/Od returns of bools [M: probes, 15.00]. A bool function returning a byte it loads (`mov al, [ebp-x]` /
+    `mov al, [eax+0x38]`) returns a bool lvalue: `return *(bool*)&v;` (as `(bool)(unsigned char)v` cl tests it:
+    `cmp byte [ebp-x], 0; setne al`; Spore 0045cd90, 0054efb0). An int function returning `x == 0` of a value
+    with `neg eax; sbb eax, eax; add eax, 1` returns `!x` (the compare spelled out is `test; sete; movzx`:
+    Spore 005632d0)."""
+    if ret == "bool":
+        body = re.sub(r"(?m)^(\s*)return \(bool\)\(unsigned char\)\*\(unsigned char\*\)(.+);$",
+                      r"\1return *(bool*)\2;", body)
+        body = re.sub(r"(?m)^(\s*)return \(bool\)\(unsigned char\)([A-Za-z_][\w.]*);$", r"\1return *(bool*)&\2;", body)
+    elif ret == "int":
+        body = re.sub(r"(?m)^(\s*)return \(int\)\(unsigned char\)\((.+) == 0\);$", r"\1return !(\2);", body)
+    return body
+
+
+_BOOL_CMP = re.compile(r"^\(unsigned char\)(\((?:\([^;]*\)) (?:==|!=|<|>|<=|>=) (?:\([^;]*\))\))$")
+
+
+def bool_vars(text):
+    """A bool function's returned byte variable as the source's `bool` (Spore 006bd430, 00c5b210: `mov al, bl` at
+    the ret; as unsigned char, `return (bool)x` costs cl a `test bl, bl; setne al`). The variable and the byte
+    copies it is returned through are one group; each assignment to them must already be a bool: 0 or 1, a
+    member of the group, a compare (`(unsigned char)(a < b)`), a byte load (read as `*(bool*)`), or a call's
+    result used nowhere else (the callee then returns bool: `bool b = f()` keeps al as is). Any other assignment
+    (a 2 or 3, an arbitrary byte) leaves the group as it is. Reads (`b != 0`, stores of b) do not change."""
+    sig = re.search(r"(?m)^extern \"C\" bool \w+ (FUN_[0-9a-f]{8})\(", text)
+    if not sig:
+        return text
+    head, body = text[:sig.start()], text[sig.start():]
+    grp = set(re.findall(r"\breturn \(bool\)\((t\d+)\);", body))
+    changed = True
+    while changed:
+        changed = False
+        for x in list(grp):
+            for y in re.findall(r"(?m)^\s*%s = \(unsigned char\)\((t\d+)\);$" % x, body):
+                if y not in grp:
+                    grp.add(y)
+                    changed = True
+    grp = {x for x in grp if re.search(r"(?m)^    unsigned char %s;$" % x, body)}
+    if not grp:
+        return text
+    edits, calls = [], []                               # (old line, new line); callee declarations to make bool
+    lines = body.split("\n")
+    for n, l in enumerate(lines):
+        m = re.match(r"^(\s*)(t\d+) = (.*);$", l)
+        if not m or m.group(2) not in grp:
+            continue
+        ind, x, e = m.groups()
+        mk = re.match(r"^\(unsigned char\)\(\(int\)([01])\)$", e)
+        mc = re.match(r"^\(unsigned char\)\((t\d+)\)$", e)
+        mb = _BOOL_CMP.match(e)
+        ml = re.match(r"^\(unsigned char\)\(\*\(unsigned char\*\)(.*)\)$", e)
+        mr = re.match(r"^\(unsigned char\)\(\(unsigned char\)\((t\d+)\)\)$", e)
+        if mk:
+            edits.append((n, "%s%s = %s;" % (ind, x, "true" if mk.group(1) == "1" else "false")))
+        elif mc and mc.group(1) in grp:
+            edits.append((n, "%s%s = %s;" % (ind, x, mc.group(1))))
+        elif mb:
+            edits.append((n, "%s%s = %s;" % (ind, x, mb.group(1))))
+        elif ml:
+            edits.append((n, "%s%s = *(bool*)%s;" % (ind, x, ml.group(1))))
+        elif mr and n > 0:
+            c = mr.group(1)
+            q0 = n - 1                                  # the call: a few plain statements back that touch
+            while q0 > n - 4 and q0 > 0 and not re.match(r"^\s*%s = " % c, lines[q0]) and \
+                    re.match(r"^\s+[^\s{}]+.*;$", lines[q0]) and not re.search(r"\b(%s|%s)\b" % (c, x), lines[q0]) \
+                    and not re.search(r"\b(return|goto)\b|:;$", lines[q0]):   # neither it nor the variable
+                q0 -= 1
+            mcall = re.match(r"^(\s*)%s = \(int\)(.*\b(FUN_[0-9a-f]{8}|s\d+)\(.*\));$" % c, lines[q0])
+            reads = [q for q, l2 in enumerate(lines) if re.search(r"\b%s\b" % c, l2) and
+                     not re.match(r"^\s*%s = " % c, l2) and not re.match(r"^\s*int %s;$" % c, l2)]
+            if not mcall or reads != [n] or mcall.group(1) != ind:
+                return text
+            cls = re.match(r"^\(\((il2c_vc\d+|C_[0-9a-f]{8})\*\)", mcall.group(2))
+            calls.append((mcall.group(3), cls.group(1) if cls else None))
+            edits.append((q0, "%s%s = %s;" % (ind, x, mcall.group(2))))
+            edits.append((n, None))
+        else:
+            return text
+    # a callee made bool must return bool at every call (a member stand-in or extern shared with int uses: no)
+    for fn, cls in calls:
+        uses = len(re.findall(r"(?m)^\s*\w+ = .*\b%s\(" % fn, body)) if cls is None or cls.startswith("C_") else 1
+        #     (a call whose result nobody takes is the same under a bool return)
+        if uses != sum(1 for f_, _c in calls if f_ == fn):
+            return text
+    for n, l in sorted(edits, key=lambda e: e[0], reverse=True):
+        if l is None:
+            del lines[n]
+        else:
+            lines[n] = l
+    body = "\n".join(lines)
+    for x in grp:
+        body = re.sub(r"(?m)^    unsigned char %s;$" % x, "    bool %s;" % x, body)
+        body = body.replace("return (bool)(%s);" % x, "return %s;" % x)
+    for fn, cls in set(calls):
+        if cls and cls.startswith("il2c_vc"):
+            head = re.sub(r"(struct %s \{(?:\n    virtual \w+ s\d+\(\);)*\n    virtual )int (%s\()" % (cls, fn),
+                          r"\1bool \2", head)
+        elif cls:
+            head = re.sub(r"(struct %s \{ )int (%s\()" % (cls, fn), r"\1bool \2", head)
+        else:
+            head = re.sub(r"(extern \"C\" )int( __\w+ %s\()" % fn, r"\1bool\2", head)
+    return head + body
 
 
 INTRIN = {

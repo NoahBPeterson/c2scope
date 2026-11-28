@@ -217,6 +217,82 @@ The full runs (`spore_all_od1`, `spore_all_o2a`, `spore_all_o2b`) had 52 EMIT-ER
   `drop_unused_decls` and `inline_x87` count once: Spore 00441440 (23 KB /Od) and 007864c0 (58 KB /O2), over lbench's
   60 s before, lift in 21 s and 17 s (00441440's unit is byte-identical with and without the speedups).
 
+## Structure causes of the closest DIFFs (2026-11-28)
+
+The Spore-Decomp session sorted the 498 closest lifts of the full runs (bdiff <= 32; spore-decomp
+work/claude/lift_structure_breakdown.md) by cause. What each turned out to be, and the rule now in the lifter:
+
+- **Calling conventions at call sites** (#2).
+  - The frame has one teardown: in `call f; add esp, 0xc; pop edi; pop esi; pop ebx; add esp, 0xc; ret 4` the first
+    add is f's cleanup (f is cdecl), the second the frame's; also `add esp, N; mov esp, ebp` / `leave` at /O2 (Spore
+    00656b80). The prologue walk-back from a ret takes one `add esp`.
+  - A call whose stack arguments the caller pops by exactly their size before the next call / branch, with no earlier
+    call's arguments still pending below them, is cdecl even when ecx was written before it: ecx is a leftover
+    (`sub ecx, eax; and ecx, -2; cmp ecx, 2; jle; push eax; call free; add esp, 4`: Spore 0065d9f0, 0065d720, 006963d0,
+    007ec660, 008d6be0, 009338e0, 009699d0). A merged cleanup counts the pending bytes too (`own + pending`).
+  - A cleanup merged with later calls' (`push x3; call edx; push x3; call ecx; add esp, 0x18`) is a caller pop for
+    the stack depth as well (all_caller_popped), so the slots read after the first call are the right ones (Spore
+    007f7670 read a28..a44 for a4..a12). `call ecx` passes no `this`.
+  - In an esp frame whose entry reserves a slot with `push ecx`, the epilogue's `pop ecx` is that slot, not a
+    cleanup of the last call (`call [g]; mov ecx, eax; call; pop edi; ...; pop ecx; ret 0x10`: the stdcall callee pops
+    its own: Spore 00c8f470).
+  - ebp read from the entry (a catch / unwind funclet in its parent's frame, Spore 01211470 and 14 neighbours) is
+    UNSUPPORTED with the LTCG custom-convention reason.
+  - Not fixable here: `add esp, 4` where cl writes `pop ecx` for a 4-byte cleanup (Spore 011e3c50, cl 13.10: both
+    compilers always choose `pop ecx`; the project notes it as /GL's peephole); `push edi; ..; call; pop edi; ret`
+    and `push esi; mov esi, eax; call; pop esi; ret` (Spore 00a60e70, 00e78de0, 00a62f80..00a63060): the callee takes
+    esi / edi (an LTCG custom convention), and these are also the #9 rows where retail has `call; ret` for our `jmp`;
+    Spore 00830910 is /Od code under a corpus row that says /O2.
+- **A virtual call on a member object.** `mov eax, [ecx+0x120]; mov edx, [eax+0x58]; add ecx, 0x120; call edx`: the
+  vtable read through the owner's base before `this` is formed is `((V*)(p + 0x120))->f()`, written with the object
+  as that expression at the call (vcall_member): a named `this` computed before a store that comes between is a lea
+  first and the vtable read through it [M: probe, 15.00] (Spore 00971b60, 00971be0, 00c24430).
+- **bool results** (#5).
+  - /O2: in a bool function the byte variable it returns (and the byte copies it is returned through) is the source's
+    `bool` when every assignment is 0 / 1, a compare, a byte load (`*(bool*)`), or a call's result used nowhere else
+    (the callee then returns bool, so `bool b = f()` keeps al): `mov al, bl` instead of `test bl, bl; setne al`
+    (bool_vars; Spore 006bd430, 00805310, 00806230, 00aeeda0, 00c5b210, 00ff5c50, 0112c640, 00675700, 0065bc20).
+  - /Od [M: probes, 15.00]: a bool function returning a byte it loads returns a bool lvalue (`return *(bool*)&v;`:
+    `mov al, [ebp-x]`, where `(bool)(unsigned char)v` costs `cmp; setne`: Spore 0045cd90, 0054efb0, 007fc690,
+    007fc790); an int function's `return (x == 0)` compiled `neg eax; sbb eax, eax; add eax, 1` is `return !x;` (the
+    compare spelled out is `test; sete; movzx`: Spore 005632d0); a temporary set to 1 / 0 in an if / else and returned
+    through a cast is a `return` in each arm (od_return_merge looks through `(bool)`: Spore 007fd390).
+  - Not done: a ret of a callee's tested al next to a bool variable's (`call; test al, al; jne L; ret; L: mov al, bl`,
+    Spore 0069df90): every source form probed (`if (!f()) return false; return b;`, `r ? b : r`, an unsigned char
+    function) compiles branch-free (`neg al; sbb al, al; and al, bl`).
+- **Member address in the base's register** (#4). `mov ebx, [esi+0x18]; mov edi, [esi+0x1c]; add esi, 0x18` (an
+  in-place add, the base's web ends there): the source read the member through its address (`v = &this->m; v->b;
+  v->e`). Loads at the member's offsets in the straight run before the add (since the last call, past every other
+  read of the base; also an operation's memory operand) read through the pointer, formed before them (member_base;
+  Spore 006a2b20). The other direction (retail `lea eax, [esi+0x5a8]` into a new register where we `add esi`,
+  Spore 00d943b0) is register allocation: the same text with the address inlined into its store compiles the same.
+- **`sub r, K` / `add r, -K`** (#7). cl lowers a switch with a few sparse cases as `sub eax, K1; je L1; sub eax, K2;
+  je L2` [M: probe, 15.00; the if-chain `x == K1 .. x == K1 + K2` is `cmp eax, K; jne`, the differences written out
+  `sub eax, K; jne; add eax, -8`]. A chain of subs whose differences only the next sub reads (the lifter's reaching
+  definitions; a void function's ret, a bool function's byte writes do not count), each tested against 0, is a
+  `switch` on the first operand with cases K1, K1+K2, ..; a last `jne D` makes D the default and the fall-through the
+  last case (sub_switch; Spore 00ea2670, 00a52840, 00816b90).
+- **Frame size** (#10). A cdecl parameter copied to a temporary that is only passed as stack arguments, in a
+  function with an address-taken local, passes the parameter itself: a dead cdecl parameter's home takes a local
+  only when the parameter is read by something other than a call argument (frame.md rule 9), and the copy is such a
+  read: cl put the local in the home (`sub esp, 0xc` for retail's 0x10, Spore 00f39130; param_args). Other frame
+  sizes (00f2f5e0: 0x27d8 for 0x27e4) are arrays whose extent the code does not show.
+- **fild for fld** (#13). A float stored over an int argument's slot and read back is the slot's bits
+  (`*(float*)&a4`), not a conversion (Spore 00f1aa10).
+- **Webs.** A call's ecx reached by several explicit writes (`lea ecx, [eax-4]` on one arm, `xor ecx, ecx` on the
+  other) is one variable: the else arm's `this = 0` was dropped (Spore 00804f80).
+- **Row extent** (#11, #12). Rows whose size runs into the next function with no padding between (Spore 0094d360,
+  00dd1910, 00b204d0: `ret 4`, then another function's code up to its `ret 8`) cannot match (a /Gy object puts each
+  function in its own section); the signature now takes the first ret's pop. The rest of #11 is retail code our
+  structuring does not produce (tail-duplicated returns, Spore 0057c4b0, 00813370).
+- **Measured** (9ba5742 -> this change): the 498 rows 2 -> 56 MATCH; staticbench `_v2` (refreshed 2026-11-28:
+  Spore /Od 635 rows, /O2 1,500, M&B 254) Spore /Od 0 -> 7, /O2 5 -> 20, M&B 0 -> 0, no MATCH lost; all new ones
+  confirmed by chk.py (work/staticbench/new_spore_od_v2_3.txt, new_spore_o2_v2_2.txt).
+- **Not addressed** (#1 independent loads / stores in another order, #3 a load on one side, #6 branch polarity, #8 a
+  memory operand folded): the examples looked at are /Od frame layouts of inlined callees (0044c450, 0045b660,
+  00548860), a redundant `test ecx, ecx` our code drops after a refcount release (0060d210), and a member read twice
+  that our compile merges (00968c10); no source rule found for them yet.
+
 ## Inlined callees at /O2 (`inline_sites`, opt-in: `L2C_INLINE=1`)
 
 The project's byte-exact leaf callees (no call, no x87, 6..40 body instructions; `build_inline_db` over the corpus's

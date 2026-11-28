@@ -44,3 +44,9 @@ void PIO::pinc() { if (k) { PIR* p = q; p->add(); k = 0; } pir_ref(0); PIR* r = 
 // a frame over a page (`mov eax, N; call __chkstk` after the ebp setup): ecx survives the probe, `this` is its home
 struct BFR { int k; int big(int i); };
 int BFR::big(int i) { int a[1100]; a[i] = k; return a[i + 1] + k; }
+// bool returns: a bool member loaded straight into al, a bool local, `!b` of a bool call as an int (Spore 0045cd90,
+// 0054efb0, 005632d0)
+struct ODB { virtual bool t(); virtual void u(); };
+bool od_bload(char* p, ODB* q) { q->u(); return *(bool*)(p + 56); }
+bool od_bloc(char* p, ODB* q) { bool v = p[3] != 0; q->u(); return v; }
+int od_bnot(ODB* q) { return !q->t(); }
