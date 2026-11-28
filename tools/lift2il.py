@@ -70,12 +70,36 @@ class Unsupported(Exception):
 
 
 class Lifter:
+    @staticmethod
+    def _cut_padding(ins):
+        """The instructions up to int3 padding after a ret / jmp that nothing before it branches past or indexes a
+        table beyond: a row whose size runs into the next function (Spore 010fd0a0: padding, then an adjacent
+        `jmp` thunk to this function)."""
+        for k in range(1, len(ins)):
+            if ins[k].mnemonic != "int3" or ins[k - 1].mnemonic not in ("ret", "jmp"):
+                continue
+            cut = ins[k].address
+            past = False
+            for i in ins[:k]:
+                for o in i.operands:
+                    v = o.imm if o.type == X.X86_OP_IMM else o.mem.disp if o.type == X.X86_OP_MEM else None
+                    if v is not None and cut <= (v & 0xFFFFFFFF) <= ins[-1].address:
+                        past = True
+            if not past:
+                return ins[:k]
+            return ins
+        return ins
+
     def __init__(self, img, va, size, mask=None, partial=False):
         self.img, self.va, self.size = img, va, size
         self.partial = partial              # an unsupported instruction becomes an OPUNSUP marker, not an error
         self.ins = img.insns(va, size)
         if not self.ins:
             raise Unsupported("no code")
+        self.ins = self._cut_padding(self.ins)
+        if any(i.mnemonic.startswith("j") and i.operands and i.operands[0].type == X.X86_OP_IMM and
+               (i.operands[0].imm & 0xFFFFFFFF) == va for i in self.ins):
+            raise Unsupported("a jump to the function's own entry (tail recursion turned into a loop)")
         self.md = img.md
         self.chkstk = None                 # (index of the __chkstk call, frame size): run() fills it
         self.indexed = {}                  # frame offset of a register-indexed local array -> its scale
@@ -170,14 +194,19 @@ class Lifter:
         the call, N) or None."""
         if len(self.ins) < 3:
             return None
-        a, b = self.ins[0], self.ins[1]
+        j = 0
+        if [(i.mnemonic, i.op_str) for i in self.ins[:2]] == [("push", "ebp"), ("mov", "ebp, esp")]:
+            j = 2                                   # an ebp frame (/Od, or /Oy-): the probe follows its setup
+        if j + 1 >= len(self.ins):
+            return None
+        a, b = self.ins[j], self.ins[j + 1]
         if not (a.mnemonic == "mov" and a.op_str.startswith("eax, ") and a.operands[1].type == X.X86_OP_IMM and
                 b.mnemonic == "call" and b.operands[0].type == X.X86_OP_IMM):
             return None
         n = a.operands[1].imm
-        if n < 0x1000 or not any(i.mnemonic == "add" and i.op_str == "esp, %s" % hex(n) for i in self.ins):
+        if n < 0x1000 or not (j or any(i.mnemonic == "add" and i.op_str == "esp, %s" % hex(n) for i in self.ins)):
             return None
-        return (1, n)
+        return (j + 1, n)
 
     def regs(self, i):
         if getattr(self, "chkstk", None) and i.address == self.ins[self.chkstk[0]].address:
@@ -639,6 +668,7 @@ class Lifter:
         self.find = find
         self.acc = acc
         names, self.webname = {}, {}
+        self.entry_webs = set()
         for key in list(parent):
             root = find(key)
             if root not in names:
@@ -649,6 +679,8 @@ class Lifter:
                     names[root] = "_aedx"
                 else:
                     names[root] = "t%d" % (1000 + len(names))
+                    if any(e[1] in ("eax", "ebx", "esi", "edi") for e in ent):
+                        self.entry_webs.add(names[root])   # a value in a register no standard convention passes
         self.names = names
 
     def var_read(self, k, r):
@@ -1335,6 +1367,9 @@ class Lifter:
                         flags = (a, b2)
                         self.carry = (a, b2, "b") if m == "cmp" else None
                     elif m == "mov" and ops[0].type == X.X86_OP_REG and ops[1].type == X.X86_OP_REG and \
+                            ops[0].reg == ops[1].reg:
+                        pass                                   # `mov edi, edi`: alignment filler (after a jmp)
+                    elif m == "mov" and ops[0].type == X.X86_OP_REG and ops[1].type == X.X86_OP_REG and \
                             self.md.reg_name(ops[1].reg) == "esp" and self.md.reg_name(ops[0].reg) != "ebp":
                         self.esp_alias[k] = esp                # `mov eax, esp`: eax points at the outgoing area
                     elif self.od_ret and m == "mov" and ops[0].type == X.X86_OP_MEM and ops[1].type == X.X86_OP_REG \
@@ -1940,8 +1975,11 @@ class Lifter:
         if self.x87_tail(k + 1) and self.float_fn():
             return True                                   # `return f();` of a float: st0 straight to the ret
         for i in self.ins[k + 1:]:
-            if i.mnemonic in ("call", "ret", "jmp") or i.mnemonic.startswith("j"):
+            if i.mnemonic in ("call", "ret", "jmp"):
                 return False
+            if i.mnemonic.startswith("j"):
+                continue                                  # a conditional branch: the fall-through path reads it too
+                #                                           (a call leaves only its result on the x87 stack)
             if i.mnemonic.startswith("f"):
                 r = self.x87_need(i)
                 if r is None:                             # not modelled: the old test, the first x87 op only
@@ -2070,7 +2108,7 @@ class Lifter:
             other = self.fpu[self.st(ops[1] if len(ops) > 1 else ops[0])] if ops else self.fpu[-2]
             self.fcmp = (self.fpu[-1], other)
             self.fmask = "fcomi"                          # the flags themselves: the next jcc reads them
-            if m.endswith("p"):
+            if m.endswith("p") or m in ("fcompi", "fucompi"):   # capstone's names for fcomip / fucomip
                 self.fpu.pop()
             return
         base = m[:-1] if m.endswith("p") and m[:-1] in FOPS else m
@@ -2923,7 +2961,9 @@ class Lifter:
             self.frame_alloc = sum(i.operands[1].imm if i.mnemonic == "sub" else 4 for q, i in enumerate(self.ins)
                                    if q in pro and q < (self.first_flow() if hasattr(self, "first_flow") else len(self.ins))
                                    and ((i.mnemonic == "sub" and i.op_str.startswith("esp, ")) or
-                                        (i.mnemonic == "push" and i.op_str in ("ecx", "eax", "edx"))))
+                                        (i.mnemonic == "push" and i.op_str in ("ecx", "eax", "edx")))) + \
+                (self.chkstk[1] if getattr(self, "chkstk", None) and self.chkstk[0] == 3 else 0)
+            #                                         (the stack probe's reservation in an ebp frame: /Od)
         op = self.ins[k].operands[0] if self.ins[k].operands else None
         imp = op is not None and op.type == X.X86_OP_MEM and not op.mem.base and not op.mem.index
         for j in range(k + 1, len(self.ins)):
@@ -3097,7 +3137,7 @@ class Lifter:
         # edi`), and an aligned frame has `and esp, -8` (M&B 00403b40), so the setup is not one leading run.
         ck = self.chkstk[0] if self.chkstk else -1      # the stack probe is frame setup, not the first call
         if self.chkstk:
-            out |= {0, ck}
+            out |= {ck - 1, ck}
         first_flow = next((k for k, i in enumerate(self.ins) if (i.mnemonic == "call" and k != ck) or i.mnemonic.startswith("j")
                            or i.mnemonic == "ret"), len(self.ins))
         restored = set()                            # registers an epilogue pops before a ret
@@ -3131,6 +3171,17 @@ class Lifter:
                 saved.add(o)
                 out.add(k)                          # saved here (once, before any write), restored before the ret
                 continue
+            if m == "push" and o in CALLEE_SAVED and o not in saved and o not in written:
+                # restored past a call in the epilogue (`pop esi; test ecx, ecx; je L; call edx; L: add esp, N;
+                # ret`: Spore 00f93790): the first pop of it, before any ret, that nothing between reads as an argument
+                later = [q for q in range(k + 1, len(self.ins))
+                         if self.ins[q].mnemonic == "pop" and self.ins[q].op_str == o]
+                if later and not any(self.ins[q].mnemonic == "ret" for q in range(k + 1, later[0])) and \
+                        not self.consumed(k, later[0]):
+                    saved.add(o)
+                    out.add(k)
+                    out.add(later[0])
+                    continue
             if i.operands and i.operands[0].type == X.X86_OP_REG and m not in ("push", "cmp", "test"):
                 written.add(full(self.md.reg_name(i.operands[0].reg)))
             if False:

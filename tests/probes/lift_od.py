@@ -21,5 +21,7 @@ for _nm, _what in (("?od_sum@@", "for loop with an induction variable and a load
                    ("?od_sw@@", "sparse switch: the compare tree on cl's switch temporary is a switch statement"),
                    ("?od_andelse@@", "if (A && B) / else"),
                    ("?od_bfset@@", "an inline bitfield setter called with constants"),
-                   ("?nestcopy@NT@@", "a by-value copy built in place whose member has its own copy constructor")):
+                   ("?nestcopy@NT@@", "a by-value copy built in place whose member has its own copy constructor"),
+                   ("?pinc@PIO@@", "an inlined `return x++ + k` whose result is dropped: a temporary below this's home"),
+                   ("?big@BFR@@", "a frame over a page: the stack probe after the ebp setup keeps ecx (`this`)")):
     check("lift /Od: %s" % _what, next((v for k, v in _got.items() if k.startswith(_nm)), _r.stderr[-300:]), "MATCH")

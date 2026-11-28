@@ -16,3 +16,7 @@ import glob as _glob, hashlib as _hl
 _g = os.path.join(HERE, "work", "scratch", "il2c_od", "gen_%s.cpp" % _hl.md5(b"?o2_fsel@@YAHPAUP@@HH@Z").hexdigest()[:8])
 check("lift /O2: comiss + jbe skips the code that runs when a > b",
       bool(os.path.exists(_g) and re.search(r"\bt\d+ > \(float\)", open(_g).read())), True)
+_g = os.path.join(HERE, "work", "scratch", "il2c_od", "gen_%s.cpp" % _hl.md5(b"?o2_fcomip@@YAHPANH@Z").hexdigest()[:8])
+check("lift /O2: fucomip / fcomip pop the x87 stack (an int function, no float left for the ret)",
+      bool(os.path.exists(_g) and 'int __cdecl FUN_' in open(_g).read() and "return (float)" not in open(_g).read()),
+      True)

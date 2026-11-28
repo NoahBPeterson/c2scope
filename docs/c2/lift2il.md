@@ -124,7 +124,7 @@ a store and a reload per temporary. The /Od emitter writes what a source file wo
 
 What it does not do yet (Spore's 1,023 non-exact /Od rows <= 1500 B, 2026-11-27: 275 MATCH, 645 DIFF): inlined
 callee bodies whose parameters cl spilled to temporaries (the deep slots below `this`'s home that are not `?:`
-results: about 110 DIFF rows; an inline helper with the expressions as arguments reproduces the spill only for some
+results or dropped postfix results, below: about 110 DIFF rows; an inline helper with the expressions as arguments reproduces the spill only for some
 argument shapes), complex expressions that need a callee-saved register (`push esi` in an /Od frame, 27 rows), objects
 built in place by nested inline constructors (11 UNSUPPORTED), x87 stack underflow, `sbb` masks other than the bool
 store, EH frames (1 row of the 1,023 has one: not a volume class at /Od).
@@ -136,6 +136,34 @@ expression, inline.md rule 13) and the member's `this` as another (`mov r, [ebp-
 floats copied by fld / fstp (an indirect source, even under /arch:SSE). The lift is one argument
 `*(il2c_bvn_i_ff*)&p` with both copy constructors written out; the window's instructions are that copy. Rows whose
 source is two adjacent locals rather than one object (00524150) lift but keep a frame DIFF.
+
+**Postfix results dropped** (`od_postinc`, Spore 00540210). A slot below `this`'s home that is stored once and never
+read, right before `X = X + 1` (or `- 1`) of a value it was computed from (`t = *(p+4) + 1; *(p+4) = *(p+4) + 1`), is an
+inlined member's `return x++ op k;` whose result the caller drops:
+
+- **What c2 makes of it [C: c2trace il at @WrnEmitWarnings, 15.00].** The inliner turns the callee's return into
+  `t70 <- t69` with `t69 = [n] + 1`, and the increment follows. t70 is an IL temporary, not a symbol (rule 11's `sN`
+  is a symbol: a return value that is a load or a nested inline call's result gets one, and /Od places those with the
+  named locals, above `this`'s home).
+- **Where /Od puts it [M: probes, identical on 13.10.3077, 14.00, 15.00].** Below the named locals and `this`'s home,
+  in one downward sequence with the `?:` results, in evaluation order (`x ? a : b`, `q->D()`, `b ? a : x`, `q->P()`
+  take -0x14, -0x18, -0x1c, -0x20 under a home at -0x10). In a free function the same sequence starts below the
+  named locals.
+- **What does not make one [M].** The same statement written directly (`q->n++ + 1;`, `(void)(...)`), `return ++n`,
+  `return n = n + 1`, `return n += 1`, `return n + 1`, a dropped call result (`return ext(n)`): none stores a
+  temporary. A named local in the inline (`int r = n++; return r;`) is a named slot, above `this`.
+  `return n++;` (old value), `return n-- * 4` and `return (m = 2, n++)` do.
+- **The lift.** The two statements become `((il2c_pi_K_T_H*)(B))->f();`, a packed helper with the value at +K and
+  `__forceinline int f() { return x++ op k; }` (E with X replaced by `x++` / `x--`). E may read X once besides
+  constants, and X's base B must be a variable, `this` or a constant (`il2c_k(0)` included): an expression would be
+  the inlinee's `this` symbol, a named slot (inline.md rule 14). A member of the packed frame structure (`fb.v_l56`)
+  is such an expression (Spore 004ca430 grew by 24 bytes), so the rewrite runs after the frame is placed and only
+  where the base is a separate local. Only in member functions (where the lifter knows which slots are below
+  `this`'s home); `L2C_OD_POSTINC=0` turns it off.
+- **Measured** (staticbench `_v2` selections, e4a644c -> this change with the error fixes below): Spore /Od 76 -> 80
+  MATCH, all four through this rewrite (004ad370, 00521ba0, 00540210, 00546f80; chk.py confirmed,
+  work/staticbench/new_spore_od_v2_2.txt); Spore /O2 14 -> 22 (the prologue and x87 fixes below; new_spore_o2_v2_1.txt);
+  M&B 1 -> 1; no MATCH lost.
 
 ## /O2 shapes (2026-11-28)
 
@@ -159,6 +187,35 @@ source is two adjacent locals rather than one object (00524150) lift but keep a 
 
 Measured on the Spore /O2 sample: 51 -> 71 MATCH; M&B 0 -> 1; Spore /Od 275 -> 283 (the cdecl / constant rules apply
 there too); no MATCH lost, the /O2 regression sets unchanged or better.
+
+## Lifter errors of the full Spore runs (2026-11-27)
+
+The full runs (`spore_all_od1`, `spore_all_o2a`, `spore_all_o2b`) had 52 EMIT-ERROR / CL-ERROR / TIMEOUT rows; by cause:
+
+- **x87.** capstone spells `fcomip` / `fucomip` as `fcompi` / `fucompi`: they pop too (the stack was left one deep,
+  then underflowed: most of the IndexErrors). A /MD binary's CRT math helpers are import thunks (`jmp [IAT]` to
+  msvcr90's `_CIasin`): `crtfp.match` names them by the import. A call's st0 result is looked for past conditional
+  branches on the fall-through path (`call f; test esi, esi; jle L; fsub [x]`).
+- **Frames.** A callee-saved push popped in an epilogue that still calls (`pop esi; test ecx, ecx; je L; call edx;
+  L: add esp, N; ret`) is a save, not an argument; the stack probe after `push ebp; mov ebp, esp` (/Od frames over a
+  page) is frame setup and keeps ecx (it was a call that clobbered `this`); the bytes above the topmost dword local of
+  an esp frame are `v_lmN` (were `v_l-N`); an argument slot no parameter starts at (`lea eax, [esp+0x25]`) is
+  `(char*)&a36 + 1`; `mov edi, edi` (filler after a jmp) is nothing.
+- **Row extent.** int3 padding after a ret / jmp that nothing branches past ends the function (rows whose size runs
+  into an adjacent `jmp` thunk).
+- **EH.** A destructor body that reads the function's slots is refused; the return value loaded after the
+  destructor's call is the function's `return`.
+- **Folds.** A temporary whose address is its one use (`f(&t)`) is not folded (`&0`).
+- **Refused with a reason (UNSUPPORTED) instead of broken C++:** a register argument no standard convention passes
+  (eax, ebx, esi or edi live from the entry and read: LTCG custom conventions such as Spore 0084cf20; a register a
+  call leaves beside its modelled result, edx of an edx:eax return or eax beside st0, also reads as never written but
+  stays a DIFF row); a slot above a realigned frame's top (`and esp, -16` at /Od /Oy); an EH state set inside a
+  branch (a leftover `__EH`); in an EH function, esp's value stored (an object built in the argument area whose
+  address a state keeps); a jump to the function's own entry (tail recursion as a loop); a callee taken for a
+  by-value class's copy constructor that is also called plainly.
+- **Time.** `rename_webs` keeps reaching definitions as bitsets, `od_fold` updates its counts per edited line,
+  `drop_unused_decls` and `inline_x87` count once: Spore 00441440 (23 KB /Od) and 007864c0 (58 KB /O2), over lbench's
+  60 s before, lift in 21 s and 17 s (00441440's unit is byte-identical with and without the speedups).
 
 ## Inlined callees at /O2 (`inline_sites`, opt-in: `L2C_INLINE=1`)
 

@@ -52,6 +52,14 @@ bucket between its neighbours', and declare each bucket's members in reverse slo
 overlapping slots is solvable (all names could share one bucket); the result is checked against the forward rule
 before it is returned.
 
+### Below the named locals: IL temporaries **[C + M]**
+
+What the walk visits are symbols (named locals, and the inliner's `sN` symbols: an inlinee's `this` or parameter
+copy, a return value that is a load). c2's IL temporaries that /Od keeps in memory (a `?:` result, an inlined
+callee's return value that is itself a temporary, as for `return x++ + 1`) get slots after them and after `this`'s
+home, in one downward sequence in evaluation order (lift2il.md, "Postfix results dropped"; same on 13.10.3077,
+14.00, 15.00). So a slot below `this`'s home is never a declared local: the inverse is a construct, not a name.
+
 ### Two exceptions **[M: probes RI_odalign.cpp and work/invert/probes/a16..a20.cpp, identical on 13.10.3052, 13.10.3077, 14.00, 15.00]**
 
 - **A frame realigned to 16** (any local of alignment 16, `__declspec(align(16))` or a Havok vector: the prologue

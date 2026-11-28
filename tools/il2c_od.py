@@ -287,21 +287,26 @@ def rename_webs(lines):
         m = DEFL.match(l)
         if m and not DECL.match(l):
             defline[k] = m.group(2)
-    IN = [dict() for _ in range(n)]
-    OUT = [dict() for _ in range(n)]
-    work = list(range(n))
+    # reaching definitions as bitsets over the definition lines (bit b = the line dlist[b]); a definition of t kills
+    # every other definition of t
+    dlist = sorted(defline)
+    bit = {k: 1 << b for b, k in enumerate(dlist)}
+    tmask = {}
+    for k in dlist:
+        tmask[defline[k]] = tmask.get(defline[k], 0) | bit[k]
+    IN = [0] * n
+    OUT = [0] * n
+    import collections as _c
+    work = _c.deque(range(n))
     inq = set(work)
     while work:
-        k = work.pop(0)
+        k = work.popleft()
         inq.discard(k)
-        st = {}
+        st = 0
         for q in pred[k]:
-            for t, ds in OUT[q].items():
-                st[t] = st.get(t, frozenset()) | ds
+            st |= OUT[q]
         IN[k] = st
-        out = dict(st)
-        if k in defline:
-            out[defline[k]] = frozenset([k])
+        out = (st & ~tmask[defline[k]]) | bit[k] if k in defline else st
         if out != OUT[k]:
             OUT[k] = out
             for q in succ[k]:
@@ -322,14 +327,21 @@ def rename_webs(lines):
             continue
         m = DEFL.match(l)
         for t in set(TMP.findall(m.group(3) if m else l)):
-            ds = IN[k].get(t)
-            if not ds:
+            v = IN[k] & tmask.get(t, 0)
+            if not v:
                 continue
-            ds = list(ds)
+            ds = []
+            while v:
+                low = v & -v
+                ds.append(dlist[low.bit_length() - 1])
+                v ^= low
             for d in ds:
                 used.add(d)
                 parent[find(d)] = find(ds[0])
             usesite[(k, t)] = ds[0]
+    use_by_t = {}
+    for (k, tt), d0 in usesite.items():
+        use_by_t.setdefault(tt, []).append((k, d0))
     webs = {}
     for d, t in defline.items():
         webs.setdefault(t, {}).setdefault(find(d), []).append(d)
@@ -354,8 +366,8 @@ def rename_webs(lines):
             for d in ds:
                 if out[d] is not None:
                     out[d] = re.sub(r"^(\s+)%s\b" % t, r"\1" + nm, out[d])
-            for (k, tt), d0 in usesite.items():
-                if tt == t and find(d0) == root and out[k] is not None:
+            for k, d0 in use_by_t.get(t, ()):
+                if find(d0) == root and out[k] is not None:
                     m = DEFL.match(out[k])
                     if m and m.group(2) in (t, nm):
                         out[k] = "%s%s = %s;" % (m.group(1), m.group(2), re.sub(r"\b%s\b" % t, nm, m.group(3)))
@@ -411,21 +423,25 @@ def od_fold(body, deep=()):
     n = len(lines)
     alive = [True] * n
     addr_taken = set(re.findall(r"&(v_l\d+)", body))
+    # counts per temporary, kept up to date as lines change: reads per line (uses), definitions (defs)
+    uses, defs = {}, {}
+
+    def account(k, sign):
+        if not alive[k] or DECL.match(lines[k]):
+            return
+        m = DEFL.match(lines[k])
+        for t in TMP.findall(m.group(3) if m else lines[k]):
+            u = uses.setdefault(t, {})
+            u[k] = u.get(k, 0) + sign
+            if not u[k]:
+                del u[k]
+        if m:
+            defs[m.group(2)] = defs.get(m.group(2), 0) + sign
+    for k in range(n):
+        account(k, 1)
     changed = True
     while changed:
         changed = False
-        occ = {}
-        defs = {}
-        use_line = {}
-        for k, l in enumerate(lines):
-            if not alive[k] or DECL.match(l):
-                continue
-            m = DEFL.match(l)
-            for t in TMP.findall(m.group(3) if m else l):
-                occ[t] = occ.get(t, 0) + 1
-                use_line[t] = k
-            if m:
-                defs[m.group(2)] = defs.get(m.group(2), 0) + 1
         for i in range(n):
             if not alive[i]:
                 continue
@@ -433,14 +449,24 @@ def od_fold(body, deep=()):
             if not m:
                 continue
             t, e = m.group(2), m.group(3)
-            if defs.get(t) == 1 and occ.get(t, 0) > 1 and t not in e and LEAF.match(e):
-                if fold_leaf(lines, alive, i, t, e, addr_taken):
+            ut = uses.get(t, {})
+            nocc = sum(ut.values())
+            if defs.get(t) == 1 and nocc > 1 and t not in e and LEAF.match(e):
+                aff = sorted(set([i]) | set(ut))
+                for k in aff:
+                    account(k, -1)
+                ok_ = fold_leaf(lines, alive, i, t, e, addr_taken)
+                for k in aff:
+                    account(k, 1)
+                if ok_:
                     changed = True
                     break
                 continue
-            if defs.get(t) != 1 or occ.get(t) != 1 or t in e:
+            if defs.get(t) != 1 or nocc != 1 or t in e:
                 continue
-            j = use_line[t]
+            j = next(iter(ut))
+            if re.search(r"&\s*\(?\s*%s\b" % t, lines[j]):
+                continue                          # its address is the use (`f(&t)`): a variable, not a value
             if j <= i:
                 continue
             call = has_call(e)
@@ -486,8 +512,11 @@ def od_fold(body, deep=()):
                 new = "%s%s = %s;" % (mj.group(1), mj.group(2), re.sub(r"\b%s\b" % t, lambda _m: "(" + e + ")", mj.group(3)))
             else:
                 new = re.sub(r"\b%s\b" % t, lambda _m: "(" + e + ")", lj)
+            account(i, -1)
+            account(j, -1)
             lines[j] = new
             alive[i] = False
+            account(j, 1)
             changed = True
             break
     out = [l for k, l in enumerate(lines) if alive[k]]
@@ -1761,3 +1790,139 @@ def od_parens(body):
     # a shift count is cl's low byte in the code, an int in the source (`(unsigned char)` there is a movzx)
     body = re.sub(r"(<<|>>) \(unsigned char\)", r"\1 ", body)
     return "\n".join(_bitfield(fix_line(l)) if l.startswith("    ") else l for l in body.split("\n"))
+
+
+# ---- an inlined callee's `return x++ op k` whose result the caller drops (lift2il.md "/Od mode", postfix results):
+# ---- c2 keeps the return value in an IL temporary, which /Od gives a slot below `this`'s home ----
+
+POSTINC = {}       # helper name -> its struct declaration
+
+
+def _strip(n):
+    while n[0] in ("grp", "cast"):
+        n = n[1] if n[0] == "grp" else n[2]
+    return n
+
+
+def _parse_expr(s):
+    try:
+        p = _P(_tokens(s))
+        n = p.expr(3)
+        return n if p.peek() is None else None
+    except (_NoParse, RecursionError, IndexError):
+        return None
+
+
+def _deref(n):
+    """`*(T*)P` -> (T, P) for an integral T, else None."""
+    n = _strip(n)
+    if n[0] != "un" or n[1] != "*":
+        return None
+    q = n[2]
+    while q[0] == "grp":
+        q = q[1]
+    if q[0] != "cast" or not q[1].endswith("*"):
+        return None
+    ty = q[1][:-1].strip()
+    if ty not in ("int", "unsigned int", "short", "unsigned short", "char", "unsigned char", "signed char"):
+        return None
+    return ty, q[2]
+
+
+def _base_off(p):
+    """P = `B + K` or `B`, B a plain variable, `this`, a constant or `il2c_k(constant)`: (B text, K)."""
+    p = _strip(p)
+    off = 0
+    if p[0] == "bin" and p[1] == "+" and _numeric(p[3]):
+        k = _strip(p[3])[1]
+        off = int(k, 0)
+        p = p[2]
+    b = _strip(p)
+    # (a member of the packed frame structure, `fb.v_l56`, is a load to the inliner: its `this` would become a
+    # symbol, a named slot; Spore 004ca430 grows by 24 bytes)
+    ok = (b[0] == "atom" and (re.match(r"^(?:v_l\d+|a\d+|self|this|\d+)$", b[1]))) or \
+        (b[0] == "call" and b[1] == ("atom", "il2c_k") and len(b[2]) == 1 and _numeric(b[2][0]))
+    return (_pr(p), off) if ok and 0 <= off < 4096 else None
+
+
+def _subst(n, key, new):
+    """n with each subtree that prints as `key` (casts and parentheses around it kept) replaced; (tree, count)."""
+    if n[0] == "atom":
+        return n, 0
+    if n[0] in ("un", "cast", "grp", "mem") or n[0] in ("bin", "tern", "idx", "call"):
+        if _pr(n) == key:
+            return new, 1
+    cnt = 0
+    out = []
+    for x in n:
+        if isinstance(x, tuple):
+            y, c = _subst(x, key, new)
+            cnt += c
+            out.append(y)
+        elif isinstance(x, list):
+            ys = []
+            for z in x:
+                y, c = _subst(z, key, new)
+                cnt += c
+                ys.append(y)
+            out.append(ys)
+        else:
+            out.append(x)
+    return tuple(out), cnt
+
+
+def _leaves_const(n):
+    """Every leaf of n a number or the postfix placeholder."""
+    if n[0] == "atom":
+        return n[1] == "x++" or n[1] == "x--" or re.match(r"^\d", n[1]) is not None
+    if n[0] == "call":
+        return False
+    return all(_leaves_const(x) for x in n[1:] if isinstance(x, tuple))
+
+
+def od_postinc(body):
+    """`t = E(X); X = X + 1;` where t is stored and never read (its slot lies below `this`'s home) and E reads X once
+    beside constants: an inlined member `return x++ op k;` whose result the caller drops. c2 keeps that return value in
+    an IL temporary (not a symbol), and /Od allocates temporaries after the named locals and `this`'s home, in
+    evaluation order with the `?:` results. Written as a call of such a helper on the object X lies in; the helper's
+    `this` is X's base, which must be a variable or a constant (an expression would become the inlinee's `this`
+    symbol, a named slot)."""
+    lines = body.split("\n")
+    for i in range(len(lines) - 1):
+        m = DEFL.match(lines[i])
+        if not m:
+            continue
+        ind, t, e = m.groups()
+        if len(re.findall(r"\b%s\b" % t, body)) != 2:      # its declaration and this store
+            continue
+        u = re.match(r"^(\s+)(.+?) = (.+);$", lines[i + 1])
+        if not u or u.group(1) != ind:
+            continue
+        lhs, rhs = _parse_expr(u.group(2)), _parse_expr(u.group(3))
+        en = _parse_expr(e)
+        if not lhs or not rhs or not en:
+            continue
+        d = _deref(lhs)
+        if not d:
+            continue
+        r = _strip(rhs)
+        if r[0] != "bin" or r[1] not in ("+", "-") or not _numeric(r[3]) or _strip(r[3])[1] != "1":
+            continue
+        key = _pr(_strip(lhs))
+        if _pr(_strip(r[2])) != key:
+            continue
+        bo = _base_off(d[1])
+        if not bo:
+            continue
+        en2, cnt = _subst(en, key, ("atom", "x++" if r[1] == "+" else "x--"))
+        if cnt != 1 or not _leaves_const(en2):
+            continue
+        ty, (base, off) = d[0], bo
+        ret = _pr(en2)
+        import zlib
+        name = "il2c_pi_%d_%s_%08x" % (off, ty.replace(" ", ""), zlib.crc32(ret.encode()))
+        POSTINC[name] = "struct %s { %s%s x; __forceinline int f() { return %s; } };" % (
+            name, "char pad[%d]; " % off if off else "", ty, ret)
+        lines[i:i + 2] = ["%s((%s*)(%s))->f();" % (ind, name, base)]
+        return od_postinc("\n".join(lines))
+    return "\n".join(lines)

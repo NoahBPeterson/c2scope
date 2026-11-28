@@ -520,9 +520,11 @@ def pure(rhs):
 def drop_unused_decls(body):
     """A declared local nothing reads or writes (a call's dropped result): at /Od every declared local gets a
     frame slot (`push ecx`, an `mov esp, ebp` epilogue: Spore 012538b0), so leave none behind."""
-    for m in list(re.finditer(r"(?m)^    (?!return\b)[\w ]+?\*? ((?:t|v_l)\d+)(?:\[\d+\])?;\n", body)):
-        if len(re.findall(r"\b%s\b" % m.group(1), body)) == 1:
-            body = body.replace(m.group(0), "", 1)
+    occ = collections.Counter(re.findall(r"\b(?:t|v_l)\d+\b", body))
+    drop = [m.group(0) for m in re.finditer(r"(?m)^    (?!return\b)[\w ]+?\*? ((?:t|v_l)\d+)(?:\[\d+\])?;\n", body)
+            if occ[m.group(1)] == 1]
+    for d in drop:
+        body = body.replace(d, "", 1)
     return body
 
 
@@ -1275,6 +1277,16 @@ def eh_local_inline(lf, em, va, params, typed, head, stmts, decls, marks, off):
         body = rest[:k1]
         dtor = [l for l in tail if not re.match(r"^    return\b", l)]
         ret = [l for l in tail if re.match(r"^    return\b", l)]
+        # the return value loaded after the destructor's call (`call ~L; mov al, [esp+0xb]`): the function's
+        # `return v;`, not the destructor's (Spore 006bcd70)
+        while dtor and ret:
+            m = re.match(r"^    (t\d+) = (.*);$", dtor[-1])
+            if not m or not re.fullmatch(r"[()\w ]*", m.group(2)) or \
+                    re.search(r"[A-Za-z_]\w*\s*\((?!\s*\w+\s*\))", m.group(2)) or \
+                    not any(re.search(r"\b%s\b" % m.group(1), l) for l in ret):
+                break
+            ret = [re.sub(r"\b%s\b" % m.group(1), lambda _m: "(" + m.group(2) + ")", l) for l in ret]
+            dtor.pop()
     else:
         if not rest or not re.match(r"^    return\b", rest[-1]):
             raise Unsupported("EH: an inline local without a final return")
@@ -1306,7 +1318,8 @@ def eh_local_inline(lf, em, va, params, typed, head, stmts, decls, marks, off):
             body = [re.sub(r"\b%s\b" % t, "v_l%d" % -saved[t], l) for l in body]     # the member's slot: named
             ret = [re.sub(r"\b%s\b" % t, "v_l%d" % -saved[t], l) for l in ret]       # obj.mN below
             outside = "\n".join(pre + body + ret)
-    if any(re.search(r"\b%s\b" % t, outside) for t in ctemps) or re.search(r"\b(a\d+|self)\b", "\n".join(ctor + dtor)):
+    if any(re.search(r"\b%s\b" % t, outside) for t in ctemps) or re.search(r"\b(a\d+|self)\b", "\n".join(ctor + dtor)) or \
+            any(not off <= -int(n) < off + size for n in re.findall(r"\bv_l(\d+)\b", "\n".join(ctor + dtor))):
         raise Unsupported("EH: an inline local's code reads the function's values")
     cdecls = ["        int %s;" % t for t in sorted(ctemps - set(saved))] if ctemps - set(saved) else []
     cls = "L_%08x" % va
@@ -1618,6 +1631,49 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
     global _LAST_EM
     _LAST_EM = None
     text, lf = _unit(img, va, size, mask, flags, partial, od)
+    if re.search(r"\bv_[la]-\d", text) and not partial and \
+            any(i.mnemonic == "and" and i.op_str.startswith("esp,") for i in lf.ins[:12]):
+        # a frame slot above a realigned frame's assumed top: no source places a local there
+        raise Unsupported("a slot above a realigned frame's top (esp-relative after `and esp, -N`: the padding "
+                          "is not modelled)")
+    for n_ in sorted(set(int(x) for x in re.findall(r"\bv_a(\d+)\b", text))):
+        # an argument slot at an offset no parameter starts at (a byte of a by-value structure, `lea eax,
+        # [esp+0x25]`): the bytes of the parameter it lies in (Spore 00a0ea10)
+        k_, r_ = n_ - n_ % 4, n_ % 4
+        if re.search(r"(?m)^\s+[\w ]+\*? v_a%d;$" % n_, text) or not re.search(r"\ba%d\b" % k_, text.split("\n{", 1)[0] + text):
+            continue
+        ty_ = CTYPE.get(lf.arg_types.get(n_, "2001"), "unsigned char") or "unsigned char"
+        text = re.sub(r"&v_a%d\b" % n_, "((char*)&a%d + %d)" % (k_, r_), text)
+        text = re.sub(r"\bv_a%d\b" % n_, "(*(%s*)((char*)&a%d + %d))" % (ty_, k_, r_), text)
+    for f_ in re.findall(r"(?m)^struct (FUN_[0-9a-f]{8}) \{", text):
+        if re.search(r"(?m)^(?:extern \"C\" )?[\w ]+\b__\w+ %s\(" % f_, text) and not partial:
+            # what lift2il took for a by-value argument's copy constructor is also called as a plain function
+            raise Unsupported("%s both a by-value class's copy constructor and a plain function" % f_)
+    if ret_void_self(text, va):
+        text = re.sub(r"(?m)^(\s*)t\d+ = \(int\)(FUN_%08x\()" % va, r"\1\2", text)
+    if not partial and getattr(lf, "eh", None) and re.search(r"\b\w*_u_esp\b", text):
+        # esp's own value as data (`push ecx; mov eax, esp; mov [esp+N], esp`: an object built in the argument
+        # area whose address an EH state keeps)
+        raise Unsupported("esp's value stored (an object built in the argument area, kept for EH)")
+    if not partial and re.search(r"\b__EH(?:\(|RESUME\b)", text):
+        # a state marker the EH writer did not turn into a try / an object's scope (a state changed inside a branch)
+        raise Unsupported("EH: a state change the writer does not place (set inside a branch)")
+    if not partial:
+        occ_ = collections.Counter(re.findall(r"\bt\d+\b", text))
+        set_ = set(re.findall(r"(?m)^\s*(t\d+) = ", text)) | set(re.findall(r"&\(?(t\d+)\b", text))
+        dec_ = re.findall(r"(?m)^    [\w ]+\*? (t\d+);$", text)
+        ndec_ = collections.Counter(dec_)
+        undef = [t for t in dec_ if occ_[t] > ndec_[t] and t not in set_ and t in getattr(lf, "entry_webs", ())]
+        if undef:
+            # read, never written, and live from the entry in eax, ebx, esi or edi: an argument no standard
+            # convention passes (LTCG's custom conventions). (A register a call leaves beside its modelled result,
+            # edx of an edx:eax return or eax beside st0, also reads as never written; those stay DIFF rows.)
+            raise Unsupported("a register argument outside the standard conventions (%s read at the entry: an "
+                              "LTCG custom convention)" % ", ".join(undef[:3]))
+    if re.search(r"\bv_[la]-\d", text) and not partial:
+        # the bytes above the topmost dword local of a frame without ebp (`mov word ptr [esp+0x1a]` with the slots
+        # named from entry-4): a valid slot, only its name needs no minus sign
+        text = re.sub(r"\bv_([la])-(\d+)", r"v_\1m\2", text)
     em = _LAST_EM
     fas = sorted(set(int(x, 16) for x in re.findall(r"@@FA([0-9a-f]{8})@@", text)))
     if fas:
@@ -1646,6 +1702,13 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
 
 
 _LAST_EM = None
+
+
+def ret_void_self(text, va):
+    """A void function that calls itself and keeps eax after the call (a leftover register web): the call is a
+    statement (`(int)` of a void call does not compile; Spore 00e87100)."""
+    return bool(re.search(r"(?m)^(?:extern \"C\" )?void \w+ FUN_%08x\(" % va, text) and
+                re.search(r"= \(int\)FUN_%08x\(" % va, text))
 
 
 def _unit(img, va, size, mask=None, flags=None, partial=None, od=None):
@@ -1737,15 +1800,31 @@ def _unit(img, va, size, mask=None, flags=None, partial=None, od=None):
         il2c_od.SWTEMPS.clear()
         while named > 0 and named + 4 in res:
             named -= 4
-        if named > 0:
-            pre_frame = body
-            fr_text, body = il2c_od.od_frame(body, named, va)
-            if os.environ.get("INVERT_OFF") != "1" and (fr_text is None or os.environ.get("INVERT_OD") != "struct"):
-                # invert: odframe (tools/invert/odframe.py)
-                from invert import odframe as inv_odframe      # separate locals, named for c1xx's /Od hash walk
-                placed = inv_odframe.place_locals(pre_frame, named)
-                if placed:
-                    body, fr_text = placed, None
+        def frame(body):
+            fr_text = None
+            if named > 0:
+                pre_frame = body
+                fr_text, body = il2c_od.od_frame(body, named, va)
+                if os.environ.get("INVERT_OFF") != "1" and (fr_text is None or os.environ.get("INVERT_OD") != "struct"):
+                    # invert: odframe (tools/invert/odframe.py)
+                    from invert import odframe as inv_odframe      # separate locals, named for c1xx's /Od hash walk
+                    placed = inv_odframe.place_locals(pre_frame, named)
+                    if placed:
+                        body, fr_text = placed, None
+            return fr_text, body
+        if this and os.environ.get("L2C_OD_POSTINC", "1") == "1":
+            # an inlined `return x++ + k` whose result is dropped (before the frame: its temporaries leave the
+            # declarations); a base that ends up a member of the packed frame structure is a load to the inliner,
+            # so then the plain statements stay (Spore 004ca430)
+            pi_ = drop_unused_decls(il2c_od.od_postinc(body))
+            fr_text, body2 = frame(pi_)
+            if fr_text and re.search(r"\(\(il2c_pi_\w+\*\)\([^;]*\bf[ab]\b", body2):
+                il2c_od.POSTINC.clear()
+                fr_text, body = frame(body)
+            else:
+                body = body2
+        else:
+            fr_text, body = frame(body)
     pty = lambda p: CTYPE.get(lf.arg_types.get(int(p[1:]), "1004"), "int")
     if pty("a4") is None:
         pass
@@ -1783,6 +1862,11 @@ def _unit(img, va, size, mask=None, flags=None, partial=None, od=None):
             head.append("__forceinline void il2c_bf_%d_%d(void* p, unsigned int x) { ((il2c_bfs_%d_%d*)p)->f = x; }"
                         % (sh_, n_, sh_, n_))
         il2c_od.BITFIELDS.clear()
+        if il2c_od.POSTINC:                              # inlined postfix results (il2c_od.od_postinc)
+            head.append("#pragma pack(push, 1)")
+            head.extend(v_ for _k, v_ in sorted(il2c_od.POSTINC.items()))
+            head.append("#pragma pack(pop)")
+        il2c_od.POSTINC.clear()
         if il2c_od.KCONST:                               # a constant that was an inlined callee's parameter
             head.append("template<class T> __forceinline T il2c_k(T v) { return v; }")
         il2c_od.KCONST.clear()
@@ -1815,8 +1899,14 @@ def inline_x87(body):
     the expression at both, which cl merges again, when no call, label or loop falls between and its operands
     are not redefined."""
     lines = body.split("\n")
+    idx = None
     for x in sorted(set(re.findall(r"(?m)^    (?:float|double) (t\d{1,3});$", body)), key=lambda t: int(t[1:])):
-        occ = [n for n, l in enumerate(lines) if re.search(r"\b%s\b" % x, l)]
+        if idx is None:                              # lines per temporary (rebuilt after an edit)
+            idx = collections.defaultdict(list)
+            for n_, l_ in enumerate(lines):
+                for t_ in set(re.findall(r"\bt\d+\b", l_)):
+                    idx[t_].append(n_)
+        occ = idx.get(x, [])
         if len(occ) not in (3, 4):
             continue
         a, us = occ[1], occ[2:]
@@ -1840,6 +1930,7 @@ def inline_x87(body):
             lines[u] = re.sub(r"\b%s\b" % x, lambda _m: m.group(2), lines[u])
         del lines[a]
         lines = [l for l in lines if l.strip() not in ("float %s;" % x, "double %s;" % x)]
+        idx = None
     return "\n".join(lines)
 
 

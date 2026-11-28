@@ -56,11 +56,39 @@ def build(out):
 _DB = None
 
 
+def import_thunk(img, va):
+    """The imported name an import thunk (`jmp dword ptr [IAT]`, a /MD binary's `__CIsqrt`) jumps through, else None."""
+    try:
+        i = img.insns(va, 8)[0]
+    except Exception:
+        return None
+    m = re.match(r"^dword ptr \[(0x[0-9a-f]+)\]$", i.op_str)
+    pe = getattr(img, "pe", None)
+    if i.mnemonic != "jmp" or not m or pe is None:
+        return None
+    if not hasattr(img, "_iat"):
+        import pefile
+        img._iat = {}
+        try:
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+            for e in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
+                for imp in e.imports:
+                    if imp.name:
+                        img._iat[imp.address] = imp.name.decode()
+        except Exception:
+            pass
+    return img._iat.get(int(m.group(1), 16))
+
+
 def match(img, va):
     """(name, args) of the CRT math helper at va, or None."""
     global _DB
     if _DB is None:
         _DB = json.load(open(DB)) if os.path.exists(DB) else {}
+    imp = import_thunk(img, va)
+    if imp is not None:
+        f = imp[3:] if imp.startswith("_CI") else None
+        return (f, FUNCS[f]) if f in FUNCS else None
     try:
         fp = fingerprint(img, va)
     except Exception:

@@ -35,3 +35,12 @@ struct NMP { int tri; NV2 uv; NMP(const NMP& o) : tri(o.tri), uv(o.uv) {} };
 struct NVB { virtual int g(int q, NMP a, int s); };
 struct NT { NVB* p; int nestcopy(int q, NMP pos, int s); };
 int NT::nestcopy(int q, NMP pos, int s) { return p->g(q, pos, s); }
+// an inlined member's `return x++ + k` whose result the caller drops (Spore 00540210): the return value is an IL
+// temporary, given a slot below this's home; the member called on a variable, on a constant pointer, and a decrement
+struct PIR { int vt; int n; int add() { return n++ + 1; } int sub() { return n-- * 4; } };
+inline void pir_ref(PIR* p) { if (p) p->add(); }
+struct PIO { PIR* q; int k; void pinc(); };
+void PIO::pinc() { if (k) { PIR* p = q; p->add(); k = 0; } pir_ref(0); PIR* r = q; r->sub(); }
+// a frame over a page (`mov eax, N; call __chkstk` after the ebp setup): ecx survives the probe, `this` is its home
+struct BFR { int k; int big(int i); };
+int BFR::big(int i) { int a[1100]; a[i] = k; return a[i + 1] + k; }
