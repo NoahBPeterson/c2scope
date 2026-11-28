@@ -2902,6 +2902,45 @@ def _one(args):
     return out
 
 
+def laptop_backend():
+    """tools/laptop64.py, the optional Windows compile machine (not part of every checkout): its module, or a clear
+    exit when it is absent."""
+    try:
+        import laptop64
+    except ImportError:
+        raise SystemExit("--laptop needs tools/laptop64.py (the Windows compile-machine client), which this checkout "
+                         "does not have; run without --laptop to compile here")
+    return laptop64
+
+
+def bench_laptop(img, vas, idx, flags=None, nvar=4):
+    """The bench on the Windows compile machine (tools/laptop64.py: one upload per chunk of 120 functions; lint off,
+    /W0). Each function: its first `nvar` lifter variants under its flag sets, the best kept. Rows as _one's."""
+    laptop64 = laptop_backend()
+    jobs, rows = [], []
+    for va in vas:
+        size = idx[va]["size"]
+        try:
+            vs = variants(img, va, size)
+        except Exception as e:
+            st = "UNSUPPORTED" if type(e).__name__ == "Unsupported" else "ERROR"
+            rows.append(dict(va="%x" % va, size=size, status=st, why=str(e)[:100]))
+            continue
+        fl = flags or flag_sets(va, idx[va])
+        jobs.append({"key": "%x" % va, "addr": va, "size": size, "cands": [t for _, t in vs][:nvar], "flagsets": fl})
+    res = laptop64.run_batch(jobs, chunk=120)
+    for j in jobs:
+        r = res.get(j["key"]) or {"status": "error"}
+        st = {"match": "MATCH", "no match": "DIFF", "does not build": "CL-ERROR"}.get(r.get("status"),
+                                                                                   str(r.get("status")).upper())
+        rows.append(dict(va=j["key"], size=j["size"], status=st, flags=" ".join(r.get("flags") or []),
+                         edits=r.get("edits"), shape=r.get("edits_noreg"), mapcost=r.get("mapcost"),
+                         why="" if st == "MATCH" else "; ".join(map(str, r.get("errors") or []))[:160]))
+    for r in rows:
+        print(json.dumps(r), flush=True)
+    return rows
+
+
 def main(argv):
     global BINARY, INDEX
     ap = argparse.ArgumentParser()
@@ -2922,6 +2961,8 @@ def main(argv):
     ap.add_argument("--extra-set", action="append", default=[],
                     help="one more whole flag set, comma-separated (repeatable), e.g. a proven PDB unit set")
     ap.add_argument("--only-extra", action="store_true", help="try only the --extra-set flag sets")
+    ap.add_argument("--laptop", action="store_true",
+                    help="bench: compile and compare on the Windows compile machine (tools/laptop64.py) instead of here")
     a = ap.parse_args(argv)
     BINARY, INDEX = a.binary or BINARY, a.index or INDEX
     EXTRA_SETS[:] = [x.split(",") for x in a.extra_set]
@@ -2959,12 +3000,15 @@ def main(argv):
         random.Random(a.seed).shuffle(pool)
         vas = pool[:a.sample]
     os.makedirs(a.work, exist_ok=True)
-    from concurrent.futures import ProcessPoolExecutor
-    rows = []
-    with ProcessPoolExecutor(a.jobs) as ex:
-        for r in ex.map(_one, [(v, idx[v], a.work, BINARY, flags, EXTRA_SETS, a.only_extra) for v in vas]):
-            rows.append(r)
-            print(json.dumps(r), flush=True)
+    if a.laptop:
+        rows = bench_laptop(img, vas, idx, flags)
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+        rows = []
+        with ProcessPoolExecutor(a.jobs) as ex:
+            for r in ex.map(_one, [(v, idx[v], a.work, BINARY, flags, EXTRA_SETS, a.only_extra) for v in vas]):
+                rows.append(r)
+                print(json.dumps(r), flush=True)
     c = collections.Counter(r["status"] for r in rows)
     print("summary:", dict(c), "of", len(rows))
     why = collections.Counter(re.sub(r"0x[0-9a-f]+|\d+", "N", r.get("why", "")) for r in rows if r["status"] != "MATCH"

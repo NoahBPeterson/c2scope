@@ -58,7 +58,32 @@ def _one(args):
     return "%x" % va, dict(row, **best)
 
 
-def run(name, tag, jobs, vs, sets):
+def run_laptop(fs, idx, vs):
+    """The bench on the Windows compile machine (lift2il64.laptop_backend): lifts here, compiles there, one upload
+    per chunk of 120 functions; rows as _one's."""
+    lp = L.laptop_backend()
+    img = L.Image()
+    jobs, rows = [], {}
+    for a, s in fs:
+        va = int(a, 16)
+        entry = dict(idx.get(va) or {}, size=s)
+        try:
+            texts = [t for _, t in L.variants(img, va, s)][:vs]
+        except Exception as e:
+            rows["%x" % va] = dict(size=s, status="lift", why=("%s: %s" % (type(e).__name__, e))[:90])
+            continue
+        jobs.append({"key": "%x" % va, "addr": va, "size": s, "cands": texts, "flagsets": L.flag_sets(va, entry)[:2]})
+    res = lp.run_batch(jobs, chunk=120)
+    for j in jobs:
+        r = res.get(j["key"]) or {"status": "error"}
+        rows[j["key"]] = dict(size=j["size"], status=r.get("status"), edits=r.get("edits"), shape=r.get("edits_noreg"),
+                              mapcost=r.get("mapcost"), n=r.get("n_orig"), ops=(r.get("ops") or [])[:20],
+                              flags=r.get("flags"),
+                              why="" if r.get("status") == "match" else str((r.get("errors") or [""])[0])[:120])
+    return rows
+
+
+def run(name, tag, jobs, vs, sets, laptop=False):
     from concurrent.futures import ProcessPoolExecutor
     fs = json.load(open(os.path.join(WORK, name + ".json")))
     idx = L.index(L.Image())
@@ -69,9 +94,14 @@ def run(name, tag, jobs, vs, sets):
         args.append((va, dict(idx.get(va) or {}, size=s), work, L.BINARY, L.INDEX, sets, vs))
     t0 = time.time()
     rows = {}
-    with ProcessPoolExecutor(min(jobs, 6)) as ex:
-        for k, r in ex.map(_one, args):
-            rows[k] = r
+    if laptop:
+        for k, v in sets.items():
+            setattr(L, k, v)
+        rows = run_laptop(fs, idx, vs)
+    else:
+        with ProcessPoolExecutor(min(jobs, 6)) as ex:
+            for k, r in ex.map(_one, args):
+                rows[k] = r
     json.dump(rows, open(os.path.join(WORK, "%s.%s.json" % (name, tag)), "w"), indent=0)
     summary(rows, time.time() - t0)
 
@@ -127,6 +157,7 @@ if __name__ == "__main__":
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--set", action="append", default=[], help="NAME=VALUE: a lift2il64 module default, e.g. RETVAR=1")
     ap.add_argument("--vs", type=int, default=2, help="lifter variants tried per function")
+    ap.add_argument("--laptop", action="store_true", help="compile on the Windows compile machine (tools/laptop64.py)")
     a = ap.parse_args()
     L.BINARY, L.INDEX = a.binary or L.BINARY, a.index or L.INDEX
     sets = {}
@@ -136,7 +167,7 @@ if __name__ == "__main__":
     if a.cmd == "make":
         make(a.name, a.min, a.max, a.count, a.seed, a.src)
     elif a.cmd == "run":
-        run(a.name, a.tag, a.jobs, a.vs, sets)
+        run(a.name, a.tag, a.jobs, a.vs, sets, a.laptop)
     elif a.cmd == "compare":
         compare(a.name, a.tag, a.other)
     else:

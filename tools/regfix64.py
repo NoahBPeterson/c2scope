@@ -53,7 +53,21 @@ def check1(va, size, text, flags, work):
                 regpairs=m.get("regpairs"))
 
 
+LAPTOP = [False]
+
+
+def laptop_check(va, size, combos):
+    """[(text, flags)] compared on the Windows compile machine (lift2il64.laptop_backend), one upload."""
+    lp = L.laptop_backend()
+    jobs = [{"key": "c%d" % n, "addr": va, "size": size, "cands": [t], "flagsets": [list(f)]}
+            for n, (t, f) in enumerate(combos)]
+    r = lp.run_batch(jobs, chunk=120)
+    return [r.get("c%d" % n) or {"status": "error"} for n in range(len(combos))]
+
+
 def check(va, size, texts, flags, work):
+    if LAPTOP[0]:
+        return laptop_check(va, size, [(t, flags) for t in texts])
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(JOBS) as ex:
         return list(ex.map(lambda nt: check1(va, size, nt[1], flags, os.path.join(work, "c%d" % nt[0])),
@@ -66,10 +80,13 @@ def best_lift(va, size, entry, work):
     vs = [t for _, t in L.variants(img, va, size)][:4]
     fls = L.flag_sets(va, entry)[:2]
     combos = [(t, f) for t in vs for f in fls]
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(JOBS) as ex:
-        rs = list(ex.map(lambda k: check1(va, size, combos[k][0], combos[k][1], os.path.join(work, "v%d" % k)),
-                         range(len(combos))))
+    if LAPTOP[0]:
+        rs = laptop_check(va, size, combos)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(JOBS) as ex:
+            rs = list(ex.map(lambda k: check1(va, size, combos[k][0], combos[k][1], os.path.join(work, "v%d" % k)),
+                             range(len(combos))))
     best = None
     for (t, f), x in zip(combos, rs):
         if x.get("status") == "match":
@@ -126,7 +143,10 @@ def main(argv):
     ap.add_argument("--flags")
     ap.add_argument("--max-compiles", type=int, default=40)
     ap.add_argument("--work", default=os.path.join(os.path.dirname(HERE), "work", "regfix"))
+    ap.add_argument("--laptop", action="store_true",
+                    help="compare on the Windows compile machine (tools/laptop64.py) instead of here")
     a = ap.parse_args(argv)
+    LAPTOP[0] = a.laptop
     va = int(a.va, 16)
     L.BINARY, L.INDEX = a.binary or L.BINARY, a.index or L.INDEX
     entry = dict(L.index(L.Image()).get(va) or {})

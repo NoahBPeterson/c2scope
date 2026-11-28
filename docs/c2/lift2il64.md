@@ -68,6 +68,15 @@ value of a class returned by value: `T x = f();`, which cl's frame packer places
 it is an out parameter. regfix64 also prints `c2trace.py slots --image --search` (the frame packer against the
 original).
 
+## Compiling on a Windows compile machine (`--laptop`)
+
+`lift2il64.py bench`, `lbench64.py run` and `regfix64.py` take `--laptop`: the lifting stays local, the compiles and
+compares go to a Windows machine through `tools/laptop64.py` (one upload per chunk of 120 functions, its own worker
+pool there; lint off and /W0 as the local bench). The client reads its connection settings from
+`~/.config/mb-worker`; nothing about the machine is in the tools. laptop64.py is optional: without it, `--laptop`
+stops with a message and every tool runs on the local x64check. Rows carry the same metrics as the local path
+(edits, shape, mapcost; regfix64 also needs `regpairs`, which laptop64 computes the same way as x64metrics).
+
 ## C++ EH tables
 
 `tools/ehinfo64.py VA` decodes a function's `__CxxFrameHandler3` FuncInfo: states and their cleanup funclets (each
