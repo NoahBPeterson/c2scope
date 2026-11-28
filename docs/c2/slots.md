@@ -261,6 +261,8 @@ are the x86 rules, so the four x86 tables need no change).
   the four, so a function with fewer than four parameters still has four param colours. nP is read from the trace,
   not modelled; it was 0 in 10 of the 29 zlib functions (all of them sorted ones), while `slots.c` `big` and `gsbuf`
   have a cookie, nP = 4 and every home refused by the cookie rule (or for size).
+  The colours are made in the visiting order (size, uses), not the parameter order, and which parameter homes a
+  local may use is section 6.3.
 - Rule 5: T grows by align16 (x86 align4); the alignment cap is FUNC+0x4c, 16 when 0.
 - Rule 6 (undo) does not exist.
 - Rule 7: same trigger (T > 128, cookie, GS copies), same compare; the direction is the x86 ESP one (GS level
@@ -421,3 +423,59 @@ Fixtures (`tests/data/slots17orig/`, `run_tests.py` `slots17_orig_tests`, no com
 original's offsets), `gf_padarr_f76` (alloca + dynamic alignment, r13 and the aligned rbp, B < A), `gzprintf_id`
 (`__chkstk`, va_start on a home); each NAME.json (snapshot), NAME.lst (our listing, the function only), NAME.s (the
 original).
+
+### 6.3 Which locals take a parameter's home (cl 17.00 x64; probe `tests/probes/slots17home.py`, source `tests/data/slots17home/`)
+
+Question (Fallout 4 0x1406e7170): why does the original put `v_lh3` in p3 (a3's home, 0x98) while ours puts it in p0?
+The packer's steps, as traced (`c2trace.py slots --c2 17.00`; the model is exact on every probe) **[C]**:
+
+1. **Param colours are made in the element order, not the parameter order.** The four colours (the real parameters and
+   the dummy `tvN` ones that fill the shadow space) are created as the visiting walk reaches the parameter elements:
+   size ascending, uses descending, creation order. A parameter that is never used has 2 uses and is visited before
+   one that is used (1 use): `void f(a, b)` with neither used offers b's home (16) before a's (8). The dummies have
+   1 use and come last. A local tries the colours in that order and takes the first without a conflict, so with
+   all four real or dummy homes free a local lands in the first-created one.
+2. **A local is visited by size, then uses.** A 4-byte local goes before an 8-byte one with more uses. A hidden return
+   slot (a class returned by value, built in place: `S s = mk(0);`, rcx = &s) is an ordinary element here: it takes
+   the same home as a plain `long long s; ext(&s)` in the same place (probe `retslot` / `plain`). `opts retslot` of
+   lift2il64 therefore cannot change a home order.
+3. **A parameter's home conflicts with a local through the parameter's LiveOnDef set.** A register parameter that is
+   only kept in a register has no stack reads, so its set holds the other parameters only (a parameter's own home
+   is "live" from entry at most against the other parameters, and the dummies never conflict with anything): a
+   local joins it. A parameter whose set holds **every** element refuses every local, and its home stays empty.
+   Seen on the traces (SYM fl6 bit 4 is set exactly when the set is full):
+   - never used (also uses = 2, not 1): refuses.
+   - used only as direct call arguments (`ext(&x); use(x); use(a);`, once or twice, in a loop, `use3(a, 0, b)`): refuses.
+   - also used in arithmetic (`use(a + x)`, `use(a + 8)`, `use(a + 1)`), stored (`g = a`), compared, returned, or
+     dereferenced (`g = *(long long *)a`), whether before or after the call argument: leaves the home to the
+     locals (probe `arith`, `store`, `arg_arith`, `deref_arg`; `use(a + 8); ...; use(a); use(a)` too).
+   **[I]** The mechanism is not read in c2. What is not pinned: the same lifted function with `a0` used as `lea
+   rcx, [a0+8]` and passed as `rcx` in the loop refuses where the same mix in the small probes (`t10`: arithmetic and
+   two argument uses) does not, so "any use besides a call argument" is a sufficient test in the probes but not a
+   necessary one; check with the trace (`conf a0$` in the `tried` column) before relying on it.
+4. **/GS**: a function with a cookie (a char buffer) offers no home: every try is `gs` (probe `gs_buf`, 14.00 / 15.00's
+   rule 4). A /GS function without a buffer is unchanged (`gs_nobuf`).
+5. **Callee-saved saves are not elements.** A save the prologue shrink-wraps (`mov [rsp+N], rbx` after an early exit)
+   goes, after the packing, into the **lowest free home**, one register per home in register-number order (rbx, rbp,
+   rsi, rdi, r12..r15); the rest go into the frame above the packed locals (Fallout 4 0x1406e7170: `rbx` in p0 = 0x80, `rsi`
+   and `rbp` at 0x50 / 0x58). A function that saves `rbp, rsi, rdi` with nothing in the homes puts them in p0, p1, p2
+   (`sw1`: [rsp+48], 56, 64); with a local in p0, in p1, p2, p3 (`sw2`). So **where the save lands tells which homes
+   the original left empty**: rbx at p0 means no local took p0.
+
+**0x1406e7170.** Ours: `v_lh3` (8 bytes, 4 uses) is visited first, `a0`'s home is free (the lift copies `a0` into
+`v1009` at entry and passes the copy to the calls, so `a0` has no use as an argument), so it takes p0; `v_lh1` p1,
+`v_lh2` p2; the save of rbx lands in the only free home, p3 (0x98). The original has rbx in p0, so p0 was empty after
+the packing, and `v_lh3` in p3 after `v_lh1` (p1) and `v_lh2` (p2). Two source properties give exactly that **[C]**:
+- `a0` is passed to the calls itself (`FUN_1406e7360(a0, ...)`, `FUN_1406c09e0(a0 + 8, ...)`: the original has `mov r15, rcx`
+  and `mov rcx, r15` in the loop), not through a copy variable: its set is full, p0 is refused to every local and left
+  empty for rbx. Alone this gives `v_lh3` p1, `v_lh1` p2, `v_lh2` p3 (1 of 4 elements right).
+- `v_lh1` and `v_lh2` are smaller than `v_lh3`: 4 bytes (an `int`, a key whose address is passed), so they are visited
+  first (rule 2), `v_lh1` takes p1 (a1's), `v_lh2` p2 (the first dummy), `v_lh3` p3. That the original's objects are 4
+  bytes is **[I]**: nothing in the function reads them; a use count of 5 or more each would give the same order.
+The edit (lifted source: `a0` where `v1009` was, `int v_lh1; int v_lh2;`) gives 4 of 4 elements at the original's offsets
+(`c2trace.py slots --image`), the prologue / epilogue and every stack operand identical; the remaining difference is a register
+(`or eax, -1` / `lock xadd [rcx+8], eax` in the original's last block, `ebp` in ours; 459 bytes against 460).
+
+Probe: `tests/probes/slots17home.py` (two traced compiles, skipped without the 17.00 x64 toolchain): the homes of a local
+against a parameter that is only an argument, unused, in arithmetic, stored, dereferenced; the hidden return slot;
+8-byte against 4-byte order; the shrink-wrap saves; /GS with and without a cookie.

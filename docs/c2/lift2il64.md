@@ -142,7 +142,11 @@ a retail x64 game that pass a return slot: no match either way, shape better 2 /
 errors (a later use outside the declaring block; `FUN_X_rv` clashing with the function itself). It is therefore
 opt-in, not a default variant. The frame packer visits the object by its uses exactly like the plain local, so a
 home-slot order like 0x1406e7170's (the local the original places after a callee-saved save) is not explained by the
-return slot alone.
+return slot alone. It is two other things (slots.md 6.3): the lift copies a parameter into a variable at entry
+(`v1009 = a0`) and passes the copy, which leaves the parameter's home free for a local where the original's
+parameter (passed to the calls itself) refuses every local; and a local the original has smaller (4 bytes) is visited
+before an 8-byte one. 0x1406e7170 reproduces the original's whole frame with `a0` in place of `v1009` and `int` for
+the two out-parameter locals.
 
 ## Not yet handled
 - Re-rolling loops. cl rotated and duplicated the loop tests, so the goto-shaped lift gets re-optimised
