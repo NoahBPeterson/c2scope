@@ -331,6 +331,9 @@ are rebuilt [C].
     the def is retargeted.
 - The def counts it uses (`+0x24`) are reset to 0 at the end, so they do not carry into Spillcosts.
 
+The in-place `imul r, size; add r, base` chain of `T* t = base + i` is this merge of `t = t67` with the sum's def;
+when the sum has a second user the copy stays and the sum is a `lea` temporary instead (immcand.md 6.6).
+
 So a copy that is coalesced away adds no references, and a copy that survives adds a use of `src` and a def of
 `dst`. `RC_copy.cpp` `cp` (`int b = a; a = g(a); ... u(b)`): the copy survives; a's first web has 3 refs (its def,
 the copy, the call argument) and b has 3 (the copy and two uses), prio 18 each [C traced], all four builds.

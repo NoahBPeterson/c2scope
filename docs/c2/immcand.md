@@ -412,21 +412,65 @@ checker]**
 
 ### 6.5 The same family elsewhere in Mount & Blade (not constants)
 
-- `Mission::spawn` 0x4832b0: `found` (prio 72) pops before `t` (59), `t` takes ebx and keeps it across the do-loop;
-  the original has `t` in edi outside the loop and in memory inside it (`mov [esp+0x14], edi` ... `mov edi,
-  [esp+0x14]`), with the loop's callee-saved registers all taken by `a` (esi), `pm` (ebx), the hoisted
-  `g_game->main_party` (ebp, `mov ebp, [ecx+0x78]` before the loop) and `found` (edi). So the original does not
-  need `t` before `found`; it needs `t` after the loop's webs, so that it is split around the loop. Why `t` is high:
-  59 = +96 in the entry block (P 8, **6 references**: `SubsumeGlobregs` folded the chain `t740 = [a+136]; t93 =
-  t740*1288; t129 = t93 + [g_game+0x13a00]; t = t129` into `t`, so `t` is defined three times in place:
-  `imul ebx, 1288; add ebx, ebp`) + 32 after the loop − 69 live-through. The original computes it in one def
-  (`lea edi, [eax+edx]` from two temporaries): 2 references, about +32 in that block, prio about −5, below `pm` and
-  the hoisted `main_party` web. **[C trace for ours; the original's references I from its code]** Source levers
-  tried: hoisting `int mp = g_game->main_party;` (mp then is a web but is spilled: insdiff 49/49 → 54/48),
-  `g_game->troops + a->troop`, a separate `int ti`, a `GameData* g` local: no change in `t`'s chain. What makes the
-  original's front end leave `t` a single `lea` is open.
+- `Mission::spawn` 0x4832b0: explained and **fixed**, see 6.6 (the in-place `t` chain; the original's single `lea` is
+  the sum shared by two evaluations). Before: `found` (prio 72) pops before `t` (59), `t` takes ebx and keeps it
+  across the do-loop; the original has `t` in edi outside the loop and in memory inside it (`mov [esp+0x14], edi`
+  ... `mov edi, [esp+0x14]`), the loop's callee-saved registers all taken by `a` (esi), `pm` (ebx), the hoisted
+  `g_game->main_party` (ebp) and `found` (edi). `t`'s 59 = +96 in the entry block (P 8, **6 references**: the
+  chain `t740 = [a+136]; t93 = t740*1288; t129 = t93 + [g_game+0x13a00]; t = t129` was folded into `t` by
+  `SubsumeGlobregs`, so `t` is defined three times in place: `imul ebx, 1288; add ebx, ebp`) + 32 after the loop
+  - 69 live-through. **[C trace for ours]**
 - `Terrain::make_grid` 0x47a460: no constant holds a callee-saved register. `this` (prio 103) takes ebx on a 0/0 tie
   with ebp (register order); the original has `this` in ebp and the inner loop's count-down counter in ebx. For
   `this` to take ebp, ebx must carry a positive weight when it is coloured (an uncoloured neighbour whose only
   register is ebx, or one that prefers it), or the counter must be coloured first. **[C trace for ours; I for the
   original]** 67 of 87 regmap votes agree: more than one decision differs.
+
+### 6.6 `base + index*size`: an in-place chain or one `lea` of two temporaries (cl 13.10 .. 15.00)
+
+`T* t = g_game->troops + a->troop` (element size 1288) reaches Color in one of three shapes, and the shape fixes the
+pointer's references, its priority and whether it can be split. Probe `tests/data/rules/RA_addrsum.cpp`
+(tests/probes/addrsum.py), the same on 13.10.3077, 13.10.3052, 14.00 and 15.00 **[C]** (traced IL at `@Globregs@4` /
+`@Color@4`, and the listings):
+
+| shape | when | IL at Globregs entry | code, `t` |
+|---|---|---|---|
+| **chain** | the sum is evaluated once | `t145 = [a+136]; t66 = t145*1288; t67 = t66 + [g_game+0x13a00]; t = t67` (the load is a memory operand of the add; 14.00/15.00 print it so, 13.10 loads it into a register first) | `imul r, 1288; add r, base`: `t` is defined three times in place (SubsumeGlobregs coalesces `t67` into `t`, then `t66` into it); 7 refs, prio 38 in a 3-web probe, 9 refs / 59 in M&B |
+| **lea** | the same sum is evaluated twice in one region (no call or aliasing store between): one common subexpression with two users | `t64 = t147*1288; t148 = [g_game+0x13a00]; t135 = lea [t64+t148*1]; t = t135; ...[t135+0]...` | `imul ecx, 1288; mov eax, [g+0x13a00]; lea esi, [ecx+eax]`: the sum is a temporary `t135` with one def; `t` itself loses its references (a copy) |
+| **base** | the *product* is shared (a named `off = i*1288` used again, or a store between the two evaluations kills the base load but not the product) | `off = t65; t145 = [g_game+0x13a00]; t67 = t145 + off; t = t67` | `mov edi, [g+0x13a00]; add edi, esi`: the base is loaded into `t`'s register, the product added |
+
+What does not matter **[C]**: `p + i`, `&p[i]`, `(T*)((char*)p + i*size)`, a local base or index (copy propagation
+removes them before GrgIdentifyCandidates), an unsigned or size_t index, a parameter index, the base a member or a
+plain global, the assignment inside a condition, `t` used before the call and after it: all **chain**. The second
+evaluation after a call (the loads are killed): **chain**. Two evaluations that both stay live (`Troop* u =
+g_game->troops + a->troop;`, `g_game->troops[a->troop].flags` inside an expression, or `int f0 = ...troops[...].flags`
+passed to a call): **lea**. The mechanism **[I]**: `dop2_Codegen` lowers an `OPADD` of a product and a load whose
+result has one use (the copy to the variable) as the two-address `add` with the load as its memory operand, so the
+result is the product's register; when the result tuple has a second user (the CSE temporary read again, usually as
+the base of a load) it is emitted as a non-destructive `lea` of two registers instead and the base load stays a
+separate `mov` (`dop2_Codegen` IL: `mov t148; lea t135`). SubsumeGlobregs is not what chooses: it only merges the
+copies it finds (`mov t, t67` with a single def before it); in the lea shape the copy `t = t135` stays because
+`t135` has another reader.
+
+For a decompiler: **a `lea edi, [eax+edx]` with eax = `imul` and edx = a loaded base (`mov edx, [ecx+0x13a00]`) after
+`mov ecx, [g]` means the address was computed in two places** (two accesses to `troops[i]` in the same region): the
+source evaluates it twice. In Mount & Blade `Mission::spawn` the second evaluation is the entry test
+
+```cpp
+Troop* t = &g_game->troops[a->troop];
+if (g_game->troops[a->troop].flags & 0x10) {     // was: if (t->flags & 0x10)
+```
+
+(the original's `t->flags` read is the same instruction, `mov eax, [edi+0x30]`). Then `t` has no web of its own: the
+sum is the temporary (`t495` in the trace: 2 refs, prio -5, below `pm`, `found` and the hoisted `main_party` web): it is split around the
+do-loop (`mov [esp+0x14], edi` / `mov edi, [esp+0x14]`) as in the original, `found` takes edi inside the loop, `this`
+gets ebx and the g_game web ecx (3077: `this` ebx, g_game ecx; the `mov ebx, ecx` / `lea ebx, [ecx+0xf8]` pair of the
+original appear). With the sum no longer owning `t`'s priority, hoisting `int mp = g_game->main_party;` (declared after
+`PartyMgr& pm`, used as `pm.lookup(mp)`) now helps: `mov ebp, [ecx+0x78]` before the loop as in the original (before
+the CSE spelling it was worse, 6.5). Mount & Blade checker, cl 13.10.3052: `chk.py` aligned 366 -> 284, size 1064 ->
+1067 (the original's), `insn_align` identical 241 -> 261 of 288, changed 38 -> 20, and ignoring stack-slot numbers
+changed 20 -> 4 (the scratch order of `ecx`/`edx` in the party lookup, and the capsule's float temporaries). The
+declaration order of `mp` matters (aligned): `mp; n; pm` 328, `mp; pm; n` 334, `pm; mp; n` 296, `n; pm; mp` 284 (the
+best; size 1067). **[C trace and checker]** The edited copy is in the Mount & Blade session's hands as a patch
+(two lines: the condition and `mp`); the repository was not touched.
+
