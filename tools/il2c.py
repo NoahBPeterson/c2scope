@@ -375,7 +375,7 @@ class Emitter:
                     cls, "".join("    virtual void s%d();\n" % k for k in range(slot)), rty, slot, ", ".join(ps))
                 self.prelude.append(decl)
                 e = "((%s*)(%s))->s%d(%s)" % (cls, argv[0], slot, ", ".join(
-                    a if p.startswith("il2c_bi_") else "(%s)(%s)" % (p, a) for p, a in zip(ps, argv[1:])))
+                    a if p.startswith(("il2c_bi_", "il2c_bvn_")) else "(%s)(%s)" % (p, a) for p, a in zip(ps, argv[1:])))
                 if d:
                     return "%s = (%s)%s;" % (self.lvalue(d[0]), rty, e)
                 return e + ";"

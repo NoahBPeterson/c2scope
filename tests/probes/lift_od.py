@@ -20,5 +20,6 @@ for _nm, _what in (("?od_sum@@", "for loop with an induction variable and a load
                    ("?od_ftail@@", "a float call's result returned through the shared epilogue"),
                    ("?od_sw@@", "sparse switch: the compare tree on cl's switch temporary is a switch statement"),
                    ("?od_andelse@@", "if (A && B) / else"),
-                   ("?od_bfset@@", "an inline bitfield setter called with constants")):
+                   ("?od_bfset@@", "an inline bitfield setter called with constants"),
+                   ("?nestcopy@NT@@", "a by-value copy built in place whose member has its own copy constructor")):
     check("lift /Od: %s" % _what, next((v for k, v in _got.items() if k.startswith(_nm)), _r.stderr[-300:]), "MATCH")

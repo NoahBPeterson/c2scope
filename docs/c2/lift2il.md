@@ -129,6 +129,14 @@ argument shapes), complex expressions that need a callee-saved register (`push e
 built in place by nested inline constructors (11 UNSUPPORTED), x87 stack underflow, `sbb` masks other than the bool
 store, EH frames (1 row of the 1,023 has one: not a volume class at /Od).
 
+**Nested in-place copies** (`nested_inplace`, Spore 005240e0): a by-value argument built in the argument area by an
+inline copy constructor whose member at +K has its own inline copy constructor. /Od shows the member's source as a
+reference temporary (`lea r, [ebp+S+K]; mov [ebp-B], r`: the address of a subobject at a nonzero offset is an
+expression, inline.md rule 13) and the member's `this` as another (`mov r, [ebp-A]; add r, K; mov [ebp-C], r`), its
+floats copied by fld / fstp (an indirect source, even under /arch:SSE). The lift is one argument
+`*(il2c_bvn_i_ff*)&p` with both copy constructors written out; the window's instructions are that copy. Rows whose
+source is two adjacent locals rather than one object (00524150) lift but keep a frame DIFF.
+
 ## /O2 shapes (2026-11-28)
 
 - **Calling conventions.** A call whose stack arguments the caller pops, even when the cleanup is scheduled a few
@@ -142,6 +150,12 @@ store, EH frames (1 row of the 1,023 has one: not a volume class at /Od).
   fcomi table, so `comiss a, b; jbe L` skips code that runs when `a > b`.
 - **Out-structures.** A local whose address leaves and the named slots above it (to the next such local or the
   frame's top) are one array: as separate ints cl drops the stores it cannot see read.
+
+- **Function addresses.** A relocated immediate whose target lies in an executable section is a function's
+  address, not data: `&FUN_<va>` (declared `extern "C" void __cdecl FUN_<va>(...)` when no call declares it), or,
+  for a callee known only as a member stand-in, the bits of a pointer to that member (`il2c_mfa(&C_x::FUN_x)`,
+  single inheritance: 4 bytes). M&B passes constructors to `eh vector constructor iterator` this way (00524860).
+  The bytes do not change (both forms are a dir32 fixup); the source reads as what it is.
 
 Measured on the Spore /O2 sample: 51 -> 71 MATCH; M&B 0 -> 1; Spore /Od 275 -> 283 (the cdecl / constant rules apply
 there too); no MATCH lost, the /O2 regression sets unchanged or better.
@@ -161,7 +175,10 @@ written-out lift on 29 rows (no MATCH gained or lost; 2 rows change by a few byt
 ## Measuring (`tools/staticbench.py`)
 
 `staticbench.py run` lifts each project's real non-exact functions (fixed selections in work/staticbench/sel_*.txt:
-Spore's /Od rows <= 1500 B, a 1,500-row sample of Spore's /O2 rows, Mount & Blade's rows <= 1500 B) with the plain
+Spore's /Od rows <= 1500 B, a 1,500-row sample of Spore's /O2 rows, Mount & Blade's rows <= 1500 B; `refresh`
+rebuilds them as the `*_v2` selections from the projects' current state: Spore's nonmatching.txt rows under match/
+and src/game/ minus every manifest VA, M&B's status.py `equiv` tier; `run` defaults to the `_v2` ones, and `compare`
+of an old run against a `_v2` run restricts both to the rows they share) with the plain
 lifter (lbench --task lift2il) and appends the counts, DIFF classes, UNSUPPORTED reasons, MATCH set and a hash of
 each emitted unit to work/staticbench/history.jsonl; `compare A B` lists MATCHes gained and lost and the rows whose
 C++ changed; `verify A B spore_od` checks B's new MATCHes with spore-decomp's chk.py.

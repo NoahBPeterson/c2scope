@@ -71,6 +71,14 @@ class Image:
         i = bisect.bisect_left(self.relocs, va)
         return i < len(self.relocs) and self.relocs[i] == va
 
+    def is_code(self, va):
+        """Is va inside an executable section (a function's address, not data's)?"""
+        for sec in self.pe.sections:
+            b = sec.VirtualAddress + self.base
+            if b <= va < b + max(sec.Misc_VirtualSize, sec.SizeOfRawData):
+                return bool(sec.Characteristics & 0x20000000)
+        return False
+
     def off(self, va):
         for b, sz, raw in self.secs:
             if b <= va < b + sz:

@@ -29,3 +29,9 @@ int od_sw(int* p, int n) { int f = 0; switch (p[2]) { case 1203833171: case -171
 int od_andelse(int* p, int a) { int r; if (a != p[1] && p[0] < a) r = p[2]; else r = p[3]; return r + a; }
 struct BFS { unsigned a : 8, b : 8, c : 8, d : 8; void setc(unsigned x) { c = x; } };
 void od_bfset(BFS* s, int n) { BFS t = *s; t.setc(97); if (n) t.setc(98); *s = t; }
+// an inline copy constructor whose member has its own (Spore 005240e0): the member's this and source are temporaries
+struct NV2 { float x, y; NV2(const NV2& o) : x(o.x), y(o.y) {} };
+struct NMP { int tri; NV2 uv; NMP(const NMP& o) : tri(o.tri), uv(o.uv) {} };
+struct NVB { virtual int g(int q, NMP a, int s); };
+struct NT { NVB* p; int nestcopy(int q, NMP pos, int s); };
+int NT::nestcopy(int q, NMP pos, int s) { return p->g(q, pos, s); }

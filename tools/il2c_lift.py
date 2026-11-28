@@ -27,6 +27,7 @@ class LiftEmitter(il2c.Emitter):
     def __init__(self, il, params, ret, glob, calls):
         super().__init__(il, params, ret, False)
         self.gl = glob                       # set of global VAs referenced
+        self.fnaddr = set()                  # function addresses used as values (`&FUN_<va>`)
         self.calls = calls                   # callee va -> {"arities": set, "this": bool, "ret": bool}
         self.needs_string = False            # a memcpy: <string.h>
         self.needs_math = False              # sqrt: <math.h>
@@ -77,6 +78,12 @@ class LiftEmitter(il2c.Emitter):
         m = re.match(r"^\?ga_([0-9a-f]{8})@@3HA$", n)
         if m:                                    # an address constant (lift2il: a relocated immediate)
             va = int(m.group(1), 16)
+            img = getattr(self, "img", None)
+            if img is not None and hasattr(img, "is_code") and img.is_code(va) and not self.lang_c:
+                # a function's address (a constructor passed to `eh vector constructor iterator`, a callback):
+                # resolved in unit() to &FUN_<va> once the callees' declarations are known
+                self.fnaddr.add(va)
+                return "(%s)@@FA%08x@@" % (CTYPE.get(ty, "int"), va)
             self.gl.add(va)
             return "(%s)g_%08x" % (CTYPE.get(ty, "int"), va)
         va = self._gva(n)
@@ -246,11 +253,35 @@ class LiftEmitter(il2c.Emitter):
         return {"5004": "float", "4004": "float", "e004": "float", "5008": "double", "4008": "double",
                 "e008": "double", "1008": "__int64"}.get(t, "unsigned int")
 
+    def bn_collapse(self, L, argv, tys):
+        """lift2il's `bnQ=ii_ff` (an inline copy constructor whose member has its own, building a by-value argument
+        in place): argument Q is the source's address, passed as `*(il2c_bvn_ii_ff*)addr`."""
+        for key, n in L["notes"].items():        # a nested copy built in place (lift2il `bnQ=ii_ff`)
+            mb = re.match(r"^bn(\d+)$", key)
+            if mb and int(mb.group(1)) < len(argv):
+                q = int(mb.group(1))
+                if self.lang_c:
+                    raise Unsupported("a by-value object built in place in a C unit")
+                so, si = n.split("_")
+                ct = lambda c_: "float" if c_ == "f" else "int"
+                inn, st = "il2c_bvni_%s" % si, "il2c_bvn_%s" % n
+                if not any(("struct %s " % inn) in x for x in self.prelude):
+                    self.prelude.append("struct %s { %s %s(const %s& o) : %s {} };\n" % (
+                        inn, " ".join("%s m%d;" % (ct(c_), j) for j, c_ in enumerate(si)), inn, inn,
+                        ", ".join("m%d(o.m%d)" % (j, j) for j in range(len(si)))))
+                if not any(("struct %s " % st) in x for x in self.prelude):
+                    self.prelude.append("struct %s { %s %s n; %s(const %s& o) : %s, n(o.n) {} };\n" % (
+                        st, " ".join("%s m%d;" % (ct(c_), j) for j, c_ in enumerate(so)), inn, st, st,
+                        ", ".join("m%d(o.m%d)" % (j, j) for j in range(len(so)))))
+                tys[q] = st
+                argv[q] = "*(%s*)(%s)" % (st, argv[q])
+        return argv, tys
+
     def bi_collapse(self, L, argv, tys):
         """/Od: a by-value object an inline constructor builds in place in the argument area (lift2il's note
         `biQ=SIG`: arguments Q.. are its members, `f` float / `i` int): one argument `il2c_bi_SIG(m0, m1, ..)` of a
         class with that constructor and a declared copy constructor (without one cl builds a temporary and copies it)."""
-        argv, tys = list(argv), list(tys)
+        argv, tys = self.bn_collapse(L, list(argv), list(tys))
         for key, n in sorted(L["notes"].items(), key=lambda kv: -int(kv[0][2:]) if re.match(r"^bi\d+$", kv[0]) else 0):
             mb = re.match(r"^bi(\d+)$", key)
             if mb and int(mb.group(1)) + len(n) <= len(argv):
@@ -1582,6 +1613,42 @@ def _one_site(lf, il, img, k0, n, cva, csize, flags, cmask=None):
 
 
 def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
+    """(C++ text, lifter): _unit, then function addresses used as values resolved (`&FUN_<va>`, declared when no call
+    declares it; a callee known only as a stand-in member keeps the data form g_<va>)."""
+    global _LAST_EM
+    _LAST_EM = None
+    text, lf = _unit(img, va, size, mask, flags, partial, od)
+    em = _LAST_EM
+    fas = sorted(set(int(x, 16) for x in re.findall(r"@@FA([0-9a-f]{8})@@", text)))
+    if fas:
+        calls = em.calls if em is not None else {}
+        cxx = "struct" in text and bool(getattr(lf, "eh", None))
+        lang_c = bool(flags) and "/TC" in flags.split()
+        decls = []
+        for f in fas:
+            c = calls.get(f)
+            if c and c["this_sigs"] and not c["sigs"]:
+                # a member function's address: the bits of the pointer to member (single inheritance: 4 bytes)
+                sig = sorted(c["this_sigs"])[0]
+                r = c.get("fret") or ("int" if c["ret"] else "void")
+                text = text.replace("@@FA%08x@@" % f, "il2c_mfa((%s (C_%08x::*)(%s))&C_%08x::FUN_%08x)" % (
+                    r, f, ", ".join(sig), f, f))
+                if not any("il2c_mfa(T" in d for d in decls):
+                    decls.append("template<class T> __forceinline int il2c_mfa(T p) { return *(int*)&p; }")
+                continue
+            text = text.replace("@@FA%08x@@" % f, "&FUN_%08x" % f)
+            if not c and f != va:
+                decls.append('%svoid __cdecl FUN_%08x(%s);' % ("" if cxx or lang_c else 'extern "C" ', f,
+                                                             "" if lang_c else "..."))
+        if decls:
+            text = "\n".join(decls) + "\n" + text
+    return text, lf
+
+
+_LAST_EM = None
+
+
+def _unit(img, va, size, mask=None, flags=None, partial=None, od=None):
     """(C++ text, lifter) for one function: lift2il, then il2c's emitter with the names and signature above.
     mask: the byte offsets retail relocates inside the function (a corpus row's `mask`), to tell addresses from
     numbers; None reads the image's relocation table."""
@@ -1608,6 +1675,9 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
             raise Unsupported("EH frame in a C unit")
         il, this_alias = alias_this(il)
     em = LiftEmitter(il, params, ret, set(), {})
+    em.img = img
+    global _LAST_EM
+    _LAST_EM = em
     em.lang_c = lang_c
     em.od = bool(od)
     em.inl = inl
@@ -1624,6 +1694,7 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
             if not partial:
                 raise
             em = LiftEmitter(il, params, ret, set(), {})   # partial: the plain body, EH shape as comments
+            em.img, _LAST_EM = img, em
             em.lang_c, em.this_alias, em.partial = lang_c, this_alias, True
             lf.eh_unsupported = str(ex)
     body = em.body()

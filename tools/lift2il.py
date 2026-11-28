@@ -99,6 +99,7 @@ class Lifter:
         self.bvctor = {}                   # outgoing offset -> (copy constructor va, bytes): a by-value class
         self.load_src = {}                 # temp -> (base token, disp) of the load that defined it
         self.bv_block = {}                 # outgoing offset -> bytes of a struct copied there by rep movsd
+        self.bn_block = {}                 # outgoing offset -> member signature of a nested copy built in place
         self.byval = []                    # the last call's by-value structs: (first argument index, address, bytes)
         # catch funclets inside the function's bytes are not its code; a resume target only a handler reaches
         # starts the catch block's own code (`catch (...) { return false; }`)
@@ -658,6 +659,81 @@ class Lifter:
         return self.names.get(self.find((k, r)), "_w_%s" % r)
 
     # ---- stack and operands
+    def nested_inplace(self, k, ebp):
+        """/Od `sub esp, N; mov [ebp-A], esp` followed by an inline copy constructor whose member at +K has its own
+        inline copy constructor (Spore 005240e0 / 00524150): the outer members' dword copies from [ebp+S+i], then
+        `lea r, [ebp+S+K]; mov [ebp-B], r` (the member's source, a reference temporary), `mov r, [ebp-A];
+        add r, K; mov [ebp-C], r` (the member's this), then its members copied [ebp-B]+o -> [ebp-C]+o (fld / fstp
+        a float, mov a dword). -> (end index, frame offset of the source S, signature `ii_ff`, (A, B, C)) or None."""
+        ins = self.ins
+        if k < 1 or ins[k - 1].mnemonic != "sub":
+            return None
+        try:
+            n = int(ins[k - 1].op_str.split(",")[1], 0)
+        except ValueError:
+            return None
+        t = ["%s %s" % (i.mnemonic, i.op_str) for i in ins]
+        ma = re.match(r"mov dword ptr \[ebp - (0x\w+|\d+)\], esp$", t[k])
+        if not ma:
+            return None
+        A = ma.group(1)
+        D = lambda x: -int(x, 0)
+        frm = lambda sgn, v: (1 if sgn == "+" else -1) * int(v, 0)
+        q = k + 1
+        outer = []                           # (offset in the object, frame offset of its source)
+        S = None
+        while q + 2 < len(t):
+            m0 = re.match(r"mov (\w+), dword ptr \[ebp - %s\]$" % A, t[q])
+            m1 = re.match(r"mov (\w+), dword ptr \[ebp ([+-]) (0x\w+|\d+)\]$", t[q + 1])
+            if not (m0 and m1):
+                break
+            m2 = re.match(r"mov dword ptr \[%s(?: \+ (0x\w+|\d+))?\], %s$" % (m0.group(1), m1.group(1)), t[q + 2])
+            if not m2:
+                break
+            o = int(m2.group(1), 0) if m2.group(1) else 0
+            src = frm(m1.group(2), m1.group(3))
+            if S is None:
+                S = src - o
+            if src - o != S or o != 4 * len(outer):
+                return None
+            outer.append(o)
+            q += 3
+        if not outer or q + 4 >= len(t):
+            return None
+        K = 4 * len(outer)
+        ml = re.match(r"lea (\w+), \[ebp ([+-]) (0x\w+|\d+)\]$", t[q])
+        mb = ml and re.match(r"mov dword ptr \[ebp - (0x\w+|\d+)\], %s$" % ml.group(1), t[q + 1])
+        if not (ml and mb) or frm(ml.group(2), ml.group(3)) != S + K:
+            return None
+        B = mb.group(1)
+        mr = re.match(r"mov (\w+), dword ptr \[ebp - %s\]$" % A, t[q + 2])
+        mk = mr and re.match(r"add %s, (0x\w+|\d+)$" % mr.group(1), t[q + 3])
+        mc = mk and re.match(r"mov dword ptr \[ebp - (0x\w+|\d+)\], %s$" % mr.group(1), t[q + 4])
+        if not (mc and int(mk.group(1), 0) == K):
+            return None
+        C = mc.group(1)
+        q += 5
+        inner = ""
+        while q + 3 < len(t):
+            md = re.match(r"mov (\w+), dword ptr \[ebp - %s\]$" % C, t[q])
+            ms = re.match(r"mov (\w+), dword ptr \[ebp - %s\]$" % B, t[q + 1])
+            if not (md and ms):
+                break
+            o = 4 * len(inner)
+            sm = r"\[%s%s\]" % (ms.group(1), (r" \+ %s" % (hex(o) if o >= 10 else str(o))) if o else "")
+            dm = r"\[%s%s\]" % (md.group(1), (r" \+ %s" % (hex(o) if o >= 10 else str(o))) if o else "")
+            if re.match(r"fld dword ptr %s$" % sm, t[q + 2]) and re.match(r"fstp dword ptr %s$" % dm, t[q + 3]):
+                inner += "f"
+            else:
+                mv = re.match(r"mov (\w+), dword ptr %s$" % sm, t[q + 2])
+                if not (mv and re.match(r"mov dword ptr %s, %s$" % (dm, mv.group(1)), t[q + 3])):
+                    return None
+                inner += "i"
+            q += 4
+        if not inner or K + 4 * len(inner) != n:
+            return None
+        return q, ebp + S, "i" * len(outer) + "_" + inner, (D(A), D(B), D(C))
+
     def frame_name(self, off, ty):
         if off >= 4:
             self.args_read.add(off)
@@ -1077,6 +1153,7 @@ class Lifter:
                         if self.byval:
                             sh = 1 if thiscall else 0
                             note = (note + " " + " ".join(("bi%d=%s" % (i + sh, _d)) if n == "bi" else
+                                                          ("bn%d=%s" % (i + sh, _d)) if n == "bn" else
                                                           ("bv%d=%d" % (i + sh, n)) if n > 0 else
                                                           ("bc%d=%d.%x" % (i + sh, -n, _d))
                                                           for i, _b, _d, n in self.byval)).strip()
@@ -1267,6 +1344,18 @@ class Lifter:
                             self.ins[k - 1].mnemonic == "sub" and self.ins[k - 1].op_str.startswith("esp, "):
                         # /Od `sub esp, N; mov [ebp-x], esp`: an inline constructor's `this` (a compiler temporary)
                         # building a by-value argument in place; its reloads point at the outgoing area
+                        nest = self.nested_inplace(k, ebp) if os.environ.get("L2C_NESTED", "1") == "1" else None
+                        if nest:
+                            # a copy constructor with a member's own copy constructor: the object is the copy of
+                            # one frame object (`*(S*)&p`); the window's instructions are that copy
+                            end, base, sig, slots = nest
+                            t = self.temp()
+                            self.emit(k, "OPASSIGN", [t], [self.frame_name(base, "1004")], "s0=&")
+                            self.out_args[esp] = (t, int(self.ins[k - 1].op_str.split(",")[1], 0))
+                            self.bn_block[esp] = sig
+                            self.inplace_slots.update(ebp + d_ for d_ in slots)
+                            self.skip.update(range(k + 1, end))
+                            continue
                         self.slot_esp[ebp + ops[0].mem.disp] = esp
                         self.inplace_slots.add(ebp + ops[0].mem.disp)
                         self.inplace_at = esp
@@ -2907,6 +2996,8 @@ class Lifter:
         for q, o in enumerate(offs):
             if o in self.bv_block:
                 self.byval.append((q, None, 0, self.bv_block.pop(o)))   # copied in by rep movsd: args[q] is the source
+            if o in self.bn_block:
+                self.byval.append((q, None, self.bn_block.pop(o), "bn"))   # a nested copy: args[q] is the source
             if o in self.bvctor:
                 cv, n = self.bvctor.pop(o)
                 self.byval.append((q, None, cv, -n))        # a class with a copy constructor (FUN_<cv>)
@@ -2941,8 +3032,9 @@ class Lifter:
                         all(src[q][1] == src[0][1] + 4 * q for q in range(len(src))):
                     self.byval.append((i, src[0][0], src[0][1], 4 * (j - i)))
             i = max(j, i + 1)
-        if any(n != "bi" and n > 0 for *_r, n in self.byval):
-            for i, b, disp, n in reversed([x for x in self.byval if x[3] != "bi" and x[3] > 0 and x[1] is not None]):
+        if any(n not in ("bi", "bn") and n > 0 for *_r, n in self.byval):
+            for i, b, disp, n in reversed([x for x in self.byval if x[3] not in ("bi", "bn") and x[3] > 0 and
+                                           x[1] is not None]):
                 t = self.temp()
                 self.lines.append("I 0 add 0 0 | %s <- %s:1004 %d:1004" % (t, b, disp))
                 args[i:i + n // 4] = [t]
