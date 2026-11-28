@@ -18,7 +18,7 @@ TOK = re.compile(r"\s*(?:(?P<num>0[xX][0-9a-fA-F]+[uUlL]*|\d+\.\d*(?:[eE][+-]?\d
                  r"(?P<id>[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)|"
                  r"(?P<op>->|<<=|>>=|<<|>>|<=|>=|==|!=|&&|\|\||\+\+|--|[-+*/%&|^]=|[-+*/%&|^~!<>=?:.,()\[\]{}]))")
 BASE = {"unsigned", "signed", "char", "short", "int", "long", "__int64", "float", "double", "void", "bool", "const",
-        "volatile"}
+        "volatile", "__m128", "__m128i", "__m128d"}
 RANK = {"bool": 0, "char": 1, "unsigned char": 1, "short": 2, "unsigned short": 2, "int": 4, "unsigned int": 4,
         "long": 4, "unsigned long": 4, "__int64": 8, "unsigned __int64": 8}
 FLOATS = {"float", "double"}
@@ -362,7 +362,7 @@ def has_call(e):
 
 class Unit:
     """Header lines, signature, body statements."""
-    DECL = re.compile(r"^((?:unsigned |signed )?(?:__int64|int|char|short|long|float|double|bool)) (\w+);$")
+    DECL = re.compile(r"^((?:unsigned |signed )?(?:__int64|int|char|short|long|float|double|bool|__m128i|__m128d|__m128)) (\w+);$")
 
     def __init__(self, text):
         lines = text.rstrip("\n").split("\n")
@@ -735,12 +735,42 @@ class Unit:
             step = 8 if pos % 8 == 0 else 4 if pos % 4 == 0 else 1
             layout.append((pos, {8: "__int64", 4: "int", 1: "char"}[step]))
             pos += step
+        # offsets the code names (read, written or address-taken) are fields; runs of the rest are padding arrays
+        used = set(fields)
+
+        def scan_addr(e):
+            k = self.frame_addr(e) if e[0] in ("cast", "bin", "un") else None
+            if k is not None:
+                used.add(k)
+                return
+            for c in kids(e):
+                scan_addr(c)
+        for st in self.stmts:
+            for e in self.exprs(st):
+                scan_addr(e)
+        groups = []                                   # (offset, type, count, is padding)
+        for off, t in layout:
+            pad = off not in used
+            if pad and groups and groups[-1][3] and groups[-1][1] == t:
+                g = groups[-1]
+                groups[-1] = (g[0], t, g[2] + 1, True)
+            else:
+                groups.append((off, t, 1, pad))
         ords = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
                 "eleventh", "twelfth"]
-        names = {}
-        for n, (off, t) in enumerate(layout):
-            names[off] = ords[n] if n < len(ords) else "item%d" % (n + 1)
-        self.frame_layout = [(t, names[off]) for off, t in layout]
+        names, self.frame_layout = {}, []
+        nf = npad = 0
+        for off, t, cnt, pad in groups:
+            if pad:
+                npad += 1
+                nm = "unused%d" % npad if sum(1 for g in groups if g[3]) > 1 else "unused"
+                self.frame_layout.append((t, nm + ("[%d]" % cnt if cnt > 1 else "")))
+                names[off] = nm
+                continue
+            nm = ords[nf] if nf < len(ords) else "item%d" % (nf + 1)
+            nf += 1
+            names[off] = nm
+            self.frame_layout.append((t, nm))
 
         def rw(e):
             if e[0] == "un" and e[1] == "*" and e[2][0] == "cast" and e[2][1].endswith("*"):
@@ -859,7 +889,7 @@ class Unit:
             defs, uses, addr = self.defs_uses()
             for v in list(self.locals):
                 d = defs.get(v, [])
-                if len(d) != 1 or v in addr:
+                if len(d) != 1 or v in addr or v in self.block:
                     continue
                 e = self.stmts[d[0]][2]
                 if e[1] != "=":
@@ -877,6 +907,7 @@ class Unit:
                     continue
                 if cand and done is not None:
                     done.add(v)
+                self.applied.add(v)
                 if self.ty(r) != self.vars[v] and not (r[0] == "num" or self.implicit_ok(r, self.vars[v])):
                     r = ("cast", self.vars[v], r)
                 elif self.ty(r) != self.vars[v]:
@@ -922,7 +953,7 @@ class Unit:
             defs, uses, addr = self.defs_uses()
             for v in list(self.locals):
                 d, u = defs.get(v, []), uses.get(v, [])
-                if len(d) != 1 or len(u) != 1 or v in addr:
+                if len(d) != 1 or len(u) != 1 or v in addr or v in self.block:
                     continue
                 i = d[0]
                 e = self.stmts[i][2]
@@ -944,6 +975,12 @@ class Unit:
                         and tgt[2][1] in ids(e[3]) and tgt[2][1] != v:
                     pass
                 r = e[3]
+                if CALLLOADS[0] == 0 and any(n[0] == "call" for n in walk(self.stmts[j][2])) and \
+                        any(n[0] == "un" and n[1] == "*" or n[0] in ("idx", "mem") for n in walk(r)):
+                    # a load kept as its own statement before a call: cl loads the arguments in statement order
+                    # (folded into the argument list, it picks its own order)
+                    continue
+                self.applied.add(v)
                 if self.ty(r) != self.vars[v] and not self.implicit_ok(r, self.vars[v]):
                     r = ("cast", self.vars[v], r)
                 elif self.ty(r) != self.vars[v] and r[0] != "num":
@@ -1206,15 +1243,70 @@ class Unit:
         return re.sub(r"\n{3,}", "\n\n", t)
 
 
-LADDER = [dict(copy=1, inline=1, decl=1, typed=1, comp=1), dict(copy=1, inline=1, decl=1, typed=1),
+CALLLOADS = [1]
+LADDER = [dict(copy=1, inline=1, decl=1, typed=1, comp=1), dict(copy=1, inline=1, decl=1, typed=1, comp=1, callloads=0),
+          dict(copy=1, inline=1, decl=1, typed=1),
           dict(copy=1, inline=1, decl=0, typed=1),
           dict(copy=1, inline=1, decl=1, typed=0), dict(copy=1, inline=0, decl=1, typed=0),
           dict(copy=0, inline=0, decl=0, typed=0)]
 
 
-def tidy_one(text, o):
+EH_TAIL = {"try": ["    } catch (...) {", "        throw;", "    }"], "swallow": ["    } catch (...) {", "    }"]}
+
+
+def eh_unwrap(text):
+    """lift2il64's EH body (try { ... } catch (...) { throw; } or { }) -> (plain text, mode) or (text, None)."""
+    L = text.split("\n")
+    if "    try {" not in L:
+        return text, None
+    i = L.index("    try {")
+    for mode, tail in EH_TAIL.items():
+        for j in range(i + 1, len(L)):
+            if L[j:j + len(tail)] == tail:
+                rest = L[j + len(tail):]
+                if rest[:1] == ["    return 0;"]:
+                    rest = rest[1:]
+                if rest[:1] != ["}"]:
+                    break
+                inner = [l[4:] if l.startswith("    ") else l for l in L[i + 1:j]]
+                return "\n".join(L[:i] + inner + rest), mode
+    raise ValueError("try block")
+
+
+def eh_rewrap(text, mode):
+    """The tidied text with its body back inside the try block."""
+    L = text.split("\n")
+    k = L.index("{") + 1
+    void = L[k - 2].startswith("void ")
+    while k < len(L):
+        if L[k].startswith("    struct ") and L[k].endswith("{"):
+            while not re.match(r"^    \} \w+;$", L[k]):
+                k += 1
+            k += 1
+        elif re.match(r"^    [\w ]+\*? \w+(\[\d+\])?;$", L[k]):
+            k += 1
+        else:
+            break
+    end = max(n for n, l in enumerate(L) if l == "}")
+    inner = ["    " + l if l.strip() else l for l in L[k:end]]
+    tail = EH_TAIL[mode] + (["    return 0;"] if mode == "swallow" and not void else [])
+    return "\n".join(L[:k] + ["    try {"] + inner + tail + L[end:])
+
+
+def tidy_one(text, o, applied=None):
+    plain, mode = eh_unwrap(text)
+    t = _tidy_one(plain, o, applied)
+    return eh_rewrap(t, mode) if mode else t
+
+
+def _tidy_one(text, o, applied=None):
+    """o: a LADDER rung, optionally copy_allow / inline_allow (greedy, adding folds) or block (variables never
+    folded away: the reverse search). applied: collects the variables the folds removed."""
     COMPOUND[0] = o.get("comp", 0)
+    CALLLOADS[0] = o.get("callloads", 1)
     u = Unit(text)
+    u.block = set(o.get("block") or ())
+    u.applied = applied if applied is not None else set()
     u.strip_all()
     u.do_frame()
     u.strip_all()
@@ -1238,6 +1330,7 @@ def tidy_one(text, o):
 def candidates(text, o):
     """The moves (('inline'|'copy', var)) that o leaves out but could still make."""
     u = Unit(text)
+    u.block, u.applied = set(o.get("block") or ()), set()
     u.strip_all()
     u.do_frame()
     u.strip_all()

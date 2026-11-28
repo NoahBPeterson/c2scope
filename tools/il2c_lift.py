@@ -91,6 +91,7 @@ class LiftEmitter(il2c.Emitter):
         if n.startswith("_l") and ty in ("1008", "2008"):
             # an __int64 read of a frame slot (`fild qword [esp+0x34]`, `params[i]`): its 8 bytes, not the
             # declared dword widened (lift2il makes such a slot a 2-dword aggregate, so the halves stay adjacent)
+            self.decl.setdefault(nm, "int")      # (a slot only ever read so: still declared)
             return "(*(%s*)&%s)" % (CTYPE[ty], nm)
         return super().var(n, ty)
 
@@ -145,6 +146,14 @@ class LiftEmitter(il2c.Emitter):
             return ("stmt", "__EH(%s);" % L["srcs"][0].split(":")[0])
         if L["op"] == "OPEHRESUME":
             return ("stmt", "__EHRESUME;")
+        if L["op"] == "OPINLINE":                # an inlined callee's body: its call (inline_sites)
+            tys = [t.replace("_", " ") for t in L["notes"]["tys"].split(",")] if L["notes"]["tys"] != "-" else []
+            e = "%s(%s)" % (L["notes"]["fn"], ", ".join("(%s)(%s)" % (t, self.rvalue(a, L))
+                                                       for t, a in zip(tys, L["srcs"])))
+            d = [x for x in L["dsts"] if x]
+            if d:
+                return ("stmt", "%s = (%s)%s;" % (self.lvalue(d[0]), self.ctype_of(d[0]), e))
+            return ("stmt", e + ";")
         if L["op"] == "OPSETCC":                 # setcc: the comparison's value
             cc = L["notes"]["cc"]
             uns = cc in ("b", "be", "a", "ae")
@@ -156,6 +165,12 @@ class LiftEmitter(il2c.Emitter):
                 self.cc_helpers.add((cc, uns))
                 return ("stmt", "%s = (unsigned char)(il2c_cc_%s%s((%s)(%s), (%s)(%s)));" % (
                     self.lvalue(L["dsts"][0]), cc, "u" if uns else "", ty, a, ty, b))
+            if L["notes"].get("nsn") == "1" and self.od and not self.lang_c:
+                # /Od `neg x; sbb r, r; neg r`: cl's conversion of x to bool (`x != 0` is a setne)
+                # (a bool store of `x != 0` compiles so; an inline helper returning it keeps that inside any
+                # expression the /Od folds build)
+                self.nz_helper = True
+                return ("stmt", "%s = (unsigned char)il2c_nz((int)(%s));" % (self.lvalue(L["dsts"][0]), a))
             if L["notes"].get("neg") == "1":     # sbb r, r: 0 or -1
                 return ("stmt", "%s = (int)(-(int)((%s)(%s) %s (%s)(%s)));" % (self.lvalue(L["dsts"][0]), ty, a, op,
                                                                              ty, b))
@@ -230,6 +245,29 @@ class LiftEmitter(il2c.Emitter):
             t = self.argty.get(base, t)
         return {"5004": "float", "4004": "float", "e004": "float", "5008": "double", "4008": "double",
                 "e008": "double", "1008": "__int64"}.get(t, "unsigned int")
+
+    def bi_collapse(self, L, argv, tys):
+        """/Od: a by-value object an inline constructor builds in place in the argument area (lift2il's note
+        `biQ=SIG`: arguments Q.. are its members, `f` float / `i` int): one argument `il2c_bi_SIG(m0, m1, ..)` of a
+        class with that constructor and a declared copy constructor (without one cl builds a temporary and copies it)."""
+        argv, tys = list(argv), list(tys)
+        for key, n in sorted(L["notes"].items(), key=lambda kv: -int(kv[0][2:]) if re.match(r"^bi\d+$", kv[0]) else 0):
+            mb = re.match(r"^bi(\d+)$", key)
+            if mb and int(mb.group(1)) + len(n) <= len(argv):
+                q, k_ = int(mb.group(1)), len(n)
+                if self.lang_c:
+                    raise Unsupported("a by-value object built in place in a C unit")
+                st = "il2c_bi_%s" % n
+                if not any(("struct %s " % st) in x for x in self.prelude):
+                    mt = ["float" if c_ == "f" else "int" for c_ in n]
+                    self.prelude.append("struct %s { %s __forceinline %s(%s) { %s } %s(const %s&); };\n" % (
+                        st, " ".join("%s m%d;" % (t_, j) for j, t_ in enumerate(mt)), st,
+                        ", ".join("%s p%d" % (t_, j) for j, t_ in enumerate(mt)),
+                        " ".join("m%d = p%d;" % (j, j) for j in range(k_)), st, st))
+                vals = ["(%s)(%s)" % ("float" if c_ == "f" else "int", a_) for c_, a_ in zip(n, argv[q:q + k_])]
+                argv[q:q + k_] = ["%s(%s)" % (st, ", ".join(vals))]
+                tys[q:q + k_] = [st]
+        return argv, tys
 
     def call(self, L):
         d = [t for t in L["dsts"] if not re.match(r"^pas\d+", t)]
@@ -373,6 +411,7 @@ class LiftEmitter(il2c.Emitter):
                     self.prelude.append("struct %s { int d[%d]; };\n" % (st, n // 4))
                 tys[q] = st
                 argv[q] = "*(%s*)(%s)" % (st, argv[q])
+        argv, tys = self.bi_collapse(L, argv, tys)
         c = self.calls.setdefault(va, {"sigs": set(), "this_sigs": set(), "ret": False})
         if L["notes"].get("noreturn") == "1":
             c["noreturn"] = True
@@ -398,6 +437,8 @@ class LiftEmitter(il2c.Emitter):
                     "(%s)(%s)" % (t, a) for t, a in zip(tys, argv)))
         for st in set(t for t in tys if t.startswith(("il2c_bv", "FUN_"))):
             e = e.replace("(%s)(*(%s*)(" % (st, st), "(*(%s*)(" % st)   # the object itself, no functional cast
+        for st in set(t for t in tys if t.startswith("il2c_bi_")):
+            e = e.replace("(%s)(%s(" % (st, st), "(%s(" % st)
         if d:
             rt = CTYPE.get(self.ty(d[0]), "int")
             c["ret"] = True
@@ -451,6 +492,31 @@ def drop_unused_decls(body):
     for m in list(re.finditer(r"(?m)^    (?!return\b)[\w ]+?\*? ((?:t|v_l)\d+)(?:\[\d+\])?;\n", body)):
         if len(re.findall(r"\b%s\b" % m.group(1), body)) == 1:
             body = body.replace(m.group(0), "", 1)
+    return body
+
+
+def escaped_objects(body, lf):
+    """/O2: a local whose address leaves (`&v_lN` passed or kept) and the named slots above it up to the next such
+    local or the frame's top are one object (an out-structure the callee fills, read back member by member): as
+    separate ints cl would keep the members it sees stored or read in registers and drop their stores."""
+    decl = {int(m.group(1)) for m in re.finditer(r"(?m)^    int v_l(\d+);$", body)}
+    esc = sorted({int(n) for n in re.findall(r"&v_l(\d+)\b", body)} & decl, reverse=True)
+    for q, N in enumerate(esc):
+        stop = esc[q + 1] if q + 1 < len(esc) else 0
+        members = [M for M in decl if stop < M < N]
+        if not members or any((-N, n) in lf.aggregates for n in range(4, N + 1)):
+            continue
+        lo = min(members)
+        if not stop:                              # the frame's top object: to the first local slot
+            pro = sorted(getattr(lf, "pro", ()))
+            sub = next((x for x in pro if lf.ins[x].mnemonic == "sub"), None)
+            pushes = sum(1 for x in pro if lf.ins[x].mnemonic == "push" and lf.ins[x].op_str in lift2il.CALLEE_SAVED
+                         and (sub is None or x < sub))
+            if lo > 4 + 4 * pushes:
+                lo = 4 + 4 * pushes
+        if any(N > M2 > lo and M2 not in decl for M2 in range(lo, N, 4)):
+            continue                              # a hole: not one object the lift sees whole
+        lf.aggregates.add((-N, N - lo + 4))
     return body
 
 
@@ -1314,6 +1380,207 @@ def _eh_sig(lf, va, typed):
     return "%s %s FUN_%08x(%s)\n" % (ret, "__stdcall" if lf.ret_pop else "__cdecl", va, ", ".join(typed) or "void")
 
 
+# ---- inlined callee bodies (/O2): a region of the original that is a known leaf callee's body (invert/inlining.py's
+# ---- shape match) becomes a call of that callee, defined __forceinline in the unit, so c2 inlines it again ----
+
+INLINE_DB = None          # {"bodies": {shape text: callee va}, "size": {va: size}}: set by the caller (lbench)
+
+
+def _ins_shape(i):
+    m, ops = i.mnemonic, i.op_str
+    ops = re.sub(r"\[esp[^]]*\]", "[S]", ops)
+    ops = re.sub(r"\b(e?[abcd]x|[abcd][lh]|e?[sd]i|ebp)\b", "R", ops)
+    return m + " " + ops
+
+
+def _callee_body(ins):
+    """The callee's body (the instructions an inlined copy keeps) and its inputs: [(register, argument index or
+    'this')], from its stack-argument loads and an ecx read before any write."""
+    body, inputs, pushes, written = [], [], 0, set()
+    for i in ins:
+        m = i.mnemonic
+        if m == "push":
+            pushes += 1
+            continue
+        if m in ("pop", "ret"):
+            continue
+        mm = re.match(r"^(e[a-d]x|e[sd]i), dword ptr \[esp(?: \+ (0x[0-9a-f]+|\d+))?\]$", i.op_str)
+        if m == "mov" and mm:
+            off = int(mm.group(2) or "0", 0) - 4 * pushes
+            if off < 4 or off % 4:
+                return None, None
+            inputs.append((mm.group(1), (off - 4) // 4))
+            written.add(mm.group(1))
+            continue
+        regs = re.findall(r"\b(e[a-d]x|e[sd]i)\b", i.op_str)
+        if "ecx" in regs and "ecx" not in written and not (m == "mov" and i.op_str.startswith("ecx,")):
+            if ("ecx", "this") not in inputs:
+                inputs.append(("ecx", "this"))
+        if regs and (m in ("mov", "lea", "movzx", "movsx") or m.startswith("set")) and not i.op_str.startswith("dword ptr") \
+                and not i.op_str.startswith(("byte", "word")):
+            written.add(regs[0])
+        body.append(i)
+    return body, inputs
+
+
+def inline_db_for(corp, img):
+    """build_inline_db over a corpus's byte-exact rows (status matched), cached under work/cache."""
+    path = os.path.join(os.path.dirname(HERE), "work", "cache", "inlinedb_%s.json" % corp.name)
+    key = "%d" % len(corp.rows)
+    if os.path.exists(path):
+        d = json.load(open(path))
+        if d.get("key") == key:
+            return d
+    d = build_inline_db(img, [r for r in corp.rows if r["status"] == "matched"])
+    d["key"] = key
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(d, open(path, "w"))
+    return d
+
+
+def build_inline_db(img, rows, lo=6, hi=40):
+    """Leaf callees (no call, no x87, lo..hi body instructions) among byte-exact rows: their body shapes."""
+    bodies, size, masks = {}, {}, {}
+    for r in rows:
+        if r["size"] > 200:
+            continue
+        va = int(r["va"], 16)
+        ins = img.insns(va, r["size"])
+        if not ins or any(i.mnemonic == "call" or i.mnemonic.startswith(("f", "j")) or "xmm" in i.op_str or
+                          "fs:" in i.op_str for i in ins):
+            continue
+        body, inputs = _callee_body(ins)
+        if body is None or not lo <= len(body) <= hi:
+            continue
+        bodies.setdefault("\n".join(_ins_shape(i) for i in body), r["va"])
+        size[r["va"]] = r["size"]
+        masks[r["va"]] = r["mask"]
+    return {"bodies": bodies, "size": size, "mask": masks}
+
+
+def inline_sites(lf, il, img, flags):
+    """Rewrite il: each region of lf's instructions matching a known callee body becomes OPINLINE (the callee's
+    lifted C++ as a __forceinline helper). Returns (il, helpers)."""
+    db = INLINE_DB
+    if not db or not db.get("bodies"):
+        return il, []
+    shapes = [_ins_shape(i) for i in lf.ins]
+    text = "\n".join(shapes) + "\n"
+    helpers, done = [], []
+    for btxt, cva in sorted(db["bodies"].items(), key=lambda kv: (-kv[0].count("\n"), kv[1])):   # longest first
+        if cva == "%08x" % lf.va or (btxt + "\n") not in text:
+            continue
+        n = btxt.count("\n") + 1
+        bl = btxt.split("\n")
+        for k0 in range(len(shapes) - n + 1):
+            if shapes[k0:k0 + n] != bl or any(a <= k0 < b or a < k0 + n <= b for a, b in done):
+                continue
+            if len([i for i in lf.ins if i.mnemonic not in ("ret", "push", "pop")]) <= n + 2:
+                continue                          # the whole function is that body: nothing to gain
+            import corpus as corpusmod
+            site = _one_site(lf, il, img, k0, n, int(cva, 16), db["size"][cva], flags,
+                             corpusmod.unpack(db["mask"][cva]) if db.get("mask", {}).get(cva) else None)
+            if site is None:
+                continue
+            il, helper = site
+            done.append((k0, k0 + n))
+            if helper not in helpers:
+                helpers.append(helper)
+    return il, helpers
+
+
+INL_WHY = []
+
+
+def _why(k):
+    INL_WHY.append(k)
+    return None
+
+
+def _one_site(lf, il, img, k0, n, cva, csize, flags, cmask=None):
+    cins = img.insns(cva, csize)
+    body, inputs = _callee_body(cins)
+    if body is None or len(body) != n:
+        return _why(1)
+    reg = {}                                     # callee register -> the caller's, first occurrence
+    for ci, i in zip(body, lf.ins[k0:k0 + n]):
+        a = re.findall(r"\b(e[a-d]x|e[sd]i|ebp)\b", ci.op_str)
+        b = re.findall(r"\b(e[a-d]x|e[sd]i|ebp)\b", i.op_str)
+        if len(a) != len(b):
+            return _why(2)
+        for x, y in zip(a, b):
+            if reg.setdefault(x, y) != y:
+                pass                              # a callee register reused for another value
+    global INLINE_DB
+    db, INLINE_DB = INLINE_DB, None
+    try:
+        ctext, clf = unit(img, cva, csize, cmask, flags=flags)
+    except Exception:
+        return _why(3)
+    finally:
+        INLINE_DB = db
+    if clf.eh or clf.float_ret:
+        return _why(4)
+    msig = re.search(r'(?m)^(?:extern "C" )?(\w[\w ]*?) (__\w+) FUN_%08x\((.*)\)\n\{\n' % cva, ctext)
+    if not msig:
+        return _why(5)
+    ret, params = msig.group(1), [p for p in msig.group(3).split(", ") if p and p != "void" and p != "int edx_unused"]
+    cbody = ctext[msig.end():].rstrip()
+    gdecl = re.findall(r'(?m)^extern "C" unsigned char g_[0-9a-f]{8}\[\];$', ctext[:msig.start()])
+    if not cbody.endswith("}") or re.search(r"\bFUN_[0-9a-f]{8}\b|il2c_", cbody):
+        return _why(6)                               # (a leaf with no globals: the helper needs no declarations)
+    cbody = cbody[:-1]
+    # the caller's values of the callee's inputs, at the first region instruction that reads each
+    args = []
+    for p in params:
+        pn = p.split()[-1]
+        if pn == "self":
+            src = next((r for r, a in inputs if a == "this"), None)
+        else:
+            src = next((r for r, a in inputs if a == (int(pn[1:]) - 4) // 4), None)
+        if src is None:
+            args.append("0:1004")                 # a parameter the body does not read
+            continue
+        if src not in reg:
+            return _why(7)
+        cr = reg[src]
+        k = next((q for q in range(k0, k0 + n) if re.search(r"\b%s\b" % cr, lf.ins[q].op_str)), None)
+        if k is None:
+            return _why(8)
+        args.append("%s:1004" % lf.var_read(k, cr))
+    addrs = {i.address for i in lf.ins[k0:k0 + n]}
+    lines = [l for l in il]
+    pos = [q for q, l in enumerate(lines) if l.startswith("I ") and int(l.split()[1], 16) in addrs]
+    if not pos:
+        return _why(9)
+    defs = set()
+    for q in pos:
+        mm = re.match(r"^I \w+ \w+ \S+ \S+ \| (.*?) <-", lines[q])
+        if mm:
+            defs |= {x.split(":")[0] for x in mm.group(1).split() if re.match(r"^t\d+:\w+$", strip_reg(x))}
+    dst = ""
+    rest = "\n".join(l for q, l in enumerate(lines) if q not in pos)
+    if ret != "void":                             # eax's last write in the body: the caller's register there
+        j = max((q for q, ci in enumerate(body) if ci.op_str.startswith("eax,")), default=None)
+        cw = re.match(r"^(e[a-d]x|e[sd]i)\b", lf.ins[k0 + j].op_str) if j is not None else None
+        if cw:
+            w = lf.var_written(k0 + j, cw.group(1))
+            if re.search(r"\b%s:" % w, rest):
+                dst = "%s:1004" % w
+    if any(re.search(r"\b%s:" % d, rest) for d in defs if not dst.startswith(d + ":")):
+        return _why(11)                               # a value the region computes is read after it
+    name = "il2c_inl_%08x" % cva
+    a0 = lines[pos[0]].split()[1]
+    tys = ",".join(" ".join(p.split()[:-1]).replace(" ", "_") for p in params)
+    new = "I %s OPINLINE 0 0 | %s <- %s ; fn=%s tys=%s ret=%s" % (a0, dst, " ".join(args), name, tys or "-",
+                                                               ret.replace(" ", "_"))
+    out = [l for q, l in enumerate(lines) if q not in pos[1:]]
+    out[pos[0]] = new
+    helper = "".join(g + "\n" for g in gdecl) + "__forceinline %s %s(%s)\n{%s}" % (
+        ret, name, ", ".join(params) or "void", cbody)
+    return out, helper
+
+
 def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
     """(C++ text, lifter) for one function: lift2il, then il2c's emitter with the names and signature above.
     mask: the byte offsets retail relocates inside the function (a corpus row's `mask`), to tell addresses from
@@ -1326,6 +1593,9 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
     lf.od_ret = bool(od)
     inl = (not flags) or any(f in ("/Ob1", "/Ob2") for f in flags.split())   # c2 inlines `inline` / forced helpers
     il = lf.run()
+    inl_helpers = []
+    if not od and not lf.eh and INLINE_DB:
+        il, inl_helpers = inline_sites(lf, il, img, flags)
     this = any(re.search(r"\b_this:", l) for l in il)
     nargs = max([(o - 4) // 4 + 1 for o in lf.args_read] + [lf.ret_pop // 4])
     params = ["a%d" % (4 + 4 * k) for k in range(nargs)]
@@ -1363,7 +1633,13 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
             body = body.replace("{", "{\n    /* lift2il: EH frame not reproduced: %s */" % lf.eh_unsupported.replace("*/", "* /"), 1)
     if os.environ.get("L2C_DROP_DEAD", "1") == "1":
         body = drop_dead(body)
+    if not od and os.environ.get("L2C_ESCAPED", "1") == "1":
+        body = escaped_objects(body, lf)
     body = drop_unused_decls(size_addressed_locals(fold_aggregates(body, lf), lf))
+    if not od and os.environ.get("C2_BUILD", "").startswith(("13.10", "3052")) and os.environ.get("INVERT_OFF") != "1" \
+            and os.environ.get("INVERT_X87") != "0":     # invert: x87names (13.10 rounds a float field, not a local)
+        from invert import x87names as inv_x87
+        body = inv_x87.members_13(body)
     fr_text = None
     if od:
         import il2c_od
@@ -1375,7 +1651,7 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
                 if int(mv.group(2)) > hn:
                     deep.append("t%d" % (5000 + int(mv.group(2))))
                     body = re.sub(r"\b%s\b" % mv.group(1), deep[-1], body)
-        body = drop_unused_decls(il2c_od.od_loops(il2c_od.od_goto_else(il2c_od.od_short_circuit(il2c_od.od_return_merge((il2c_od.od_inline_calls if inl else (lambda b: b))(il2c_od.od_clean(il2c_od.od_struct_copies(il2c_od.od_fold(body, deep)))))))))
+        body = drop_unused_decls(il2c_od.od_loops(il2c_od.od_goto_else(il2c_od.od_short_circuit(il2c_od.od_return_merge(il2c_od.od_switch((il2c_od.od_inline_calls if inl else (lambda b: b))(il2c_od.od_clean(il2c_od.od_struct_copies(il2c_od.od_fold(body, deep))))))))))
         body = il2c_od.od_parens(body)
         home = None
         if this and not getattr(em, "self_assigned", False):
@@ -1383,8 +1659,22 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
         fr_text = None
         lf.caller_cleans(0)                              # sets lf.frame_alloc: the prologue's reservation
         named = (home - 8) if home else lf.frame_alloc    # `this`'s home is the first temporary below the named block
+        res = set()
+        for o_ in getattr(lf, "inplace_slots", ()):      # an in-place by-value object's temporaries (its `this` and
+            res |= {-o_, -o_ - 4}                         # the slot above): cl allocates them for our constructor too
+        res |= il2c_od.SWTEMPS                           # a sparse switch's temporary (od_switch)
+        il2c_od.SWTEMPS.clear()
+        while named > 0 and named + 4 in res:
+            named -= 4
         if named > 0:
+            pre_frame = body
             fr_text, body = il2c_od.od_frame(body, named, va)
+            if os.environ.get("INVERT_OFF") != "1" and (fr_text is None or os.environ.get("INVERT_OD") != "struct"):
+                # invert: odframe (tools/invert/odframe.py)
+                from invert import odframe as inv_odframe      # separate locals, named for c1xx's /Od hash walk
+                placed = inv_odframe.place_locals(pre_frame, named)
+                if placed:
+                    body, fr_text = placed, None
     pty = lambda p: CTYPE.get(lf.arg_types.get(int(p[1:]), "1004"), "int")
     if pty("a4") is None:
         pass
@@ -1414,6 +1704,17 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
         for f_ in sorted(il2c_od.DELS):
             head.append("__forceinline void il2c_d_%s(int p, int fl) { if (fl & 1) %s((unsigned int)(p)); }" % (f_, f_))
         il2c_od.DELS.clear()
+        if getattr(em, "nz_helper", False):
+            head.append("template<class T> __forceinline bool il2c_nz(T v) { return v != 0; }")
+        for sh_, n_ in sorted(il2c_od.BITFIELDS):         # an inline bitfield setter (il2c_od._bitfield)
+            head.append("struct il2c_bfs_%d_%d { %sunsigned int f : %d; };" % (
+                sh_, n_, "unsigned int pad : %d; " % sh_ if sh_ else "", n_))
+            head.append("__forceinline void il2c_bf_%d_%d(void* p, unsigned int x) { ((il2c_bfs_%d_%d*)p)->f = x; }"
+                        % (sh_, n_, sh_, n_))
+        il2c_od.BITFIELDS.clear()
+        if il2c_od.KCONST:                               # a constant that was an inlined callee's parameter
+            head.append("template<class T> __forceinline T il2c_k(T v) { return v; }")
+        il2c_od.KCONST.clear()
     ext = "" if lang_c else 'extern "C" '
     # 2. a path that returns nothing in a function that returns a value (a void tail call next to value rets)
     if ret != "void":
@@ -1431,6 +1732,7 @@ def unit(img, va, size, mask=None, flags=None, partial=None, od=None):
         body = body.replace("(bool)", "(unsigned char)")
     elif ret == "bool":
         body = bool_flags(body)
+    head += inl_helpers                                  # inlined callees, defined ahead of the caller
     return "\n".join(head) + ("\n\n" if head else "") + sig + body + "\n", lf
 
 

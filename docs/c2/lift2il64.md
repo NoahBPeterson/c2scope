@@ -15,8 +15,70 @@ Function sizes come from the executable's `.pdata`. A leaf function has no unwin
 pass `--index FILE`, a JSON file `{"functions": [{"address": "0x...", "size": N, "flags": [[...], ...]}]}`. The
 optional `flags` field gives the flag sets to try for that function, for example `/O1` for the size-optimised ones
 or `/EHsc` for the ones with C++ EH. `--flags` gives one set, comma-separated; to try several, separate the sets
-with `;`. The default is `/O2,/GS-`. The C++ names functions `FUN_<va>` and globals `g_<va>`, and x64check resolves
-those names to their addresses.
+with `;`. The default is `/O2,/GS-`. A function whose float compares branch on equality without a parity check
+(`ucomiss` then `je` / `jne`, no `jp`) was built with `/fp:fast`: each set is tried with `/fp:fast` first; one with a
+parity check never gets it; when the bytes do not say, `LIFT64_FPFAST=1` tries `/fp:fast` after the plain sets (for
+code built with it throughout). `--extra-set A,B,..` (repeatable) adds whole flag sets after those, `--only-extra`
+tries them alone. A C++ exception frame is read from the executable's unwind data (a `__CxxFrameHandler3` FuncInfo,
+`ehinfo64.py`); give such functions `/EHsc` in the index. The C++ names functions `FUN_<va>` and globals `g_<va>`, and x64check resolves
+those names to their addresses. Register webs are named `v1001`, `v1002`, ... (variables; `t\d+` is the name of
+cl's own temporaries to `ncolsim.named()` and `realize --from-ncol`).
+
+What the lifter writes beyond plain statements:
+- packed SSE through the `_mm_*` intrinsics, scalar ops on vectors through the `_ss` ones (`sqrtss` from another
+  register as `_mm_move_ss(d, _mm_sqrt_ss(s))`), division by constants, `sbb` / `bt`, variadic calls;
+- cl's null-checked pointer adjustment (`lea r, [x+D]; test x, x; jne; xor r, r`, or the `je` form) as
+  `nullcast_downD(x)` / `nullcast_upD(x)`: inline helpers that `static_cast` between two classes D bytes apart;
+- `rdtsc; shl rdx, 32; or rax, rdx` as `__rdtsc()`, `rol` / `ror` as `_rotl*` / `_rotr*`;
+- one signature per callee: when two call sites of one callee disagree (a stale register read as an argument), the
+  function is lifted again with an integer register wherever they disagree;
+- C++ EH frames (the `-2` UnwindHelp store): the body inside `try { } catch (...)`, rethrown or swallowed;
+- `MARKS = True` ends each statement with `//@<address>` (lsearch64), `RETVAR` (off) gives the return value its own
+  variable.
+
+The register webs are numbered in address order of their first definition, so the text does not depend on
+`PYTHONHASHSEED`.
+
+## Metrics and fixed benches
+
+`tools/x64metrics.py` measures how far a no-match is from the original, from x64check's two listings: `edits`
+(Levenshtein distance over the instructions, in-function jumps position-free), `edits_noreg` (the same once every
+register is `R` and every `[rsp/rbp+off]` is `[S]`), `mapcost` (register choice and stack layout as a mapping over the
+shape-aligned instructions: the pairs that break the majority mapping plus the mappings that are not the identity,
+so one different allocation costs about 1) and `regpairs` (our register -> the original's). `lift2il64 check` prints
+them and `bench` rows carry `edits` / `shape` / `mapcost`. `edits_noreg` 0 with `mapcost` above 0 means the code is
+right and only registers or slots differ.
+
+`tools/lbench64.py make NAME --min 200 --max 1200 --count 300` picks a fixed set of functions by size (from the
+index, or `--from LIST`, a JSON list of `[address, size]`), `run NAME --tag T` lifts and checks them (6 jobs) and
+writes `work/lbench64/NAME.T.json`, `compare NAME A B` lists the matches won and lost between two runs and how many
+shapes got better or worse.
+
+## regfix64: the code is right, the registers are not
+
+`tools/regfix64.py VA --binary EXE` takes the lifter's best variant (or `--src`), and:
+1. compiles and compares it: the `regpairs` mapping says which original register each of ours stands for;
+2. traces our compile with `c2ncol.py --c2 17.00`, which gives each variable (`v1xxx`) its register;
+3. asks `realize.py --from-ncol --want-regs` for the original's register for each callee-saved variable;
+4. compares every variant realize keeps and lists the matches (`WORK/<va>/match_N.cpp`).
+
+When no register needs to move, the difference is the stack frame. regfix64 then prints `frameinfo64`'s reading of
+each stack address passed to a call. A slot is a return slot when the callee returns that pointer (the hidden return
+value of a class returned by value: `T x = f();`, which cl's frame packer places after the named locals); otherwise
+it is an out parameter. regfix64 also prints `c2trace.py slots --image --search` (the frame packer against the
+original).
+
+## C++ EH tables
+
+`tools/ehinfo64.py VA` decodes a function's `__CxxFrameHandler3` FuncInfo: states and their cleanup funclets (each
+call, and where its `rcx` points in the parent's frame: a local, a pointer in a slot, a by-value argument's home, a
+member of `this`), try blocks and catch handlers, and ip-to-state. `tools/ehobj64.py VA` uses it on constructors whose
+every state destroys a member of `this`: it rebuilds the members as classes whose inline constructor forwards to the
+original's call and whose destructor binds to the original's through its `FUN_` name. The constructor runs them as
+member initializers, so cl writes the original's state machine.
+
+`tools/lsearch64.py` (mutation search: merge / fold / type / order edits scored by x64metrics) is a reference only and is
+not part of the release.
 
 ## x64check
 
@@ -63,6 +125,8 @@ uses offsets, stand-in types and `FUN_`/`g_` names; the real types and names are
 ## Not yet handled
 - Re-rolling loops. cl rotated and duplicated the loop tests, so the goto-shaped lift gets re-optimised
   differently. This is the main cause of misses above 128 bytes.
-- x64 C++ EH. This needs objects with destructors (the -2 unwind-help store).
-- Packed SSE, parity float branches, sbb, and one-operand mul / imul.
-- Differences in register choice.
+- x64 C++ EH beyond try / catch (...) and ehobj64's constructors: other objects with destructors.
+- Parity float branches and one-operand mul / imul.
+- Hidden return slots. A class returned by value is lifted as a named local and a pointer, not as `T x = f();`, so
+  cl can place its slot elsewhere (frameinfo64 finds these slots).
+- Register choice beyond what regfix64 can ask realize for.

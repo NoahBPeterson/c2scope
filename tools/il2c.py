@@ -363,13 +363,19 @@ class Emitter:
             if mm and int(m.group(2)) % 4 == 0 and (mm.group(1) == a0src or mm.group(1) == a0):
                 slot = int(m.group(2)) // 4
                 ps = [self.ctype_of(a) for a in args[1:]]
+                if hasattr(self, "arg_ctype"):      # il2c_lift: an OPARG temporary carrying a float is a float
+                    ps = [self.arg_ctype(a) if self.arg_ctype(a) in ("float", "double", "__int64") else p
+                          for p, a in zip(ps, args[1:])]
+                argv = [self.rvalue(a, L) for a in args]
+                if hasattr(self, "bi_collapse"):    # il2c_lift: a by-value object built in place
+                    argv, ps_ = self.bi_collapse(L, argv, [None] + ps)
+                    ps = ps_[1:]
                 cls = "il2c_vc%d" % len(self.prelude)
                 decl = "struct %s {\n%s    virtual %s s%d(%s);\n};\n" % (
                     cls, "".join("    virtual void s%d();\n" % k for k in range(slot)), rty, slot, ", ".join(ps))
                 self.prelude.append(decl)
-                argv = [self.rvalue(a, L) for a in args]
                 e = "((%s*)(%s))->s%d(%s)" % (cls, argv[0], slot, ", ".join(
-                    "(%s)(%s)" % (p, a) for p, a in zip(ps, argv[1:])))
+                    a if p.startswith("il2c_bi_") else "(%s)(%s)" % (p, a) for p, a in zip(ps, argv[1:])))
                 if d:
                     return "%s = (%s)%s;" % (self.lvalue(d[0]), rty, e)
                 return e + ";"

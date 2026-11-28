@@ -3710,7 +3710,9 @@ def x64_mine_pairs_tests():
             for a_, (mn, ops) in zip(lst.addrs, tsweep.cs_text(lst)):
                 f.write("+0x%x  %s  %s\n" % (a_, mn, ops))
         return p
-    env = dict(os.environ, EFFECTMINE_DIR=tempfile.mkdtemp(prefix="em17test_"))
+    # the compile server has no x64 traced toolchain: effectmine refuses wine when a server is configured, so these
+    # checks (of effectmine's logic, not of the server) compile here (as b54c133 does for the incsnap check)
+    env = dict(os.environ, EFFECTMINE_DIR=tempfile.mkdtemp(prefix="em17test_"), EFFECTMINE_ALLOW_LOCAL="1")
     EMS = os.path.join(HERE, "tests", "data", "effectmine.cpp")
     r = subprocess.run(em + ["mine", EMS, "--func", "em__base", "--features", "regs,keys", "--eager-feats", "keys",
                              "--classes", r"^(copy|pad\.init\.top|decl\.extvar\.before)$", "--max-compiles", "40",

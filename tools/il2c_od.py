@@ -73,6 +73,8 @@ def fold_leaf(lines, alive, i, t, e, addr_taken):
         dm = DEFL.match(L)
         if dm and dm.group(2) == t:
             return False
+        if re.search(r"&\s*\(?\s*%s\b" % t, L):
+            return False                      # its address is taken (`*(T*)&t = ..`): a variable, not a value
     for k in range(i + 1, last + 1):
         if alive[k] and pat.search(lines[k]) and not DECL.match(lines[k]):
             lines[k] = pat.sub(lambda _m: "(" + e + ")", lines[k])
@@ -708,6 +710,76 @@ def _close(lines, i):
     return -1
 
 
+def _nested_loop(lines, a, k, kinds=("for", "while", "do", "switch")):
+    """Is lines[k] inside a loop (or switch) block opened at or after lines[a]?"""
+    st = []
+    for j in range(a, k):
+        s = lines[j]
+        for _ in range(s.count("}")):
+            if st:
+                st.pop()
+        for _ in range(s.count("{")):
+            st.append(bool(re.match(r"^\s*(?:%s)\b" % "|".join(kinds), s)))
+    return any(st)
+
+
+def _inner_backjump(lines, a, b):
+    """A label in lines[a:b] that a later goto in lines[a:b] reaches: an inner loop not yet written as one."""
+    for k in range(a, b):
+        m = LABEL.match(lines[k])
+        if m and any(re.search(r"\bgoto %s;" % m.group(1), lines[j]) for j in range(k + 1, b)):
+            return True
+    return False
+
+
+def _loop_body(lines, f, e, Lab, refs):
+    """The body of the loop whose `if` is lines[f] (closed at lines[e]) and whose back edge is `goto Lab`, written
+    with `continue` / `break`, or None. The back edges inside the body (not inside an inner loop) are `continue`; a
+    body that falls out of the `if` leaves the loop (`break` at its end, or in the arm that falls out when the other
+    arm is a bare `continue`); a goto to the label right after the loop is `break`."""
+    body = lines[f + 1:e]
+    a = f + 1
+    inside = sum(1 for l in body if re.search(r"\bgoto %s;" % Lab, l))
+    if inside != refs(Lab) or not inside:
+        return None
+    last_back = GOTO.match(lines[e - 1]) is not None and GOTO.match(lines[e - 1]).group(1) == Lab
+    if last_back and inside == 1:
+        return None                               # the plain loop: od_loops' own rule
+    if _inner_backjump(lines, a, e):
+        return None
+    for k in range(a, e - (1 if last_back else 0)):
+        if re.search(r"\bgoto %s;" % Lab, lines[k]) and _nested_loop(lines, a, k):
+            return None
+    out_lab = LABEL.match(lines[e + 1]).group(1) if e + 1 < len(lines) and LABEL.match(lines[e + 1]) else None
+    if out_lab:
+        for k in range(a, e):
+            if re.search(r"\bgoto %s;" % out_lab, lines[k]) and _nested_loop(lines, a, k, ("for", "while", "do",
+                                                                                            "switch")):
+                return None
+    body = list(body)
+    if last_back:
+        body = body[:-1]
+    else:
+        if not body or re.match(r"^\s*(?:return\b.*|goto \w+);$", body[-1]):
+            return None
+        ind = re.match(r"^(\s*)", lines[f]).group(1) + "    "
+        # `if (c) { A } else { goto Lab; }` at the end: `if (c) { A; break; }`
+        if len(body) >= 3 and body[-1] == ind + "}" and body[-3] == ind + "} else {" and \
+                GOTO.match(body[-2]) and GOTO.match(body[-2]).group(1) == Lab and \
+                not re.match(r"^\s*(?:return\b.*|goto \w+|continue|break);$", body[-4]):
+            body = body[:-3] + [ind + "    break;", ind + "}"]
+        else:
+            return None                           # (the goto form compiles like the source's own loop: Spore 004549b0)
+    body = [re.sub(r"\bgoto %s;" % Lab, "continue;", l) for l in body]
+    drop_out = False
+    if out_lab:
+        n_out = sum(1 for l in body if re.search(r"\bgoto %s;" % out_lab, l))
+        if n_out:
+            body = [re.sub(r"\bgoto %s;" % out_lab, "break;", l) for l in body]
+            drop_out = n_out == refs(out_lab)
+    return body, drop_out
+
+
 def od_loops(body):
     """cl compiles `for (init; c; inc) body` at /Od as `init; jmp C; I: inc; C: c; jcc out; body; jmp I` and
     `while (c) body` as `T: c; jcc out; body; jmp T`; a `goto` written for either gets another jmp.  il2c's structuring
@@ -741,11 +813,19 @@ def od_loops(body):
                 if not im:
                     continue
                 e = _close(lines, f)
-                if e < 0 or not GOTO.match(lines[e - 1]) or GOTO.match(lines[e - 1]).group(1) != Lab or refs(Lab) != 1:
+                if e < 0:
                     continue
                 ind = im.group(1)
-                new = ["%sfor (; %s; %s) {" % (ind, im.group(2), ", ".join(inc))] + lines[f + 1:e - 1] + [lines[e]]
-                lines[i:e + 1] = new
+                if GOTO.match(lines[e - 1]) and GOTO.match(lines[e - 1]).group(1) == Lab and refs(Lab) == 1:
+                    new = ["%sfor (; %s; %s) {" % (ind, im.group(2), ", ".join(inc))] + lines[f + 1:e - 1] + [lines[e]]
+                    lines[i:e + 1] = new
+                else:                                 # continue / break inside, or a body that leaves the loop
+                    lb = _loop_body(lines, f, e, Lab, refs)
+                    if lb is None:
+                        continue
+                    new = ["%sfor (; %s; %s) {" % (ind, im.group(2), ", ".join(inc))] + lb[0] + [lines[e]]
+                    tail = lines[e + 2:] if lb[1] else lines[e + 1:]
+                    lines[i:] = new + tail
                 changed = True
                 break
             if ml and i + 1 < len(lines):
@@ -753,11 +833,18 @@ def od_loops(body):
                 if not im:
                     continue
                 e = _close(lines, i + 1)
-                if e < 0 or not GOTO.match(lines[e - 1]) or GOTO.match(lines[e - 1]).group(1) != ml.group(1) or \
-                        refs(ml.group(1)) != 1:
+                if e < 0:
                     continue
-                new = ["%swhile (%s) {" % (im.group(1), im.group(2))] + lines[i + 2:e - 1] + [lines[e]]
-                lines[i:e + 1] = new
+                if GOTO.match(lines[e - 1]) and GOTO.match(lines[e - 1]).group(1) == ml.group(1) and \
+                        refs(ml.group(1)) == 1:
+                    new = ["%swhile (%s) {" % (im.group(1), im.group(2))] + lines[i + 2:e - 1] + [lines[e]]
+                    lines[i:e + 1] = new
+                else:
+                    lb = _loop_body(lines, i + 1, e, ml.group(1), refs)
+                    if lb is None:
+                        continue
+                    new = ["%swhile (%s) {" % (im.group(1), im.group(2))] + lb[0] + [lines[e]]
+                    lines[i:] = new + (lines[e + 2:] if lb[1] else lines[e + 1:])
                 changed = True
                 break
     return "\n".join(lines)
@@ -1001,6 +1088,206 @@ def _push_ret(lines, close, T):
     return out
 
 
+def _sw_eval(n, T, v):
+    """Evaluate a parsed condition with variable T = v (32-bit int semantics), or raise _NoParse."""
+    k = n[0]
+    if k == "grp":
+        return _sw_eval(n[1], T, v)
+    if k == "atom":
+        if n[1] == T:
+            return v
+        if re.match(r"^\d+$", n[1]):
+            return int(n[1])
+        raise _NoParse(n[1])
+    if k == "cast":
+        x = _sw_eval(n[2], T, v) & 0xFFFFFFFF
+        if n[1] == "unsigned int":
+            return x
+        if n[1] == "int":
+            return x - (1 << 32) if x & 0x80000000 else x
+        raise _NoParse(n[1])
+    if k == "un":
+        x = _sw_eval(n[2], T, v)
+        if n[1] == "-":
+            return -x
+        if n[1] == "!":
+            return int(not x)
+        raise _NoParse(n[1])
+    if k == "bin":
+        op = n[1]
+        if op == "&&":
+            return int(bool(_sw_eval(n[2], T, v)) and bool(_sw_eval(n[3], T, v)))
+        if op == "||":
+            return int(bool(_sw_eval(n[2], T, v)) or bool(_sw_eval(n[3], T, v)))
+        a, b = _sw_eval(n[2], T, v), _sw_eval(n[3], T, v)
+        f = {"==": a == b, "!=": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}
+        if op not in f:
+            raise _NoParse(op)
+        return int(f[op])
+    raise _NoParse(k)
+
+
+def _sw_consts(n, out):
+    if isinstance(n, tuple):
+        if n[0] in ("atom", "un", "cast", "grp") and n[0] != "bin":
+            try:
+                if _sw_eval(n, "\0", 0) is not None and not (n[0] == "un" and n[1] == "!"):
+                    out.add(_sw_eval(n, "\0", 0))
+                    return
+            except _NoParse:
+                pass
+        for x in n[1:]:
+            _sw_consts(x, out)
+
+
+SWTEMPS = set()
+SWIF = re.compile(r"^(\s*)if \((.*)\) (goto L\w+;|\{)$")
+
+
+def od_switch(body):
+    """/Od sparse switch: `T = e;` then a compare tree on T (`cmp [T], K; jg / je ..`, lifted as ifs and gotos) whose
+    leaves are the case labels and the label after the switch: `switch (e) { case K: .. }` (cl builds the same tree and
+    its own temporary T). The switch closes at that label (no default: a value outside the cases leaves the switch)."""
+    lines = body.split("\n")
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s+)(v_l\d+) = (.*);$", lines[i])
+        if not m:
+            i += 1
+            continue
+        ind, T, E = m.groups()
+        # the dispatch: ifs / gotos on T only, ending right before a label
+        j, d, conds, ok = i + 1, 0, [], True
+        while j < len(lines):
+            l = lines[j]
+            if LABEL.match(l) and d == 0:
+                break
+            mi = SWIF.match(l)
+            if mi:
+                try:
+                    p = _P(_tokens(mi.group(2)))
+                    n = p.expr(3)
+                    if p.peek() is not None:
+                        raise _NoParse("tail")
+                    _sw_eval(n, T, 0)
+                except (_NoParse, RecursionError, IndexError):
+                    ok = False
+                    break
+                conds.append(n)
+                d += mi.group(3) == "{"
+            elif GOTO.match(l):
+                pass
+            elif l.strip() == "}" and d > 0:
+                d -= 1
+            elif l.strip() == "} else {" and d > 0:
+                pass
+            else:
+                ok = False
+                break
+            j += 1
+        if not ok or j >= len(lines) or len(conds) < 2 or d != 0:
+            i += 1
+            continue
+        # T only here (its assignment, the dispatch) and in plain stores before it
+        uses = [k for k, l in enumerate(lines) if re.search(r"\b%s\b" % T, l) and not DECL_ANY.match(l)]
+        pre = [k for k in uses if k < i and re.match(r"^\s+%s = [^;]*;$" % T, lines[k])]
+        if any(not (i <= k < j) and k not in pre for k in uses):
+            i += 1
+            continue
+        fall = LABEL.match(lines[j]).group(1)
+
+        def run(a, b, v):
+            k = a
+            while k < b:
+                l = lines[k]
+                g = GOTO.match(l)
+                if g:
+                    return g.group(1)
+                mi = SWIF.match(l)
+                if mi:
+                    c = _sw_eval(_P(_tokens(mi.group(2))).expr(3), T, v)
+                    if mi.group(3) != "{":
+                        if c:
+                            return re.match(r"goto (L\w+);", mi.group(3)).group(1)
+                        k += 1
+                        continue
+                    e = _close(lines, k)
+                    el = next((q for q in range(k + 1, e) if lines[q].startswith(mi.group(1) + "} else {")), None)
+                    if c:
+                        r = run(k + 1, el if el is not None else e, v)
+                    else:
+                        r = run(el + 1, e, v) if el is not None else None
+                    if r:
+                        return r
+                    k = e + 1
+                    continue
+                k += 1
+            return None
+        ks = set()
+        for n in conds:
+            _sw_consts(n, ks)
+        ks = sorted(x - (1 << 32) if x >= 0x80000000 else x for x in ks)
+        try:
+            tgt = {v: run(i + 1, j, v) or fall for v in ks}
+            probes = {ks[0] - 1, ks[-1] + 1} | {x + 1 for x in ks} | {x - 1 for x in ks}
+            dflt = {run(i + 1, j, v) or fall for v in probes if v not in ks}
+        except (_NoParse, RecursionError, IndexError):
+            i += 1
+            continue
+        if len(dflt) != 1:
+            i += 1
+            continue
+        D = dflt.pop()
+        cases = {v: t for v, t in tgt.items() if t != D}
+        if len(cases) < 2:
+            i += 1
+            continue
+        # the labels: case targets after the dispatch, then D at the dispatch's depth; braces balanced between
+        labs = {LABEL.match(l).group(1): k for k, l in enumerate(lines) if LABEL.match(l)}
+        if D not in labs or any(t not in labs for t in cases.values()):
+            i += 1
+            continue
+        dk = labs[D]
+        if any(not j <= labs[t] < dk for t in cases.values()) or dk < j or \
+                not lines[dk].startswith(ind + "L") or sum(x.count("{") - x.count("}") for x in lines[j:dk]) != 0:
+            i += 1
+            continue
+        run_, bad = 0, False
+        for x in lines[j:dk]:
+            if run_ == 0 and x.strip().startswith("}"):
+                bad = True
+            run_ += x.count("{") - x.count("}")
+        if bad:
+            i += 1
+            continue
+        uns = any("unsigned" in str(n) for n in conds)
+        SWTEMPS.add(int(T[3:]))                   # its slot is cl's switch temporary now
+        out = [l for k, l in enumerate(lines[:i]) if k not in pre]
+        out.append("%sswitch (%s) {" % (ind, "(unsigned int)(%s)" % E if uns else E))
+        bylab = {}
+        for v, t in cases.items():
+            bylab.setdefault(t, []).append(v)
+        nD = sum(1 for l in lines if re.search(r"\bgoto %s;" % D, l))
+        nDin = 0
+        for k in range(j, dk):
+            l = lines[k]
+            ml = LABEL.match(l)
+            if ml and ml.group(1) in bylab:
+                for v in sorted(bylab[ml.group(1)]):
+                    out.append("%scase %d:" % (ind, v))
+            if re.search(r"\bgoto %s;" % D, l) and not _nested_loop(lines, j, k):
+                l = re.sub(r"\bgoto %s;" % D, "break;", l)
+                nDin += 1
+            out.append(("    " + l) if l.strip() else l)
+        out.append(ind + "}")
+        nDdisp = sum(1 for k in range(i + 1, j) if re.search(r"\bgoto %s;" % D, lines[k]))
+        keep = nD - nDdisp - nDin > 0
+        out += lines[dk:] if keep else lines[dk + 1:]
+        lines = out
+        i += 1
+    return "\n".join(lines)
+
+
 def od_return_merge(body):
     """`if (c) { ..; t = e1; } else { ..; t = e2; } return t;`: the source had a `return` in each arm (cl's eax is the
     one register both arms leave, not a variable)."""
@@ -1115,6 +1402,15 @@ def od_goto_else(body):
             e = _close(lines, i)
             if e < 0 or e - 1 <= i or e + 1 >= len(lines) or lines[e].strip() != "}":
                 continue
+            b_ = IFL.match(lines[i + 1])
+            ib_ = b_.group(1) if b_ else None
+            if b_ and _close(lines, i + 1) == e - 1 and GOTO.match(lines[e - 2]) and \
+                    not any(x.startswith(ib_ + "} else") for x in lines[i + 2:e - 1]):
+                # `if (A) { if (B) { s; goto L; } }`: `if (A && B) { s; goto L; }` (the same code), then an else
+                lines[i:e + 1] = ["%sif ((%s) && (%s)) {" % (a.group(1), a.group(2), b_.group(2))] + \
+                    [x[4:] for x in lines[i + 2:e - 1]] + [lines[e]]
+                changed = True
+                break
             g = GOTO.match(lines[e - 1])
             if not g or lines[i + 1:e].count(lines[e - 1]) != 1:
                 continue
@@ -1122,19 +1418,63 @@ def od_goto_else(body):
             if any(lines[k].strip().startswith("} else") and depth_of(lines, k) == di for k in range(i + 1, e)):
                 continue                      # the if already has an else arm
             L = g.group(1)
-            if sum(1 for x in lines if re.search(r"\bgoto %s;" % L, x)) != 1:
-                continue
+            uses = sum(1 for x in lines if re.search(r"\bgoto %s;" % L, x))
             lab = next((k for k in range(e + 1, len(lines)) if lines[k].strip() == "%s:;" % L), None)
             if lab is None or lab == e + 1:
                 continue
             seg = lines[e + 1:lab]
-            if any(LABEL.match(x) for x in seg) or sum(x.count("{") - x.count("}") for x in seg) != 0:
+            # the label may follow the ends of enclosing if / else arms (`if (A) { ..; goto L; } if (B) { ..; goto L; }
+            # r; L:` once the outer one is an else: B's goto reaches L by falling out of the else arm)
+            closers = max(0, -sum(x.count("{") - x.count("}") for x in seg))
+            if closers and any(x.strip() != "}" for x in seg[len(seg) - closers:]):
                 continue
-            if depth_of(lines, i) != depth_of(lines, lab):
+            run_ = 0
+            for x in seg[:len(seg) - closers]:    # r stays inside the block it starts in
+                if run_ == 0 and x.strip().startswith("}"):
+                    break
+                run_ += x.count("{") - x.count("}")
+                if run_ < 0:
+                    break
+            else:
+                run_ = None
+            if run_ is not None:
+                continue
+            if closers:
+                body_ = seg[:len(seg) - closers]
+                if sum(x.count("{") - x.count("}") for x in body_) != 0 or not body_:
+                    continue
+                ok = True
+                for q in range(closers):          # each closed block is an if or else arm, not a loop body
+                    k_ = e + 1 + len(body_) + q
+                    d, o = 0, None
+                    for j in range(k_, -1, -1):
+                        d += lines[j].count("}") - lines[j].count("{")
+                        if d == 0:
+                            o = j
+                            break
+                    if o is None or not re.match(r"^\s*(?:\} else )?(?:if \(.*\) )?\{\s*$|^\s*\} else \{\s*$", lines[o]) \
+                            or not (IFL.match(lines[o]) or lines[o].strip().startswith("} else")):
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                seg = body_
+            inner = [LABEL.match(x).group(1) for x in seg if LABEL.match(x)]
+            segtext = "\n".join(seg)
+            if any(len(re.findall(r"\bgoto %s;" % q, segtext)) != len(re.findall(r"\bgoto %s;" % q, "\n".join(lines)))
+                   for q in inner) or sum(x.count("{") - x.count("}") for x in seg) != 0:
+                continue                          # a label in r that only r's own loops reach moves with it
+            if depth_of(lines, i) != depth_of(lines, lab) + closers:
                 continue
             ind = a.group(1)
             new = lines[i:e - 1] + [ind + "} else {"] + ["    " + x for x in seg] + [ind + "}"]
-            lines[i:lab + 1] = new
+            if uses == 1 and not closers:
+                lines[i:lab + 1] = new
+            else:                                 # other gotos still reach the label
+                lines[i:e + 1 + len(seg)] = new
+                if uses == 1:
+                    lab_ = next(k for k in range(len(lines)) if lines[k].strip() == "%s:;" % L)
+                    del lines[lab_]
             changed = True
             break
     return "\n".join(lines)
@@ -1310,9 +1650,25 @@ def _pr(n, parent=0, right=False):
         s = "%s ? %s : %s" % (_pr(n[1], 4), _pr(n[2], 0), _pr(n[3], 3))
     else:
         p = _BINPREC[n[1]]
-        s = "%s %s %s" % (_pr(n[2], p), n[1], _pr(n[3], p + 1))
+        if n[1] not in ("&&", "||") and _numeric(n[2]) and _numeric(n[3]):
+            # both operands constant: the front end would fold it, so in the original the left one was an inlined
+            # callee's parameter that c2 replaced by the constant (`mov eax, 31; cmp eax, 60` at /Od)
+            KCONST.add(1)
+            s = "il2c_k(%s) %s %s" % (_pr(n[2]), n[1], _pr(n[3], p + 1))
+        else:
+            s = "%s %s %s" % (_pr(n[2], p), n[1], _pr(n[3], p + 1))
     own = _prec(n)
     return "(%s)" % s if own < parent else s
+
+
+KCONST = set()
+
+
+def _numeric(n):
+    """A literal number, maybe cast or parenthesised."""
+    while n[0] in ("grp", "cast"):
+        n = n[1] if n[0] == "grp" else n[2]
+    return n[0] == "atom" and re.match(r"^\d", n[1]) is not None
 
 
 def minparens(e):
@@ -1382,5 +1738,26 @@ def fix_stmt(s):
     return minparens(s)
 
 
+BITFIELDS = set()
+_BF = re.compile(r"^(\s+)(.+?) = (.+?) & (-?\d+) \| \(il2c_k\((\d+)\) & (\d+)\)(?: << (\d+))?;$")
+
+
+def _bitfield(l):
+    """`x = x & ~(w << s) | (il2c_k(k) & w) << s`: an inline setter of a bitfield called with a constant (cl computes
+    the field before loading x; written as the mask and or, it loads x first)."""
+    m = _BF.match(l)
+    if not m or m.group(2) != m.group(3):
+        return l
+    ind, x, _x, mk, k, w, sh = m.groups()
+    sh, w = int(sh or 0), int(w)
+    n = w.bit_length()
+    if w != (1 << n) - 1 or (~int(mk)) & 0xFFFFFFFF != (w << sh) & 0xFFFFFFFF or sh + n > 32:
+        return l
+    BITFIELDS.add((sh, n))
+    return "%sil2c_bf_%d_%d(&(%s), %s);" % (ind, sh, n, x, k)
+
+
 def od_parens(body):
-    return "\n".join(fix_line(l) if l.startswith("    ") else l for l in body.split("\n"))
+    # a shift count is cl's low byte in the code, an int in the source (`(unsigned char)` there is a movzx)
+    body = re.sub(r"(<<|>>) \(unsigned char\)", r"\1 ", body)
+    return "\n".join(_bitfield(fix_line(l)) if l.startswith("    ") else l for l in body.split("\n"))

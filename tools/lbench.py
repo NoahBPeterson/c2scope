@@ -268,6 +268,9 @@ def run_group(a, corp, rows, outdir):
     img = corp.image()
     w8_emit.MASKS = {int(r["va"], 16): corpusmod.unpack(r["mask"]) for r in rows}
     eimg = w8_emit.Image(corp.head["image"])
+    if lift2il and os.environ.get("L2C_INLINE") == "1":   # opt-in: measured no gain (lift2il.md)
+        import il2c_lift                          # the project's byte-exact leaf callees, re-inlined where the
+        il2c_lift.INLINE_DB = il2c_lift.inline_db_for(corp, eimg)   # original inlined them (inline_sites)
     srcdir = os.path.join(outdir, "src")
     os.makedirs(srcdir, exist_ok=True)
     tasks, res = [], {}
@@ -390,7 +393,7 @@ def cmd_run(a):
 def emitter_state():
     """(commit of the last change to the lifters, True when they have uncommitted edits): a run of a half-edited emitter
     is not comparable with anything (2026-11-25: band1c measured a rule that was reverted before its commit)."""
-    files = ["tools/w8_emit.py", "tools/lift2il.py", "tools/il2c_lift.py", "tools/il2c.py", "tools/w8_diff.py",
+    files = ["tools/w8_emit.py", "tools/lift2il.py", "tools/il2c_lift.py", "tools/il2c_od.py", "tools/il2c.py", "tools/w8_diff.py",
              "tools/w8_score.py"]
     head = subprocess.run(["git", "log", "-1", "--format=%h", "--"] + files, cwd=ROOT, capture_output=True, text=True).stdout.strip()
     dirty = bool(subprocess.run(["git", "status", "--porcelain", "--"] + files, cwd=ROOT, capture_output=True,
@@ -398,7 +401,7 @@ def emitter_state():
     return head, dirty
 
 
-LIFTER_FILES = ["w8_emit.py", "lift2il.py", "il2c_lift.py", "il2c.py", "w8_diff.py", "w8_score.py", "lift.py"]
+LIFTER_FILES = ["w8_emit.py", "lift2il.py", "il2c_lift.py", "il2c_od.py", "il2c.py", "w8_diff.py", "w8_score.py", "lift.py"]
 
 
 def lifter_hash():

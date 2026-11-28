@@ -101,6 +101,50 @@ def greedy(lifted_text, pack, o, flags=None, budget=40):
     return o, best_t, best_r
 
 
+def reverse(lifted_text, pack, flags=None, budget=60):
+    """From the most rewritten rung, keep variables one at a time (block their folds) until it matches, then
+    give back every kept variable that is not needed. (opts, text, result) or (None, None, None)."""
+    for o in tidy64.LADDER[:2]:
+        applied = set()
+        try:
+            tidy64.tidy_one(lifted_text, o, applied)
+        except Exception:
+            continue
+        block, n = set(), 0
+        r = None
+        while n < budget:
+            best = None
+            for v in sorted(applied - block):
+                n += 1
+                o2 = dict(o, block=block | {v})
+                try:
+                    t = tidy64.tidy_one(lifted_text, o2)
+                except Exception:
+                    continue
+                r = check_text(t, pack, flags)
+                if r["status"] == "match":
+                    best = (v, t, r, 0)
+                    break
+                d = r.get("differing_instructions")
+                if d is not None and (best is None or d < best[3]):
+                    best = (v, t, r, d)
+                if n >= budget:
+                    break
+            if best is None:
+                break
+            block.add(best[0])
+            if best[2]["status"] == "match":
+                for v in sorted(block):              # drop what the match does not need
+                    o2 = dict(o, block=block - {v})
+                    t = tidy64.tidy_one(lifted_text, o2)
+                    rr = check_text(t, pack, flags)
+                    if rr["status"] == "match":
+                        block.discard(v)
+                        best = (None, t, rr, 0)
+                return dict(o, block=sorted(block)), best[1], best[2]
+    return None, None, None
+
+
 def _bench_one(a):
     va, flags, root, out = a
     t0 = time.time()
@@ -112,8 +156,11 @@ def _bench_one(a):
     json.dump(pk, open(os.path.join(d, "pack.json"), "w"))
     o, t, r = one(open(src).read(), d)
     if t and not o.get("inline"):
+        ro, rt, rr = reverse(open(src).read(), d)
+        if rt:
+            o, t, r = dict(ro, reverse=1), rt, rr
         go, gt, gr = greedy(open(src).read(), d, dict(o, inline_allow=set()))
-        if gt:
+        if gt and not o.get("reverse"):
             o, t, r = dict(go, inline_allow=sorted(go["inline_allow"]), copy_allow=sorted(go["copy_allow"]),
                            greedy=1), gt, gr
     row = dict(va=va, secs=round(time.time() - t0, 1))

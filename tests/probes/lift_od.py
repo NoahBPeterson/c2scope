@@ -13,5 +13,12 @@ for _nm, _what in (("?od_sum@@", "for loop with an induction variable and a load
                    ("?tg@T@@", "member if / else, no return value"),
                    ("?od_ifelse@@", "if / else assigning one local"),
                    ("?od_fcopy@@", "float member copies stay separate statements (fld / fstp), no parentheses around the right side"),
-                   ("?od_fadd@@", "float read-modify-write")):
+                   ("?od_fadd@@", "float read-modify-write"),
+                   ("?od_elif@@", "if / else if / else chain: the arms' gotos to one label are else arms"),
+                   ("?bvinplace@TB@@", "a by-value object an inline constructor builds in the argument area (virtual call)"),
+                   ("?od_bitk@@", "loop with a break in an arm; an inlined callee's constant parameter (il2c_k); a bool store of a compare (il2c_nz)"),
+                   ("?od_ftail@@", "a float call's result returned through the shared epilogue"),
+                   ("?od_sw@@", "sparse switch: the compare tree on cl's switch temporary is a switch statement"),
+                   ("?od_andelse@@", "if (A && B) / else"),
+                   ("?od_bfset@@", "an inline bitfield setter called with constants")):
     check("lift /Od: %s" % _what, next((v for k, v in _got.items() if k.startswith(_nm)), _r.stderr[-300:]), "MATCH")

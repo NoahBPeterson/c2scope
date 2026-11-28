@@ -267,6 +267,9 @@ def check(pe, va, size, src, flags, warn_clean=False, full_diff=None):
                 o = a[i1 + k] if i1 + k < i2 else ("", "")
                 y = b[j1 + k] if j1 + k < j2 else ("", "")
                 lines.append("%s %-8s %-40s | %s" % (" " if op == "equal" else "!", o[0], o[1], y[1]))
+        nxt = [s["value"] for s in coff.functions() if s["section"] == target["section"] and s["value"] > target["value"]]
+        res["rows"] = [a, b]                        # the two listings (x64metrics) and our function's length
+        res["extent"] = (min(nxt) if nxt else len(sec)) - target["value"]
         res.update(status="no match", errors=errs, differing_instructions=sum(1 for l in lines if l[0] == "!"),
                    diff="\n".join(lines[:120]) + ("\n... %d more lines" % (len(lines) - 120) if len(lines) > 120 else ""))
         if full_diff:

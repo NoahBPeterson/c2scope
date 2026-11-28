@@ -89,6 +89,11 @@ class Lifter:
         self.tls_base = set()
         self.esp_alias = {}                # instruction index of `mov r, esp` -> esp's delta there
         self.alias_written = set()         # outgoing offsets stored through such a copy (a by-value struct)
+        self.slot_esp = {}                 # /Od: frame slot holding esp (an inline constructor's this) -> esp there
+        self.inplace_alias = set()         # instruction indices of reloads of such a slot
+        self.inplace_written = {}          # outgoing offset -> (store order, type): stores through those reloads
+        self.inplace_at = None             # esp where the in-place object starts
+        self.inplace_slots = set()         # every such slot (the emitted constructor's own temporaries)
         self.frame_addr = {}               # variable -> the frame offset it holds the address of (a lea)
         self.aggregates = set()            # (frame offset, bytes): one object (a block copy's source / destination)
         self.bvctor = {}                   # outgoing offset -> (copy constructor va, bytes): a by-value class
@@ -297,6 +302,8 @@ class Lifter:
                 ins[k].operands and ins[k].operands[0].type == X.X86_OP_IMM]
         km1 = next((k for k in near if (ins[k].operands[0].imm & 0xFFFFFFFF) == 0xFFFFFFFF), None)
         kh = next((k for k in near if km1 is not None and k == km1 + 1), None)
+        if kh is None and km1 is not None and km1 + 2 == kfs + 1 and kfs + 1 in near:
+            kh = kfs + 1                              # `push -1; mov eax, fs:[0]; push H` (scheduled between)
         if km1 is None or kh is None:
             raise Unsupported("EH: registration shape")
         H = ins[kh].operands[0].imm & 0xFFFFFFFF
@@ -463,8 +470,8 @@ class Lifter:
             return False
         for d in defs:
             if d[0] == "entry":
-                if not self.this_used:
-                    return False
+                if not self.this_used or self.od_ret:
+                    return False             # (/Od reloads `this` from its home for every call: an entry ecx is a leftover)
                 op = self.ins[k].operands[0] if self.ins[k].operands else None
                 if op is not None and op.type == X.X86_OP_MEM and not op.mem.base and not op.mem.index:
                     return False             # `call [import]` with the caller's this left in ecx (InterlockedDecrement)
@@ -612,10 +619,11 @@ class Lifter:
             cur = {r: set(ds) for r, ds in IN[bn].items()}
             for k in b:
                 rd, wr = acc[k]
-                for r in rd:
+                for r in sorted(rd):
                     ds = cur.get(r) or {("undef", r)}
                     self.reach_defs[(k, r)] = set(ds)
-                    ds = list(ds)
+                    # in address order: the web names (and so the declarations) must not depend on set order
+                    ds = sorted(ds, key=lambda d: (d[0] if isinstance(d[0], int) else -1, str(d)))
                     find(ds[0])
                     # a call's (or tail jmp's) ecx read only asks "is this a __thiscall"; when several defs reach it
                     # (entry this, a scratch value, an earlier call's clobber) it must not join their webs
@@ -624,7 +632,7 @@ class Lifter:
                         for d in ds[1:]:
                             union(ds[0], d)
                     self.reach[(k, r)] = ds[0]
-                for r in wr:
+                for r in sorted(wr):
                     cur[r] = {(k, r)}
                     find((k, r))
         self.find = find
@@ -699,6 +707,8 @@ class Lifter:
                 d = next(iter(ds))[0]
                 if isinstance(d, int) and d in self.esp_alias:
                     self.alias_written.add(self.esp_alias[d] + m.disp)
+                    if d in self.inplace_alias and k > d:
+                        self.inplace_written.setdefault(self.esp_alias[d] + m.disp, (len(self.inplace_written), ty))
                     return self.frame_name(self.esp_alias[d] + m.disp, ty)   # `mov eax, esp; mov [eax+4], x`
         if base == "esp" and not idx:
             return self.frame_name(esp + m.disp, ty)
@@ -928,6 +938,8 @@ class Lifter:
                         flags = self.carry = None
                         continue
                     if k in self.skip:
+                        if k in getattr(self, "div_end", {}):
+                            flags = (self.div_end[k], "0:1004")   # the quotient's last step sets the flags a jcc reads
                         continue
                     if k in self.strlens:
                         kl, p = self.strlens[k]
@@ -943,6 +955,9 @@ class Lifter:
                         x = self.opnd(k, xop, esp, ebp).rsplit(":", 1)[0] + ":" + ty
                         self.emit(k, "OPDIV", ["%s:%s" % (self.var_written(kend, dreg), ty)], [x, "%d:%s" % (dvs, ty)])
                         flags = None
+                        if kend > k and self.ins[kend].mnemonic in ("add", "sub", "sar", "shr"):
+                            self.div_end = getattr(self, "div_end", {})
+                            self.div_end[kend] = "%s:%s" % (self.var_written(kend, dreg), ty)
                         continue
                     if self.eh and m == "mov" and ops[0].type == X.X86_OP_MEM and ops[1].type == X.X86_OP_IMM:
                         mm = ops[0].mem
@@ -1017,6 +1032,8 @@ class Lifter:
                         nxt = self.ins[k + 1] if k + 1 < len(self.ins) else None
                         caller_pops = nxt is not None and ((nxt.mnemonic == "add" and nxt.op_str.startswith("esp, ")) or
                                                            (nxt.mnemonic == "pop" and nxt.op_str in ("ecx", "edx")))
+                        if not caller_pops and top is not None and not self.od_ret and self.cleans_before_next_call(k):
+                            caller_pops = True                 # the cleanup scheduled a few instructions later
                         if top is not None and not caller_pops:
                             esp_after = top                    # __stdcall / __thiscall: the callee popped them
                         else:
@@ -1026,10 +1043,16 @@ class Lifter:
                         pushed = any(isinstance(d[0], int) and any(
                             self.ins[q].mnemonic == "push" and self.ins[q].op_str == "ecx" for q in range(d[0] + 1, k))
                             for d in ds_)
-                        if thiscall and args and (all(d[0] == "entry" for d in ds_) or pushed) and \
+                        if thiscall and args and (all(d[0] == "entry" for d in ds_) or pushed or all(
+                                isinstance(d[0], int) and self.ins[d[0]].mnemonic == "mov" and
+                                self.ins[d[0]].operands[1].type == X.X86_OP_IMM for d in ds_)) and \
                                 self.cleans_before_next_call(k):
-                            thiscall = False                   # ecx is only the caller's this left over, and the
-                            #                                    caller pops the arguments: a cdecl call
+                            thiscall = False                   # ecx is only the caller's this left over (or a
+                            #                                    constant: data), and the caller pops the
+                            #                                    arguments: a cdecl call
+                        if thiscall and args and not self.od_ret and self.all_caller_popped(k, 4 * len(args)):
+                            thiscall = False                   # the cleanup after it pops its arguments with the next
+                            #                                    calls': a thiscall callee pops its own (cdecl)
                         if thiscall and self.od_ret and args and caller_pops:
                             thiscall = False                   # /Od: no merged cleanups, so a callee whose arguments the
                             #                                    caller pops right away is cdecl (a thiscall callee pops them)
@@ -1053,7 +1076,8 @@ class Lifter:
                             note = (note + " noreturn=1").strip()   # nothing after it: the callee never returns
                         if self.byval:
                             sh = 1 if thiscall else 0
-                            note = (note + " " + " ".join(("bv%d=%d" % (i + sh, n)) if n > 0 else
+                            note = (note + " " + " ".join(("bi%d=%s" % (i + sh, _d)) if n == "bi" else
+                                                          ("bv%d=%d" % (i + sh, n)) if n > 0 else
                                                           ("bc%d=%d.%x" % (i + sh, -n, _d))
                                                           for i, _b, _d, n in self.byval)).strip()
                         if thiscall:
@@ -1062,8 +1086,9 @@ class Lifter:
                             note = (note + " stdcall=1").strip()   # no `add esp` / `pop` for its arguments before the
                             #                                     next call or branch: the callee popped them
                         if self.st0_after(k):               # x87 code after it reads st0: a float result,
-                            t = self.temp(F8)                  # at x87 precision (cl's code for a `double`
-                            #                                    return; a float one adds a rounding store)
+                            # at x87 precision (cl's code for a `double` return; a float one adds a rounding store),
+                            # or the function's own float result when st0 goes straight to its ret
+                            t = self.temp(F4 if self.x87_tail(k + 1) and self.float_fn() else F8)
                             self.emit(k, "OPCALL", [t], [callee] + toks, note)
                             self.fpu.append(t)
                             flags = None
@@ -1087,7 +1112,11 @@ class Lifter:
                             self.float_ret = True
                             self.value_ret = True
                             self.emit(k, "OPRET", [], [self.fpu[-1]])
-                        elif self.fn_value and self.used_after(None, k=k, reg="eax"):
+                        elif self.fn_value and (self.used_after(None, k=k, reg="eax") or (
+                                not self.od_ret and self.reach_defs.get((k, "eax")) and
+                                all(isinstance(d[0], int) and self.ins[d[0]].mnemonic == "call"
+                                    for d in self.reach_defs[(k, "eax")]))):
+                            # (`call f; ret` in a function other paths return a value from: `return f(..);`)
                             self.value_ret = True
                             w = self.ret_width(k)
                             if w == 1:
@@ -1098,7 +1127,12 @@ class Lifter:
                             self.emit(k, "OPRET", [], [])
                     elif m == "jmp":
                         tgt = ops[0]
-                        if tgt.type == X.X86_OP_IMM and self.va <= tgt.imm < self.va + self.size:
+                        if tgt.type == X.X86_OP_IMM and self.va <= tgt.imm < self.va + self.size and self.fpu and \
+                                self.od_ret and self.x87_tail(k):
+                            self.float_ret = True               # /Od `return f();` of a float: st0 into the shared
+                            self.value_ret = True               # epilogue
+                            self.emit(k, "OPRET", [], [self.fpu.pop()])
+                        elif tgt.type == X.X86_OP_IMM and self.va <= tgt.imm < self.va + self.size:
                             self.emit(k, "OPGOTO", [], ["s0:0", "->"], "s0=L%x" % tgt.imm)
                             depth.setdefault(tgt.imm, esp)
                         elif tgt.type == X.X86_OP_IMM or self.is_tailjmp(i):
@@ -1139,6 +1173,11 @@ class Lifter:
                             self.md.reg_name(ops[0].reg) == "ah" and ops[1].type == X.X86_OP_IMM:
                         self.fmask = ops[1].imm
                     elif m in CCOF or m in ("jp", "jnp", "jpe", "jpo"):
+                        if self.fmask is None and flags is not None and flags is getattr(self, "last_comiss", None) \
+                                and ("fcomi", m) in FCC and os.environ.get("L2C_COMISS", "1") == "1":
+                            # comiss / ucomiss set ZF, PF, CF as fcomi does (unordered sets all three): `jbe` jumps
+                            # on !(a > b), NaN included, so the code it skips runs when a > b
+                            self.fmask, self.fcmp = "fcomi", flags
                         if self.fmask is not None:          # a float compare: fcom* / fnstsw / test ah, MASK / jcc
                             jm = {"jpe": "jp", "jpo": "jnp", "jz": "je", "jnz": "jne"}.get(m, m)
                             cc = FCC.get((self.fmask, jm))
@@ -1221,10 +1260,28 @@ class Lifter:
                     elif m == "mov" and ops[0].type == X.X86_OP_REG and ops[1].type == X.X86_OP_REG and \
                             self.md.reg_name(ops[1].reg) == "esp" and self.md.reg_name(ops[0].reg) != "ebp":
                         self.esp_alias[k] = esp                # `mov eax, esp`: eax points at the outgoing area
+                    elif self.od_ret and m == "mov" and ops[0].type == X.X86_OP_MEM and ops[1].type == X.X86_OP_REG \
+                            and self.md.reg_name(ops[1].reg) == "esp" and ebp is not None and \
+                            ops[0].mem.base and self.md.reg_name(ops[0].mem.base) == "ebp" and not ops[0].mem.index \
+                            and self.out_top is not None and k not in self.eh_ins and k >= 1 and \
+                            self.ins[k - 1].mnemonic == "sub" and self.ins[k - 1].op_str.startswith("esp, "):
+                        # /Od `sub esp, N; mov [ebp-x], esp`: an inline constructor's `this` (a compiler temporary)
+                        # building a by-value argument in place; its reloads point at the outgoing area
+                        self.slot_esp[ebp + ops[0].mem.disp] = esp
+                        self.inplace_slots.add(ebp + ops[0].mem.disp)
+                        self.inplace_at = esp
+                    elif self.od_ret and m == "mov" and ops[0].type == X.X86_OP_REG and ops[1].type == X.X86_OP_MEM \
+                            and ops[1].mem.base and self.md.reg_name(ops[1].mem.base) == "ebp" and \
+                            not ops[1].mem.index and ebp is not None and ebp + ops[1].mem.disp in self.slot_esp:
+                        self.esp_alias[k] = self.slot_esp[ebp + ops[1].mem.disp]
+                        self.inplace_alias.add(k)
                     elif m in ("mov", "movzx", "movsx"):
                         if ops[0].type == X.X86_OP_REG and self.md.reg_name(ops[0].reg) == "ecx":
                             ecx_set = True
-                        self.emit(k, "OPASSIGN", [self.dst(k, ops[0], esp, ebp)], [self.opnd(k, ops[1], esp, ebp)])
+                        src_ = self.opnd(k, ops[1], esp, ebp)
+                        if m == "movsx" and src_.endswith((":2001", ":2002")):
+                            src_ = src_[:-5] + (":1001" if src_.endswith(":2001") else ":1002")   # sign-extended
+                        self.emit(k, "OPASSIGN", [self.dst(k, ops[0], esp, ebp)], [src_])
                         flags = flags
                     elif m == "lea" and ops[1].mem.base == ops[0].reg and not ops[1].mem.index and not ops[1].mem.disp:
                         pass                                   # `lea esp, [esp]` / `lea ecx, [ecx]`: alignment filler
@@ -1235,6 +1292,18 @@ class Lifter:
                         if m == "xor" and ops[0].type == X.X86_OP_REG and len(ops) == 2 and ops[1].type == X.X86_OP_REG \
                                 and ops[0].reg == ops[1].reg:
                             self.emit(k, "OPASSIGN", [d], ["0:1004"])
+                            flags = (d, "0:1004")
+                            continue
+                        if m in ("or", "and") and ops[0].type == X.X86_OP_REG and ops[0].size == 4 and len(ops) == 2 \
+                                and ops[1].type == X.X86_OP_IMM and (ops[1].imm & 0xFFFFFFFF) == \
+                                (0xFFFFFFFF if m == "or" else 0) and \
+                                all(x[0] in ("entry", "undef") or self.ins[x[0]].mnemonic == "call"
+                                    for x in self.reach_defs.get((k, full(self.md.reg_name(ops[0].reg))),
+                                                                 {("undef",)})):
+                            # `or r, -1` / `and r, 0` of a register nothing set (or a call's clobber): cl's short
+                            # form of a constant
+                            v = "-1:1004" if m == "or" else "0:1004"
+                            self.emit(k, "OPASSIGN", [d], [v])
                             flags = (d, "0:1004")
                             continue
                         if ops[0].type == X.X86_OP_REG and self.md.reg_name(ops[0].reg) == "ecx":
@@ -1281,8 +1350,9 @@ class Lifter:
                         bf = self.bform.get(x.rsplit(":", 1)[0]) if m == "neg" else None
                         if bf:                                 # neg of bool(c) = mask(c); of mask(c) = bool(c);
                             c = bf[1]                          # either way CF = (value != 0) = c
+                            nsn = bf[0] == "mask" and c[1] == "0:1004" and c[2] == "ne" and self.od_ret
                             self.emit(k, "OPSETCC", [d], [c[0], c[1]], "cc=%s%s" % (c[2], " neg=1" if bf[0] == "bool"
-                                                                                     else ""))
+                                                                                     else " nsn=1" if nsn else ""))
                             self.bform[d.rsplit(":", 1)[0]] = ("mask" if bf[0] == "bool" else "bool", c)
                             flags, self.carry = (d, "0:1004"), c
                             continue
@@ -1404,6 +1474,7 @@ class Lifter:
                 # `ucomiss; lahf; test ah, MASK; jcc`: ZF / PF / CF land where fnstsw puts C3 / C2 / C0, with the
                 # same meaning (unordered sets all three), so the x87 table (FCC) reads it
                 self.fcmp = ab
+            self.last_comiss = ab
             return ab
         if m in ("cvtsi2ss", "cvtsi2sd"):
             src = self.opnd(k, ops[1], esp, ebp)
@@ -1777,6 +1848,8 @@ class Lifter:
         """Does the call at k return a value in st0? Yes when x87 code after it (before the next call or branch)
         reads deeper than what it pushed itself (`call get; fld [a]; fmul [b]; faddp st(1)` reads the result)."""
         d = 0
+        if self.x87_tail(k + 1) and self.float_fn():
+            return True                                   # `return f();` of a float: st0 straight to the ret
         for i in self.ins[k + 1:]:
             if i.mnemonic in ("call", "ret", "jmp") or i.mnemonic.startswith("j"):
                 return False
@@ -1790,6 +1863,33 @@ class Lifter:
                     return True
                 d += delta
         return False
+
+    def x87_tail(self, j):
+        """Is the code from index j (through one `jmp`) only the epilogue and its ret?"""
+        byaddr = getattr(self, "_byaddr", None)
+        if byaddr is None:
+            byaddr = self._byaddr = {i.address: q for q, i in enumerate(self.ins)}
+        seen = 0
+        while j < len(self.ins) and seen < 8:
+            i = self.ins[j]
+            if i.mnemonic == "ret":
+                return True
+            if i.mnemonic == "jmp" and i.operands and i.operands[0].type == X.X86_OP_IMM and \
+                    i.operands[0].imm in byaddr:
+                j = byaddr[i.operands[0].imm]
+            elif i.mnemonic in ("leave", "pop") or (i.mnemonic == "mov" and i.op_str == "esp, ebp"):
+                j += 1
+            else:
+                return False
+            seen += 1
+        return False
+
+    def float_fn(self):
+        """Does another path return a float (an x87 load right before the epilogue)?"""
+        if not hasattr(self, "_float_fn"):
+            self._float_fn = any(i.mnemonic.startswith("fld") and self.x87_tail(q + 1)
+                                 for q, i in enumerate(self.ins))
+        return self._float_fn
 
     def st(self, op):
         """The x87 stack entry an st(i) operand names."""
@@ -2690,6 +2790,21 @@ class Lifter:
         """Entry-relative offsets of the frame slots the lifted code names (`_lN` is -N)."""
         return {-int(m) for l in self.lines for m in re.findall(r"\b_l(\d+):", l)}
 
+    def all_caller_popped(self, k, own):
+        """After the call at k (own bytes of stack arguments), the first `add esp, N` before a branch or ret pops
+        exactly every argument pushed since (this call's and later calls'): the callees popped none of them."""
+        pend = own
+        for q in range(k + 1, len(self.ins)):
+            i = self.ins[q]
+            m = i.mnemonic
+            if m == "push":
+                pend += 4
+            elif m == "add" and i.op_str.startswith("esp, ") and i.operands[1].type == X.X86_OP_IMM:
+                return i.operands[1].imm == pend and pend > own
+            elif m in ("ret", "jmp") or m.startswith("j") or m == "pop" or (m == "sub" and "esp" in i.op_str):
+                return False
+        return False
+
     def cleans_before_next_call(self, k):
         """An `add esp, N` / `pop ecx` cleanup after the call at k and before the next call, branch or ret (cl may
         schedule a `mov esi, eax` in between), not the epilogue's: this call's own arguments popped by the caller.
@@ -2730,6 +2845,10 @@ class Lifter:
             if j in pro:
                 if m == "add" and i.op_str.startswith("esp, ") and i.operands[1].imm > self.frame_alloc:
                     return True                    # the epilogue's `add esp` pops this call's arguments too
+                if m == "add" and i.op_str.startswith("esp, ") and self.frame_alloc and \
+                        i.operands[1].imm != self.frame_alloc and j + 1 < len(self.ins) and \
+                        self.ins[j + 1].mnemonic == "add" and self.ins[j + 1].op_str == "esp, %#x" % self.frame_alloc:
+                    return True                    # `add esp, 4; add esp, 0x10`: this call's cleanup, then the frame's
                 continue
             if (m == "add" and i.op_str.startswith("esp, ")) or (m == "pop" and i.op_str in ("ecx", "edx", "eax")):
                 return True
@@ -2791,6 +2910,26 @@ class Lifter:
             if o in self.bvctor:
                 cv, n = self.bvctor.pop(o)
                 self.byval.append((q, None, cv, -n))        # a class with a copy constructor (FUN_<cv>)
+        if self.inplace_written:
+            # /Od: an object built in the argument area by an inline constructor (`mov [ebp-x], esp`; stores through
+            # its reloads): one argument of a class with that constructor (and a copy constructor, so cl builds it
+            # in place instead of copying a temporary)
+            w = self.inplace_written
+            q0 = offs.index(self.inplace_at) if self.inplace_at in offs else None
+            run = []
+            q = q0
+            while q is not None and q < len(offs) and offs[q] in w:
+                run.append(q)
+                q += 1
+            order = [w[offs[q]][0] for q in run]
+            if q0 is None or len(run) != len(w) or order != sorted(order) or \
+                    any(self.out_args.get(offs[q], (0, 4))[1] != 4 for q in run) or \
+                    any(w[offs[q]][1] not in ("1004", "e004", F4) for q in run):
+                raise Unsupported("an object built in the argument area of another shape")
+            sig = "".join("f" if w[offs[q]][1] != "1004" else "i" for q in run)
+            self.byval.append((q0, None, sig, "bi"))
+            self.alias_written -= {offs[q] for q in run}
+            self.inplace_written, self.slot_esp, self.inplace_at = {}, {}, None
         i = 0
         while i < len(args):
             j = i
@@ -2802,12 +2941,13 @@ class Lifter:
                         all(src[q][1] == src[0][1] + 4 * q for q in range(len(src))):
                     self.byval.append((i, src[0][0], src[0][1], 4 * (j - i)))
             i = max(j, i + 1)
-        if any(n > 0 for *_r, n in self.byval):
-            for i, b, disp, n in reversed([x for x in self.byval if x[3] > 0 and x[1] is not None]):
+        if any(n != "bi" and n > 0 for *_r, n in self.byval):
+            for i, b, disp, n in reversed([x for x in self.byval if x[3] != "bi" and x[3] > 0 and x[1] is not None]):
                 t = self.temp()
                 self.lines.append("I 0 add 0 0 | %s <- %s:1004 %d:1004" % (t, b, disp))
                 args[i:i + n // 4] = [t]
         self.alias_written = set()
+        self.inplace_written, self.slot_esp, self.inplace_at = {}, {}, None
         self.out_args, self.out_top = {}, None
         return args
 

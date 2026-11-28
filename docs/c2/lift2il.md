@@ -104,10 +104,67 @@ a store and a reload per temporary. The /Od emitter writes what a source file wo
   is a void function. A callee whose pushed arguments the caller pops at once is cdecl, not thiscall (`and ecx, 1; je`
   leaves a dead ecx).
 
-What it does not do yet: functions with an EH frame (`eh_unit` does not take the /Od path), by-value structure arguments
-built in place (`sub esp, N; mov [ebp-x], esp`: 86 of 1147 Spore rows), x87 stack underflow, `sbb` masks, inlined bodies
-other than the two helpers (their dead slots are filled, their code is lifted as if written out), `xor eax, eax` store
-sequences for a float zero, compiler temporaries that are not `?:` results.
+- **More control flow.** An arm's `goto` to a label that other arms also reach is an else (else-if chains), also when
+  the label follows the ends of enclosing if / else arms; `if (A) { if (B) { s; goto L; } }` is `if (A && B)` with an
+  else. Loops whose body has more back edges are `continue`, a goto to the label right after the loop `break`, and a
+  body ending `if (c) { A } else { goto I; }` (the other way leaves the loop) is `if (c) { A; break; }`. A compare
+  tree on cl's switch temporary (`mov [t], x; cmp [t], K; jg ..; je ..`) is a `switch` whose case labels sit at the
+  targets and which closes at the label every other value reaches (the temporary's slot leaves the named frame).
+- **Inlined callees' traces.** An operation on two constants was an inlined callee's parameter that c2 replaced by a
+  constant (`mov eax, 31; cmp eax, 60`): the left one is written `il2c_k(31)` (an identity `__forceinline` template);
+  `neg x; sbb r, r; neg r` is a bool store of `x != 0` (`il2c_nz(x)`); `x = x & ~(w << s) | (il2c_k(k) & w) << s` is
+  an inline bitfield setter (`il2c_bf_S_N(&x, k)`: the field is computed before x is loaded). Shift counts are ints
+  (an `(unsigned char)` count is a movzx).
+- **By-value objects built in place.** `sub esp, N; mov [ebp-x], esp` and stores through the slot's reloads: an
+  inline constructor's `this` building the argument in the outgoing area; written `il2c_bi_SIG(m0, m1, ..)`, a class
+  with that `__forceinline` constructor and a declared copy constructor (without one cl builds a temporary and copies
+  it); the constructor's two temporaries (its `this` and the slot above) leave the named frame.
+- **Calls.** An entry ecx reaching a call is a leftover (/Od reloads `this` from its home for every call); a float
+  call's result that goes straight to the shared epilogue is the return value.
+
+What it does not do yet (Spore's 1,023 non-exact /Od rows <= 1500 B, 2026-11-27: 275 MATCH, 645 DIFF): inlined
+callee bodies whose parameters cl spilled to temporaries (the deep slots below `this`'s home that are not `?:`
+results: about 110 DIFF rows; an inline helper with the expressions as arguments reproduces the spill only for some
+argument shapes), complex expressions that need a callee-saved register (`push esi` in an /Od frame, 27 rows), objects
+built in place by nested inline constructors (11 UNSUPPORTED), x87 stack underflow, `sbb` masks other than the bool
+store, EH frames (1 row of the 1,023 has one: not a volume class at /Od).
+
+## /O2 shapes (2026-11-28)
+
+- **Calling conventions.** A call whose stack arguments the caller pops, even when the cleanup is scheduled a few
+  instructions later (`call f; mov ebp, [edi+4]; add esp, 0xc`) or merged with later calls' (`add esp, 0x14` after two
+  calls of 2 and 3 arguments), is cdecl: not a thiscall (a thiscall callee pops its own), and the stack depth after
+  it counts the cleanup once. `add esp, 4; add esp, N` before the ret is this call's cleanup, then the frame's.
+- **Return values.** `call f; ret` in a function whose other paths return a value returns f's result.
+- **Constants.** `or r, -1` / `and r, 0` of a register nothing set (or a call clobbered) is the constant.
+- **Loads.** movsx reads a signed char / short.
+- **SSE compares.** comiss / ucomiss set the flags as fcomi does (unordered sets ZF, PF, CF): the branch takes the
+  fcomi table, so `comiss a, b; jbe L` skips code that runs when `a > b`.
+- **Out-structures.** A local whose address leaves and the named slots above it (to the next such local or the
+  frame's top) are one array: as separate ints cl drops the stores it cannot see read.
+
+Measured on the Spore /O2 sample: 51 -> 71 MATCH; M&B 0 -> 1; Spore /Od 275 -> 283 (the cdecl / constant rules apply
+there too); no MATCH lost, the /O2 regression sets unchanged or better.
+
+## Inlined callees at /O2 (`inline_sites`, opt-in: `L2C_INLINE=1`)
+
+The project's byte-exact leaf callees (no call, no x87, 6..40 body instructions; `build_inline_db` over the corpus's
+matched rows, cached in work/cache/inlinedb_<corpus>.json) are shapes (registers and stack slots wildcarded, member
+offsets kept: invert/inlining.py's `detect`). A region of the lifted function with a callee's shape is replaced by
+one `OPINLINE` tuple: the callee lifted on its own becomes `__forceinline il2c_inl_<va>(..)` defined before the
+caller, its inputs (stack arguments, `this`) bound to the caller's registers at the region by aligning the two
+instruction lists, its result to the register its last eax write maps to (when the caller reads it). Regions whose
+other values the caller reads afterwards stay written out. On the Spore /O2 selection 31 of 1,500 rows have such a
+region (mostly 12- and 16-byte copies: `SetKey`, `hkVector4` copies); re-inlined they compile to the same bytes as the
+written-out lift on 29 rows (no MATCH gained or lost; 2 rows change by a few bytes), so it stays off by default.
+
+## Measuring (`tools/staticbench.py`)
+
+`staticbench.py run` lifts each project's real non-exact functions (fixed selections in work/staticbench/sel_*.txt:
+Spore's /Od rows <= 1500 B, a 1,500-row sample of Spore's /O2 rows, Mount & Blade's rows <= 1500 B) with the plain
+lifter (lbench --task lift2il) and appends the counts, DIFF classes, UNSUPPORTED reasons, MATCH set and a hash of
+each emitted unit to work/staticbench/history.jsonl; `compare A B` lists MATCHes gained and lost and the rows whose
+C++ changed; `verify A B spore_od` checks B's new MATCHes with spore-decomp's chk.py.
 
 ## What a match is, and what it is not
 
