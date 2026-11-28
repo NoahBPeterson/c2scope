@@ -321,6 +321,9 @@ the same offsets on 13.10, 14.00 and 15.00) and shows it wherever the name is sh
   `k0`: that text comes from c2trace.dll and was left alone; the load `OPENTERLOAD k0 <- 1000` names the constant.
 
 What decides whether a constant is a candidate and in which blocks it counts is in docs/c2/immcand.md.
+When a candidate gets a register, the byte flag (a one-byte use: ebx only across calls), the penalty it puts on
+ebx for everyone coloured before it, and which variable it takes the register from: immcand.md section 6 and
+`tools/constregs.py` (per function, every constant's uses by width and block, outcome and levers).
 
 ## `il`: the function's IL at chosen passes
 

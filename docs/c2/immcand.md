@@ -289,3 +289,144 @@ where it stands.
   `long long` store is two dword stores by then, and each half is its own 32-bit value. The high half 7 of
   `0x0000000700000005` shares one candidate with a separate `= 7` (k64d); halves 5 and 6 used once are not
   candidates (k64c) **[M, all four builds]**.
+
+## 6. When a constant gets a register, and what that costs the others (Color, cl 13.10 to 15.00)
+
+Sections 1 to 5 say which constants are candidates and where they count in P. This section says when Color gives
+one a register, how that takes a register from a variable, and what in the source changes it. Checked on
+13.10.3077 and 13.10.3052 (the Mount & Blade builds) and on 14.00 and 15.00 with `tests/data/rules/RA_constbyte.cpp`
+(`tests/probes/constregs.py`); code addresses are 14.00's unless a 13.10.3077 one is given.
+
+### 6.1 The rule
+
+1. **Candidacy**: sections 2 and 2.3 (two qualifying uses of one 32-bit value, or one inside a loop). **[C]**
+2. **Benefit** (`GLOBREG+0x40`, Spillcosts): Σ over its uses of cost·w, minus 1·w for its load (`OPENTERLOAD`;
+   `CmdLoadCost` is 1 for an immediate). A use costs 1 when the instruction's other operand is memory with a symbol
+   or displacement (`cmp [eax+ecx+4], K`, `mov byte [m+0x8b4], K`), else 0 (`cmp reg, K`, `mov var, K`, a store
+   through `[reg]` with no displacement; `CmdSubCost`, regalloc_cost.md). **[C; M: the probe's `type` at offset 0 gave
+   benefit 1, at offset 4 benefit 4]** A spill of a web that shares an instruction with the constant raises the
+   constant's benefit by that block's w (`CmdUpdateCost`, regalloc.md 3.6.4). **[C]**
+3. **Priority** (`GLOBREG+0x0c`): the formula of every web (regalloc.md 3.2) with those costs: cost·P·w in each
+   block that references it, −P·w in each block it is only live through. So a constant whose uses are far apart
+   pays −P·w in every block between them, and a constant used in a block with a large P (a loop body full of
+   values) gains a lot from one use there. Immediates have defOrd 0; between equal priorities the one inserted last
+   goes first (regalloc.md 3.4). **[C]**
+4. **The pop** (regalloc.md 3.6.1): benefit ≤ 0 → deferred to the very end of the list and then spilled or cut
+   (never coloured; immediates are never coloured at benefit 0, the one-block exception excludes them). Benefit > 0
+   → coloured with the first free register in eax ecx edx esi edi ebx ebp order (weights permitting), **at its
+   place in the priority order, like a variable**. A constant with prio −11 pops after every positive-prio web, but
+   before a call-crossing parameter whose many live-through blocks gave it −51. **[C]**
+5. **A one-byte use flags the whole web** (`fl5 |= 0x80`): `InitialSplitPoints` tests every operand's type size and
+   marks the operand's globreg when it is 1 (14.00 10b0e2e9..10b0e2fb, `and cx, 0xfff; cmp cx, 1; jne; mov eax,
+   [edi+0x1c]; or byte [eax+5], 0x80`; the same sequence in 13.10.3077 at 1078b91c..1078b931, 1078c8e6, 1078c96b:
+   BBT-scattered, so the function name is the index's guess). The immediate symbol itself is always made 4 bytes
+   (`GrgRewriteImmedAsReg` 10b56770: type 0x1004), but the rewritten operand keeps the store's byte type. **[C]**
+   So a constant shared by dword uses and one byte store needs a byte register: eax, ecx, edx or ebx; across a
+   call, **ebx only** (`avail at queue {ebx}`). **[M, all four builds]**
+6. **Its only register is a penalty for everyone coloured before it.** While it is queued, every interfering web
+   that ChoosePhysReg colours sees ebx weight +100·benefit (regalloc.md 4.2). This steers a web off ebx only when
+   ebx was its best register (it then takes ebp). **[C; M: RA_constbyte q_ref, `vv` → ebp on 13.10, `k` → ebp on
+   14.00/15.00]**
+7. **When it is coloured it takes the register from every neighbour that still has it** (`UpdateAffectedGlobregs`):
+   a call-crossing variable left with only ebx is split at that moment (its pieces are recosted in the next round
+   and get what is left). **[C trace, M&B 0x4915d0 below]**
+8. **When a neighbour is coloured first with its only register** (a call-crossing web that takes ebx), the constant
+   is taken off the list as a neighbour without a register, and every use stays an immediate. **[C trace; M: q_ref]**
+9. **After Color**, `CmdPostspill` gives a callee-saved register back unless the constant's benefit is ≥ 3 (opt.md 7
+   item 5): with benefit 1 or 2 the code has immediates although Color gave the constant ebx, *and the variable it
+   displaced still lost ebx*. **[C, opt.md; M: q_byte benefit 4 keeps `mov ebx, 1` and `mov [eax+12], bl`]**
+
+| RA_constbyte.cpp | uses of 1 | byte | avail | outcome (all four builds) |
+|---|---|---|---|---|
+| `q_byte` | 2 dword `cmp [m+4], 1`, `dirty = 1` byte store | yes | {ebx} | ebx at its pop; `mov ebx, 1`, `mov [eax+12], bl` |
+| `q_dword` | the store as a dword | no | {ebx,ebp,esi,edi} | ebx (first free) |
+| `q_two` | `dirty = 2` instead (1 keeps the two compares: benefit 2) | no | {ebx,ebp,esi,edi} | taken off the list (lower prio), no register holds 1 |
+| `q_ref` | as q_byte, plus `int& e = vv->b[k];` kept across the loop's first call | yes | {ebx} | a call-crossing web takes ebx first; 1 taken off the list, immediates |
+| `q_noref` | the same loop without the reference | yes | {ebx} | ebx |
+
+### 6.2 Levers (what to change in the source)
+
+| want | lever | why |
+|---|---|---|
+| the constant out of ebx, a variable in it | give the variable a higher prio than the constant, **or** lower the constant's prio below the variable's (remove its use in the high-P block, or its uses in loops) | 6.1.3, 6.1.7 |
+| the same | drop the byte use from the shared value: the store of another value, a non-constant, or (128..255, negatives) the other signedness (R2) | without the byte use the web is not byte, its avail has four registers, and its term in that block is gone (q_two; for M&B 0x4915d0 `constregs` estimates prio −11 → −73) |
+| the same | a call-crossing web that the original has and the draft lacks, coloured before the constant, takes ebx | 6.1.8; the M&B fix below |
+| no register for a constant at all | benefit ≤ 0: remove the uses that carry a memory operand with a displacement, or move them out of loops; or bring it to one use outside loops (2.3) | 6.1.2, 6.1.4 |
+| a constant in a callee-saved register in the final code | benefit ≥ 3 | 6.1.9 |
+
+Things that do not move it (the value is the key, 2.2): `1u`, `(char)1`, `true`, a `bool` field, a named constant;
+`type - 1 != 0` keeps the same operand after the optimizer.
+
+### 6.3 `tools/constregs.py`
+
+```sh
+uv run tools/constregs.py tu.cpp --func Class::method [--c2 13.10] [--value 1] [--export snap.json] -- <cl args>
+uv run tools/constregs.py --from snap.json [--value 1]
+```
+
+One traced compile with the `regs` hooks plus an IL dump at `@Globregs@4` entry, where constants are still
+literals. Each `k0` operand of the IL at Color entry is paired with the literal at the same operand position of the
+same instruction, which gives every reference's value and width (the IL at Color prints every immediate candidate
+as `k0`). Per constant of the first Spillcosts pass it prints: its prio and place in the list, benefit, references
+by width plus loads, the avail set when it was queued and the byte flag; the outcome (`pop N -> reg` and the
+neighbours that lost that register then, with their prio and whether it was their last register; or `taken off the
+list when pop N gave X reg`); how many webs saw its only register as a +100·benefit penalty and which of them were
+steered off it; each use (block, w, P, width, `mem`/`reg` = cost 1/0, the instruction); the prio terms; and levers
+from 6.2 with the numbers filled in. `--export` writes the `regs --export` snapshot plus the dump (key `gil`);
+`--from` reads it back (a plain `regs --export` snapshot works too, without per-use widths). Probe:
+`tests/probes/constregs.py` on `tests/data/rules/RA_constbyte.cpp`.
+
+### 6.4 Mount & Blade `GameData::remove_party` 0x4915d0 (cl 13.10): explained and fixed
+
+`constregs.py --value 1` on the module source: `const 1  prio -11  benefit 4  refs byte 1, dword 2  avail {ebx}
+BYTE`; uses `cmp [..+4], 1` (block 3, w 1, +5), the loop's `cmp [..+4], 1` (block 16, w 2, +10), `dirty = 1` (block
+17, w 2, P 16, +32); `pop 34 -> ebx`, taking ebx from `id` (prio −51, its last register: split; the pieces get ebp),
+`this`, `k` and the constants 0 and −1. The zero constant (16 uses, also byte through `engaged = 0`, benefit 8) is
+then taken off the list, so every `cmp x, 0` is `test`/an immediate. Same on 13.10.3052.
+
+The original keeps id in ebx outside the loop and reloads it at the loop end; inside the loop ebx is
+`&p->attached[k]` (`lea ebx, [edx+ebp]`), kept across the first `lookup` call and read again as `mov edx, [ebx]`,
+while the draft re-read `p->attached[k]` through a reloaded vector base. That address is the call-crossing web of
+6.1.8: written as a reference,
+
+```cpp
+for (unsigned k = 0; k < p->attached.size(); k++) {
+    int& a = p->attached[k];
+    if ((unsigned)p->attached[k] >= m->serial) continue;
+    int j = m->lookup(p->attached[k]);
+    ...
+    wd_at(m, m->lookup(a))->attached_to = -1;
+```
+
+it pops at 16 (prio 110, only ebx left) and takes ebx; the constant 1 is taken off the list, `id` gets ebx at pop
+34, the zero constant ebp at pop 36 (`xor ebp, ebp` after the first lookup, `cmp x, ebp`), as in the original.
+regmap: every Color web agrees (98 of 104; the six left are scratch picks). M&B `chk.py` aligned 158 → 55 (size 776 →
+760 = the original's), `insdiff` 61/54 → 14/15 (the throwaway `dirty = (id != 0) | 1` gave 34/32). The throwaway
+worked for two reasons, neither of them the sharing as such: it adds a use of `id` in the loop's store block (P 17,
+w 2: `id` −51 → 49, so `id` pops at 23 and takes ebx), and the constant's byte use becomes `or r8, 1` with a register
+operand (cost 0: its term there +32 → 0, prio −11 → −43, benefit 4 → 2; still byte). The rest is
+scratch rotation and the order of the esi/ebp saves. Other spellings: the reference bound after the bound check,
+or also used for the first lookup, gives the same 55; the reference used in the bound check too gives 74 (the
+serial is loaded into ecx first); a pointer `int* a = &p->attached[k]` used throughout gives 74. **[C trace and
+checker]**
+
+### 6.5 The same family elsewhere in Mount & Blade (not constants)
+
+- `Mission::spawn` 0x4832b0: `found` (prio 72) pops before `t` (59), `t` takes ebx and keeps it across the do-loop;
+  the original has `t` in edi outside the loop and in memory inside it (`mov [esp+0x14], edi` ... `mov edi,
+  [esp+0x14]`), with the loop's callee-saved registers all taken by `a` (esi), `pm` (ebx), the hoisted
+  `g_game->main_party` (ebp, `mov ebp, [ecx+0x78]` before the loop) and `found` (edi). So the original does not
+  need `t` before `found`; it needs `t` after the loop's webs, so that it is split around the loop. Why `t` is high:
+  59 = +96 in the entry block (P 8, **6 references**: `SubsumeGlobregs` folded the chain `t740 = [a+136]; t93 =
+  t740*1288; t129 = t93 + [g_game+0x13a00]; t = t129` into `t`, so `t` is defined three times in place:
+  `imul ebx, 1288; add ebx, ebp`) + 32 after the loop − 69 live-through. The original computes it in one def
+  (`lea edi, [eax+edx]` from two temporaries): 2 references, about +32 in that block, prio about −5, below `pm` and
+  the hoisted `main_party` web. **[C trace for ours; the original's references I from its code]** Source levers
+  tried: hoisting `int mp = g_game->main_party;` (mp then is a web but is spilled: insdiff 49/49 → 54/48),
+  `g_game->troops + a->troop`, a separate `int ti`, a `GameData* g` local: no change in `t`'s chain. What makes the
+  original's front end leave `t` a single `lea` is open.
+- `Terrain::make_grid` 0x47a460: no constant holds a callee-saved register. `this` (prio 103) takes ebx on a 0/0 tie
+  with ebp (register order); the original has `this` in ebp and the inner loop's count-down counter in ebx. For
+  `this` to take ebp, ebx must carry a positive weight when it is coloured (an uncoloured neighbour whose only
+  register is ebx, or one that prefers it), or the counter must be coloured first. **[C trace for ours; I for the
+  original]** 67 of 87 regmap votes agree: more than one decision differs.
