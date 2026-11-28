@@ -183,6 +183,39 @@ class Fn:
             if named(nm) and e.get("src") is None:
                 k = (nm, rn.get(str(e["reg"]), str(e["reg"])))
                 self.prefs[k] = self.prefs.get(k, 0) + 1
+        # the same relations with the compiler's locals (`local23`: a name that survives a source change), for the
+        # answers of rasim that name them; the registers each web may have when it is first queued (noreg / canreg);
+        # and the blocks each web is referenced in (where a source construct has to go for a value with no name)
+        namedl = lambda n: n and not re.match(r"(t|imm|k\d+_)\d+$", n) and n != "?"
+        self.interf_l, self.copies_l, self.prefs_l = set(), set(), {}
+        for p in self.snap.get("pops", []):
+            c = p.get("choice")
+            if not c or p.get("cls") not in (0, None):
+                continue
+            for n in c["nbrs"]:
+                if namedl(p["name"]) and namedl(n["name"]) and n["name"] != p["name"]:
+                    self.interf_l.add(tuple(sorted((p["name"], n["name"]))))
+            for n in c["partners"]:
+                o = gname.get(n["gr"])
+                if namedl(p["name"]) and namedl(o) and o != p["name"]:
+                    self.copies_l.add(tuple(sorted((p["name"], o))))
+        for e in self.snap.get("pref_events", []):
+            nm = gname.get(e["gr"])
+            if namedl(nm) and e.get("src") is None:
+                k = (nm, rn.get(str(e["reg"]), str(e["reg"])))
+                self.prefs_l[k] = self.prefs_l.get(k, 0) + 1
+        self.avail = {}
+        for e in self.snap.get("inserts") or []:
+            nm = (e.get("x") or {}).get("name")
+            if namedl(nm) and nm not in self.avail and e.get("avail"):
+                self.avail[nm] = frozenset(rn.get(str(r_), str(r_)) for r_ in e["avail"])
+        self.known = set(self.avail) | {m_.get("name") for m_ in (self.snap.get("missing") or [])}
+        self.where = {}
+        for (p, b), lst in fn.get("byblock", {}).items():
+            if p == self.np:
+                for nm, g, cost, d in lst:
+                    if cost is not None and namedl(nm):
+                        self.where.setdefault(nm, set()).add(b)
 
     def lines_of(self, b):
         return self.blocks[b - 1][3] if 0 < b <= len(self.blocks) else []
@@ -297,6 +330,23 @@ class Delta:
                         (a.dord[x] > a.dord[y]) != (b.dord[x] > b.dord[y]) and a.dord[x] != a.dord[y] and b.dord[x] != b.dord[y]:
                     self.ties.append((x, y) if b.dord[x] > b.dord[y] else (y, x))
         self.interf = (sorted(b.interf - a.interf), sorted(a.interf - b.interf))
+        self.interf_l = (sorted(b.interf_l - a.interf_l), sorted(a.interf_l - b.interf_l))
+        self.copies_l = (sorted(b.copies_l - a.copies_l), sorted(a.copies_l - b.copies_l))
+        self.prefs_l = {k: b.prefs_l.get(k, 0) - a.prefs_l.get(k, 0) for k in sorted(set(a.prefs_l) | set(b.prefs_l))
+                        if a.prefs_l.get(k, 0) != b.prefs_l.get(k, 0)}
+        # registers a value may or may not have: lost (noreg: it now lives across something that clobbers it) or
+        # gained (canreg), for the caller-saved registers only
+        self.noreg, self.canreg = [], []
+        full = frozenset(("eax", "ecx", "edx", "ebx", "esi", "edi", "ebp"))
+        for n in sorted(set(a.avail) | set(b.avail)):
+            if n not in b.avail or (n not in a.avail and n not in a.known):
+                continue                           # gone, or a new value: nothing in the base to lose a register from
+            av0 = a.avail.get(n, full)             # a value that had no web in the base (a parameter left in memory)
+            for r_ in ("eax", "ecx", "edx"):
+                if r_ in av0 and r_ not in b.avail[n]:
+                    self.noreg.append((n, r_))
+                elif r_ not in av0 and r_ in b.avail[n]:
+                    self.canreg.append((n, r_))
         self.copies = (sorted(b.copies - a.copies), sorted(a.copies - b.copies))
         self.prefs = {k: b.prefs.get(k, 0) - a.prefs.get(k, 0) for k in sorted(set(a.prefs) | set(b.prefs))
                       if a.prefs.get(k, 0) != b.prefs.get(k, 0)}
@@ -327,6 +377,7 @@ class Delta:
         out += ["interf:%s:%s" % p for p in self.interf[0]] + ["nointerf:%s:%s" % p for p in self.interf[1]]
         out += ["copy:%s:%s" % p for p in self.copies[0]] + ["nocopy:%s:%s" % p for p in self.copies[1]]
         out += ["pref:%s:%s:%+d" % (k[0], k[1], v) for k, v in self.prefs.items()]
+        out += ["noreg:%s:%s" % p for p in self.noreg] + ["canreg:%s:%s" % p for p in self.canreg]
         out += ["tie:%s>%s" % t for t in getattr(self, "ties", [])]
         return out
 
@@ -425,12 +476,22 @@ def verdict(want, d):
         side = [s for s in side if s != "P:%d:%+d" % (want["block"], implied)]
     elif k in ("interf", "nointerf", "copy", "nocopy"):
         pair = tuple(sorted((want["var"], want["other"])))
-        lst = {"interf": d.interf[0], "nointerf": d.interf[1], "copy": d.copies[0], "nocopy": d.copies[1]}[k]
-        ok = pair in lst
+        lst = {"interf": d.interf_l[0], "nointerf": d.interf_l[1], "copy": d.copies_l[0], "nocopy": d.copies_l[1]}[k]
+        # a rewrite that introduces a variable (`rz_c`, `rz_h`) can only make the relation with the new web: it
+        # counts when the other end is one of the wanted names (the new variable takes that role)
+        gone = {e[1] for e in d.edits if e[0] == "gone"}
+        ok = pair in lst or any(any(n.startswith("rz_") for n in q) and bool(set(q) & set(pair)) and not (set(pair) & gone)
+                                for q in lst)
         side = [s for s in side if s != "%s:%s:%s" % ((k,) + pair)]
     elif k == "pref":
-        ok = d.prefs.get((want["var"], want["other"]), 0) * want["n"] > 0
+        # the preferences for that register summed over every web: a rename (the same value under another name) is 0
+        gone = {e[1] for e in d.edits if e[0] == "gone"}
+        net = sum(v for (n_, r_), v in d.prefs_l.items() if r_ == want["other"])
+        ok = (d.prefs_l.get((want["var"], want["other"]), 0) * want["n"] > 0 and want["var"] not in gone) or net * want["n"] > 0
         side = [s for s in side if not s.startswith("pref:%s:%s:" % (want["var"], want["other"]))]
+    elif k in ("noreg", "canreg"):
+        ok = (want["var"], want["other"]) in (d.noreg if k == "noreg" else d.canreg)
+        side = [s for s in side if s != "%s:%s:%s" % (k, want["var"], want["other"])]
     else:
         ok = not d.empty()
     if not ok:
@@ -445,6 +506,7 @@ class _Sub:
         self.edits, self.tmp, self.P, self.lost, self.new = edits, d.tmp, d.P, d.lost, d.new
         self.interf, self.copies, self.prefs = d.interf, d.copies, d.prefs
         self.ties = getattr(d, "ties", [])
+        self.noreg, self.canreg = d.noreg, d.canreg
 
 
 # ---------------------------------------------------------------- symbol keys
@@ -2140,6 +2202,187 @@ def g_load(c, w):
     return out[:12]
 
 
+
+# ---------------------------------------------------------------- register-role answers: interf / copy / pref / canreg
+#
+# rasim's `interf:A:B`, `nointerf:A:B`, `copy:A:B`, `nocopy:A:B`, `pref:V:REG[:N]`, `noreg:V:REG` and `canreg:V:REG`
+# describe the colouring's input, not the IL (regalloc.md 3.3, 4). The constructs below are the source-level ways to
+# make that relation appear or go away (docs/c2/realize.md 2.4, measured in tests/data/realize_rel.cpp); every
+# candidate is compiled and the Delta of the two traces decides (verdict): the pair, the preference or the register
+# set has to change. Names are the trace's: a source variable (the rewrites go to its statements), or a compiler
+# local / temporary (`local23`: the statements of the blocks it is referenced in).
+
+REL_KINDS = ("interf", "nointerf", "copy", "nocopy", "pref", "noreg", "canreg")
+REG_NAMES = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp")
+
+
+def _rel_sites(c, names):
+    """(variables, statement starts): the source variables among `names`, and the statements that mention them or
+    sit in the blocks an unnamed value is referenced in (every statement when nothing is known)."""
+    B = c.B
+    vs = [n for n in names if n in B.vars and n != "this" or n == "this" and c.cls]
+    sts = []
+    for v in vs:
+        sts += _mention_stmts(c, v)
+    for n in names:
+        if n not in B.vars:
+            for blk in sorted(c.base.where.get(n, ())):
+                sts += c.stmts(blk)
+    sts = sorted(set(sts))
+    return vs, sts or list(B.starts)
+
+
+def g_move(c, sts, vs, span=3):
+    """regroles' `move`: one simple statement moved past up to `span` independent neighbours. It ends a value's life
+    before a clobber or another value's definition (nointerf / canreg), or lets it reach past it (interf / noreg)."""
+    import regroles
+    keep = {c.B.toks[st][1] for st in sts}
+    pats = [re.compile(r"\b%s\b" % re.escape(v)) for v in vs]
+    for fam, desc, edits in regroles.gen_move(c.B, span):
+        a_, b_, _r = edits[0]
+        txt = c.text[a_:b_]
+        if any(p_.search(txt) for p_ in pats) or any(a_ <= x <= b_ for x in keep):
+            yield (fam, desc, edits, "")
+
+
+def g_ptrfield(c):
+    """regroles' `ptrfield`: an induction pointer defined before the trip count of the loop that steps a pointer."""
+    import regroles
+    if not c.a.asm_vs:
+        return
+    for fam, desc, edits in regroles.gen_ptrfield(c.B, regroles.orig_offsets(c.a.asm_vs)):
+        yield (fam, desc, edits, "")
+
+
+def g_hoist(c, vs, span=4):
+    """`T rz_h = V->m;` a few statements above the statement that reads `V->m` (no call between them in the source
+    it is read from): V's last use moves up, ahead of the calls and divisions V would otherwise live across (canreg),
+    and `rz_h` takes the value's place. Changes the meaning if a call or store in between writes that member, so it is
+    only tried with --hoist-mem; rwsweep's `reread` is its reverse."""
+    B = c.B
+    if not getattr(c.a, "hoist_mem", False):
+        return
+    for V in vs:
+        ty, decl = B.vars.get(V, ("", -1))
+        if V == "this" or "*" not in ty:
+            continue
+        for i in B.uses.get(V, []):
+            if i + 2 >= len(B.toks) or B.toks[i + 1][0] != "->" or B.toks[i + 3][0] == "(" or B.written(i, i + 3):
+                continue
+            m = B.toks[i + 2][0]
+            mty = _member_type(c, m)
+            if not mty or "[" in mty:
+                continue
+            st = max((x for x in B.starts if x <= i), default=None)
+            if st is None or B.paren[i]:
+                continue
+            prev = [x for x in B.starts if x < st and B.block[x] == B.block[st] and x > max(decl, 0)
+                    and B.toks[x][0] not in ("case", "default", "else")]
+            for h in prev[-span:]:
+                if _in_loop(B, h):
+                    continue
+                pos = B.toks[h][1]
+                yield ("hoist", "`%s rz_h = %s->%s;` before line +%d, read at line +%d" % (mty, V, m, c.lineoff(h), c.lineoff(st)),
+                       [(pos, pos, "%s rz_h = %s->%s; " % (mty, V, m)), (B.toks[i][1], B.toks[i + 2][2], "rz_h")], "")
+
+
+def _has_call(B, i, j):
+    return any(re.match(r"[A-Za-z_]\w*$", B.toks[q][0]) and B.toks[q][0] not in c_KEYWORDS(B) and B.toks[q + 1][0] == "("
+               for q in range(i, j - 1))
+
+
+def c_KEYWORDS(B):
+    import rwsweep
+    return rwsweep.KEYWORDS | rwsweep.NOCALL
+
+
+def g_callsplit(c, sts):
+    """`X op= f(..);` -> `T rz_r = f(..); X op= rz_r;`: the call's result gets a web of its own, one `mov web, eax`
+    copy: `pref:rz_r:eax:+1` (call results are the only copies with eax that Spillcosts counts on the def side).
+    The same value, the same order of evaluation; one instruction more on 14.00 / 15.00 (measured, p2 `sep`)."""
+    B = c.B
+    for st in sts:
+        s = _stmt_span(c, st)
+        if not s or B.paren[st]:
+            continue
+        i, j = s
+        if B.toks[i][0] not in B.vars or B.toks[i + 1][0] not in ("+=", "-=", "*=", "|=", "&=", "^=") or not _has_call(B, i + 2, j):
+            continue
+        ty = B.vars[B.toks[i][0]][0]
+        if "&" in ty or "[" in ty or not (re.search(SCALAR, ty) or "*" in ty):
+            continue
+        ty = re.sub(r"\bconst\b", "", ty).strip()
+        rhs = B.src(i + 2, j - 1)
+        yield ("callsplit", "`%s rz_r = %s;` before `%s %s rz_r` at line +%d" % (ty, rhs[:30], B.toks[i][0], B.toks[i + 1][0], c.lineoff(i)),
+               [(B.toks[i][1], B.toks[j - 1][2], "%s rz_r = %s; %s %s rz_r;" % (ty, rhs, B.toks[i][0], B.toks[i + 1][0]))], "")
+
+
+def g_uncallsplit(c, sts):
+    """`T v = f(..); X op= v;` -> `X op= f(..);` (the reverse: v's web and its `mov v, eax` go). v is used once, in
+    the next statement, which has no other call."""
+    B = c.B
+    for st in sts:
+        s = _stmt_span(c, st)
+        if not s or B.paren[st]:
+            continue
+        i, j = s
+        m = c.rw.DECL.match(B.text, B.toks[i][1])
+        if not m or m.group(3) != "=" or m.group(2) not in B.vars or "&" in m.group(1) or not _has_call(B, i, j):
+            continue
+        v = m.group(2)
+        uses = B.uses.get(v, [])
+        nxt = _stmt_span(c, j) if j in B.starts else None
+        if len(uses) != 1 or not nxt or not (nxt[0] <= uses[0] < nxt[1]) or B.written(uses[0], uses[0] + 1) or \
+                _has_call(B, nxt[0], nxt[1]):
+            continue
+        eq = next(q for q in range(i, j) if B.toks[q][1] >= m.end() - 1)
+        rhs = B.src(eq + 1, j - 1)
+        yield ("uncallsplit", "`%s %s = %s;` folded into its one use at line +%d" % (m.group(1).strip(), v, rhs[:30], c.lineoff(nxt[0])),
+               [(B.toks[i][1], B.toks[j - 1][2], ""), (B.toks[uses[0]][1], B.toks[uses[0]][2], "(%s)" % rhs)], "")
+
+
+def g_rel(c, w):
+    k = w["kind"]
+    if k in ("noreg", "canreg") and w["other"] not in ("eax", "ecx", "edx"):
+        return []                  # only caller-saved registers are lost to a clobber (a call, shift, division)
+    names = [w["var"]] + ([w["other"]] if k != "pref" and k not in ("noreg", "canreg") else [])
+    vs, sts = _rel_sites(c, names)
+    lines = {c.lineoff(st) for st in sts}
+    out = []
+    grow = k in ("interf", "noreg")                      # the range of a value must grow
+    if k in ("interf", "noreg", "pref", "nointerf", "canreg", "copy", "nocopy"):
+        out += list(g_move(c, sts, vs))
+    if grow:
+        for v in vs:
+            first = min(c.B.uses.get(v) or [-1])
+            out += list(g_eqif(c, v, [st for st in c.B.starts if st > first]))
+    if k in ("nointerf", "canreg"):
+        out += list(g_hoist(c, vs))
+        for v in vs:
+            out += list(g_uneqif(c, v, lines))
+        out += list(g_rw(c, "subst", lines)) + list(g_rw(c, "reread", lines)) + list(g_rw(c, "recompute", lines))
+        out += list(g_ptrfield(c))
+    if k in ("interf", "noreg"):
+        out += list(g_ptrfield(c))
+        if vs:
+            out += list(g_rw(c, "touch", lines, lambda d: any(d.endswith(" %s at body line %s" % (v, d.rsplit(" ", 1)[-1])) for v in vs)))
+    if k in ("copy", "pref"):
+        for v in (vs or [x for x in c.B.vars if x != "this"]):
+            out += list(g_copy(c, v, list(c.B.starts)))
+    if k in ("nocopy", "pref"):
+        out += list(g_uncopy(c, None, list(c.B.starts)))
+    if k == "pref":
+        out += list(g_callsplit(c, list(c.B.starts)) if w.get("n", 1) > 0 else g_uncallsplit(c, list(c.B.starts)))
+        out += list(g_rw(c, "wrap", lines)) + list(g_rw(c, "subst", lines))
+    seen, res = set(), []
+    for g in out:
+        key = repr((sorted(g[2]), g[3]))
+        if key not in seen:
+            seen.add(key)
+            res.append(g)
+    return res
+
+
 def generate(c, w):
     """Candidate rewrites for one parsed edit, most specific construct first."""
     k = w["kind"]
@@ -2188,6 +2431,8 @@ def generate(c, w):
                 out += list(g_rw(c, "const", lines)) + list(g_guard(c, lines))
     elif k == "key":
         out += list(g_keys(c, w))
+    elif k in REL_KINDS:
+        out = g_rel(c, w)
     pick = set(c.a.constructs.split(",")) if c.a.constructs else None
     out = [v for v in out if not pick or v[0] in pick]
     return out[:c.a.limit] if c.a.limit else out
@@ -2527,6 +2772,31 @@ def parse_answers(text):
     return wants, answers
 
 
+def partial_answers(c, snap, text, nvars=8, nrel=3, nsrc=2):
+    """No answer gives every wanted register: the answers for each wanted register on its own (`rasim need SNAP
+    reg:V=R`), the abstract relation kinds first (interf / nointerf / copy / nocopy / pref / noreg / canreg have
+    constructs now: realize.md 2.4a), appended in the format parse_answers reads. Each realises one value's colouring
+    and moves others, which the measurement against the original judges."""
+    pat = re.compile(r"^(\S+) \(pop \d+, prio -?\d+\): now (\w+), wanted (\w+)", re.M)
+    out, done = "", 0
+    for m in pat.finditer(text):
+        v, now, want = m.group(1), m.group(2), m.group(3)
+        base = v.split("@p")[0].split("#")[0]
+        if re.match(r"(t|imm)\d+$", base) or done >= nvars:
+            continue
+        r = subprocess.run([RASIM, "need", snap, "reg:%s=%s" % (v, want), "--top", "10"], capture_output=True, text=True).stdout
+        _w, ans = parse_answers(r)
+        rel = [a_ for a_ in ans if len(a_) == 1 and a_[0].split(":")[0] in REL_KINDS][:nrel]
+        src = [a_ for a_ in ans if a_ not in rel and len(a_) == 1][:nsrc]
+        if not rel and not src:
+            continue
+        done += 1
+        out += "\n# partial answers for %s -> %s\n" % (v, want)
+        for a_ in rel + src:
+            out += "  %-40s\n" % a_[0]
+    return out
+
+
 def auto_answers(c, a):
     """regmap against the original, then `rasim want`: the answer list for --from-rasim auto."""
     if not a.asm_vs:
@@ -2547,6 +2817,8 @@ def auto_answers(c, a):
             if "VIOLATED" in q.stdout:
                 print("# regmap swap %s <-> %s: rasim need '%s>%s'" % (x, y, first, second))
                 text += "\n# rasim need '%s>%s'\n" % (first, second) + q.stdout
+    if "nothing found" in text and not a.no_partial:
+        text += partial_answers(c, snap, text)
     open(os.path.join(c.out, "answers.txt"), "w").write(text)
     print("# regmap: %s" % (rm.stdout.strip().splitlines() or ["(no output)"])[-1])
     return text
@@ -2584,7 +2856,7 @@ def answer_alternatives(c, ans, snap):
                 alts.append(ws)
             else:
                 unreal.append(e)
-        elif w["kind"] in ABSTRACT:
+        elif w["kind"] in ABSTRACT and w["kind"] not in REL_KINDS:
             unreal.append(e)
         else:
             alts.append([w])
@@ -2665,7 +2937,10 @@ def realise_answer(c, a, alts, tag, st):
                     if hit(c, r):
                         return r
         got.sort(key=lambda r: (_score(r), r["d"].bag))
-        per.append(got[:3])
+        if got or len(alts) == 1 or not any(w["kind"] in REL_KINDS for w in ws):
+            per.append(got[:3])
+        else:
+            print("  (no variant realises %s: the rest of the answer is realised without it)" % " / ".join(w["text"] for w in ws))
     if len(per) < 2 or not all(per):
         return None
     import itertools
@@ -2870,6 +3145,12 @@ def cmd_pipeline(c, a):
     wants, answers = parse_answers(text)
     if a.from_model:
         answers = answers0
+    else:
+        # source-level edits first, then the relation answers (they have constructs: 2.4a), the order answers last
+        # (each needs a second query to become source edits)
+        kind_rank = lambda ans: 2 if any(e.split(":")[0] in ("before", "after") for e in ans) else \
+            1 if any(e.split(":")[0] in REL_KINDS for e in ans) else 0
+        answers = sorted(answers, key=kind_rank)
     if a.from_rasim == "auto" and os.path.exists(os.path.join(c.out, "regmap.txt")):
         for ln in open(os.path.join(c.out, "regmap.txt")):
             m = re.match(r"(\S+)\s+(\S+)\s+.*WANTS (\w+)", ln)
@@ -3824,6 +4105,8 @@ def main():
     ap.add_argument("--max-answers", type=int, default=12)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--keep")
+    ap.add_argument("--no-partial", action="store_true", help="--from-rasim auto: do not add the per-register answers when no answer gives every wanted register")
+    ap.add_argument("--hoist-mem", action="store_true", help="also try `T rz_h = V->m;` hoisted above the calls (rel answers; changes the meaning if a call or store in between writes V->m)")
     ap.add_argument("--with-store", action="store_true", help="--from-rasim: also try `rz_keep(V);` (one instruction of code: a diagnosis, never a match)")
     ap.add_argument("--max-compiles", type=int, default=60)
     ap.add_argument("--pairs", type=int, default=1, help="pipeline: after the answers, combine the closest variants: "

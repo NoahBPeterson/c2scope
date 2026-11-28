@@ -198,8 +198,9 @@ spelled `V`), hoist a common head statement. A reference that the original's ins
 
 ### 2.4 Order, interference, preference, copy partners
 
-`canreg:` / `noreg:` / `interf:` answers about a parameter that lives across a `mul` / `div` / call have no construct here:
-`tools/regroles.py` (docs/c2/regroles.md) realises them by statement moves and an explicit induction pointer defined before the clobber (Spore 0x009e0b90).
+`canreg:` / `noreg:` / `interf:` answers about a parameter that lives across a `mul` / `div` / call: section 2.4a
+(statement moves, equal arms, a hoisted read, and `tools/regroles.py`'s explicit induction pointer defined before the clobber,
+docs/c2/regroles.md; Spore 0x009e0b90).
 
 `before:A:B` / `after:A:B` are priority edits: ask `rasim need SNAP 'A>B'` for the `ref:` / `unref:` form and take
 it to 2.1 or 2.3. A tie (equal priorities, decided by defOrd) is also an order of statements:
@@ -212,6 +213,46 @@ it to 2.1 or 2.3. A tie (equal priorities, decided by defOrd) is also an order o
 | `pref:A:REG:+1` | equal arms around a statement that copies A to or from a fixed register: a fastcall argument (`s += gf(n, s)`: `pref:s:edx:+1`, code 0 on all three builds). The same around a cdecl call result or a thiscall `this` did not merge (the arms' argument loads took different scratch registers: +5, +13) | 0 for the fastcall probe; S's references come with it |
 | `pref:A:REG` otherwise | a copy with a fixed register: return value, fastcall or thiscall argument, call result | changes code (tracer.md pairs fc_pref, h_ret) |
 | `noreg:A:REG` / `canreg:A:REG` | A lives (no longer lives) across a call, shift, division | changes code, or 2.2 |
+
+### 2.4a Register-role answers: `interf:` `nointerf:` `copy:` `nocopy:` `pref:` `noreg:` `canreg:`
+
+The table is a set of rules (source construct -> effect on the allocator's input), each measured on 14.00, 15.00 and
+13.10.3077 and pinned by `tests/probes/realize_rel.py`. The generators that apply them are conveniences, not the claim.
+
+These answers describe Color's input, not the IL (regalloc.md 3.3, 4): who interferes, who is a copy partner, which
+copies with a fixed register a web has, which of eax / ecx / edx a web may not have (it lives across a call, a shift
+count, a division). `realize.py edit` / `--from-rasim` (also `auto`, which appends the per-register answers of
+`rasim need reg:V=R` when no answer gives every wanted register; `--no-partial` skips them) generate the constructs
+below at the statements that mention the named variables (or, for a compiler value such as `local23`, at the statements
+of the blocks it is referenced in), compile each, and the Delta of the two traces is the verdict: the pair has to
+appear (or go), the preference has to change (summed over every web: a rename is 0), the register has to leave (join)
+the web's initial avail set (`noreg:V:R` / `canreg:V:R` are printed in the difference since this section). A rewrite that
+introduces a variable (`rz_c`, `rz_r`, `rz_h`) cannot make the relation with a name it does not have: it counts when the
+other end is one of the wanted names and the wanted variable still exists (a plain rename does not count). Measured on
+14.00, 15.00 and 13.10.3077 with the same relation changes (probes `work/rgk/p1.cpp`, `p2.cpp`, `p4.cpp`; regression
+`tests/data/realize_rel.cpp`, `tests/probes/realize_rel.py`; the instruction counts differ by one on 13.10, the edits do not).
+
+| Answer | Construct (family) | State change measured | Code |
+|---|---|---|---|
+| `copy:k:V` (add) | `T k = V;` before V's next modification, later uses spelled k (`copy`; a parameter copied into the variable a loop steps is the common case) | `copy:k:V`, `interf:k:..`, `ref:V:B:+2`, `P:B:+1`; V gains eax/ecx/edx (`canreg:V:..`: it no longer lives across the loop's calls), k has none | 0 (cp__copy) |
+| `copy` that does nothing | the same copy when V is not modified afterwards, a `const` copy, `y2 = y` where y dies at the copy, reusing a variable for the second phase (`a = ..` instead of a new `b`), a scoping block | no change in c2's state except names: webs are one per lifetime (CreateGlobregs), so splitting or merging variables and scopes renames, it does not move a relation; cl propagates a copy whose source is not live afterwards | 0 |
+| `copy` that costs | `{ int y2 = y; y2 += ..; y = y2; }`, a copy whose source is used after the loop (`cpp__copyuse`) | `interf:y:y2` appears and V's range grows | 1 to 9 |
+| `nocopy:k:V` | the copy removed, uses spelled V (`uncopy`; `subst` for a single-use local) | `nocopy:k:V`, `nointerf:k:..`, `ref:V:-2`, V loses eax/ecx/edx again (`noreg:V:..`) | 0 (cp__copy) |
+| `interf:A:B` | the statement that defines B written before the last use of A, i.e. a `move` of one simple statement past up to 3 independent neighbours (regroles' `move`; itf__late: `t = a + 1` after `s = g(p->a)`); equal arms on A at a statement inside B's range (`eqif`, rule 8); `ptrfield` for a stepped pointer (regroles.md) | `interf:a:s` (a now lives across the call: `noreg:a:eax/ecx/edx`), `nointerf:s:t` | same instructions (bag 0), registers move (code 8) |
+| `nointerf:A:B` | the same moves the other way; `uneqif` (nr__eqif: `nointerf:n:p`, `nointerf:n:s` came back, code 14 bag 2: n is out of its register again); `subst`, `reread`, `recompute` (rwsweep); `ptrfield` | the reverse | bag 0 for the moves |
+| `noreg:V:R` | V used after the clobber: equal arms on a statement after the calls (`eqif`, V a value with a web of its own or a parameter that was left in memory), or a `move` down | V's initial avail loses eax, ecx, edx; `interf:V:` the values live across the calls | eqif: bag 2 for a parameter (it needs a register now: one load) |
+| `canreg:V:R` | V's last use ahead of the clobber: `T rz_h = V->m;` written a few statements up (`hoist`, only with `--hoist-mem`: it assumes nothing in between writes V->m), `move` up, `subst` / `reread` / `recompute` (rwsweep), `uneqif` | V gains eax, ecx, edx; `interf:V:rz_h`, `nointerf:V:s` | hoist: one more instruction (the member read earlier is held in a register) |
+| `pref:V:R:+1` | the call result in its own web: `X op= f(..);` -> `T rz_r = f(..); X op= rz_r;` (`callsplit`) | `pref:rz_r:eax:+1` (one `mov web, eax`, regalloc.md 4.1), `ref:X:-2` | +1 instruction |
+| `pref:V:R:-1` | `T t = f(..); X op= t;` folded (`uncallsplit`; `subst` when the initialiser has no call) | the web and its preference go | +1 instruction (3 bytes) |
+| `pref` on a thiscall `this` / fastcall argument | none found that is code-neutral | the preference comes with the copy `mov ecx, V`, which is the call's own argument load | |
+
+What does not realise any of these: a use that leaves no code (`(void)V;`, `if (V) {}`, `__assume`, the `touch` family: all vanish before Color,
+rule 1), so `interf:` / `noreg:` need an eqif-type reference or a moved statement; a copy preference without the
+references of the statement that carries it (rule 7); a rename.
+
+Spore rows tried with the generators (15.00; closest diffs, none matched): 0x00902950 245 -> 200..219 bytes (equal arms on A; 19 registers wanted at once, no single or pair answer gives them), 0x00fe0f40 247 -> 200 (equal arms), 0x0057f6c0 405 (no improvement), 0x009a9c00 586 (skeleton source, base far off), 0x00b56fe0 51 (mb/local185 eax-ecx swap; the answers `nointerf:local185:mb`, `pref:mb:eax` have no construct that moves it), 0x00d247f0 47 (pm/keyA/keyB; the answer is an order gap of 2, `after:pm:keyB`, which needs a statement move the run did not reach), 0x00826290 not run (function-name lookup failed), 0x00f986f0 already matches in the corpus. No row matched.
+
+`regroles.py --rel` adds these constructs for the relation answers of its diagnosis to its own `move` / `ptrfield` pool.
 
 ### 2.5 Scratch picks: `rasim scratch SSNAP drop:N` / `ins:N`
 

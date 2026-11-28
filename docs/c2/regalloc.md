@@ -1127,6 +1127,18 @@ seen once, no source probe made]**. `regs` shows this as a `spill/defer` pop fol
 with a single candidate. Seen once: b250.c pop 3513/3514, an immediate with esi:1 and avail eax ecx edx esi edi
 ebx, coloured esi.
 
+### 4.5 The same state changes from source (measured; docs/c2/realize.md 2.4a)
+
+Every input of 4.1 to 4.4 has a source-level lever, found by compiling and comparing the traces (`realize.py`, 14.00, 15.00 and 13.10.3077
+alike): a **copy partner** (`copy:A:B`) is `T k = V;` before V's next modification (k's later uses), code 0; a copy
+whose source dies at it, a `const` copy, merging two variables into one and scoping blocks change nothing but names
+(webs are per lifetime). **Interference** (`interf:A:B`) is one value's range reaching the other's definition: a
+statement moved past the definition (bag 0), or a use that leaves code (equal arms, realize.md rule 8); **`noreg` /
+`canreg`** are the same fact about a clobber (call, shift count, division): the avail set the web is first queued with
+loses (gains) eax, ecx, edx, and which web crosses which call is a source-order fact. A **preference** (`pref:V:eax`)
+only comes with a copy with a fixed register: the call result in a web of its own (`mov web, eax`) adds one,
+folding it into its use removes it, and both change the code by one instruction.
+
 ---
 
 ## 5. Recipe: predicting the callee-saved assignment of a small function (/O2)

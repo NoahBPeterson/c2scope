@@ -70,7 +70,17 @@ def diagnose(c, rows, cl):
             if "give every target" in ln or ln.startswith("  ") and re.match(r"\s+\S+:\S+", ln):
                 print("#   " + ln.strip()[:150])
         wants.append((nm, want))
+        # the relation answers (interf / copy / pref / noreg / canreg): realize's constructs realise them (--rel)
+        _w, ans = realize.parse_answers(q)
+        k = 0
+        for a_ in ans:
+            if len(a_) == 1 and a_[0].split(":")[0] in realize.REL_KINDS and k < 3:
+                RELS.append(a_[0])
+                k += 1
     return wants
+
+
+RELS = []
 
 
 # ---------------------------------------------------------------- candidates
@@ -188,8 +198,14 @@ def gen_ptrfield(B, offs):
             break
 
 
-def candidates(c, span, offs):
+def candidates(c, span, offs, rel=False):
     out = list(gen_move(c.B, span))
+    if rel:                       # realize's constructs for the relation answers of the diagnosis
+        for e in dict.fromkeys(RELS):
+            try:
+                out += [g[:3] for g in realize.generate(c, realize.parse_edit(e))]
+            except SystemExit:
+                pass
     if offs and "rg_p" not in c.text:
         out += list(gen_ptrfield(c.B, offs))
     seen, res = set(), []
@@ -235,11 +251,14 @@ def main():
     ap.add_argument("--span", type=int, default=4)
     ap.add_argument("--no-ptrfield", action="store_true")
     ap.add_argument("--no-diag", action="store_true", help="skip the regmap / rasim diagnosis")
+    ap.add_argument("--rel", action="store_true", help="also the constructs of realize.py for the diagnosis' interf / copy / pref / noreg / canreg answers (docs/c2/realize.md 2.4a)")
+    ap.add_argument("--hoist-mem", action="store_true", help="with --rel: also `T rz_h = V->m;` hoists (change the meaning if a call between writes V->m)")
     ap.add_argument("--keep")
     ap.add_argument("--top", type=int, default=8)
     a = ap.parse_args(argv)
     a.asm_vs = os.path.abspath(a.asm_vs)
     a.want_regs = None
+    a.constructs, a.limit = None, 0
     cur, budget = os.path.abspath(a.src), a.max_compiles
     best_path = None
     for rnd in range(a.rounds):
@@ -252,7 +271,7 @@ def main():
             break
         if rnd == 0 and not a.no_diag:
             diagnose(c, regmap_rows(cur, a.func, a.asm_vs, a.asm_func, cl), cl)
-        cands = candidates(c, a.span, [] if a.no_ptrfield else orig_offsets(a.asm_vs))[:budget]
+        cands = candidates(c, a.span, [] if a.no_ptrfield else orig_offsets(a.asm_vs), a.rel)[:budget]
         if not cands:
             print("no candidates")
             break
