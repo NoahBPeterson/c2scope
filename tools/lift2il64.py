@@ -2592,6 +2592,106 @@ CT = {"e004": "float", "e008": "double", "1008": "__int64", "1004": "int", "2004
       "2001": "unsigned char", "1001": "signed char", "2002": "unsigned short", "1002": "short"}
 
 
+RV_SIZES = {"__int64": 8, "unsigned __int64": 8, "int": 4, "unsigned int": 4}
+
+
+def _split_args(s):
+    out, depth, cur = [], 0, ""
+    for ch in s:
+        depth += ch == "("
+        depth -= ch == ")"
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def retslots(text, img, va):
+    """A call that fills a local through the callee's hidden return pointer (the callee returns that same pointer:
+    frameinfo64.returns_arg) as a class returned by value, initialised in place:
+        v1063 = (__int64)&v_lh3;  v1012 = FUN_X(this, v1063);  ... v_lh3 ...
+    ->  RetVal8 v_lh3 = ((RvObj_FUN_X*)(this))->call();  v1012 = (__int64)&v_lh3;  ... v_lh3.v ...
+    RetVal<N> has a declared copy constructor, so cl returns it through the hidden pointer (a POD of 1/2/4/8 bytes
+    would come back in rax). Only when every later use of the local stays inside the call's block; the slot in rcx is
+    a free function FUN_X_rv(...), the slot in rdx a member function of its rcx.
+    Opt-in (opts retslot=1), not a default variant: on 150 open functions of a retail cl 17.00 x64 game that pass a
+    return slot it gave no match, shape better 2 / worse 28 / same 113 (2026-11-27), and the frame packer still
+    visits the object by its uses like the plain local (0x1406e7170's home-slot order unchanged)."""
+    import frameinfo64
+    lines = text.split("\n")
+    decl = {}
+    for n, ln in enumerate(lines):
+        m = re.match(r"^    ([\w ]+) (v_\w+);$", ln)
+        if m and m.group(1) in RV_SIZES:
+            decl[m.group(2)] = (n, m.group(1))
+    addr = {}                                      # temp -> local whose address it holds
+    for n, ln in enumerate(lines):
+        m = re.match(r"^\s*(v\d+) = \(__int64\)\(\(__int64\)&(v_\w+)\);$", ln)
+        if m and m.group(2) in decl:
+            addr[m.group(1)] = (n, m.group(2))
+    types, structs, drop = {}, [], set()
+    for n, ln in enumerate(lines):
+        m = re.match(r"^(\s*)(?:(v\d+) = \([\w ]+\))?FUN_([0-9a-f]+)\((.*)\);$", ln)
+        if not m:
+            continue
+        ind, dst, callee, args = m.group(1), m.group(2), int(m.group(3), 16), _split_args(m.group(4))
+        slot = [(p, a) for p, a in enumerate(args[:2]) if re.sub(r"[()]|__int64", "", a) in addr]
+        if len(slot) != 1:
+            continue
+        p, a = slot[0]
+        tmp = re.sub(r"[()]|__int64", "", a)
+        an, local = addr[tmp]
+        if ("rcx", "rdx")[p] not in frameinfo64.returns_arg(img, callee):
+            continue
+        uses = [k for k, x in enumerate(lines) if k not in (decl[local][0], an) and re.search(r"\b%s\b" % local, x)]
+        tdecl = [k for k, x in enumerate(lines) if re.match(r"^    [\w ]+ %s;$" % tmp, x)]
+        if not uses or any(k < n for k in uses) or any(re.search(r"\b%s\b" % tmp, x) for k, x in enumerate(lines)
+                                                         if k not in [an, n] + tdecl):
+            continue
+        depth, ok = 0, True                        # the uses stay inside the call's block
+        for k in range(n + 1, max(uses) + 1):
+            depth += lines[k].count("{") - lines[k].count("}")
+            if depth < 0:
+                ok = False
+                break
+        if not ok:
+            continue
+        ty = decl[local][1]
+        sz = RV_SIZES[ty]
+        rv = "RetVal%d" % sz
+        types[rv] = "struct %s { %s v; %s(const %s&); };" % (rv, ty, rv, rv)
+        rest = [x for k, x in enumerate(args) if k != p]
+        if p == 1:
+            obj = "RvObj_FUN_%x" % callee
+            structs.append("struct %s { %s call(%s); };" % (obj, rv, ", ".join("__int64" for _ in rest[1:])))
+            call = "((%s*)(%s))->call(%s)" % (obj, rest[0], ", ".join(rest[1:]))
+        else:
+            fn = "FUN_%x_rv" % callee
+            structs.append("%s %s(%s);" % (rv, fn, ", ".join("__int64" for _ in rest)))
+            call = "%s(%s)" % (fn, ", ".join(rest))
+        new = ["%s%s %s = %s;" % (ind, rv, local, call)]
+        if dst:
+            new.append("%s%s = (__int64)&%s;" % (ind, dst, local))
+        lines[n] = "\n".join(new)
+        drop |= {an, decl[local][0]} | set(tdecl)
+        for k in uses:
+            lines[k] = re.sub(r"\b%s\b(?!\.)" % local, local + ".v", lines[k])
+    if not types:
+        return text
+    lines = [x for k, x in enumerate(lines) if k not in drop]
+    out = "\n".join(lines)
+    for c in sorted(set(re.findall(r"^\S[^\n]* FUN_([0-9a-f]+)\([^\n]*\);$", out, re.M))):
+        if not re.search(r"\bFUN_%s\(" % c, out.split("\n{", 1)[-1]):
+            out = re.sub(r"^\S[^\n]* FUN_%s\([^\n]*\);\n" % c, "", out, flags=re.M)
+    sig = re.search(r"^\S[^\n]* FUN_%x\(" % va, out, re.M)
+    extra = "\n".join(sorted(types.values()) + sorted(set(structs))) + "\n"
+    return out[:sig.start()] + extra + out[sig.start():]
+
+
 def variants(img, va, size):
     """[(opts, C++ text)]: the default lifting first, then the readings the bytes leave open (whether rax / xmm0
     at a ret is a value), each text once."""
@@ -2611,6 +2711,7 @@ def variants(img, va, size):
         alts.append({"sqrt": "f"})
     if any(i.mnemonic == "sbb" for i in lf.ins):
         alts.append({"sbb": "neg"})
+
     if lf.eh_help is not None:                   # the game has a C++ exception frame here: only an EH body can match
         alts = [dict(a, eh=m) for m in ("try", "swallow") for a in [{}] + alts]
         out, seen = [], set()
@@ -2741,7 +2842,10 @@ def unit(img, va, size, opts=None):
         for sig in sorted(c["sigs"]):
             head.append("%s FUN_%x(%s);" % (r, cva, ", ".join(sig)))
     sig = "%s FUN_%x(%s)\n" % (ret, va, ", ".join(typed) or "void")
-    return "\n".join(head) + ("\n\n" if head else "") + sig + body + "\n", lf
+    text = "\n".join(head) + ("\n\n" if head else "") + sig + body + "\n"
+    if lf.opts.get("retslot"):
+        text = retslots(text, img, va)
+    return text, lf
 
 
 # ------------------------------------------------------------------------------------------------------ checking

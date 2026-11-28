@@ -131,6 +131,19 @@ without warnings at /W3. PACKDIR is the per-function folder that `check` and `be
 2% of the functions are compiler-made (adjustor thunks, unwind and catch funclets) and have no source form. A match
 uses offsets, stand-in types and `FUN_`/`g_` names; the real types and names are still to come.
 
+## Return slots (`frameinfo64.py`, opts `retslot`)
+
+`frameinfo64.py VA` reads, from the binary alone, every stack address passed to a call: a **return slot** when the
+callee returns that same register (`mov rax, rdx` before its ret: the hidden return pointer of a class returned by
+value), else an **out param**. regfix64's frame report prints it. `unit(..., {"retslot": 1})` rewrites a named local
+filled through a return slot as `RetVal8 x = ((RvObj_FUN_X*)obj)->call();` (RetVal8 has a declared copy
+constructor, so it comes back through the hidden pointer) and its reads as `x.v`. Measured on 150 open functions of
+a retail x64 game that pass a return slot: no match either way, shape better 2 / worse 28 / same 113, 7 compile
+errors (a later use outside the declaring block; `FUN_X_rv` clashing with the function itself). It is therefore
+opt-in, not a default variant. The frame packer visits the object by its uses exactly like the plain local, so a
+home-slot order like 0x1406e7170's (the local the original places after a callee-saved save) is not explained by the
+return slot alone.
+
 ## Not yet handled
 - Re-rolling loops. cl rotated and duplicated the loop tests, so the goto-shaped lift gets re-optimised
   differently. This is the main cause of misses above 128 bytes.
