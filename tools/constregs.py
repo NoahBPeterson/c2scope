@@ -4,6 +4,15 @@ of each, and which source change drops (or keeps) a constant's candidacy.  Doc: 
 
 usage: uv run tools/constregs.py SRC --func S [--c2 BUILD] [--value V] [--keep DIR] [--export SNAP] [-- <cl args>]
        uv run tools/constregs.py --from SNAP [--value V]
+       uv run tools/constregs.py SRC --func S --c2 17.00 [--keep DIR] [-- <cl args>]     (x64: the fold test, below)
+
+cl 17.00 x64 is a different mechanism (docs/c2/immcand.md section 7): there is no Color / Spillcosts / ChoosePhysReg,
+no benefit-minus-load number and no byte flag.  A constant is a candidate of NColor (OPENTERLOAD `k0 <- K`), and
+NColProcessCandidateRegion either folds it away (every use stays an immediate) or gives it a register:
+NColMdNoFoldBenefit (per use) summed by NColBenefitOfUsesInRange (each use shifted by twice its zone depth) is
+compared with MdmDefCost (the def's cost shifted by twice its depth): folded when cost >= sum.  With --c2 17.00 this
+tool logs those calls (hooks.constfold of the build table) and prints, per constant candidate: the uses with their
+benefits (INF = cannot take an immediate: a 16-bit store, an imm64), the def cost, the sum, and the outcome.
 
 One traced compile: the hooks of `c2trace.py regs` plus an IL dump at `@Globregs@4` entry, where the constants are
 still literal operands (CmdIdentifyImmedCandidates runs first in Globregs and turns each qualifying operand into the
@@ -30,6 +39,11 @@ Per constant (immediate globreg of pass 1):
 import json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c2build  # noqa: F401  (takes --c2 BUILD out of sys.argv, port-1310.md)
+
+
+def _x64():
+    t = c2build.table()
+    return bool(t) and t.get("arch") == "x64"
 
 REGORDER = ["eax", "ecx", "edx", "esi", "edi", "ebx", "ebp"]
 TOK = re.compile(r"\S+")
@@ -323,7 +337,102 @@ def show(fname, cs, P1):
             print("    lever: " + l)
 
 
+OP17 = {0x13b: "mov", 0x32: "cmp", 0xa: "add", 0x2b5: "imul"}
+INF = 0x7fffffff
+
+
+def _fields(ln):
+    """(hook index, kind 'E'/'X', words before '|', words after '|') of a raw log line."""
+    head, _, tail = ln.partition("|")
+    w = head.split()
+    return int(w[3]), w[0], w[4:], tail.split()
+
+
+def analyse17(log):
+    """Constant candidates of one traced compile under cl 17.00 (hooks.constfold, in order): [dict(first, last, prio,
+    uses=[(op, type word, imm, benefit)], defcost, sum, folded, reg, net)] for the candidates that had uses asked."""
+    cands, cur, pend = [], None, {}
+    for ln in log.splitlines():
+        if ln[:2] not in ("E ", "X ") or "|" not in ln:
+            continue
+        h, k, pre, post = _fields(ln)
+        if h == 0 and k == "E":
+            cur = dict(name=post[0].strip('"'), prio=int(post[-3], 16), first=int(post[-2], 16),
+                       last=int(post[-1], 16), uses=[], defcost=None, sum=None, folded=False, reg=None, net=None)
+            cands.append(cur)
+        elif cur is None:
+            continue
+        elif h == 1 and k == "E":
+            pend[1] = post
+        elif h == 1 and k == "X" and 1 in pend:
+            p = pend.pop(1)
+            cur["uses"].append((int(p[0], 16), int(p[1], 16), int(p[3], 16), int(post[0], 16)))
+        elif h == 2 and k == "X":
+            cur["defcost"] = int(post[0], 16)
+        elif h == 3 and k == "X":
+            cur["sum"] = int(post[0], 16)
+        elif h == 4 and k == "E":
+            cur["folded"] = True
+        elif h == 5 and k == "E":
+            cur["reg"], cur["net"] = post[0].strip('"'), int(post[-1], 16)
+    return [c for c in cands if c["uses"]]
+
+
+def show17(fname, cs):
+    print("%s: %d candidate(s) with a constant definition (cl 17.00 NColor)" % (fname, len(cs)))
+    for c in cs:
+        vals = sorted({u[2] for u in c["uses"]})
+        print("\n  constant %s  candidate tuples %x..%x prio %x" % (", ".join("%#x" % v for v in vals), c["first"],
+                                                                     c["last"], c["prio"]))
+        by = {}
+        for op, tw, imm, ben in c["uses"]:
+            key = (OP17.get(op, "op%x" % op), _width(tw), "INF" if ben == INF else str(ben))
+            by[key] = by.get(key, 0) + 1
+        print("    uses asked (instruction, width, benefit): " + ", ".join(
+            "%d x %s %s -> %s" % (n, o, w, b) for (o, w, b), n in sorted(by.items())))
+        if c["defcost"] is not None:
+            print("    MdmDefCost %s; NColBenefitOfUsesInRange %s (each use shifted by twice its zone depth)%s" % (
+                c["defcost"], "INF" if c["sum"] == INF else c["sum"],
+                "" if c["sum"] is None else "; folded when cost << 2*depth >= sum"))
+        if c["folded"]:
+            print("    outcome: folded away (NColFoldAwayRegion): every use stays an immediate")
+        elif c["reg"]:
+            print("    outcome: register %s (benefit - cost %s); the remaining immediates of the value are then "
+                  "rewritten to it by LateGlobalOptimize (immcand.md 7.3)" % (c["reg"], "unfoldable" if c["net"] == INF else c["net"]))
+        else:
+            print("    outcome: no region store seen (not coloured; see c2ncol.py)")
+        inf = [u for u in c["uses"] if u[3] == INF]
+        if inf:
+            print("    lever: %d use(s) cannot take an immediate (INF: %s): the web is never folded; remove them to let "
+                  "the value fold" % (len(inf), ", ".join(sorted({_width(u[1]) + " " + OP17.get(u[0], hex(u[0])) for u in inf}))))
+        elif c["defcost"] is not None and c["sum"] is not None and not c["folded"]:
+            print("    lever: sum %d vs cost %d: to fold, bring the counted uses down (outside loops a use counts 1 for a "
+                  "zero stored through memory, 0 for any other value)" % (c["sum"], c["defcost"]))
+
+
+def main17(argv):
+    import argparse, c2trace
+    cl = []
+    if "--" in argv:
+        k = argv.index("--"); argv, cl = argv[:k], argv[k + 1:]
+    ap = argparse.ArgumentParser(prog="constregs.py")
+    ap.add_argument("src"); ap.add_argument("--func"); ap.add_argument("--keep")
+    a = ap.parse_args(argv)
+    hooks = c2trace.c2build.hooks("constfold", None)
+    img, hk, rc, out, log = c2trace.run_trace(a.src, list(hooks), cl, keep=a.keep, exit_all=True, func=a.func)
+    if rc:
+        sys.stdout.write(out)
+    cs = analyse17(log)
+    if not cs:
+        print("%s: no constant candidate asked for a use benefit" % (a.func or "?"))
+    else:
+        show17(a.func or "?", cs)
+    return rc
+
+
 def main(argv):
+    if _x64():
+        return main17(argv)
     frm = None
     if "--from" in argv:
         k = argv.index("--from"); frm = argv[k + 1]; del argv[k:k + 2]

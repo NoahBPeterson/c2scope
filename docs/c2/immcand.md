@@ -474,3 +474,119 @@ declaration order of `mp` matters (aligned): `mp; n; pm` 328, `mp; pm; n` 334, `
 best; size 1067). **[C trace and checker]** The edited copy is in the Mount & Blade session's hands as a patch
 (two lines: the condition and `mp`); the repository was not touched.
 
+
+## 7. cl 17.00 x64: when a constant is held in a register or rebuilt as an immediate (NColor)
+
+Sections 1 to 6 are the x86 allocator (Color / Spillcosts / ChoosePhysReg). cl 17.00 x64 has none of them
+(port-1700.md section 2), and the answer to "is this zero used from the register or as an immediate / a fresh `xor`"
+is not a benefit-minus-load number and not a byte flag: it is made in **three places**, each traced and each with its
+own source properties. Everything below was read with traced compiles of 17.00.61030 x86_amd64 (`tools/constregs.py
+--c2 17.00`, `c2trace.py il`, `tests/data/constfold17/constfold.cpp`, `tests/probes/constfold17.py`); the code
+addresses are c2.dll 17.00.61030 (`work/index/17.00.61030-x64`). Tags as above; **[C trace]** is a hook on the
+function named, with its arguments and return value logged.
+
+### 7.1 A: which operands are candidates (before NColor)
+
+At `@NColor@4` entry every constant is `OPENTERLOAD k0:T <- K` and its uses are the operand `k0`. What becomes a use
+of `k0` **[C trace, IL at NColor entry]**:
+
+| use of the value | `k0`? |
+|---|---|
+| dword / qword store to memory (`mov [m], K`, with or without displacement), a qword copy to a variable | yes |
+| a 16-bit store: cl never emits `mov word [m], imm16` (length-changing prefix), it writes `t <- k0:1004; [m]:1002 <- t` | yes, and that use can never be an immediate (INF below) |
+| an argument or return value of 4 or 8 bytes (`edx <- k0`, `eax <- k0`) | yes for a nonzero value; a zero stays the literal `0` (`xor` is its def) |
+| `cmp [m], K` with an imm32 K | yes (`0x12345`); `cmp [m], 0` and `cmp reg, K` for small K are plain literals |
+| a byte-width store, compare or argument (`0:1001`), add / and / xor / imul with K | no (literal operand) |
+
+The key is the value, not the width: dword, qword and the truncated 16-bit use of one value share one candidate
+(`k0` of `0:1008`; the 16-bit store of `0x12345` is the different value `0x2345`).
+
+### 7.2 B: NColor folds the constant into its uses, or gives it a register
+
+`NColProcessCandidate` takes the constant as a one-definition candidate (list 4/5 of ncolor.md section 2, "single def
+from constants only"); `NColProcessCandidateRegion` step 6 (ncolor.md 3.2) then compares two numbers, and when the
+cost is not below the sum the region is **folded away**: no register, every `k0` stays an immediate **[C trace]**:
+
+- **cost** = `MdmDefCost(def)` (0x1019bc00, `<< 2 * the def's zone depth`, times the number of defs);
+- **sum** = `NColBenefitOfUsesInRange` (0x100c7580) of the per-use `NColMdNoFoldBenefit(use, def)` (0x100cb140), each
+  use shifted by twice its zone depth. A use that cannot take an immediate returns INF (0x7fffffff), so the sum is INF
+  and the region is never folded: **a 16-bit store of the value, an imm64 (`movabs`: the value does not fit a
+  sign-extended imm32), any use `NColCanReplaceCandWithImmed` refuses**.
+
+The two numbers depend on what cl optimises for (`TLS+0xdd08`), **[C trace, /O2 and /O1]**:
+
+| | cost of the def | benefit of a use |
+|---|---|---|
+| /O2 (speed) | 1 for any constant | **0** for any nonzero value; **1** for a zero stored through memory (`mov [m], 0`), 0 for a zero moved into a register; a loop use is shifted left by 2 per level (`loop0b`: 1 -> 4) |
+| /O1 (size) | the bytes of the def: 2 for `xor r,r`, 5 for `mov r32, imm`, 9 for a 64-bit one | the bytes saved: 1 for a zero store, 3 for a nonzero dword store, 7 for a qword |
+
+So under /O2 **only a zero (or a value some use needs in a register: a 16-bit store, an imm64) is ever held in a
+register**: `z8` (eight zero dword stores, sum 8 > cost 1) -> `xor eax,eax` and eight `mov [m], eax`; one zero store
+(sum 1 >= cost 1) stays `mov dword [m], 0`; eight stores of 7 (sum 0) stay `mov dword [m], 7`, and 24 of them do too
+(`tests/probes/constfold17.py`). Under /O1 every constant that is stored four times is a register. With two
+definitions (a variable assigned 0 in both arms) the candidate has no use benefits (L+0x4c & 0x40, ncolor.md 3.1)
+and keeps its register.
+
+### 7.3 C: what happens to the immediates that remain when a register holds the value
+
+Two later passes decide per instruction **[C trace: `c2trace.py il --diff`]**:
+
+1. `dop2_CodegenFinish` turns every `mov r, 0` into `xor r, r` (argument registers of any width: `dl <- 0:1001`
+   becomes `xor edx,edx`; the arguments are never a copy of the zero register: `xor` is as short as `mov edx, ebp`).
+2. **`LateGlobalOptimize`** (SsaPeeps / CleanSsa on the allocated code, `PpSsaMdSubstWorthIt`,
+   `PpSsaRegEncodingCost`) rewrites every remaining immediate **dominated by the register's definition** to the
+   register wherever the instruction has a register form: `cmp [m], 0` and `cmp [m], K`, byte stores `mov [m+1], bpl`,
+   argument moves `mov edx, ebp` (for a nonzero value) / `movzx edx, bpl`, `and` / `xor reg, K`; not `imul r, r, K`
+   (no register form) and not `add` (an `lea`). A use *before* the register's definition in the IL order stays an
+   immediate (the first `mov byte [rbx], 0` of a probe that stores the byte before the `xor`; `*pc = 7` before the
+   `k0 <- 7` load in `w2.cpp`). This is why the value in the register ends up used almost everywhere, while NColor
+   counted only the 4/8-byte stores.
+   **[C trace for the substitutions; I for the exact tie rule]**.
+3. The same pass **combines adjacent stores** (`PpSsaCombineStores`, 0x1007de40): two dword stores of the same register
+   become `mov qword [m], r64` when the register has one definition (its upper half is known zero), and one
+   `mov qword [m], 0` **immediate** when two definitions reach the stores (a zero set in both arms of an `if`): the
+   combiner sees a constant, not a register **[M: `pair_one` / `pair_two` in constfold.cpp; I for the reason]**.
+   The combined store is created after the substitution of step 2 has run, so it stays an immediate.
+
+### 7.4 What this means for a decompiler
+
+- A `mov qword/dword [m], imm` **while a register holds the same value** (an `xor ebp,ebp` live over the instruction)
+  is *never* a store of a literal in the source (a literal qword zero store would be `mov [m], rbp`). It is (a) a
+  store before the register's first definition, (b) a combined pair of narrower stores of the value (`a = 0; b = 0;`
+  with two zero definitions reaching them), or (c) a value the register form cannot express. Fallout 4
+  0x140cc1870: the original's `mov qword [rsi+0x10], 0` is two adjacent `int` fields assigned 0
+  (`*(int*)(p+16) = 0; *(int*)(p+20) = 0;`): **MATCH**; the lifter's `*(__int64*)(p+16) = 0` gives `mov [rsi+0x10], rbp`.
+- A zero that is **re-materialised as a fresh `xor r, r`** instead of a copy of the zero register is either an argument
+  register (always, 7.3 step 1) or a def of a **1-byte web**: `unsigned char` / `bool` variable assigned 0. A 4-byte
+  variable assigned 0 is `mov ecx, edi` (copy of the zero register, 2 bytes, same as `xor`; with REX a byte copy would
+  be longer). Fallout 4 0x141c40fd0: the lifter declares the byte web `unsigned int v1097`; declared `unsigned char`
+  (reads `(unsigned char)v1097`) the def is `xor cl,cl` as in the original (`xor r8b,r8b`).
+- Nonzero constants are **never held in a register under /O2** (sum 0): `mov r14d, 7` followed by uses of `r14d` is
+  proof that the value also appears in a 16-bit store or in a place that cannot take an immediate. Under /O1 a constant
+  with four or more stores is a register.
+- A value NColor gave a register is then used by **every** later use: if the original has an immediate for one use
+  of a held value, find why it is not that value (a different truncation, a combined store, an earlier tuple).
+
+### 7.5 `tools/constregs.py --c2 17.00`
+
+```sh
+uv run tools/constregs.py SRC --func F --c2 17.00 -- /O2 /GS-
+```
+
+One traced compile with `hooks.constfold` of the build table (the candidate, NColMdNoFoldBenefit with its return value,
+MdmDefCost, NColBenefitOfUsesInRange, NColFoldAwayRegion, the region store). Per constant candidate it prints the uses
+(instruction, width, benefit; INF), the def cost and the sum, whether the region was folded or got a register, and the
+lever (the INF uses; how far the sum is from the cost). A constant with one use is not processed (no benefit lines).
+The x86 builds' numbers of section 6 are not comparable: no benefit-minus-load, no priorities in P, no byte flag
+(`mov [m+1], bpl` is a byte-register use of a web NColor allocated on 4/8-byte uses).
+
+### 7.6 Not verified
+
+- The exact tie rule of the substitution in 7.3 (which instruction shapes it rewrites when the register form is
+  not shorter); `PpSsaMdSubstWorthIt` and `PpSsaRegEncodingCost` were read, not stepped.
+- The size-mode (/O1) per-use numbers for shapes other than stores (the cold path at 0x102d11ca); compares and
+  arithmetic uses of a nonzero value there.
+- Why the store combiner picks the register with one definition and the immediate with two (7.3 step 3): the cause
+  is an inference from `pair_one` / `pair_two`, not a read of `PpSsaCanCreatePackedConstLeafChainTable`.
+- Fallout 4 0x141c40fd0 is not matched: the byte web gets `xor cl,cl` where the original has `xor r8b,r8b` (see
+  the report in port-1700.md section 14).
