@@ -148,6 +148,18 @@ parameter (passed to the calls itself) refuses every local; and a local the orig
 before an 8-byte one. 0x1406e7170 reproduces the original's whole frame with `a0` in place of `v1009` and `int` for
 the two out-parameter locals.
 
+## Parameter copies, out-parameter sizes, `or r, -1`
+
+- `or r, -1` lifts as the constant -1 (cl's short load of -1; the register's old value is not read). Before, the
+  lift read the register's previous value (`v = w | -1`), a false dependency that changed allocation.
+- opts `pcopy` (a variant whenever a parameter is copied at entry): `v1009 = a0` with no other def of either and no
+  address taken becomes a0 itself. cl 17.00's packer leaves a parameter's home to the parameter when its only uses
+  are call arguments (slots.md 6.3); the copy frees the home for a local. 300 functions: shape better 14 / worse 16.
+- opts `outsize`: a local whose address is only passed to calls is typed by the callee's first store through that
+  pointer (1 / 2 / 4 bytes; following register copies of it). The packer visits frame locals by size first.
+0x1406e7170 with pcopy and its two out locals declared int: frame 4 of 4 at the original's offsets, 4 edits left (a
+callee-saved register for the second `lock xadd`'s -1: ebp in the original, eax here, also 1 byte of `test`).
+
 ## Not yet handled
 - Re-rolling loops. cl rotated and duplicated the loop tests, so the goto-shaped lift gets re-optimised
   differently. This is the main cause of misses above 128 bytes.

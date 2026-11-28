@@ -1867,6 +1867,14 @@ class Lifter:
                         self.emit(k, "OPASSIGN", [d], ["0:%s" % d.rsplit(":", 1)[1]])
                         flags = (d, "0:%s" % d.rsplit(":", 1)[1], "i")
                         continue
+                    if m == "or" and ops[0].type == X.X86_OP_REG and len(ops) > 1 and ops[1].type == X.X86_OP_IMM and \
+                            (ops[1].imm & ((1 << (8 * ops[0].size)) - 1)) == (1 << (8 * ops[0].size)) - 1 and \
+                            not self.opts.get("orm1"):
+                        # `or r, -1`: cl's short load of the constant -1 (the register's old value is not read)
+                        ty = d.rsplit(":", 1)[1]
+                        self.emit(k, "OPASSIGN", [d], ["-1:%s" % ("1004" if ty == "2004" else ty)])
+                        flags = (d, "0:%s" % ty, "i")
+                        continue
                     a = self.opnd(k, ops[0])
                     b2 = self.opnd(k, ops[1]) if len(ops) > 1 else "1:1004"
                     if m in ("shl", "shr", "sar") and len(ops) > 1 and ops[1].type == X.X86_OP_REG:
@@ -2610,6 +2618,110 @@ def _split_args(s):
     return out
 
 
+PCOPY = False            # param_copies by default (opts pcopy overrides; a variant, see variants: on 300 functions of a
+                         # retail x64 game shape better 14 / worse 16, so not the default)
+OUTSIZE = False          # outparam_sizes by default (opts outsize overrides)
+
+
+def param_copies(text, va):
+    """A parameter copied into a variable at entry (`v1009 = (__int64)((__int64)(a0));`, cl's move to a callee-saved
+    register) and the copy never set again: the parameter itself. The source passes `this` / a parameter to calls
+    directly; with the copy the parameter's home is free and a local takes it (cl 17.00's packer: a parameter used
+    only as call arguments keeps its home, docs/c2/slots.md 6.3)."""
+    head, sep, body = text.partition("\n{\n")
+    if not sep or not re.search(r"^\S[^\n]* FUN_%x\(" % va, head, re.M):
+        return text
+    for _ in range(8):
+        hit = None
+        for m in re.finditer(r"^\s*(v\d+) = \(__int64\)\(\(__int64\)\((a\d+)\)\);$", body, re.M):
+            v, a = m.group(1), m.group(2)
+            defs = re.findall(r"^\s*%s = " % v, body, re.M)
+            if len(defs) == 1 and not re.search(r"^\s*%s = " % a, body, re.M) and \
+                    not re.search(r"&%s\b" % a, body) and not re.search(r"&%s\b" % v, body):
+                hit = (m, v, a)
+                break
+        if not hit:
+            break
+        m, v, a = hit
+        body = body[:m.start()] + body[m.end() + 1:]
+        body = re.sub(r"^    [\w ]+ %s;\n" % v, "", body, flags=re.M)
+        body = re.sub(r"\b%s\b" % v, a, body)
+    return head + sep + body
+
+
+def store_width(img, va, reg, depth=0):
+    """Bytes of the first store the function at va makes through its pointer argument `reg` (following copies of it
+    into other registers), or None."""
+    pd = None
+    try:
+        import ehinfo64
+        pd = ehinfo64.pdata(img)
+    except Exception:
+        pass
+    end = pd.get(va, (va + 0x200,))[0] if pd else va + 0x200
+    alias = {reg}
+    for i in img.insns(va, max(16, min(end - va, 0x400))):
+        if i.mnemonic in ("ret", "jmp") and depth == 0 and i.operands and i.operands[0].type == X.X86_OP_IMM and \
+                i.mnemonic == "jmp" and i is not None:
+            break
+        ops = i.operands
+        if i.mnemonic == "mov" and len(ops) == 2 and ops[0].type == X.X86_OP_MEM and ops[0].mem.base and \
+                not ops[0].mem.index and ops[0].mem.disp == 0 and canon(i.reg_name(ops[0].mem.base)) in alias:
+            return ops[0].size
+        if i.mnemonic == "mov" and len(ops) == 2 and ops[0].type == X.X86_OP_REG and ops[1].type == X.X86_OP_REG:
+            d, s_ = canon(i.reg_name(ops[0].reg)), canon(i.reg_name(ops[1].reg))
+            if s_ in alias and ops[0].size == 8:
+                alias.add(d)
+            elif d in alias:
+                alias.discard(d)
+        elif ops and ops[0].type == X.X86_OP_REG and canon(i.reg_name(ops[0].reg)) in alias and \
+                i.mnemonic not in ("cmp", "test", "push"):
+            alias.discard(canon(i.reg_name(ops[0].reg)))
+        if i.mnemonic == "call":
+            alias &= {"rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15"}
+        if not alias or i.mnemonic in ("ret", "repz ret"):
+            break
+    return None
+
+
+def outparam_sizes(text, img):
+    """A local whose address is only passed to calls (never read or written here): typed by the width of the
+    callee's first store through it (`int` for a 4-byte store). cl 17.00's packer visits frame locals by size first,
+    so a 4-byte out parameter goes before an 8-byte local with more uses (docs/c2/slots.md 6.3)."""
+    import frameinfo64
+    lines = text.split("\n")
+    decl = {}
+    for n, ln in enumerate(lines):
+        m = re.match(r"^    (__int64) (v_\w+);$", ln)
+        if m:
+            decl[m.group(2)] = n
+    want = {}
+    for name, dn in decl.items():
+        uses = [x for k, x in enumerate(lines) if k != dn and re.search(r"\b%s\b" % name, x)]
+        if not uses or not all(re.match(r"^\s*(v\d+) = \(__int64\)\(\(__int64\)&%s\);$" % name, x) for x in uses):
+            continue
+        widths = set()
+        for x in uses:
+            tmp = re.match(r"^\s*(v\d+) = ", x).group(1)
+            for c in lines:
+                m = re.match(r"^\s*(?:v\d+ = \([\w ]+\))?FUN_([0-9a-f]+)\((.*)\);$", c)
+                if not m:
+                    continue
+                args = _split_args(m.group(2))
+                for p, a in enumerate(args[:4]):
+                    if re.sub(r"[()]|__int64", "", a) == tmp:
+                        callee = int(m.group(1), 16)
+                        if ("rcx", "rdx", "r8", "r9")[p] in frameinfo64.returns_arg(img, callee):
+                            widths.add(None)
+                        else:
+                            widths.add(store_width(img, callee, ("rcx", "rdx", "r8", "r9")[p]))
+        if len(widths) == 1 and list(widths)[0] in (1, 2, 4):
+            want[dn] = {1: "unsigned char", 2: "unsigned short", 4: "int"}[list(widths)[0]]
+    for dn, ty in want.items():
+        lines[dn] = re.sub(r"^    __int64 ", "    %s " % ty, lines[dn])
+    return "\n".join(lines)
+
+
 def retslots(text, img, va):
     """A call that fills a local through the callee's hidden return pointer (the callee returns that same pointer:
     frameinfo64.returns_arg) as a class returned by value, initialised in place:
@@ -2711,6 +2823,8 @@ def variants(img, va, size):
         alts.append({"sqrt": "f"})
     if any(i.mnemonic == "sbb" for i in lf.ins):
         alts.append({"sbb": "neg"})
+    if re.search(r"^\s*v\d+ = \(__int64\)\(\(__int64\)\(a\d+\)\);$", text, re.M):
+        alts.append({"pcopy": 1})                # a parameter copied at entry: passed itself (14 better / 16 worse)
 
     if lf.eh_help is not None:                   # the game has a C++ exception frame here: only an EH body can match
         alts = [dict(a, eh=m) for m in ("try", "swallow") for a in [{}] + alts]
@@ -2843,6 +2957,10 @@ def unit(img, va, size, opts=None):
             head.append("%s FUN_%x(%s);" % (r, cva, ", ".join(sig)))
     sig = "%s FUN_%x(%s)\n" % (ret, va, ", ".join(typed) or "void")
     text = "\n".join(head) + ("\n\n" if head else "") + sig + body + "\n"
+    if lf.opts.get("pcopy", PCOPY):
+        text = param_copies(text, va)
+    if lf.opts.get("outsize", OUTSIZE):
+        text = outparam_sizes(text, img)
     if lf.opts.get("retslot"):
         text = retslots(text, img, va)
     return text, lf
