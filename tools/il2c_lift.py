@@ -135,7 +135,7 @@ class LiftEmitter(il2c.Emitter):
             return "(%s)&%s" % (CTYPE.get(want, "int"), nm)          # a frame slot's address (lift2il's lea)
         return super().rvalue(tok, line, want)
 
-    def stmt(self, L):
+    def _stmt0(self, L):
         if not getattr(self, "partial", False):
             return self.stmt1(L)
         try:
@@ -143,6 +143,15 @@ class LiftEmitter(il2c.Emitter):
         except Exception as ex:                  # partial mode: a tuple il2c cannot write becomes a comment
             return ("stmt", "/* lift2il: not emitted (%s: %s) at %s */" % (
                 type(ex).__name__, str(ex)[:60].replace("*/", "* /"), L["text"].split()[1]))
+
+    def stmt(self, L):
+        r = self._stmt0(L)
+        if L["op"] == "OPCALL" and L["notes"].get("nested") == "1":   # a call nested in the next one's arguments
+            if isinstance(r, str) and r.endswith(";"):
+                return r + "/*nested*/"
+            if isinstance(r, tuple) and r[0] == "stmt" and isinstance(r[1], str) and r[1].endswith(";"):
+                return (r[0], r[1] + "/*nested*/") + tuple(r[2:])
+        return r
 
     def stmt1(self, L):
         if L["op"] == "OPBRANCH" and L["notes"].get("fneg") == "1":   # jump when !(x cc y) (a float, NaN included)
@@ -316,6 +325,39 @@ class LiftEmitter(il2c.Emitter):
                 tys[q:q + k_] = [st]
         return argv, tys
 
+    def indirect_conv(self, L, d, srcs, tgt):
+        """A call through a pointer that is no virtual call, with the callee's convention from the bytes: the callee
+        pops its stack arguments (`stdcall=1`: `p->vt->f(p, x)` of a COM-style interface, Spore 011fd6f0) through a
+        `__stdcall` pointer; `this` in ecx (`mov edx, [esi]; mov ecx, ebx; call edx`, a delegate / a member
+        pointer: Spore 00dddb10, 00545220) through a pointer to member of a one-member class (single inheritance:
+        4 bytes, the same call). A register target must have been loaded from memory (the pointer's own slot)."""
+        th, sc = L["notes"].get("thiscall") == "1", L["notes"].get("stdcall") == "1"
+        if not th and not sc:
+            return None
+        if tgt.startswith("["):
+            loc = self.mem(strip_reg(srcs[0]))
+        elif tgt in self.loads:
+            loc = self.mem(self.loads[tgt])
+        else:
+            return None
+        rty = self.ctype_of(d[0]) if d else "void"
+        if th:
+            if len(srcs) < 2:
+                return None
+            argv = [self.rvalue(a, L) for a in srcs[1:]]
+            tys = [self.arg_ctype(a) for a in srcs[2:]]
+            n = len(self.prelude)
+            self.prelude.append("struct il2c_gm%d { %s m(%s); };\ntypedef %s (il2c_gm%d::*il2c_gp%d)(%s);\n" % (
+                n, rty, ", ".join(tys), rty, n, n, ", ".join(tys)))
+            e = "(((il2c_gm%d*)(%s))->*(*(il2c_gp%d*)&(%s)))(%s)" % (n, argv[0], n, loc, ", ".join(
+                "(%s)(%s)" % (t, a) for t, a in zip(tys, argv[1:])))
+        else:
+            argv = [self.rvalue(a, L) for a in srcs[1:]]
+            tys = [self.arg_ctype(a) for a in srcs[1:]]
+            e = "((%s (__stdcall*)(%s))(%s))(%s)" % (rty, ", ".join(tys) or "void", loc, ", ".join(
+                "(%s)(%s)" % (t, a) for t, a in zip(tys, argv)))
+        return ("%s = (%s)%s;" % (self.lvalue(d[0]), rty, e)) if d else e + ";"
+
     def vcall_member(self, vp, a0):
         """`mov eax, [ecx+N]; mov edx, [eax+D]; add ecx, N; call edx`: the vtable read through the object's base
         before its `this` (base + N) is formed, `p->m.f()` for a member m at N (Spore 00c24430). The vtable load
@@ -459,6 +501,11 @@ class LiftEmitter(il2c.Emitter):
             self.needs_string = True
             return "memset((void*)(%s), (int)(%s), (unsigned int)(%s));" % tuple(argv)
         m = re.match(r"^\?FUN_([0-9a-f]{8})@@YAXXZ$", tgt)
+        if not m and not self.lang_c and self._gva(tgt) is None and (
+                re.match(r"^t\d+$", tgt) or tgt.startswith("[")):
+            r_ = self.indirect_conv(L, d, srcs, tgt)
+            if r_ is not None:
+                return r_
         if not m:
             return super().call(L)
         va = int(m.group(1), 16)
@@ -645,6 +692,51 @@ def _sub_chain_dead(lf, lines):
         if not uses <= ({subs[n + 1]} if n + 1 < len(subs) else set()):
             return False
     return True
+
+
+def nest_calls(body):
+    """lift2il's `nested=1` calls (a cleanup that pops only the call's own arguments while an outer call's pushes wait
+    above them): `t = f(..);` right before the call that passes t once, and t read nowhere else, is `g(f(..), x)`, so
+    cl pushes x before calling f as retail does (Spore 010527f0). The marker goes in any case."""
+    lines = body.split("\n")
+    for n, l in enumerate(lines):
+        if l is None:
+            continue
+        m = re.match(r"^(\s*)(t\d+) = \((?:unsigned )?int\)(.*);/\*nested\*/$", l)
+        if not m:
+            lines[n] = l.replace("/*nested*/", "")
+            continue
+        t, e = m.group(2), m.group(3)
+
+        def uses_of(v):
+            return [q for q, l2 in enumerate(lines) if l2 is not None and re.search(r"\b%s\b" % v, l2) and
+                    not re.match(r"^\s*(?:int|unsigned int) %s;$" % v, l2)]
+        nx, pure = n + 1, []                        # the outer callee's own load may come between (`mov ecx,
+        while nx < len(lines) and lines[nx] is not None:   # [esi+4]` after the inner call): it goes into the
+            mp = re.match(r"^\s*(t\d+) = (\(int\)\(\*\(int\*\)\(\(char\*\)\((?:t\d+|\(int\)\(self\))\)"
+                          r"(?: \+ \d+)?\)\));$", lines[nx])   # call too
+            if not mp:
+                break
+            pure.append((nx, mp.group(1), mp.group(2)))
+            nx += 1
+        ok = nx < len(lines) and uses_of(t) == [n, nx] and len(re.findall(r"\b%s\b" % t, lines[nx])) == 1 and \
+            re.search(r"\((?:unsigned )?int\)\(%s\)" % t, lines[nx]) and \
+            all(uses_of(v) == [q, nx] and len(re.findall(r"\b%s\b" % v, lines[nx])) == 1 for q, v, _e in pure)
+        if ok and n > 0 and lines[n - 1] is not None:   # the inner callee's own load right before it, too
+            mp = re.match(r"^\s*(t\d+) = (\(int\)\(\*\(int\*\)\(\(char\*\)\((?:t\d+|\(int\)\(self\))\)"
+                          r"(?: \+ \d+)?\)\));$", lines[n - 1])
+            if mp and uses_of(mp.group(1)) == [n - 1, n] and len(re.findall(r"\b%s\b" % mp.group(1), e)) == 1:
+                e = re.sub(r"\b%s\b" % mp.group(1), lambda _m: mp.group(2), e)
+                lines[n - 1] = None
+        if ok:
+            for q, v, pe in pure:
+                lines[nx] = re.sub(r"\b%s\b" % v, lambda _m: pe, lines[nx])
+                lines[q] = None
+            lines[nx] = re.sub(r"\b%s\b" % t, lambda _m: "(int)" + e, lines[nx])
+            lines[n] = None
+        else:
+            lines[n] = l.replace("/*nested*/", "")
+    return "\n".join(l for l in lines if l is not None)
 
 
 def param_args(body):
@@ -1989,6 +2081,7 @@ def _unit(img, va, size, mask=None, flags=None, partial=None, od=None):
         body = re.sub(r"(?m)^(\s*)__EH\((-?\d+)\);$", r"\1/* EH state \2 */", body).replace("__EHRESUME;", "/* catch resumes here */")
         if lf.eh_unsupported:
             body = body.replace("{", "{\n    /* lift2il: EH frame not reproduced: %s */" % lf.eh_unsupported.replace("*/", "* /"), 1)
+    body = nest_calls(body)
     if os.environ.get("L2C_DROP_DEAD", "1") == "1":
         body = drop_dead(body)
     if not od and os.environ.get("L2C_ESCAPED", "1") == "1":

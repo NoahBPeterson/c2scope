@@ -24,5 +24,9 @@ for _nm, _what in (("?o2_vmem@@", "a virtual call on a member object, the vtable
                    ("?o2_cfp@@", "merged cdecl cleanups and an esp frame's own teardown; `call ecx` passes no this"),
                    ("?o2_bret@@", "a bool variable returned as is (mov al, bl)"),
                    ("?o2_bret2@@", "a bool callee's result kept in a bool variable"),
-                   ("?o2_subsw@@", "a chain of subs tested against 0 is a switch (sub eax, K; je; sub eax, 8; je)")):
+                   ("?o2_subsw@@", "a chain of subs tested against 0 is a switch (sub eax, K; je; sub eax, 8; je)"),
+                   ("?o2_com@@", "a COM-style call through the object's vtable, the object pushed first: __stdcall"),
+                   ("?o2_pmf@@", "a call through a pointer to member (this in ecx, no virtual slot)"),
+                   ("?o2_nest@@", "a call nested in another's arguments: its cleanup pops only its own"),
+                   ("?o2_idx@@", "sar + lea of a scaled index: a multiply, not a shift")):
     check("lift /O2: %s" % _what, next((v for k, v in _got.items() if k.startswith(_nm)), "?"), "MATCH")

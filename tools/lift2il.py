@@ -1141,7 +1141,30 @@ class Lifter:
                         continue
                     elif m == "call":
                         top = self.out_top
+                        nx_ = None                             # its cleanup: the first `add esp` before the next
+                        for q_ in range(k + 1, min(k + 6, len(self.ins))):   # call / push / branch (cl may
+                            j_ = self.ins[q_]                  # schedule a load of the outer callee first)
+                            if j_.mnemonic == "add" and j_.op_str.startswith("esp, "):
+                                nx_ = j_
+                                break
+                            if j_.mnemonic in ("call", "push", "pop", "ret", "sub") or j_.mnemonic.startswith("j") \
+                                    or "esp" in j_.op_str:
+                                break
+                        keep_ = None
+                        if top is not None and nx_ is not None and nx_.mnemonic == "add" and \
+                                nx_.op_str.startswith("esp, ") and nx_.operands[1].type == X.X86_OP_IMM and \
+                                0 < nx_.operands[1].imm < top - esp and nx_.operands[1].imm % 4 == 0 and \
+                                esp + nx_.operands[1].imm in self.out_args:
+                            # a call nested in another's arguments (`push eax; push 1; push K; push g; call f;
+                            # add esp, 0xc; push eax; call h`: h(f(g, K, 1), x)): its cleanup pops only its own,
+                            # the pushes above them wait for the outer call (Spore 010527f0)
+                            cut_ = esp + nx_.operands[1].imm
+                            keep_ = ({o: v for o, v in self.out_args.items() if o >= cut_}, top)
+                            self.out_args = {o: v for o, v in self.out_args.items() if o < cut_}
+                            self.out_top = top = cut_
                         args = self.take_args(esp)
+                        if keep_ is not None:
+                            self.out_args, self.out_top = keep_
                         nxt = self.ins[k + 1] if k + 1 < len(self.ins) else None
                         caller_pops = nxt is not None and ((nxt.mnemonic == "add" and nxt.op_str.startswith("esp, ")) or
                                                            (nxt.mnemonic == "pop" and nxt.op_str in ("ecx", "edx")))
@@ -1171,6 +1194,11 @@ class Lifter:
                             #                                    calls': a thiscall callee pops its own (cdecl)
                         if thiscall and ops[0].type == X.X86_OP_REG and self.md.reg_name(ops[0].reg) == "ecx":
                             thiscall = False                   # `mov ecx, [ebx]; call ecx`: ecx is the callee
+                        if thiscall and ops[0].type == X.X86_OP_MEM and ops[0].mem.base and \
+                                self.com_call(k, ops[0], args):
+                            thiscall = False                   # `mov edx, [eax]; push eax; call [edx+K]`: the object
+                            #                                    is the first stack argument (a COM-style interface,
+                            #                                    __stdcall), ecx a leftover (Spore 011fd6f0)
                         if thiscall and args and not self.od_ret and top is not None and \
                                 self.own_cleanup(k, 4 * len(args) + (self.pending_below(k, top) or 0)):
                             thiscall = False                   # the caller pops exactly its arguments and no earlier
@@ -1205,6 +1233,8 @@ class Lifter:
                                                           ("bv%d=%d" % (i + sh, n)) if n > 0 else
                                                           ("bc%d=%d.%x" % (i + sh, -n, _d))
                                                           for i, _b, _d, n in self.byval)).strip()
+                        if keep_ is not None:
+                            note = (note + " nested=1").strip()   # its result is the outer call's argument
                         if thiscall:
                             note = (note + " thiscall=1").strip()
                         elif args and not self.caller_cleans(k):
@@ -2231,7 +2261,16 @@ class Lifter:
             iv = "%s:1004" % self.var_read(k, full(idx))
             if m.scale > 1:
                 t = self.temp()
-                self.emit(k, "shl", [t], [iv, "%d:1004" % {2: 1, 4: 2, 8: 3}[m.scale]])
+                sh = {2: 1, 4: 2, 8: 3}[m.scale]
+                ds = self.reach_defs.get((k, full(idx)), set())
+                dk = next(iter(ds))[0] if len(ds) == 1 else None
+                if isinstance(dk, int) and self.ins[dk].mnemonic in ("sar", "shr") and \
+                        self.ins[dk].operands[1].type == X.X86_OP_IMM and self.ins[dk].operands[1].imm == sh:
+                    # `sar ebx, 2; lea eax, [eax + ebx*4]`: an element count scaled back (`p + n`, n = bytes / 4):
+                    # as a multiply cl keeps both; `(n << 2)` it folds into `and ebx, -4` (Spore 00a9a7f0)
+                    self.emit(k, "OPMUL", [t], [iv, "%d:1004" % m.scale])
+                else:
+                    self.emit(k, "shl", [t], [iv, "%d:1004" % sh])
                 iv = t
             terms.append(iv)
         if m.disp:
@@ -2949,6 +2988,25 @@ class Lifter:
             elif m in ("ret", "jmp") or m.startswith("j") or m == "pop" or (m == "sub" and "esp" in i.op_str):
                 return False
         return False
+
+    def com_call(self, k, op, args):
+        """`call [R+K]` where R is the vtable (`mov R, [B]`) of the call's first stack argument B, or R is ecx itself
+        (ecx then holds the vtable, not `this`)."""
+        r = full(self.md.reg_name(op.mem.base))
+        if r == "ecx":
+            return True
+        ds = self.reach_defs.get((k, r), set())
+        if len(ds) != 1 or not args:
+            return False
+        d = next(iter(ds))[0]
+        if not isinstance(d, int):
+            return False
+        i = self.ins[d]
+        if i.mnemonic != "mov" or i.operands[1].type != X.X86_OP_MEM or not i.operands[1].mem.base or \
+                i.operands[1].mem.disp or i.operands[1].mem.index:
+            return False
+        b = full(self.md.reg_name(i.operands[1].mem.base))
+        return args[0].rsplit(":", 1)[0] == self.var_read(d, b)
 
     def own_cleanup(self, k, own):
         """The first stack cleanup after the call at k, before the next call, branch or ret, pops exactly `own` bytes

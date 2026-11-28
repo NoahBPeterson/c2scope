@@ -243,6 +243,23 @@ work/claude/lift_structure_breakdown.md) by cause. What each turned out to be, a
     and `push esi; mov esi, eax; call; pop esi; ret` (Spore 00a60e70, 00e78de0, 00a62f80..00a63060): the callee takes
     esi / edi (an LTCG custom convention), and these are also the #9 rows where retail has `call; ret` for our `jmp`;
     Spore 00830910 is /Od code under a corpus row that says /O2.
+- **Calls through pointers** (the rest of #2). A call through a register loaded from memory, or through memory,
+  that is no virtual call takes the convention the bytes show: the callee pops (`stdcall=1`) through a `__stdcall`
+  pointer; `this` in ecx (`mov edx, [esi]; mov ecx, ebx; call edx`: a delegate or a pointer to member, Spore
+  00dddb10; /Od 00545220) as `((C*)obj->*(*(PM*)&slot))(..)`, a pointer to member of a one-member class (4 bytes,
+  single inheritance). `mov edx, [eax]; push ..; push eax; call [edx+K]` (the vtable of the first stack argument)
+  and `call [ecx+K]` pass no `this` in ecx: a COM-style interface, __stdcall (Spore 011fd6f0, 011fd730).
+- **Nested calls.** A cdecl call whose cleanup (the first `add esp` before the next call / push / branch) pops less
+  than was pushed since argument setup began is nested in the next call's arguments: it takes only its own, the
+  pushes above wait (`push eax; push 1; push K; push g; call f; add esp, 0xc; push eax; call h; add esp, 8` is
+  `h(f(g, K, 1), x)`; the lifter had given f all four). Written nested (with the outer callee's load, and the inner
+  one's, inside the call expression), cl pushes x before calling f as retail does (Spore 010527f0; nest_calls).
+- **A scaled index after a shift.** `sar ebx, 2; lea eax, [eax + ebx*4]` (an element count scaled back: `p + n`)
+  lifts the scale as `n * 4`: as `(n << 2)` cl folds the pair into `and ebx, -4; add` [M: probe, 15.00] (Spore
+  00a9a7f0, 00eaeef0).
+- **cl 13.10 rows built /G7** (a finding for the project's flags, not the lifter): Spore 01133020, 0113b9d0,
+  0112da30, 0112da60 (`/O2 /MD /Gy /TP`, no /arch) match with /G7 added (`sub edi, 1` for `dec edi`, `add esi,
+  esi` x2 for `shl esi, 2`); the /arch:SSE 13.10 rows tried do not change with it.
 - **A virtual call on a member object.** `mov eax, [ecx+0x120]; mov edx, [eax+0x58]; add ecx, 0x120; call edx`: the
   vtable read through the owner's base before `this` is formed is `((V*)(p + 0x120))->f()`, written with the object
   as that expression at the call (vcall_member): a named `this` computed before a store that comes between is a lea
@@ -285,9 +302,10 @@ work/claude/lift_structure_breakdown.md) by cause. What each turned out to be, a
   00dd1910, 00b204d0: `ret 4`, then another function's code up to its `ret 8`) cannot match (a /Gy object puts each
   function in its own section); the signature now takes the first ret's pop. The rest of #11 is retail code our
   structuring does not produce (tail-duplicated returns, Spore 0057c4b0, 00813370).
-- **Measured** (9ba5742 -> this change): the 498 rows 2 -> 56 MATCH; staticbench `_v2` (refreshed 2026-11-28:
-  Spore /Od 635 rows, /O2 1,500, M&B 254) Spore /Od 0 -> 7, /O2 5 -> 20, M&B 0 -> 0, no MATCH lost; all new ones
-  confirmed by chk.py (work/staticbench/new_spore_od_v2_3.txt, new_spore_o2_v2_2.txt).
+- **Measured** (9ba5742 -> 18439c4 -> the call rules above): the 498 rows 2 -> 56 -> 63 MATCH; staticbench `_v2`
+  (refreshed 2026-11-28: Spore /Od 635 rows, /O2 1,500, M&B 254) Spore /Od 0 -> 7 -> 8, /O2 5 -> 20 -> 22, M&B
+  0 -> 0, no MATCH lost; all new ones confirmed by chk.py (work/staticbench/new_spore_od_v2_3/4.txt,
+  new_spore_o2_v2_2/3.txt, new_spore_498_1/2.txt).
 - **Not addressed** (#1 independent loads / stores in another order, #3 a load on one side, #6 branch polarity, #8 a
   memory operand folded): the examples looked at are /Od frame layouts of inlined callees (0044c450, 0045b660,
   00548860), a redundant `test ecx, ecx` our code drops after a refcount release (0060d210), and a member read twice

@@ -21,3 +21,14 @@ bool o2_bret2(L2B* p, L2B* q) { bool r = p->t(); q->u(); return r; }
 // (Spore 00ea2670)
 struct L2S { virtual int s0(); };
 int o2_subsw(L2S* p, int* q) { switch (p->s0()) { case 84027824: return q[1]; case 84027832: return q[2]; } return 0; }
+// calls through pointers with the callee's convention from the bytes: a COM-style interface (the object pushed
+// first, the callee pops: __stdcall, Spore 011fd6f0), a pointer to member (`this` in ecx, Spore 00dddb10), a call
+// nested in another's arguments (its cleanup pops only its own: Spore 010527f0)
+struct L2I; struct L2IV { int (__stdcall* f)(L2I*, int); }; struct L2I { L2IV* vt; };
+int o2_com(L2I* p, int a) { return p->vt->f(p, a) + 1; }
+struct L2P { void (L2P::*fn)(int); };
+void o2_pmf(L2P* o, L2P* t, int a) { (t->*(o->fn))(a); }
+struct L2N { int (*f)(int, int, int); void (*g)(int, int); };
+void o2_nest(L2N* n, int x) { n->g(n->f(1, 2, x), x); }
+// `sar ebx, 2; lea eax, [eax + ebx*4]`: an element count scaled back is a multiply (a shift folds into `and`)
+int o2_idx(int* p, int a, int b) { int n = (b - a) >> 2; return (int)(p + n); }
